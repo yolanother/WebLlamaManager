@@ -39,6 +39,33 @@ let downloadProcesses = new Map();
 let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
 
+// Log buffer (circular buffer for recent logs)
+const MAX_LOG_LINES = 500;
+let logBuffer = [];
+
+function addLog(source, message) {
+  const timestamp = new Date().toISOString();
+  const lines = message.toString().split('\n').filter(l => l.trim());
+  for (const line of lines) {
+    const logEntry = { timestamp, source, message: line };
+    logBuffer.push(logEntry);
+    if (logBuffer.length > MAX_LOG_LINES) {
+      logBuffer.shift();
+    }
+    // Broadcast to connected WebSocket clients
+    broadcastLog(logEntry);
+  }
+}
+
+function broadcastLog(logEntry) {
+  const message = JSON.stringify({ type: 'log', data: logEntry });
+  for (const client of connectedClients) {
+    if (client.readyState === client.OPEN) {
+      client.send(message);
+    }
+  }
+}
+
 // Optimized single-model presets
 // These use specific configurations not supported in router mode
 const OPTIMIZED_PRESETS = {
@@ -209,13 +236,16 @@ async function getGpuStats() {
         const data = JSON.parse(output.trim() || '{}');
         if (data.card0 || data['card0']) {
           const card = data.card0 || data['card0'];
+          const vramTotal = parseInt(card['VRAM Total Memory (B)'] || 0);
+          const vramUsed = parseInt(card['VRAM Total Used Memory (B)'] || 0);
+          const vramUsage = vramTotal > 0 ? Math.round((vramUsed / vramTotal) * 1000) / 10 : 0;
           resolve({
             temperature: parseFloat(card['Temperature (Sensor edge) (C)'] || card.temperature || 0),
             usage: parseFloat(card['GPU use (%)'] || card.gpu_use || 0),
             vram: {
-              total: parseInt(card['VRAM Total Memory (B)'] || 0),
-              used: parseInt(card['VRAM Total Used Memory (B)'] || 0),
-              usage: 0
+              total: vramTotal,
+              used: vramUsed,
+              usage: vramUsage
             }
           });
         } else {
@@ -551,14 +581,14 @@ app.post('/api/server/start', async (req, res) => {
     });
 
     llamaProcess.stdout.on('data', (data) => {
-      console.log(`[llama] ${data}`);
+      addLog('llama', data);
     });
     llamaProcess.stderr.on('data', (data) => {
-      console.error(`[llama] ${data}`);
+      addLog('llama', data);
     });
 
     llamaProcess.on('exit', (code) => {
-      console.log(`llama-server exited with code ${code}`);
+      addLog('system', `llama-server exited with code ${code}`);
     });
 
     res.json({ success: true, mode: 'router', pid: llamaProcess.pid });
@@ -598,14 +628,14 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
     });
 
     llamaProcess.stdout.on('data', (data) => {
-      console.log(`[llama] ${data}`);
+      addLog('llama', data);
     });
     llamaProcess.stderr.on('data', (data) => {
-      console.error(`[llama] ${data}`);
+      addLog('llama', data);
     });
 
     llamaProcess.on('exit', (code) => {
-      console.log(`llama-server exited with code ${code}`);
+      addLog('system', `llama-server exited with code ${code}`);
       if (code !== 0) {
         currentMode = 'router';
         currentPreset = null;
@@ -883,6 +913,13 @@ app.get('/api/stats', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Get server logs
+app.get('/api/logs', (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  const logs = logBuffer.slice(-limit);
+  res.json({ logs });
 });
 
 // Catch-all for SPA routing

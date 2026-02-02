@@ -25,12 +25,14 @@ function formatUptime(ms) {
   return `${seconds}s`;
 }
 
-// WebSocket hook for real-time stats
+// WebSocket hook for real-time stats and logs
 function useWebSocket() {
   const [stats, setStats] = useState(null);
+  const [logs, setLogs] = useState([]);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
+  const MAX_LOGS = 500;
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -49,6 +51,11 @@ function useWebSocket() {
           const message = JSON.parse(event.data);
           if (message.type === 'stats') {
             setStats(message.data);
+          } else if (message.type === 'log') {
+            setLogs(prev => {
+              const newLogs = [...prev, message.data];
+              return newLogs.slice(-MAX_LOGS);
+            });
           }
         } catch (e) {
           console.error('[ws] Parse error:', e);
@@ -78,7 +85,9 @@ function useWebSocket() {
     };
   }, [connect]);
 
-  return { stats, connected };
+  const clearLogs = useCallback(() => setLogs([]), []);
+
+  return { stats, logs, connected, clearLogs };
 }
 
 // Sidebar Navigation
@@ -112,6 +121,10 @@ function Sidebar({ stats }) {
         <NavLink to="/download" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
           <span className="nav-icon">&#x2B07;</span>
           Download
+        </NavLink>
+        <NavLink to="/logs" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+          <span className="nav-icon">&#x1F4DC;</span>
+          Logs
         </NavLink>
       </div>
 
@@ -834,6 +847,106 @@ function DownloadPage({ stats }) {
   );
 }
 
+// Logs Page
+function LogsPage({ logs, clearLogs }) {
+  const [filter, setFilter] = useState('');
+  const [autoScroll, setAutoScroll] = useState(true);
+  const logsEndRef = useRef(null);
+  const logsContainerRef = useRef(null);
+
+  // Fetch initial logs on mount
+  useEffect(() => {
+    const fetchInitialLogs = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/logs?limit=500`);
+        const data = await res.json();
+        // Logs from API are added via the parent's setLogs if needed
+        // For now, we rely on WebSocket for real-time logs
+      } catch (err) {
+        console.error('Failed to fetch logs:', err);
+      }
+    };
+    fetchInitialLogs();
+  }, []);
+
+  useEffect(() => {
+    if (autoScroll && logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs, autoScroll]);
+
+  const handleScroll = () => {
+    if (!logsContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = logsContainerRef.current;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
+    setAutoScroll(isAtBottom);
+  };
+
+  const filteredLogs = filter
+    ? logs.filter(log =>
+        log.message.toLowerCase().includes(filter.toLowerCase()) ||
+        log.source.toLowerCase().includes(filter.toLowerCase())
+      )
+    : logs;
+
+  const formatTime = (timestamp) => {
+    const date = new Date(timestamp);
+    return date.toLocaleTimeString('en-US', { hour12: false });
+  };
+
+  return (
+    <div className="page logs-page">
+      <div className="page-header">
+        <h2>Server Logs</h2>
+        <div className="logs-actions">
+          <input
+            type="text"
+            placeholder="Filter logs..."
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            className="logs-filter"
+          />
+          <button className="btn-secondary" onClick={clearLogs}>
+            Clear
+          </button>
+          <label className="auto-scroll-toggle">
+            <input
+              type="checkbox"
+              checked={autoScroll}
+              onChange={(e) => setAutoScroll(e.target.checked)}
+            />
+            Auto-scroll
+          </label>
+        </div>
+      </div>
+
+      <div
+        className="logs-container"
+        ref={logsContainerRef}
+        onScroll={handleScroll}
+      >
+        {filteredLogs.length === 0 ? (
+          <div className="logs-empty">
+            <p>No logs yet</p>
+            <p className="hint">Logs will appear here when the server outputs messages</p>
+          </div>
+        ) : (
+          <div className="logs-list">
+            {filteredLogs.map((log, i) => (
+              <div key={i} className={`log-entry ${log.source}`}>
+                <span className="log-time">{formatTime(log.timestamp)}</span>
+                <span className={`log-source ${log.source}`}>{log.source}</span>
+                <span className="log-message">{log.message}</span>
+              </div>
+            ))}
+            <div ref={logsEndRef} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Query Panel Component
 function QueryPanel({ stats }) {
   const [isOpen, setIsOpen] = useState(false);
@@ -1047,7 +1160,7 @@ function QueryPanel({ stats }) {
 
 // Main App
 function App() {
-  const { stats, connected } = useWebSocket();
+  const { stats, logs, connected, clearLogs } = useWebSocket();
 
   return (
     <BrowserRouter>
@@ -1064,6 +1177,7 @@ function App() {
             <Route path="/presets" element={<PresetsPage stats={stats} />} />
             <Route path="/models" element={<ModelsPage stats={stats} />} />
             <Route path="/download" element={<DownloadPage stats={stats} />} />
+            <Route path="/logs" element={<LogsPage logs={logs} clearLogs={clearLogs} />} />
           </Routes>
         </main>
         <QueryPanel stats={stats} />
