@@ -42,18 +42,40 @@ let currentPreset = null;
 // Log buffer (circular buffer for recent logs)
 const MAX_LOG_LINES = 500;
 let logBuffer = [];
+let lastLogEntry = null;
+let lastLogCount = 0;
 
 function addLog(source, message) {
   const timestamp = new Date().toISOString();
   const lines = message.toString().split('\n').filter(l => l.trim());
+
   for (const line of lines) {
-    const logEntry = { timestamp, source, message: line };
-    logBuffer.push(logEntry);
-    if (logBuffer.length > MAX_LOG_LINES) {
-      logBuffer.shift();
+    // Check if this is a repeat of the last message
+    if (lastLogEntry && lastLogEntry.source === source && lastLogEntry.message === line) {
+      lastLogCount++;
+      lastLogEntry.count = lastLogCount;
+      lastLogEntry.timestamp = timestamp; // Update timestamp to latest
+      // Broadcast update to existing entry
+      broadcastLog({ ...lastLogEntry, type: 'update' });
+    } else {
+      // Flush the previous entry if it had repeats
+      if (lastLogEntry && lastLogCount > 1) {
+        // The entry is already in the buffer with count, just finalize it
+      }
+
+      // Create new entry
+      const logEntry = { timestamp, source, message: line, count: 1, id: Date.now() + Math.random() };
+      logBuffer.push(logEntry);
+      if (logBuffer.length > MAX_LOG_LINES) {
+        logBuffer.shift();
+      }
+
+      lastLogEntry = logEntry;
+      lastLogCount = 1;
+
+      // Broadcast new entry
+      broadcastLog(logEntry);
     }
-    // Broadcast to connected WebSocket clients
-    broadcastLog(logEntry);
   }
 }
 

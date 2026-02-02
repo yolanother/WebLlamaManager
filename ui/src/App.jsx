@@ -53,7 +53,15 @@ function useWebSocket() {
             setStats(message.data);
           } else if (message.type === 'log') {
             setLogs(prev => {
-              const newLogs = [...prev, message.data];
+              const logData = message.data;
+              // Check if this is an update to an existing log entry
+              if (logData.type === 'update' && logData.id) {
+                return prev.map(log =>
+                  log.id === logData.id ? { ...log, count: logData.count, timestamp: logData.timestamp } : log
+                );
+              }
+              // New log entry
+              const newLogs = [...prev, logData];
               return newLogs.slice(-MAX_LOGS);
             });
           }
@@ -933,10 +941,11 @@ function LogsPage({ logs, clearLogs }) {
         ) : (
           <div className="logs-list">
             {filteredLogs.map((log, i) => (
-              <div key={i} className={`log-entry ${log.source}`}>
+              <div key={log.id || i} className={`log-entry ${log.source}`}>
                 <span className="log-time">{formatTime(log.timestamp)}</span>
                 <span className={`log-source ${log.source}`}>{log.source}</span>
                 <span className="log-message">{log.message}</span>
+                {log.count > 1 && <span className="log-count">×{log.count}</span>}
               </div>
             ))}
             <div ref={logsEndRef} />
