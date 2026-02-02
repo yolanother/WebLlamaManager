@@ -834,6 +834,216 @@ function DownloadPage({ stats }) {
   );
 }
 
+// Query Panel Component
+function QueryPanel({ stats }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [models, setModels] = useState([]);
+  const [selectedModel, setSelectedModel] = useState(() => {
+    return localStorage.getItem('lastSelectedModel') || '';
+  });
+  const [prompt, setPrompt] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [streamingMessage, setStreamingMessage] = useState('');
+  const messagesEndRef = useRef(null);
+  const textareaRef = useRef(null);
+
+  // Fetch available models
+  const fetchModels = useCallback(async () => {
+    try {
+      const llamaPort = stats?.llamaPort || 5251;
+      const response = await fetch(`http://${window.location.hostname}:${llamaPort}/models`);
+      if (response.ok) {
+        const data = await response.json();
+        const modelList = data.data || data || [];
+        setModels(modelList);
+
+        // Auto-select first model if none selected
+        if (!selectedModel && modelList.length > 0) {
+          const firstModel = modelList[0].id || modelList[0].model;
+          setSelectedModel(firstModel);
+          localStorage.setItem('lastSelectedModel', firstModel);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch models:', err);
+    }
+  }, [stats?.llamaPort, selectedModel]);
+
+  useEffect(() => {
+    if (isOpen) {
+      fetchModels();
+    }
+  }, [isOpen, fetchModels]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, streamingMessage]);
+
+  const handleModelChange = (e) => {
+    const model = e.target.value;
+    setSelectedModel(model);
+    localStorage.setItem('lastSelectedModel', model);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!prompt.trim() || isLoading) return;
+
+    const userMessage = { role: 'user', content: prompt.trim() };
+    setMessages(prev => [...prev, userMessage]);
+    setPrompt('');
+    setIsLoading(true);
+    setStreamingMessage('');
+
+    try {
+      const llamaPort = stats?.llamaPort || 5251;
+      const response = await fetch(`http://${window.location.hostname}:${llamaPort}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: selectedModel,
+          messages: [...messages, userMessage],
+          stream: true
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '[DONE]') continue;
+
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.delta?.content || '';
+              fullContent += content;
+              setStreamingMessage(fullContent);
+            } catch {
+              // Skip invalid JSON
+            }
+          }
+        }
+      }
+
+      setMessages(prev => [...prev, { role: 'assistant', content: fullContent }]);
+      setStreamingMessage('');
+    } catch (err) {
+      console.error('Query failed:', err);
+      setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${err.message}` }]);
+    }
+
+    setIsLoading(false);
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit(e);
+    }
+  };
+
+  const clearChat = () => {
+    setMessages([]);
+    setStreamingMessage('');
+  };
+
+  const isHealthy = stats?.llama?.status === 'ok';
+
+  return (
+    <div className={`query-panel ${isOpen ? 'open' : ''}`}>
+      <button
+        className={`query-fab ${isOpen ? 'open' : ''}`}
+        onClick={() => setIsOpen(!isOpen)}
+        title={isOpen ? 'Close chat' : 'Test query'}
+      >
+        <span className="fab-icon">{isOpen ? '✕' : '💬'}</span>
+      </button>
+
+      <div className="query-container">
+        <div className="query-header">
+          <h3>Query Panel</h3>
+          <div className="query-controls">
+            <select
+              value={selectedModel}
+              onChange={handleModelChange}
+              disabled={!isHealthy || models.length === 0}
+            >
+              {models.length === 0 ? (
+                <option value="">No models available</option>
+              ) : (
+                models.map((model) => (
+                  <option key={model.id || model.model} value={model.id || model.model}>
+                    {model.id || model.model}
+                  </option>
+                ))
+              )}
+            </select>
+            <button className="btn-ghost btn-small" onClick={clearChat} title="Clear chat">
+              🗑️
+            </button>
+          </div>
+        </div>
+
+        <div className="query-messages">
+          {messages.length === 0 && !streamingMessage && (
+            <div className="query-empty">
+              <p>Send a message to test the model</p>
+              {!isHealthy && <p className="hint">Server is not running</p>}
+            </div>
+          )}
+          {messages.map((msg, i) => (
+            <div key={i} className={`query-message ${msg.role}`}>
+              <span className="message-role">{msg.role === 'user' ? 'You' : 'AI'}</span>
+              <div className="message-content">{msg.content}</div>
+            </div>
+          ))}
+          {streamingMessage && (
+            <div className="query-message assistant streaming">
+              <span className="message-role">AI</span>
+              <div className="message-content">{streamingMessage}</div>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+
+        <form className="query-input" onSubmit={handleSubmit}>
+          <textarea
+            ref={textareaRef}
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={isHealthy ? "Type a message... (Enter to send)" : "Server not running"}
+            disabled={!isHealthy || isLoading}
+            rows={1}
+          />
+          <button
+            type="submit"
+            className="btn-primary"
+            disabled={!isHealthy || isLoading || !prompt.trim()}
+          >
+            {isLoading ? '...' : '→'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 // Main App
 function App() {
   const { stats, connected } = useWebSocket();
@@ -855,6 +1065,7 @@ function App() {
             <Route path="/download" element={<DownloadPage stats={stats} />} />
           </Routes>
         </main>
+        <QueryPanel stats={stats} />
       </div>
     </BrowserRouter>
   );
