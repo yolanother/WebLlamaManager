@@ -1,0 +1,20 @@
+[Unit]
+Description=Llama Manager API and Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/yolan/workspace/ai/llama-server/api
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=API_PORT=3001
+Environment=LLAMA_PORT=8080
+
+# Allow the service to manage distrobox containers
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+
+[Install]
+WantedBy=default.target
