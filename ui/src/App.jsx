@@ -385,23 +385,27 @@ function Dashboard({ stats }) {
             </div>
           )}
 
-          {stats?.context && stats.context.totalContext > 0 && (
-            <div className="resource-card">
-              <ProgressRing
-                value={stats.context.usage || 0}
-                color="var(--info)"
-              />
-              <div className="resource-info">
-                <span className="resource-label">Context</span>
-                <span className="resource-detail">
-                  {(stats.context.usedContext || 0).toLocaleString()} / {(stats.context.totalContext || 0).toLocaleString()} tokens
-                </span>
-                <span className="resource-detail" style={{fontSize: '0.7em', opacity: 0.7}}>
-                  {stats.context.models?.length || 0} model{stats.context.models?.length !== 1 ? 's' : ''} loaded
-                </span>
-              </div>
+          <div className="resource-card">
+            <ProgressRing
+              value={stats?.context?.usage || 0}
+              color="var(--info)"
+            />
+            <div className="resource-info">
+              <span className="resource-label">Context</span>
+              {stats?.context?.totalContext > 0 ? (
+                <>
+                  <span className="resource-detail">
+                    {(stats.context.usedContext || 0).toLocaleString()} / {(stats.context.totalContext || 0).toLocaleString()} tokens
+                  </span>
+                  <span className="resource-detail" style={{fontSize: '0.7em', opacity: 0.7}}>
+                    {stats.context.models?.length || 0} model{stats.context.models?.length !== 1 ? 's' : ''} loaded
+                  </span>
+                </>
+              ) : (
+                <span className="resource-detail">No models loaded</span>
+              )}
             </div>
-          )}
+          </div>
         </div>
       </section>
 
