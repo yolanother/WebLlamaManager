@@ -2,7 +2,17 @@
   "permissions": {
     "allow": [
       "Bash(distrobox list:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(systemctl:*)",
+      "Bash(journalctl:*)",
+      "Bash(./install.sh:*)",
+      "Bash(npm run build:*)",
+      "Bash(pkill:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(npm install:*)",
+      "Bash(git push)",
+      "Bash(curl:*)"
     ]
   }
 }
