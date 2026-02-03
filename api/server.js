@@ -175,6 +175,30 @@ const STATS_INTERVAL = parseInt(process.env.STATS_INTERVAL) || 1000; // Default 
 let statsInterval = null;
 let connectedClients = new Set();
 
+// Get CPU temperature from thermal zones
+function getCpuTemperature() {
+  try {
+    // Try to read from thermal_zone0 (usually CPU on most systems)
+    const tempFiles = readdirSync('/sys/class/thermal/')
+      .filter(f => f.startsWith('thermal_zone'))
+      .map(f => `/sys/class/thermal/${f}/temp`);
+
+    for (const tempFile of tempFiles) {
+      try {
+        const temp = parseInt(readFileSync(tempFile, 'utf-8').trim());
+        if (temp > 0) {
+          return Math.round(temp / 100) / 10; // Convert millidegrees to degrees with 1 decimal
+        }
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    // Thermal zones not available
+  }
+  return null;
+}
+
 // System stats collection
 async function getSystemStats() {
   const cpuCores = cpus();
@@ -188,6 +212,9 @@ async function getSystemStats() {
   const freeMem = freemem();
   const usedMem = totalMem - freeMem;
   const memUsage = (usedMem / totalMem) * 100;
+
+  // Get CPU temperature
+  const cpuTemp = getCpuTemperature();
 
   // Get GPU/VRAM stats from rocm-smi inside the container
   let gpuStats = null;
@@ -216,7 +243,8 @@ async function getSystemStats() {
     cpu: {
       usage: Math.round(cpuUsage * 10) / 10,
       cores: cpuCores.length,
-      loadAvg: loadavg()
+      loadAvg: loadavg(),
+      temperature: cpuTemp
     },
     memory: {
       total: totalMem,
@@ -379,7 +407,7 @@ async function getGpuStats() {
     const cmd = spawn('/usr/local/bin/distrobox', [
       'enter', CONTAINER_NAME, '--',
       'bash', '-c',
-      'rocm-smi --showmeminfo vram --showuse --showtemp --json 2>/dev/null || echo "{}"'
+      'rocm-smi --showmeminfo vram --showuse --showtemp --showpower --showclocks --json 2>/dev/null || echo "{}"'
     ], {
       env: { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' },
       stdio: ['ignore', 'pipe', 'pipe']
@@ -400,6 +428,18 @@ async function getGpuStats() {
           const vramUsed = parseInt(card['VRAM Total Used Memory (B)'] || 0);
           const vramUsage = vramTotal > 0 ? Math.round((vramUsed / vramTotal) * 1000) / 10 : 0;
 
+          // Parse power (watts)
+          const powerStr = card['Current Socket Graphics Package Power (W)'] || card['Average Graphics Package Power (W)'] || '0';
+          const power = parseFloat(powerStr) || 0;
+
+          // Parse clock speeds (extract MHz from strings like "(1000Mhz)")
+          const sclkStr = card['sclk clock speed:'] || '';
+          const mclkStr = card['mclk clock speed:'] || '';
+          const sclkMatch = sclkStr.match(/\((\d+)Mhz\)/i);
+          const mclkMatch = mclkStr.match(/\((\d+)Mhz\)/i);
+          const coreClock = sclkMatch ? parseInt(sclkMatch[1]) : 0;
+          const memClock = mclkMatch ? parseInt(mclkMatch[1]) : 0;
+
           // For systems with unified memory (APUs, MI300A, etc.), GTT is the primary memory for LLM inference
           // If GTT is larger than VRAM, prefer showing GTT as it represents usable memory
           const isAPU = gttStats.total > vramTotal;
@@ -407,6 +447,9 @@ async function getGpuStats() {
           resolve({
             temperature: parseFloat(card['Temperature (Sensor edge) (C)'] || card.temperature || 0),
             usage: parseFloat(card['GPU use (%)'] || card.gpu_use || 0),
+            power,
+            coreClock,
+            memClock,
             vram: {
               total: vramTotal,
               used: vramUsed,
@@ -421,6 +464,9 @@ async function getGpuStats() {
             resolve({
               temperature: 0,
               usage: 0,
+              power: 0,
+              coreClock: 0,
+              memClock: 0,
               vram: { total: 0, used: 0, usage: 0 },
               gtt: gttStats,
               isAPU: true
@@ -435,6 +481,9 @@ async function getGpuStats() {
           resolve({
             temperature: 0,
             usage: 0,
+            power: 0,
+            coreClock: 0,
+            memClock: 0,
             vram: { total: 0, used: 0, usage: 0 },
             gtt: gttStats,
             isAPU: true

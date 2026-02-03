@@ -321,9 +321,11 @@ function Dashboard({ stats }) {
               color={stats?.cpu?.usage > 80 ? 'var(--error)' : 'var(--accent)'}
             />
             <div className="resource-info">
-              <span className="resource-label">CPU Usage</span>
-              <span className="resource-detail">{stats?.cpu?.cores || 0} cores</span>
-              <span className="resource-detail">Load: {stats?.cpu?.loadAvg?.[0]?.toFixed(2) || '0.00'}</span>
+              <span className="resource-label">CPU</span>
+              <span className="resource-detail">{stats?.cpu?.cores || 0} cores @ {stats?.cpu?.loadAvg?.[0]?.toFixed(1) || '0.0'} load</span>
+              {stats?.cpu?.temperature && (
+                <span className="resource-detail">Temp: {stats.cpu.temperature}°C</span>
+              )}
             </div>
           </div>
 
@@ -359,9 +361,6 @@ function Dashboard({ stats }) {
                       : `${formatBytes(stats.gpu.vram?.used)} / ${formatBytes(stats.gpu.vram?.total)}`
                     }
                   </span>
-                  {stats.gpu.temperature > 0 && (
-                    <span className="resource-detail">Temp: {stats.gpu.temperature}°C</span>
-                  )}
                   {stats.gpu.isAPU && (
                     <span className="resource-detail" style={{fontSize: '0.7em', opacity: 0.7}}>Unified Memory</span>
                   )}
@@ -379,8 +378,28 @@ function Dashboard({ stats }) {
                 color="var(--accent)"
               />
               <div className="resource-info">
-                <span className="resource-label">GPU Usage</span>
-                <span className="resource-detail">{stats.gpu.usage?.toFixed(1) || 0}%</span>
+                <span className="resource-label">GPU</span>
+                <span className="resource-detail">
+                  {stats.gpu.usage?.toFixed(0) || 0}% @ {stats.gpu.coreClock || 0} MHz
+                </span>
+                {stats.gpu.temperature > 0 && (
+                  <span className="resource-detail">Temp: {stats.gpu.temperature}°C</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {stats?.gpu?.power > 0 && (
+            <div className="resource-card">
+              <div className="power-display">
+                <span className="power-value">{stats.gpu.power.toFixed(0)}</span>
+                <span className="power-unit">W</span>
+              </div>
+              <div className="resource-info">
+                <span className="resource-label">Power</span>
+                <span className="resource-detail">
+                  Mem: {stats.gpu.memClock || 0} MHz
+                </span>
               </div>
             </div>
           )}

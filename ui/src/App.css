@@ -344,6 +344,31 @@ input::placeholder {
   color: var(--text-secondary);
 }
 
+/* Power Display */
+.power-display {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  background: var(--bg-tertiary);
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.power-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--warning);
+}
+
+.power-unit {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-left: 2px;
+}
+
 /* Progress Ring */
 .progress-ring {
   transform: rotate(-90deg);
