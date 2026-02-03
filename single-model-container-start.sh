@@ -12,7 +12,8 @@ case "$model" in
     REPOID=Unsloth
     MODEL=gpt-oss-120b-GGUF
     QUANTIZATION=Q5_K_M
-    CONTEXT=131072
+    #CONTEXT=131072
+    CONTEXT=64000
 
     CHAT_TEMPLATE_KWARGS='{"reasoning_effort": "high"}'
     REASONING_FORMAT=deepseek
@@ -106,6 +107,7 @@ CMD_ARGS=(
   --parallel 1
   --host 0.0.0.0
   --port "$PORT"
+  --models-dir /home/yolan/models
 )
 
 # Add extra switches (like --jinja)
