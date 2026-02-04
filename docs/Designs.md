@@ -50,6 +50,10 @@ Llama Manager is a service for managing llama.cpp in multi-model router mode. It
 | [ApiDocs.md](Designs/ApiDocs.md) | API documentation enhancements |
 | [OpenCode.md](Designs/OpenCode.md) | OpenCode AI integration |
 
+## Screenshots
+
+See [screenshots/](screenshots/) for UI screenshots.
+
 ## Key Design Decisions
 
 ### Router vs Single Mode
@@ -71,6 +75,21 @@ The MCP server exposes tools for:
 - Sending chat completions
 - Managing model loading/unloading
 - Monitoring server status
+
+### Model Aliases
+
+Models can have user-friendly display names (aliases) that appear in the UI while using the actual model path for API calls. Aliases are stored in `config.json` under `modelAliases`.
+
+### Split Model Handling
+
+Multi-part GGUF models (e.g., `model-00001-of-00003.gguf`) are automatically detected and grouped. Only the base model is shown in the UI, not individual part files.
+
+### Download Management
+
+- Downloads run via HuggingFace CLI in a Python venv (`.venv/`)
+- Progress displayed in header with expandable details
+- Errors shown with full details and copy button
+- HF_TRANSFER enabled for faster downloads
 
 ## Configuration
 

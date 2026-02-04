@@ -1,15 +1,32 @@
+<img src="ui/public/favicon/favicon-96x96.png" alt="Llama Manager" align="left" width="64" height="64" style="margin-right: 16px;">
+
 # Llama Manager
 
 A systemd service with web UI for managing llama.cpp in multi-model router mode on AMD GPUs using distrobox.
+
+<br clear="left">
 
 ## Features
 
 - **Multi-model support**: Load and unload models dynamically without restarting
 - **Web UI**: Modern React interface for model management
-- **HuggingFace integration**: Search and download GGUF models directly
+- **HuggingFace integration**: Search and download GGUF models with progress tracking
+- **Model aliases**: Friendly display names for your models
 - **Models stored in ~/models**: All models in one place, easy to manage
 - **systemd service**: Auto-start on boot, runs in background
 - **OpenAI-compatible API**: Use with any client that supports OpenAI API
+- **MCP Server**: Integration with AI agents like Claude Desktop
+- **Full Chat Interface**: Multi-conversation chat with streaming and image support
+- **Real-time monitoring**: GPU, CPU, memory stats and analytics dashboard
+
+## Screenshots
+
+<!-- Add screenshots here -->
+| Dashboard | Models | Chat |
+|-----------|--------|------|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Models](docs/screenshots/models.png) | ![Chat](docs/screenshots/chat.png) |
+
+> Screenshots coming soon. Run the app at http://localhost:3001 to see it in action.
 
 ## Requirements
 
