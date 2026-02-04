@@ -2596,7 +2596,10 @@ input::placeholder {
 
 /* API Docs Page */
 .api-docs-page {
-  max-width: 1600px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .api-tabs {
@@ -2633,6 +2636,7 @@ input::placeholder {
   gap: 24px;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
 .api-endpoints-list {
@@ -2640,9 +2644,8 @@ input::placeholder {
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 20px;
-  height: fit-content;
-  max-height: calc(100vh - 250px);
   overflow-y: auto;
+  min-height: 0;
 }
 
 .api-endpoints-list h3 {
@@ -2737,6 +2740,8 @@ input::placeholder {
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 24px;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .endpoint-header {
@@ -2943,6 +2948,7 @@ input::placeholder {
 @media (max-width: 900px) {
   .api-docs-layout {
     grid-template-columns: 1fr;
+    overflow-y: auto;
   }
 
   .api-endpoints-list {
