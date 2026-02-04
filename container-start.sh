@@ -19,6 +19,9 @@ export HSA_OVERRIDE_GFX_VERSION=11.5.1
 export ROCM_LLVM_PRE_VEGA=1
 export IP_ADDRESS=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk 'NR==1 {print $2}' | cut -d'/' -f1)
 
+# Set llama.cpp cache directory to MODELS_DIR so HF downloads go there
+export LLAMA_CACHE="$MODELS_DIR"
+
 # Ensure models directory exists
 mkdir -p "$MODELS_DIR"
 

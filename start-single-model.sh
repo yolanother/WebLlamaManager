@@ -35,5 +35,6 @@ fi
 # Enter the container and run the single-model start script
 exec $DISTROBOX enter "$CONTAINER_NAME" -- bash -c "
     export PORT='$PORT'
+    export MODELS_DIR='${MODELS_DIR:-$HOME/models}'
     cd '$SCRIPT_DIR' && ./single-model-container-start.sh '$PRESET_ID'
 "

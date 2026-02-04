@@ -12,8 +12,8 @@ case "$model" in
     REPOID=Unsloth
     MODEL=gpt-oss-120b-GGUF
     QUANTIZATION=Q5_K_M
-    #CONTEXT=131072
-    CONTEXT=64000
+    CONTEXT=131072
+    #CONTEXT=16000
 
     CHAT_TEMPLATE_KWARGS='{"reasoning_effort": "high"}'
     REASONING_FORMAT=deepseek
@@ -67,8 +67,12 @@ esac
 # Configure the server
 ##
 : "${PORT:=8080}"
+: "${MODELS_DIR:=$HOME/models}"
 export HSA_OVERRIDE_GFX_VERSION=11.5.1
 export ROCM_LLVM_PRE_VEGA=1
+
+# Set llama.cpp cache directory to MODELS_DIR so HF downloads go there
+export LLAMA_CACHE="$MODELS_DIR"
 export IP_ADDRESS=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk 'NR==1 {print $2}' | cut -d'/' -f1)
 
 ##
@@ -107,7 +111,7 @@ CMD_ARGS=(
   --parallel 1
   --host 0.0.0.0
   --port "$PORT"
-  --models-dir /home/yolan/models
+  --models-dir "$MODELS_DIR"
 )
 
 # Add extra switches (like --jinja)
