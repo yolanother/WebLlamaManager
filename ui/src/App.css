@@ -3010,15 +3010,19 @@ input::placeholder {
 
 /* Documentation Page */
 .docs-page {
-  max-width: 1400px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .docs-layout {
   display: grid;
   grid-template-columns: 200px 1fr;
   gap: 32px;
-  height: 100%;
+  flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
 .docs-sidebar {
@@ -3222,6 +3226,7 @@ input::placeholder {
 @media (max-width: 768px) {
   .docs-layout {
     grid-template-columns: 1fr;
+    overflow-y: auto;
   }
 
   .docs-sidebar {
