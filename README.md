@@ -215,3 +215,65 @@ Enable lingering: `sudo loginctl enable-linger $USER`
 - Check GPU memory availability
 - Try reducing `modelsMax` in config.json
 - Try a smaller quantization (Q4 instead of Q5/Q6)
+
+## MCP Server
+
+Llama Manager includes an MCP (Model Context Protocol) server for integration with AI agents like Claude Desktop.
+
+### Setup with Claude Desktop
+
+Add to your Claude Desktop config (`~/.config/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "llama-manager": {
+      "command": "node",
+      "args": ["/path/to/llama-server/mcp/server.js"],
+      "env": {
+        "LLAMA_MANAGER_URL": "http://localhost:5250"
+      }
+    }
+  }
+}
+```
+
+Replace `/path/to/llama-server` with the actual path to this repository.
+
+### Available MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `llama_get_status` | Get server status, mode, and health |
+| `llama_get_stats` | Get CPU, memory, GPU, and context usage |
+| `llama_get_analytics` | Get time-series performance data |
+| `llama_list_models` | List local and loaded models |
+| `llama_load_model` | Load a model into the server |
+| `llama_unload_model` | Unload a model from the server |
+| `llama_start_server` | Start the llama server in router mode |
+| `llama_stop_server` | Stop the llama server |
+| `llama_get_settings` | Get current server settings |
+| `llama_update_settings` | Update server settings |
+| `llama_list_presets` | List available optimized presets |
+| `llama_activate_preset` | Activate an optimized preset |
+| `llama_search_models` | Search HuggingFace for GGUF models |
+| `llama_download_model` | Download a model from HuggingFace |
+| `llama_get_processes` | List running llama-server processes |
+| `llama_get_logs` | Get recent server logs |
+| `llama_chat` | Send a chat completion request |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLAMA_MANAGER_URL` | `http://localhost:5250` | Llama Manager API URL |
+
+## Documentation
+
+Additional documentation is available in the [docs/](docs/) directory:
+
+- [Architecture Overview](docs/Designs.md) - System architecture and design decisions
+- [Feature Template](docs/Designs/Feature.md) - Template for documenting new features
+- [Chat Page Design](docs/Designs/ChatPage.md) - Full chat interface design
+- [Docs Page Design](docs/Designs/DocsPage.md) - In-app documentation design
+- [API Docs Design](docs/Designs/ApiDocs.md) - API documentation enhancements
