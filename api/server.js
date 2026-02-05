@@ -1806,23 +1806,26 @@ app.get('/api/search', async (req, res) => {
 });
 
 // Get files in a HuggingFace repo (to find quantizations)
-// Uses huggingface-cli for reliable file listing
+// Uses huggingface-cli for file listing, falls back to API for sizes
 app.get('/api/repo/:author/:model/files', async (req, res) => {
   const { author, model } = req.params;
   const repoId = `${author}/${model}`;
 
   try {
-    // First try using huggingface-cli to list files (more reliable)
-    const files = await listRepoFilesWithCli(repoId);
+    // First try using huggingface-cli to list files (fast but may not have sizes)
+    let files = await listRepoFilesWithCli(repoId);
 
-    if (files.length > 0) {
-      const quantizations = groupFilesByQuantization(files);
-      return res.json({ quantizations });
+    // Check if CLI returned files but without sizes - fall back to API
+    const hasAnySizes = files.some(f => f.size > 0);
+    if (files.length > 0 && !hasAnySizes) {
+      console.log('[repo/files] CLI returned files without sizes, falling back to API');
+      files = await fetchRepoFilesRecursive(repoId);
+    } else if (files.length === 0) {
+      // No files from CLI, use API
+      files = await fetchRepoFilesRecursive(repoId);
     }
 
-    // Fallback to API with recursive tree fetching
-    const apiFiles = await fetchRepoFilesRecursive(repoId);
-    const quantizations = groupFilesByQuantization(apiFiles);
+    const quantizations = groupFilesByQuantization(files);
     res.json({ quantizations });
   } catch (error) {
     console.error('[repo/files] Error:', error);
@@ -1875,9 +1878,11 @@ async function listRepoFilesWithCli(repoId) {
         for (const sibling of siblings) {
           const filename = sibling.rfilename || sibling.path || '';
           if (filename.endsWith('.gguf')) {
+            // Size might be in sibling.size or sibling.lfs.size for large files
+            const size = sibling.size || sibling.lfs?.size || 0;
             files.push({
               path: filename,
-              size: sibling.size || 0
+              size: size
             });
           }
         }
@@ -1918,9 +1923,11 @@ async function fetchRepoFilesRecursive(repoId, path = '') {
         const subFiles = await fetchRepoFilesRecursive(repoId, item.path);
         allFiles.push(...subFiles);
       } else if (item.path && item.path.endsWith('.gguf')) {
+        // Size might be in item.size or item.lfs.size for large files
+        const size = item.size || item.lfs?.size || 0;
         allFiles.push({
           path: item.path,
-          size: item.size || 0
+          size: size
         });
       }
     }
