@@ -1981,6 +1981,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
   // Fetch historical LLM logs on first tab switch
   const [fetchedLlmLogs, setFetchedLlmLogs] = useState([]);
   const [llmLogsLoaded, setLlmLogsLoaded] = useState(false);
+  const [expandedRequestLogs, setExpandedRequestLogs] = useState(new Set());
   const [expandedLlmLogs, setExpandedLlmLogs] = useState(new Set());
   const [expandedSystemMsgs, setExpandedSystemMsgs] = useState(new Set());
   useEffect(() => {
@@ -2307,16 +2308,39 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredRequestLogs.map((log, i) => (
-                    <tr key={log.id || i} className={getStatusClass(log.status)}>
-                      <td className="log-time">{formatTime(log.timestamp)}</td>
-                      <td className="request-method">{log.method}</td>
-                      <td className="request-path" title={log.path}>{log.path}</td>
-                      <td className={`request-status ${getStatusClass(log.status)}`}>{log.status}</td>
-                      <td className="request-duration">{log.duration}ms</td>
-                      <td className="request-model">{log.model || '-'}</td>
-                    </tr>
-                  ))}
+                  {filteredRequestLogs.map((log, i) => {
+                    const hasError = log.error && log.status >= 400;
+                    const isExpanded = expandedRequestLogs.has(log.id);
+                    return (
+                      <React.Fragment key={log.id || i}>
+                        <tr
+                          className={`${getStatusClass(log.status)} ${hasError ? 'clickable' : ''}`}
+                          onClick={() => hasError && setExpandedRequestLogs(prev => {
+                            const next = new Set(prev);
+                            if (next.has(log.id)) next.delete(log.id); else next.add(log.id);
+                            return next;
+                          })}
+                        >
+                          <td className="log-time">
+                            {hasError && <span className="request-expand">{isExpanded ? '\u25BC' : '\u25B6'}</span>}
+                            {formatTime(log.timestamp)}
+                          </td>
+                          <td className="request-method">{log.method}</td>
+                          <td className="request-path" title={log.path}>{log.path}</td>
+                          <td className={`request-status ${getStatusClass(log.status)}`}>{log.status}</td>
+                          <td className="request-duration">{log.duration}ms</td>
+                          <td className="request-model">{log.model || '-'}</td>
+                        </tr>
+                        {isExpanded && (
+                          <tr className="request-error-row">
+                            <td colSpan="6">
+                              <div className="request-error-content">{log.error}</div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
               <div ref={logsEndRef} />

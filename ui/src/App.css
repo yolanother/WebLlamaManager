@@ -1919,6 +1919,34 @@ input::placeholder {
   font-style: italic;
 }
 
+.request-logs-table tbody tr.clickable {
+  cursor: pointer;
+}
+
+.request-expand {
+  font-size: 9px;
+  color: var(--text-secondary);
+  margin-right: 6px;
+}
+
+.request-error-row td {
+  padding: 0 12px 8px !important;
+  border-bottom: 1px solid var(--border);
+}
+
+.request-error-content {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--error);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
 /* LLM Conversation Log */
 .llm-logs-container {
   padding: 12px;

@@ -17,7 +17,7 @@ const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '200mb' }));
 
 // Request logging middleware
 const REQUEST_LOG_SKIP_PATHS = new Set(['/ws', '/api/stats', '/api/analytics']);
@@ -36,14 +36,40 @@ app.use((req, res, next) => {
   const origWrite = res.write;
   const origEnd = res.end;
 
+  let errorBody = '';
+
   res.write = function(chunk, ...args) {
-    if (chunk) responseSize += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+    if (chunk) {
+      responseSize += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+      // Capture error response body (limit to 4KB)
+      if (res.statusCode >= 400 && errorBody.length < 4096) {
+        errorBody += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+      }
+    }
     return origWrite.apply(this, [chunk, ...args]);
   };
 
   res.end = function(chunk, ...args) {
-    if (chunk) responseSize += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+    if (chunk) {
+      responseSize += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+      if (res.statusCode >= 400 && errorBody.length < 4096) {
+        errorBody += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+      }
+    }
     const duration = Date.now() - start;
+
+    // Try to extract a readable error message from the response body
+    let errorMessage = null;
+    if (res.statusCode >= 400) {
+      try {
+        const parsed = JSON.parse(errorBody);
+        errorMessage = parsed?.error?.message || parsed?.error || parsed?.message || errorBody;
+        if (typeof errorMessage === 'object') errorMessage = JSON.stringify(errorMessage);
+      } catch {
+        errorMessage = errorBody || res.statusMessage;
+      }
+      if (errorMessage && errorMessage.length > 4096) errorMessage = errorMessage.slice(0, 4096) + '...';
+    }
 
     const entry = {
       id: Date.now() + Math.random(),
@@ -58,7 +84,7 @@ app.use((req, res, next) => {
       userAgent: req.headers['user-agent'] || '',
       model: req.body?.model || null,
       stream: req.body?.stream || false,
-      error: res.statusCode >= 400 ? res.statusMessage : null
+      error: errorMessage
     };
 
     addRequestLog(entry);
@@ -2456,6 +2482,33 @@ app.get('/api/v1/models', async (req, res) => {
   }
 });
 
+// Sanitize messages for llama.cpp chat templates that reject both content+thinking on tool_calls
+function sanitizeMessages(messages) {
+  if (!Array.isArray(messages)) return messages;
+  let changed = 0;
+  const result = messages.map(msg => {
+    if (msg.role === 'assistant' && msg.tool_calls) {
+      // Remove content key entirely if thinking is also present - even empty strings
+      // The Jinja template checks key existence, not just truthiness
+      if ('content' in msg && 'thinking' in msg) {
+        changed++;
+        const { content, thinking, ...rest } = msg;
+        const merged = (thinking || '') + (content ? '\n' + content : '');
+        return { ...rest, thinking: merged || '' };
+      }
+    }
+    return msg;
+  });
+  console.log(`[sanitize] Processed ${messages.length} messages, fixed ${changed} tool_call messages`);
+  return result;
+}
+
+// Check if an error is a template error that sanitization can fix
+function isTemplateSanitizable(errorText) {
+  return typeof errorText === 'string' &&
+    errorText.includes('Cannot pass both content and thinking');
+}
+
 // OpenAI-compatible chat completions (streaming and non-streaming)
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
@@ -2464,12 +2517,36 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
 
-  try {
-    const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
+  async function doFetch(body) {
+    return fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(body)
     });
+  }
+
+  try {
+    let response = await doFetch(req.body);
+
+    // If template rejects the message format, retry with sanitized messages
+    if (!response.ok && req.body.messages) {
+      const errorText = await response.text();
+      if (isTemplateSanitizable(errorText)) {
+        console.log(`[chat/completions] Template error, retrying with sanitized messages`);
+        const sanitizedBody = { ...req.body, messages: sanitizeMessages(req.body.messages) };
+        response = await doFetch(sanitizedBody);
+      } else {
+        console.error(`[chat/completions] Error ${response.status} for model ${requestedModel}: ${errorText}`);
+        addLog('chat', `Chat completion failed for model ${requestedModel}: ${errorText}`);
+        addLlmLog({
+          endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
+          status: response.status, duration: Date.now() - startTime,
+          promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
+          messages: req.body.messages || null, prompt: null, response: null, error: errorText
+        });
+        return res.status(response.status).send(errorText);
+      }
+    }
 
     if (!response.ok) {
       const error = await response.text();
