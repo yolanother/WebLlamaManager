@@ -2031,6 +2031,49 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
     });
   };
 
+  const [resubmitting, setResubmitting] = useState({});
+  const [copiedField, setCopiedField] = useState(null);
+
+  const handleCopyField = async (text, fieldId) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedField(fieldId);
+      setTimeout(() => setCopiedField(null), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  };
+
+  const handleResubmit = async (log) => {
+    if (!log.requestBody) return;
+    setResubmitting(prev => ({ ...prev, [log.id]: 'loading' }));
+    try {
+      // Force non-streaming for resubmit so we get a clean response
+      const body = { ...log.requestBody, stream: false };
+      const res = await fetch(`${API_BASE}/v1/${log.endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (res.ok) {
+        setResubmitting(prev => ({ ...prev, [log.id]: 'success' }));
+      } else {
+        const errText = await res.text();
+        setResubmitting(prev => ({ ...prev, [log.id]: `error: ${res.status} - ${errText.slice(0, 200)}` }));
+      }
+    } catch (err) {
+      setResubmitting(prev => ({ ...prev, [log.id]: `error: ${err.message}` }));
+    }
+    // Clear status after 10 seconds
+    setTimeout(() => {
+      setResubmitting(prev => {
+        const next = { ...prev };
+        delete next[log.id];
+        return next;
+      });
+    }, 10000);
+  };
+
   const filteredLlmLogs = filter
     ? allLlmLogs.filter(log =>
         (log.model || '').toLowerCase().includes(filter.toLowerCase()) ||
@@ -2434,8 +2477,40 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                         )}
                         {log.error && (
                           <div className="llm-log-error-section">
-                            <div className="llm-log-section-title">Error</div>
+                            <div className="llm-log-section-title">
+                              Error
+                              <button
+                                className="copy-field-btn"
+                                onClick={(e) => { e.stopPropagation(); handleCopyField(log.error, `error-${log.id}`); }}
+                              >{copiedField === `error-${log.id}` ? 'Copied' : 'Copy'}</button>
+                            </div>
                             <div className="llm-log-error-content">{log.error}</div>
+                          </div>
+                        )}
+                        {log.requestBody && (
+                          <div className="llm-log-request-body-section">
+                            <div className="llm-log-section-title">
+                              Full Request Body
+                              <button
+                                className="copy-field-btn"
+                                onClick={(e) => { e.stopPropagation(); handleCopyField(JSON.stringify(log.requestBody, null, 2), `body-${log.id}`); }}
+                              >{copiedField === `body-${log.id}` ? 'Copied' : 'Copy'}</button>
+                            </div>
+                            <pre className="llm-log-request-body">{JSON.stringify(log.requestBody, null, 2)}</pre>
+                            <div className="llm-log-resubmit-row">
+                              <button
+                                className="btn-secondary resubmit-btn"
+                                onClick={(e) => { e.stopPropagation(); handleResubmit(log); }}
+                                disabled={resubmitting[log.id] === 'loading'}
+                              >
+                                {resubmitting[log.id] === 'loading' ? 'Resubmitting...' : 'Resubmit Request'}
+                              </button>
+                              {resubmitting[log.id] && resubmitting[log.id] !== 'loading' && (
+                                <span className={`resubmit-status ${resubmitting[log.id] === 'success' ? 'success' : 'error'}`}>
+                                  {resubmitting[log.id] === 'success' ? 'Success - check LLM Log for new entry' : resubmitting[log.id]}
+                                </span>
+                              )}
+                            </div>
                           </div>
                         )}
                       </div>
@@ -2851,6 +2926,94 @@ function SettingsPage() {
             <p className="setting-hint">
               Automatically start the llama server when the manager starts.
             </p>
+          </div>
+        </div>
+      </section>
+
+      <section className="page-section">
+        <h3>Inference Defaults</h3>
+        <div className="settings-grid">
+          <div className="setting-item">
+            <label htmlFor="defaultReasoningEffort">Default Reasoning Effort</label>
+            <p className="setting-hint">
+              Inject reasoning_effort into chat_template_kwargs for models that support it. Client-set values always take priority.
+            </p>
+            <select
+              id="defaultReasoningEffort"
+              value={settings?.defaultReasoningEffort || ''}
+              onChange={(e) => updateSetting('defaultReasoningEffort', e.target.value || null)}
+            >
+              <option value="">Disabled</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="model-overrides-section">
+          <label>Per-Model Overrides</label>
+          <p className="setting-hint">
+            Override reasoning effort for specific models. Use * as wildcard (e.g. gpt-oss*).
+          </p>
+          <div className="model-overrides-list">
+            {Object.entries(settings?.modelReasoningEffort || {}).map(([pattern, effort]) => (
+              <div key={pattern} className="model-override-row">
+                <span className="model-override-pattern">{pattern}</span>
+                <select
+                  value={effort}
+                  onChange={(e) => {
+                    const updated = { ...settings.modelReasoningEffort };
+                    updated[pattern] = e.target.value;
+                    updateSetting('modelReasoningEffort', updated);
+                  }}
+                >
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+                <button
+                  className="btn btn-sm btn-danger"
+                  onClick={() => {
+                    const updated = { ...settings.modelReasoningEffort };
+                    delete updated[pattern];
+                    updateSetting('modelReasoningEffort', updated);
+                  }}
+                  title="Remove override"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+          <div className="model-override-add">
+            <input
+              type="text"
+              placeholder="Model pattern (e.g. gpt-oss*)"
+              id="newOverridePattern"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  const pattern = e.target.value.trim();
+                  if (pattern && !(settings?.modelReasoningEffort || {})[pattern]) {
+                    updateSetting('modelReasoningEffort', { ...settings.modelReasoningEffort, [pattern]: 'high' });
+                    e.target.value = '';
+                  }
+                }
+              }}
+            />
+            <button
+              className="btn btn-sm"
+              onClick={() => {
+                const input = document.getElementById('newOverridePattern');
+                const pattern = input.value.trim();
+                if (pattern && !(settings?.modelReasoningEffort || {})[pattern]) {
+                  updateSetting('modelReasoningEffort', { ...settings.modelReasoningEffort, [pattern]: 'high' });
+                  input.value = '';
+                }
+              }}
+            >
+              Add
+            </button>
           </div>
         </div>
       </section>

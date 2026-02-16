@@ -2183,6 +2183,74 @@ input::placeholder {
   word-break: break-word;
 }
 
+.copy-field-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 11px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.copy-field-btn:hover {
+  background: var(--bg-tertiary, var(--border));
+  color: var(--text-primary);
+}
+
+.llm-log-request-body-section {
+  margin-top: 12px;
+}
+
+.llm-log-request-body {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 400px;
+  overflow-y: auto;
+  margin: 0;
+}
+
+.llm-log-resubmit-row {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.resubmit-btn {
+  background: var(--accent) !important;
+  color: white !important;
+  border: none !important;
+  padding: 6px 16px !important;
+  font-size: 13px !important;
+  cursor: pointer;
+}
+
+.resubmit-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.resubmit-status {
+  font-size: 13px;
+}
+
+.resubmit-status.success {
+  color: var(--success, #22c55e);
+}
+
+.resubmit-status.error {
+  color: var(--error);
+}
+
 /* Query Panel */
 .query-panel {
   position: fixed;
@@ -2883,6 +2951,77 @@ input::placeholder {
   font-size: 13px;
   overflow-x: auto;
   color: var(--text-secondary);
+}
+
+/* Model Reasoning Effort Overrides */
+.model-overrides-section {
+  margin-top: 20px;
+}
+
+.model-overrides-section > label {
+  font-weight: 500;
+  font-size: 14px;
+  display: block;
+  margin-bottom: 4px;
+}
+
+.model-overrides-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.model-override-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.model-override-pattern {
+  font-family: monospace;
+  font-size: 13px;
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.model-override-row select {
+  padding: 6px 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.model-override-add {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.model-override-add input {
+  flex: 1;
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: monospace;
+  max-width: 300px;
+}
+
+.model-override-add input:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
 /* llama.cpp Update Section */

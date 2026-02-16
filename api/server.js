@@ -925,7 +925,9 @@ app.get('/api/settings', (req, res) => {
       noWarmup: config.noWarmup || false,
       flashAttn: config.flashAttn || false,
       gpuLayers: config.gpuLayers || 99,
-      requestLogging: config.requestLogging || false
+      requestLogging: config.requestLogging || false,
+      defaultReasoningEffort: config.defaultReasoningEffort || null,
+      modelReasoningEffort: config.modelReasoningEffort || {}
     },
     // Include environment defaults for reference
     defaults: {
@@ -937,7 +939,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, defaultReasoningEffort, modelReasoningEffort } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -981,6 +983,27 @@ app.post('/api/settings', (req, res) => {
 
   if (requestLogging !== undefined) {
     config.requestLogging = Boolean(requestLogging);
+  }
+
+  if (defaultReasoningEffort !== undefined) {
+    const valid = [null, 'low', 'medium', 'high'];
+    if (!valid.includes(defaultReasoningEffort)) {
+      return res.status(400).json({ error: 'defaultReasoningEffort must be null, "low", "medium", or "high"' });
+    }
+    config.defaultReasoningEffort = defaultReasoningEffort;
+  }
+
+  if (modelReasoningEffort !== undefined) {
+    if (typeof modelReasoningEffort !== 'object' || Array.isArray(modelReasoningEffort)) {
+      return res.status(400).json({ error: 'modelReasoningEffort must be an object mapping model patterns to effort levels' });
+    }
+    const validEfforts = ['low', 'medium', 'high'];
+    for (const [pattern, effort] of Object.entries(modelReasoningEffort)) {
+      if (!validEfforts.includes(effort)) {
+        return res.status(400).json({ error: `Invalid effort "${effort}" for pattern "${pattern}". Must be "low", "medium", or "high"` });
+      }
+    }
+    config.modelReasoningEffort = modelReasoningEffort;
   }
 
   saveConfig(config);
@@ -2509,6 +2532,47 @@ function isTemplateSanitizable(errorText) {
     errorText.includes('Cannot pass both content and thinking');
 }
 
+// Inject reasoning_effort into chat_template_kwargs if configured
+function injectReasoningEffort(body) {
+  // 1. Top-level reasoning_effort (OpenAI format) → move to chat_template_kwargs
+  if (body.reasoning_effort) {
+    const effort = body.reasoning_effort;
+    const result = { ...body };
+    delete result.reasoning_effort;
+    result.chat_template_kwargs = { ...result.chat_template_kwargs, reasoning_effort: effort };
+    return result;
+  }
+
+  // 2. Already set in chat_template_kwargs → don't touch
+  if (body.chat_template_kwargs?.reasoning_effort) {
+    return body;
+  }
+
+  // 3. Look up per-model pattern match, fall back to global default
+  const model = body.model || '';
+  const perModel = config.modelReasoningEffort || {};
+  let effort = null;
+
+  for (const [pattern, value] of Object.entries(perModel)) {
+    // Support glob-style wildcards: "gpt-oss*" matches "gpt-oss-2025"
+    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+    if (regex.test(model)) {
+      effort = value;
+      break;
+    }
+  }
+
+  if (!effort) {
+    effort = config.defaultReasoningEffort || null;
+  }
+
+  if (effort) {
+    return { ...body, chat_template_kwargs: { ...body.chat_template_kwargs, reasoning_effort: effort } };
+  }
+
+  return body;
+}
+
 // OpenAI-compatible chat completions (streaming and non-streaming)
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
@@ -2516,6 +2580,9 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   const requestedModel = req.body.model || 'default';
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
+
+  // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
+  const proxyBody = injectReasoningEffort(req.body);
 
   async function doFetch(body) {
     return fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
@@ -2526,14 +2593,14 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   }
 
   try {
-    let response = await doFetch(req.body);
+    let response = await doFetch(proxyBody);
 
     // If template rejects the message format, retry with sanitized messages
-    if (!response.ok && req.body.messages) {
+    if (!response.ok && proxyBody.messages) {
       const errorText = await response.text();
       if (isTemplateSanitizable(errorText)) {
         console.log(`[chat/completions] Template error, retrying with sanitized messages`);
-        const sanitizedBody = { ...req.body, messages: sanitizeMessages(req.body.messages) };
+        const sanitizedBody = { ...proxyBody, messages: sanitizeMessages(proxyBody.messages) };
         response = await doFetch(sanitizedBody);
       } else {
         console.error(`[chat/completions] Error ${response.status} for model ${requestedModel}: ${errorText}`);
@@ -2542,7 +2609,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
           status: response.status, duration: Date.now() - startTime,
           promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-          messages: req.body.messages || null, prompt: null, response: null, error: errorText
+          messages: req.body.messages || null, prompt: null, response: null, error: errorText,
+          requestBody: req.body
         });
         return res.status(response.status).send(errorText);
       }
@@ -2556,7 +2624,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
         status: response.status, duration: Date.now() - startTime,
         promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-        messages: req.body.messages || null, prompt: null, response: null, error
+        messages: req.body.messages || null, prompt: null, response: null, error,
+        requestBody: req.body
       });
       return res.status(response.status).send(error);
     }
@@ -2623,7 +2692,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             status: 200, duration, promptTokens, completionTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.messages || null, prompt: null,
-            response: responseText, error: null
+            response: responseText, error: null, requestBody: null
           });
         } catch (e) {
           console.error('[proxy] Stream error:', e);
@@ -2656,7 +2725,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         stream: false, status: 200, duration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
-        response: data.choices?.[0]?.message?.content || null, error: null
+        response: data.choices?.[0]?.message?.content || null, error: null, requestBody: null
       });
 
       // Add our tracking info to response
@@ -2673,7 +2742,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       status: 502, duration: Date.now() - startTime,
       promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
       messages: req.body.messages || null, prompt: null,
-      response: null, error: error.message
+      response: null, error: error.message, requestBody: req.body
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
@@ -2698,7 +2767,8 @@ app.post('/api/v1/completions', async (req, res) => {
         endpoint: 'completions', model: requestedModel, stream: isStreaming,
         status: response.status, duration: Date.now() - startTime,
         promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-        messages: null, prompt: req.body.prompt || null, response: null, error
+        messages: null, prompt: req.body.prompt || null, response: null, error,
+        requestBody: req.body
       });
       return res.status(response.status).send(error);
     }
@@ -2750,7 +2820,7 @@ app.post('/api/v1/completions', async (req, res) => {
             status: 200, duration, promptTokens: 0, completionTokens: tokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: null, prompt: req.body.prompt || null,
-            response: responseText, error: null
+            response: responseText, error: null, requestBody: null
           });
         } catch (e) {
           res.end();
@@ -2779,7 +2849,7 @@ app.post('/api/v1/completions', async (req, res) => {
         stream: false, status: 200, duration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: null, prompt: req.body.prompt || null,
-        response: data.choices?.[0]?.text || null, error: null
+        response: data.choices?.[0]?.text || null, error: null, requestBody: null
       });
 
       res.json(data);
@@ -2790,7 +2860,7 @@ app.post('/api/v1/completions', async (req, res) => {
       status: 502, duration: Date.now() - startTime,
       promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
       messages: null, prompt: req.body.prompt || null,
-      response: null, error: error.message
+      response: null, error: error.message, requestBody: req.body
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
@@ -2862,11 +2932,14 @@ app.post('/api/v1/responses', async (req, res) => {
 
   console.log(`[responses] Request for model: ${requestedModel}`);
 
+  // Inject reasoning_effort if configured
+  const proxyBody = injectReasoningEffort(req.body);
+
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/responses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(proxyBody)
     });
 
     if (!response.ok) {
@@ -2878,7 +2951,7 @@ app.post('/api/v1/responses', async (req, res) => {
         status: response.status, duration: Date.now() - startTime,
         promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
         messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-        prompt: null, response: null, error
+        prompt: null, response: null, error, requestBody: req.body
       });
       return res.status(response.status).send(error);
     }
@@ -2936,7 +3009,7 @@ app.post('/api/v1/responses', async (req, res) => {
             status: 200, duration, promptTokens, completionTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-            prompt: null, response: responseText, error: null
+            prompt: null, response: responseText, error: null, requestBody: null
           });
         } catch (e) {
           console.error('[responses] Stream error:', e);
@@ -2977,7 +3050,7 @@ app.post('/api/v1/responses', async (req, res) => {
         stream: false, status: 200, duration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-        prompt: null, response: respText, error: null
+        prompt: null, response: respText, error: null, requestBody: null
       });
 
       data._llama_manager = {
@@ -2993,7 +3066,7 @@ app.post('/api/v1/responses', async (req, res) => {
       status: 502, duration: Date.now() - startTime,
       promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
       messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-      prompt: null, response: null, error: error.message
+      prompt: null, response: null, error: error.message, requestBody: req.body
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
@@ -3007,11 +3080,14 @@ app.post('/api/v1/messages', async (req, res) => {
 
   console.log(`[messages] Request for model: ${requestedModel}`);
 
+  // Inject reasoning_effort if configured
+  const proxyBody = injectReasoningEffort(req.body);
+
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(proxyBody)
     });
 
     if (!response.ok) {
@@ -3022,7 +3098,8 @@ app.post('/api/v1/messages', async (req, res) => {
         endpoint: 'messages', model: requestedModel, stream: isStreaming,
         status: response.status, duration: Date.now() - startTime,
         promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-        messages: req.body.messages || null, prompt: null, response: null, error
+        messages: req.body.messages || null, prompt: null, response: null, error,
+        requestBody: req.body
       });
       return res.status(response.status).send(error);
     }
@@ -3082,7 +3159,7 @@ app.post('/api/v1/messages', async (req, res) => {
             status: 200, duration, promptTokens: inputTokens, completionTokens: outputTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.messages || null, prompt: null,
-            response: responseText, error: null
+            response: responseText, error: null, requestBody: null
           });
         } catch (e) {
           console.error('[messages] Stream error:', e);
@@ -3113,7 +3190,7 @@ app.post('/api/v1/messages', async (req, res) => {
         promptTokens: inputTokens, completionTokens: outputTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
-        response: data.content?.[0]?.text || null, error: null
+        response: data.content?.[0]?.text || null, error: null, requestBody: null
       });
 
       data._llama_manager = {
@@ -3129,7 +3206,7 @@ app.post('/api/v1/messages', async (req, res) => {
       status: 502, duration: Date.now() - startTime,
       promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
       messages: req.body.messages || null, prompt: null,
-      response: null, error: error.message
+      response: null, error: error.message, requestBody: req.body
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
