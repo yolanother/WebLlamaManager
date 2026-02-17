@@ -110,7 +110,12 @@ SERVICE_WAS_ENABLED=false
 if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     SERVICE_WAS_RUNNING=true
     echo "[0/6] Stopping existing service..."
-    systemctl --user stop "$SERVICE_NAME"
+    # Use timeout to prevent hanging if the graceful shutdown takes too long
+    timeout 15 systemctl --user stop "$SERVICE_NAME" 2>/dev/null || {
+        echo "  Graceful stop timed out, force killing..."
+        systemctl --user kill -s SIGKILL "$SERVICE_NAME" 2>/dev/null || true
+        sleep 1
+    }
     echo "  Service stopped."
 fi
 
@@ -152,6 +157,7 @@ WorkingDirectory=$SCRIPT_DIR/api
 ExecStart=/usr/bin/node server.js
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=15
 
 # Configuration
 Environment=NODE_ENV=production

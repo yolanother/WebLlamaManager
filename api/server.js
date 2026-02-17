@@ -2532,6 +2532,54 @@ function isTemplateSanitizable(errorText) {
     errorText.includes('Cannot pass both content and thinking');
 }
 
+// Retry fetch with backoff for transient connection failures (e.g. model switching in router mode)
+async function fetchWithRetry(url, options, { retries = 3, baseDelay = 1000, label = 'proxy' } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fetch(url, options);
+    } catch (err) {
+      if (attempt === retries) throw err;
+      const delay = baseDelay * Math.pow(2, attempt);
+      console.log(`[${label}] Connection failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms: ${err.message}`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
+// Detect model load failure and unload other models to make room, then retry
+function isModelLoadFailure(status, text) {
+  return status === 500 && typeof text === 'string' && text.includes('failed to load');
+}
+
+async function unloadOtherModels(keepModel) {
+  try {
+    const modelsRes = await fetch(`http://localhost:${LLAMA_PORT}/models`);
+    if (!modelsRes.ok) return false;
+    const modelsData = await modelsRes.json();
+    const loaded = (modelsData.data || []).filter(m => m.status?.value === 'loaded' && m.id !== keepModel);
+    if (loaded.length === 0) return false;
+
+    console.log(`[model-switch] Unloading ${loaded.length} model(s) to make room for ${keepModel}`);
+    for (const model of loaded) {
+      console.log(`[model-switch] Unloading: ${model.id}`);
+      addLog('models', `Auto-unloading ${model.id} to make room for ${keepModel}`);
+      const unloadRes = await fetch(`http://localhost:${LLAMA_PORT}/models/unload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: model.id })
+      });
+      if (!unloadRes.ok) {
+        const err = await unloadRes.text();
+        console.error(`[model-switch] Failed to unload ${model.id}: ${err}`);
+      }
+    }
+    return true;
+  } catch (err) {
+    console.error(`[model-switch] Error during unload: ${err.message}`);
+    return false;
+  }
+}
+
 // Inject reasoning_effort into chat_template_kwargs if configured
 function injectReasoningEffort(body) {
   // 1. Top-level reasoning_effort (OpenAI format) → move to chat_template_kwargs
@@ -2585,22 +2633,63 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   const proxyBody = injectReasoningEffort(req.body);
 
   async function doFetch(body) {
-    return fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
+    return fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
-    });
+    }, { label: 'chat/completions' });
   }
 
   try {
     let response = await doFetch(proxyBody);
+    let activeBody = proxyBody;
 
-    // If template rejects the message format, retry with sanitized messages
-    if (!response.ok && proxyBody.messages) {
+    // If model failed to load (e.g. too large), unload others and retry
+    if (!response.ok) {
       const errorText = await response.text();
-      if (isTemplateSanitizable(errorText)) {
+      if (isModelLoadFailure(response.status, errorText)) {
+        console.log(`[chat/completions] Model load failure for ${requestedModel}, attempting to free memory`);
+        const unloaded = await unloadOtherModels(requestedModel);
+        if (unloaded) {
+          response = await doFetch(proxyBody);
+          if (!response.ok) {
+            const retryError = await response.text();
+            // Check for template error on retry
+            if (isTemplateSanitizable(retryError) && proxyBody.messages) {
+              const sanitizedBody = { ...proxyBody, messages: sanitizeMessages(proxyBody.messages) };
+              activeBody = sanitizedBody;
+              response = await doFetch(sanitizedBody);
+            } else {
+              console.error(`[chat/completions] Still failing after unload for ${requestedModel}: ${retryError}`);
+              addLog('chat', `Chat completion failed for model ${requestedModel}: ${retryError}`);
+              addLlmLog({
+                endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
+                status: response.status, duration: Date.now() - startTime,
+                promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
+                messages: req.body.messages || null, prompt: null, response: null, error: retryError,
+                requestBody: req.body
+              });
+              return res.status(response.status).send(retryError);
+            }
+          }
+        } else {
+          // Couldn't unload, return original error
+          console.error(`[chat/completions] Error ${response.status} for model ${requestedModel}: ${errorText}`);
+          addLog('chat', `Chat completion failed for model ${requestedModel}: ${errorText}`);
+          addLlmLog({
+            endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
+            status: response.status, duration: Date.now() - startTime,
+            promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
+            messages: req.body.messages || null, prompt: null, response: null, error: errorText,
+            requestBody: req.body
+          });
+          return res.status(response.status).send(errorText);
+        }
+      } else if (isTemplateSanitizable(errorText) && proxyBody.messages) {
+        // Template rejects the message format, retry with sanitized messages
         console.log(`[chat/completions] Template error, retrying with sanitized messages`);
         const sanitizedBody = { ...proxyBody, messages: sanitizeMessages(proxyBody.messages) };
+        activeBody = sanitizedBody;
         response = await doFetch(sanitizedBody);
       } else {
         console.error(`[chat/completions] Error ${response.status} for model ${requestedModel}: ${errorText}`);
@@ -2755,11 +2844,11 @@ app.post('/api/v1/completions', async (req, res) => {
   const isStreaming = req.body.stream === true;
 
   try {
-    const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/completions`, {
+    const response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body)
-    });
+    }, { label: 'completions' });
 
     if (!response.ok) {
       const error = await response.text();
@@ -2936,24 +3025,39 @@ app.post('/api/v1/responses', async (req, res) => {
   const proxyBody = injectReasoningEffort(req.body);
 
   try {
-    const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/responses`, {
+    let response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(proxyBody)
-    });
+    }, { label: 'responses' });
 
+    // If model failed to load, unload others and retry
     if (!response.ok) {
       const error = await response.text();
-      console.error(`[responses] Error ${response.status} for model ${requestedModel}: ${error}`);
-      addLog('responses', `Responses API failed for model ${requestedModel}: ${error}`);
-      addLlmLog({
-        endpoint: 'responses', model: requestedModel, stream: isStreaming,
-        status: response.status, duration: Date.now() - startTime,
-        promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-        messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-        prompt: null, response: null, error, requestBody: req.body
-      });
-      return res.status(response.status).send(error);
+      if (isModelLoadFailure(response.status, error)) {
+        console.log(`[responses] Model load failure for ${requestedModel}, attempting to free memory`);
+        const unloaded = await unloadOtherModels(requestedModel);
+        if (unloaded) {
+          response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(proxyBody)
+          }, { label: 'responses' });
+        }
+      }
+      if (!response.ok) {
+        const retryError = response.bodyUsed ? error : await response.text();
+        console.error(`[responses] Error ${response.status} for model ${requestedModel}: ${retryError}`);
+        addLog('responses', `Responses API failed for model ${requestedModel}: ${retryError}`);
+        addLlmLog({
+          endpoint: 'responses', model: requestedModel, stream: isStreaming,
+          status: response.status, duration: Date.now() - startTime,
+          promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
+          messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
+          prompt: null, response: null, error: retryError, requestBody: req.body
+        });
+        return res.status(response.status).send(retryError);
+      }
     }
 
     if (isStreaming) {
@@ -3084,24 +3188,39 @@ app.post('/api/v1/messages', async (req, res) => {
   const proxyBody = injectReasoningEffort(req.body);
 
   try {
-    const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/messages`, {
+    let response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(proxyBody)
-    });
+    }, { label: 'messages' });
 
+    // If model failed to load, unload others and retry
     if (!response.ok) {
       const error = await response.text();
-      console.error(`[messages] Error ${response.status} for model ${requestedModel}: ${error}`);
-      addLog('messages', `Messages API failed for model ${requestedModel}: ${error}`);
-      addLlmLog({
-        endpoint: 'messages', model: requestedModel, stream: isStreaming,
-        status: response.status, duration: Date.now() - startTime,
-        promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-        messages: req.body.messages || null, prompt: null, response: null, error,
-        requestBody: req.body
-      });
-      return res.status(response.status).send(error);
+      if (isModelLoadFailure(response.status, error)) {
+        console.log(`[messages] Model load failure for ${requestedModel}, attempting to free memory`);
+        const unloaded = await unloadOtherModels(requestedModel);
+        if (unloaded) {
+          response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(proxyBody)
+          }, { label: 'messages' });
+        }
+      }
+      if (!response.ok) {
+        const retryError = response.bodyUsed ? error : await response.text();
+        console.error(`[messages] Error ${response.status} for model ${requestedModel}: ${retryError}`);
+        addLog('messages', `Messages API failed for model ${requestedModel}: ${retryError}`);
+        addLlmLog({
+          endpoint: 'messages', model: requestedModel, stream: isStreaming,
+          status: response.status, duration: Date.now() - startTime,
+          promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
+          messages: req.body.messages || null, prompt: null, response: null, error: retryError,
+          requestBody: req.body
+        });
+        return res.status(response.status).send(retryError);
+      }
     }
 
     if (isStreaming) {
@@ -3304,15 +3423,16 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   }
 });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('Received SIGTERM, shutting down...');
-  await stopLlamaServer();
-  process.exit(0);
-});
+// Graceful shutdown with forced exit timeout
+function shutdownWithTimeout(signal) {
+  console.log(`Received ${signal}, shutting down...`);
+  const forceExit = setTimeout(() => {
+    console.log('Shutdown timeout, forcing exit');
+    process.exit(1);
+  }, 10000);
+  forceExit.unref();
+  stopLlamaServer().finally(() => process.exit(0));
+}
 
-process.on('SIGINT', async () => {
-  console.log('Received SIGINT, shutting down...');
-  await stopLlamaServer();
-  process.exit(0);
-});
+process.on('SIGTERM', () => shutdownWithTimeout('SIGTERM'));
+process.on('SIGINT', () => shutdownWithTimeout('SIGINT'));
