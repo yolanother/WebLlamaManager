@@ -4,22 +4,38 @@
 
 <img width="1500" height="1167" alt="image" src="https://github.com/user-attachments/assets/e57cad3c-8d95-45c3-a504-b984249f90aa" />
 
-A systemd service with web UI for managing llama.cpp in multi-model router mode on AMD GPUs using distrobox.
+A comprehensive LLM management, debugging, and performance monitoring platform for llama.cpp. Provides a modern web UI with real-time GPU/CPU/memory telemetry, persistent historical analytics, request tracking with error breakdown, token throughput analysis, full conversation logging, and a hands-free fullscreen dashboard for wall-mounted monitoring. Supports multi-model router mode on AMD GPUs via distrobox with on-demand model loading, LRU eviction, and OpenAI-compatible API proxying.
 
 <br clear="left">
 
 ## Features
 
-- **Multi-model support**: Load and unload models dynamically without restarting
-- **Web UI**: Modern React interface for model management
+### Monitoring & Analytics
+- **Real-time telemetry**: Live GPU temperature, power draw, VRAM/GTT usage, CPU load, and context utilization with 1-second resolution
+- **Historical analytics**: Persistent minute-level data (JSONL, up to 1 year) with configurable time ranges (1H/1D/1W/1M/1Y) and automatic downsampling
+- **Request tracking**: Per-request logging with status codes, latency, error messages, and stacked success/error volume charts
+- **Token throughput**: Generation speed (tok/s) tracking across completions with historical trend analysis
+- **Error breakdown**: Status code distribution bar charts for diagnosing API issues
+- **Fullscreen dashboard**: Auto-paging, hands-free display mode for wall-mounted monitors with configurable cycle interval
+
+### LLM Debugging
+- **Conversation logging**: Full request/response capture for LLM API calls including messages, token counts, and timing
+- **Request body inspection**: Detailed HTTP request/response logging with expandable error details
+- **Process monitoring**: View and manage running llama-server processes with resource usage
+- **Server log streaming**: Real-time log output with configurable noise filters
+
+### Model Management
+- **Multi-model router**: Load and unload models dynamically without restarting, with LRU eviction
 - **HuggingFace integration**: Search and download GGUF models with progress tracking
+- **Optimized presets**: One-click configurations for specific models (custom sampling, chat templates, reasoning formats)
 - **Model aliases**: Friendly display names for your models
-- **Models stored in ~/models**: All models in one place, easy to manage
-- **systemd service**: Auto-start on boot, runs in background
-- **OpenAI-compatible API**: Use with any client that supports OpenAI API
+
+### Infrastructure
+- **OpenAI-compatible API**: Drop-in replacement proxy with automatic message sanitization for tool-call edge cases
 - **MCP Server**: Integration with AI agents like Claude Desktop
-- **Full Chat Interface**: Multi-conversation chat with streaming and image support
-- **Real-time monitoring**: GPU, CPU, memory stats and analytics dashboard
+- **Full Chat Interface**: Multi-conversation chat with streaming, code highlighting, and image support
+- **systemd service**: Auto-start on boot, runs in background
+- **Models stored in ~/models**: All models in one place, easy to manage
 
 ## Screenshots
 
