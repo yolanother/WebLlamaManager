@@ -4425,3 +4425,183 @@ input::placeholder {
   font-size: 11px;
   color: var(--text-secondary);
 }
+
+/* ============================================ */
+/* Historical Analytics & Dashboard Improvements */
+/* ============================================ */
+
+/* Section header with inline controls */
+.section-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.section-header-row h3 {
+  margin-bottom: 0;
+}
+
+/* Time range selector pills */
+.time-range-selector {
+  display: flex;
+  gap: 4px;
+}
+
+.time-range-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.time-range-btn:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.time-range-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+/* History summary stats */
+.history-summary {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+/* Wide chart cards (2-column span) */
+.charts-grid-wide {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+}
+
+.chart-card-wide {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+}
+
+.chart-card-wide h4 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chart-card-wide h4 .chart-value {
+  margin-left: auto;
+  font-family: monospace;
+  color: var(--accent);
+}
+
+.chart-container-wide {
+  height: 240px;
+  position: relative;
+}
+
+/* Loaded models card */
+.loaded-models-card {
+  align-items: flex-start;
+}
+
+.loaded-models-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.loaded-model-name {
+  font-size: 11px;
+  color: var(--accent);
+  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.loaded-model-none {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* Fullscreen dashboard mode */
+.fullscreen-dashboard {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--bg-primary);
+  z-index: 10000;
+  padding: 32px 40px;
+  overflow-y: auto;
+}
+
+.fullscreen-page {
+  display: none;
+  animation: fadeIn 0.3s ease;
+}
+
+.fullscreen-page.active {
+  display: block;
+}
+
+.fullscreen-page h3 {
+  font-size: 20px;
+  font-weight: 600;
+  margin-bottom: 24px;
+  color: var(--text-primary);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.fullscreen-indicator {
+  position: fixed;
+  bottom: 16px;
+  right: 24px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  opacity: 0.5;
+  font-family: monospace;
+  z-index: 10001;
+}
+
+/* Responsive: wide cards fall back to single column on small screens */
+@media (max-width: 800px) {
+  .charts-grid-wide {
+    grid-template-columns: 1fr;
+  }
+
+  .history-summary {
+    flex-wrap: wrap;
+  }
+
+  .section-header-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .fullscreen-dashboard {
+    padding: 16px;
+  }
+}

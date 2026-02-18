@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart,
+  BarChart, Bar
 } from 'recharts';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
@@ -490,7 +491,9 @@ const CHART_COLORS = {
   power: '#f59e0b',
   memory: '#22c55e',
   memorySecondary: '#8b5cf6',
-  tokens: '#3b82f6'
+  tokens: '#3b82f6',
+  requestOk: '#22c55e',
+  requestErr: '#ef4444'
 };
 
 // Custom tooltip for charts
@@ -623,7 +626,7 @@ function MemoryChart({ data, primaryKey = 'vram', height = 140 }) {
 
 // Tokens/sec Chart Component
 function TokensChart({ data, height = 140 }) {
-  if (!data || data.length < 2) {
+  if (!data || data.length < 1) {
     return (
       <div className="chart-container" style={{ height }}>
         <div className="chart-empty">Collecting data...</div>
@@ -654,11 +657,73 @@ function TokensChart({ data, height = 140 }) {
   );
 }
 
+// Format timestamp for historical charts based on range
+function formatHistoryTime(ts, range) {
+  const date = new Date(ts);
+  switch (range) {
+    case '1h':
+    case '1d':
+      return date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
+    case '1w':
+      return date.toLocaleDateString('en-US', { weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
+    case '1m':
+      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    case '1y':
+      return date.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+    default:
+      return date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
+  }
+}
+
+// History chart tooltip
+function HistoryTooltip({ active, payload, label, unit = '', range = '1h' }) {
+  if (!active || !payload || !payload.length) return null;
+  const date = new Date(label);
+  const timeStr = date.toLocaleString('en-US', { hour12: false, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+  return (
+    <div className="chart-tooltip">
+      <div className="chart-tooltip-time">{timeStr}</div>
+      {payload.map((entry, i) => (
+        <div key={i} className="chart-tooltip-row">
+          <span className="chart-tooltip-dot" style={{ background: entry.color }} />
+          <span className="chart-tooltip-label">{entry.name}:</span>
+          <span className="chart-tooltip-value">{typeof entry.value === 'number' ? entry.value.toFixed(1) : entry.value}{unit}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Time range selector component
+function TimeRangeSelector({ value, onChange }) {
+  const ranges = ['1H', '1D', '1W', '1M', '1Y'];
+  return (
+    <div className="time-range-selector">
+      {ranges.map(r => (
+        <button
+          key={r}
+          className={`time-range-btn ${value === r.toLowerCase() ? 'active' : ''}`}
+          onClick={() => onChange(r.toLowerCase())}
+        >
+          {r}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // Dashboard Page
 function Dashboard({ stats }) {
   const [serverModels, setServerModels] = useState([]);
   const [loading, setLoading] = useState({});
   const [analytics, setAnalytics] = useState(null);
+  const [historyRange, setHistoryRange] = useState('1h');
+  const [historyData, setHistoryData] = useState(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [fullscreenPage, setFullscreenPage] = useState(0);
+  const fullscreenTimerRef = useRef(null);
+  const FULLSCREEN_PAGES = 4;
 
   const fetchModels = useCallback(async () => {
     try {
@@ -680,16 +745,89 @@ function Dashboard({ stats }) {
     }
   }, []);
 
+  const fetchHistory = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/analytics/history?range=${historyRange}`);
+      const data = await res.json();
+      setHistoryData(data);
+    } catch (err) {
+      console.error('Failed to fetch history:', err);
+    }
+  }, [historyRange]);
+
   useEffect(() => {
     fetchModels();
     fetchAnalytics();
+    fetchHistory();
     const modelsInterval = setInterval(fetchModels, 10000);
     const analyticsInterval = setInterval(fetchAnalytics, 2000);
+    const historyInterval = setInterval(fetchHistory, 60000);
     return () => {
       clearInterval(modelsInterval);
       clearInterval(analyticsInterval);
+      clearInterval(historyInterval);
     };
-  }, [fetchModels, fetchAnalytics]);
+  }, [fetchModels, fetchAnalytics, fetchHistory]);
+
+  // Refetch history when range changes
+  useEffect(() => {
+    fetchHistory();
+  }, [historyRange, fetchHistory]);
+
+  // Fullscreen mode
+  const enterFullscreen = useCallback(() => {
+    document.documentElement.requestFullscreen().then(() => {
+      setIsFullscreen(true);
+      setFullscreenPage(0);
+    }).catch(() => {});
+  }, []);
+
+  const exitFullscreen = useCallback(() => {
+    setIsFullscreen(false);
+    setFullscreenPage(0);
+    if (fullscreenTimerRef.current) {
+      clearInterval(fullscreenTimerRef.current);
+      fullscreenTimerRef.current = null;
+    }
+  }, []);
+
+  // Listen for fullscreen change (ESC key exits)
+  useEffect(() => {
+    const handler = () => {
+      if (!document.fullscreenElement) {
+        exitFullscreen();
+      }
+    };
+    document.addEventListener('fullscreenchange', handler);
+    return () => document.removeEventListener('fullscreenchange', handler);
+  }, [exitFullscreen]);
+
+  // Auto-page in fullscreen (fetch interval from settings)
+  useEffect(() => {
+    if (isFullscreen) {
+      let cancelled = false;
+      (async () => {
+        let interval = 30000;
+        try {
+          const res = await fetch(`${API_BASE}/settings`);
+          const data = await res.json();
+          interval = data.settings?.fullscreenInterval || 30000;
+        } catch { /* use default */ }
+        if (!cancelled) {
+          fullscreenTimerRef.current = setInterval(() => {
+            setFullscreenPage(p => (p + 1) % FULLSCREEN_PAGES);
+          }, interval);
+        }
+      })();
+      return () => {
+        cancelled = true;
+        if (fullscreenTimerRef.current) {
+          clearInterval(fullscreenTimerRef.current);
+          fullscreenTimerRef.current = null;
+        }
+      };
+    }
+  }, [isFullscreen]);
 
   const startServer = async () => {
     setLoading(l => ({ ...l, server: true }));
@@ -716,11 +854,170 @@ function Dashboard({ stats }) {
   const llamaPort = stats?.llamaPort || 5251;
   const llamaUiUrl = stats?.llamaUiUrl || `http://${window.location.hostname}:${llamaPort}`;
 
+  // Prepare history chart data
+  const historyPoints = (historyData?.points || []).map(p => ({
+    ...p,
+    time: formatHistoryTime(p.ts, historyRange)
+  }));
+
+  // Build error code breakdown data from summary
+  const errorCodeData = historyData?.summary?.statusCodes
+    ? Object.entries(historyData.summary.statusCodes)
+        .filter(([code]) => parseInt(code) >= 400)
+        .map(([code, count]) => ({ code, count }))
+        .sort((a, b) => b.count - a.count)
+    : [];
+
+  // Fullscreen rendering
+  if (isFullscreen) {
+    return (
+      <div className="fullscreen-dashboard">
+        <div className={`fullscreen-page ${fullscreenPage === 0 ? 'active' : ''}`}>
+          <h3>Server Status & System Resources</h3>
+          <div className="status-grid" style={{ marginBottom: 24 }}>
+            <StatCard label="Status" value={isHealthy ? 'Running' : 'Stopped'} status={isHealthy ? 'success' : 'error'} icon="&#x1F7E2;" />
+            <StatCard label="Mode" value={isSingleMode ? 'Single Model' : 'Router (Multi)'} subValue={stats?.preset?.name || null} icon="&#x2699;&#xFE0F;" />
+            <StatCard label="Uptime" value={formatUptime(stats?.llama?.uptime)} icon="&#x23F1;&#xFE0F;" />
+          </div>
+          <div className="resources-grid">
+            <div className="resource-card">
+              <ProgressRing value={stats?.cpu?.usage || 0} color={stats?.cpu?.usage > 80 ? 'var(--error)' : 'var(--accent)'} />
+              <div className="resource-info">
+                <span className="resource-label">CPU</span>
+                <span className="resource-detail">{stats?.cpu?.cores || 0} cores</span>
+              </div>
+            </div>
+            <div className="resource-card">
+              <ProgressRing value={stats?.memory?.usage || 0} color={stats?.memory?.usage > 80 ? 'var(--error)' : 'var(--success)'} />
+              <div className="resource-info">
+                <span className="resource-label">Memory</span>
+                <span className="resource-detail">{formatBytes(stats?.memory?.used)} / {formatBytes(stats?.memory?.total)}</span>
+              </div>
+            </div>
+            {stats?.gpu && (
+              <div className="resource-card">
+                <ProgressRing value={stats.gpu.isAPU ? (stats.gpu.gtt?.usage || 0) : (stats.gpu.vram?.usage || 0)} color="var(--warning)" />
+                <div className="resource-info">
+                  <span className="resource-label">{stats.gpu.isAPU ? 'GTT' : 'VRAM'}</span>
+                  <span className="resource-detail">{stats.gpu.isAPU ? `${formatBytes(stats.gpu.gtt?.used)} / ${formatBytes(stats.gpu.gtt?.total)}` : `${formatBytes(stats.gpu.vram?.used)} / ${formatBytes(stats.gpu.vram?.total)}`}</span>
+                </div>
+              </div>
+            )}
+            {stats?.gpu?.power > 0 && (
+              <div className="resource-card">
+                <div className="power-display"><div className="power-inner"><span className="power-value">{stats.gpu.power.toFixed(0)}</span><span className="power-unit">W</span></div></div>
+                <div className="resource-info"><span className="resource-label">Power</span></div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className={`fullscreen-page ${fullscreenPage === 1 ? 'active' : ''}`}>
+          <h3>Performance Analytics (5 min)</h3>
+          <div className="charts-grid">
+            <div className="chart-card"><h4>Temperature</h4><TemperatureChart data={analytics?.temperature || []} /></div>
+            <div className="chart-card"><h4>Power <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span></h4><PowerChart data={analytics?.power || []} /></div>
+            <div className="chart-card"><h4>Memory</h4><MemoryChart data={analytics?.memory || []} primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'} /></div>
+            <div className="chart-card"><h4>Generation Speed <span className="chart-value">{analytics?.tokenStats?.averageTokensPerSecond?.toFixed(1) || 0} tok/s</span></h4><TokensChart data={analytics?.tokens || []} /></div>
+          </div>
+        </div>
+
+        <div className={`fullscreen-page ${fullscreenPage === 2 ? 'active' : ''}`}>
+          <h3>Historical: Power & Memory</h3>
+          <div className="charts-grid-wide">
+            <div className="chart-card-wide">
+              <h4>Power Consumption</h4>
+              <div className="chart-container-wide">
+                {historyPoints.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                      <defs><linearGradient id="gradHistPwr" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.power} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.power} stopOpacity={0} /></linearGradient></defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <Tooltip content={<HistoryTooltip unit="W" range={historyRange} />} />
+                      <Area type="monotone" dataKey="pwr" name="Power" stroke={CHART_COLORS.power} fill="url(#gradHistPwr)" strokeWidth={2} dot={false} animationDuration={500} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No historical data yet</div>}
+              </div>
+            </div>
+            <div className="chart-card-wide">
+              <h4>Memory Usage</h4>
+              <div className="chart-container-wide">
+                {historyPoints.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                      <defs><linearGradient id="gradHistMg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.memory} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.memory} stopOpacity={0} /></linearGradient><linearGradient id="gradHistMs" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0.2} /><stop offset="95%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0} /></linearGradient></defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
+                      <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={CHART_COLORS.memory} fill="url(#gradHistMg)" strokeWidth={2} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="ms" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradHistMs)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No historical data yet</div>}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className={`fullscreen-page ${fullscreenPage === 3 ? 'active' : ''}`}>
+          <h3>Historical: Generation & Requests</h3>
+          <div className="charts-grid-wide">
+            <div className="chart-card-wide">
+              <h4>Generation Speed</h4>
+              <div className="chart-container-wide">
+                {historyPoints.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                      <defs><linearGradient id="gradHistTps" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} /></linearGradient></defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
+                      <Area type="monotone" dataKey="tps" name="Avg tok/s" stroke={CHART_COLORS.tokens} fill="url(#gradHistTps)" strokeWidth={2} dot={false} animationDuration={500} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No historical data yet</div>}
+              </div>
+            </div>
+            <div className="chart-card-wide">
+              <h4>Request Volume</h4>
+              <div className="chart-container-wide">
+                {historyPoints.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <Tooltip content={<HistoryTooltip range={historyRange} />} />
+                      <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                      <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No historical data yet</div>}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="fullscreen-indicator">
+          {fullscreenPage + 1} / {FULLSCREEN_PAGES}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="page dashboard">
       <div className="page-header">
         <h2>Dashboard</h2>
         <div className="header-actions">
+          <button className="btn-secondary" onClick={enterFullscreen} title="Fullscreen Dashboard">
+            &#x26F6;
+          </button>
           {isHealthy ? (
             <button className="btn-danger" onClick={stopServer} disabled={loading.server}>
               {loading.server ? 'Stopping...' : 'Stop Server'}
@@ -749,11 +1046,22 @@ function Dashboard({ stats }) {
             subValue={stats?.preset?.name || null}
             icon="&#x1F3AF;"
           />
-          <StatCard
-            label="Loaded Models"
-            value={serverModels.length}
-            icon="&#x1F4E6;"
-          />
+          <div className="stat-card loaded-models-card">
+            <span className="stat-icon">&#x1F4E6;</span>
+            <div className="stat-content">
+              <span className="stat-value">{serverModels.length} Loaded</span>
+              <span className="stat-label">Models</span>
+              {serverModels.length > 0 ? (
+                <div className="loaded-models-list">
+                  {serverModels.map((m, i) => (
+                    <span key={i} className="loaded-model-name">{formatModelName(m)}</span>
+                  ))}
+                </div>
+              ) : (
+                <span className="loaded-model-none">No models loaded</span>
+              )}
+            </div>
+          </div>
           <div className="stat-card link-card">
             <a
               href={llamaUiUrl}
@@ -1001,6 +1309,155 @@ function Dashboard({ stats }) {
                 <div className="token-stat-value">{((analytics?.tokenStats?.totalCompletionTokens || 0) / 1000).toFixed(1)}k</div>
                 <div className="token-stat-label">Completion Tokens</div>
               </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Historical Analytics */}
+      <section className="dashboard-section analytics-section">
+        <div className="section-header-row">
+          <h3>Historical Analytics</h3>
+          <TimeRangeSelector value={historyRange} onChange={setHistoryRange} />
+        </div>
+
+        {historyData?.summary && (
+          <div className="history-summary">
+            <div className="token-stat-card">
+              <div className="token-stat-value">{historyData.summary.totalRequests.toLocaleString()}</div>
+              <div className="token-stat-label">Total Requests</div>
+            </div>
+            <div className="token-stat-card">
+              <div className="token-stat-value" style={{ color: 'var(--error)' }}>{historyData.summary.totalErrors.toLocaleString()}</div>
+              <div className="token-stat-label">Total Errors</div>
+            </div>
+            <div className="token-stat-card">
+              <div className="token-stat-value">{historyData.summary.avgTps}</div>
+              <div className="token-stat-label">Avg tok/s</div>
+            </div>
+          </div>
+        )}
+
+        <div className="charts-grid-wide">
+          {/* Power History */}
+          <div className="chart-card-wide">
+            <h4>Power Consumption <span className="chart-value">over time</span></h4>
+            <div className="chart-container-wide">
+              {historyPoints.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <defs>
+                      <linearGradient id="gradHistPower" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.power} stopOpacity={0.3} />
+                        <stop offset="95%" stopColor={CHART_COLORS.power} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <Tooltip content={<HistoryTooltip unit="W" range={historyRange} />} />
+                    <Area type="monotone" dataKey="pwr" name="Power" stroke={CHART_COLORS.power} fill="url(#gradHistPower)" strokeWidth={2} dot={false} animationDuration={500} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No historical data yet. Data is aggregated every minute.</div>}
+            </div>
+          </div>
+
+          {/* Memory History */}
+          <div className="chart-card-wide">
+            <h4>Memory Usage <span className="chart-value">GTT/VRAM + System</span></h4>
+            <div className="chart-container-wide">
+              {historyPoints.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <defs>
+                      <linearGradient id="gradHistMem" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.memory} stopOpacity={0.3} />
+                        <stop offset="95%" stopColor={CHART_COLORS.memory} stopOpacity={0} />
+                      </linearGradient>
+                      <linearGradient id="gradHistSys" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0.2} />
+                        <stop offset="95%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
+                    <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={CHART_COLORS.memory} fill="url(#gradHistMem)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="ms" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradHistSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No historical data yet</div>}
+            </div>
+            <div className="chart-legend">
+              <div className="chart-legend-item"><span className="chart-legend-dot vram"></span>GTT/VRAM</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot system"></span>System</div>
+            </div>
+          </div>
+
+          {/* Generation Speed History */}
+          <div className="chart-card-wide">
+            <h4>Generation Speed <span className="chart-value">avg tok/s</span></h4>
+            <div className="chart-container-wide">
+              {historyPoints.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <defs>
+                      <linearGradient id="gradHistTokens" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} />
+                        <stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
+                    <Area type="monotone" dataKey="tps" name="Avg tok/s" stroke={CHART_COLORS.tokens} fill="url(#gradHistTokens)" strokeWidth={2} dot={false} animationDuration={500} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No historical data yet</div>}
+            </div>
+          </div>
+
+          {/* Request Volume History */}
+          <div className="chart-card-wide">
+            <h4>Request Volume <span className="chart-value">success vs errors</span></h4>
+            <div className="chart-container-wide">
+              {historyPoints.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <Tooltip content={<HistoryTooltip range={historyRange} />} />
+                    <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No historical data yet</div>}
+            </div>
+            <div className="chart-legend">
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestOk }}></span>Success</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestErr }}></span>Errors</div>
+            </div>
+          </div>
+
+          {/* Error Code Breakdown */}
+          <div className="chart-card-wide">
+            <h4>Error Code Breakdown <span className="chart-value">status codes &ge; 400</span></h4>
+            <div className="chart-container-wide">
+              {errorCodeData.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={errorCodeData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="code" tick={{ fill: '#888', fontSize: 11 }} tickLine={false} />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <Tooltip content={<HistoryTooltip range={historyRange} />} />
+                    <Bar dataKey="count" name="Count" fill={CHART_COLORS.requestErr} radius={[4, 4, 0, 0]} animationDuration={500} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No errors in this time range</div>}
             </div>
           </div>
         </div>
@@ -3033,6 +3490,26 @@ function SettingsPage() {
             <p className="setting-hint">
               Log HTTP requests with method, path, status, and timing. View in the Logs page under Request Logs tab.
             </p>
+          </div>
+        </div>
+      </section>
+
+      <section className="page-section">
+        <h3>Dashboard</h3>
+        <div className="settings-grid">
+          <div className="setting-item">
+            <label htmlFor="fullscreenInterval">Fullscreen Cycle Interval</label>
+            <p className="setting-hint">
+              How long each page is displayed in fullscreen dashboard mode (in seconds).
+            </p>
+            <input
+              type="number"
+              id="fullscreenInterval"
+              value={Math.round((settings?.fullscreenInterval || 30000) / 1000)}
+              onChange={(e) => updateSetting('fullscreenInterval', parseInt(e.target.value) * 1000)}
+              min={5}
+              max={300}
+            />
           </div>
         </div>
       </section>

@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { spawn, exec, execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, basename } from 'path';
 import { createServer } from 'http';
@@ -20,15 +20,30 @@ app.use(cors());
 app.use(express.json({ limit: '200mb' }));
 
 // Request logging middleware
-const REQUEST_LOG_SKIP_PATHS = new Set(['/ws', '/api/stats', '/api/analytics']);
+const REQUEST_LOG_SKIP_PATHS = new Set(['/ws', '/api/stats', '/api/analytics', '/api/analytics/history']);
 const STATIC_EXTENSIONS = /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map)$/;
 
 app.use((req, res, next) => {
-  if (!config.requestLogging) return next();
-
   const path = req.path;
   if (REQUEST_LOG_SKIP_PATHS.has(path)) return next();
   if (!path.startsWith('/api/') && STATIC_EXTENSIONS.test(path)) return next();
+
+  // Always track basic request stats for analytics, even when detailed logging is off
+  if (!config.requestLogging) {
+    const origEnd = res.end;
+    res.end = function(chunk, ...args) {
+      requestStatsAccum.total++;
+      if (res.statusCode < 400) {
+        requestStatsAccum.ok++;
+      } else {
+        requestStatsAccum.err++;
+      }
+      const sc = String(res.statusCode);
+      requestStatsAccum.statusCodes[sc] = (requestStatsAccum.statusCodes[sc] || 0) + 1;
+      return origEnd.apply(this, [chunk, ...args]);
+    };
+    return next();
+  }
 
   const start = Date.now();
   let responseSize = 0;
@@ -87,6 +102,16 @@ app.use((req, res, next) => {
       error: errorMessage
     };
 
+    // Track request stats for analytics
+    requestStatsAccum.total++;
+    if (res.statusCode < 400) {
+      requestStatsAccum.ok++;
+    } else {
+      requestStatsAccum.err++;
+    }
+    const sc = String(res.statusCode);
+    requestStatsAccum.statusCodes[sc] = (requestStatsAccum.statusCodes[sc] || 0) + 1;
+
     addRequestLog(entry);
     return origEnd.apply(this, [chunk, ...args]);
   };
@@ -129,6 +154,108 @@ const analyticsData = {
   memory: [],        // { timestamp, vram, gtt, system }
   tokens: []         // { timestamp, promptTokens, completionTokens, tokensPerSecond, model }
 };
+
+// Persistent analytics storage (minute-level aggregates in JSONL file)
+const ANALYTICS_DIR = join(PROJECT_ROOT, 'data');
+const ANALYTICS_FILE = join(ANALYTICS_DIR, 'analytics.jsonl');
+const MAX_ANALYTICS_HISTORY = 525600; // 1 year of minute-level data
+let analyticsHistory = [];
+
+// Load existing analytics history on startup
+function loadAnalyticsHistory() {
+  try {
+    if (!existsSync(ANALYTICS_DIR)) {
+      mkdirSync(ANALYTICS_DIR, { recursive: true });
+    }
+    if (existsSync(ANALYTICS_FILE)) {
+      const lines = readFileSync(ANALYTICS_FILE, 'utf-8').split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        try {
+          analyticsHistory.push(JSON.parse(line));
+        } catch { /* skip malformed lines */ }
+      }
+      // Cap and sort
+      analyticsHistory.sort((a, b) => a.ts - b.ts);
+      if (analyticsHistory.length > MAX_ANALYTICS_HISTORY) {
+        analyticsHistory = analyticsHistory.slice(-MAX_ANALYTICS_HISTORY);
+      }
+      console.log(`[analytics] Loaded ${analyticsHistory.length} historical data points`);
+    }
+  } catch (err) {
+    console.error('[analytics] Failed to load history:', err.message);
+  }
+}
+loadAnalyticsHistory();
+
+// Request stats accumulator (per-minute tallies)
+const requestStatsAccum = {
+  total: 0,
+  ok: 0,
+  err: 0,
+  statusCodes: {},
+  totalPromptTokens: 0,
+  totalCompletionTokens: 0
+};
+
+// Flush minute-level aggregate to persistent storage
+function flushAnalyticsMinute() {
+  const now = Date.now();
+  const cutoff = now - 60000;
+
+  // Aggregate 1-second samples from the last minute
+  const tempPoints = analyticsData.temperature.filter(p => p.timestamp > cutoff);
+  const powerPoints = analyticsData.power.filter(p => p.timestamp > cutoff);
+  const memPoints = analyticsData.memory.filter(p => p.timestamp > cutoff);
+  const tokenPoints = analyticsData.tokens.filter(p => p.timestamp > cutoff);
+
+  const avg = (arr, key) => arr.length > 0 ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
+  const max = (arr, key) => arr.length > 0 ? Math.max(...arr.map(p => p[key] || 0)) : 0;
+
+  const record = {
+    ts: now,
+    pwr: Math.round(avg(powerPoints, 'watts') * 10) / 10,
+    mv: Math.round(avg(memPoints, 'vram') * 10) / 10,
+    mg: Math.round(avg(memPoints, 'gtt') * 10) / 10,
+    ms: Math.round(avg(memPoints, 'system') * 10) / 10,
+    tg: Math.round(avg(tempPoints, 'gpu') * 10) / 10,
+    tc: Math.round(avg(tempPoints, 'cpu') * 10) / 10,
+    tps: Math.round(avg(tokenPoints, 'tokensPerSecond') * 10) / 10,
+    tpsMax: Math.round(max(tokenPoints, 'tokensPerSecond') * 10) / 10,
+    rT: requestStatsAccum.total,
+    rOk: requestStatsAccum.ok,
+    rErr: requestStatsAccum.err,
+    sc: { ...requestStatsAccum.statusCodes },
+    tp: requestStatsAccum.totalPromptTokens,
+    tcc: requestStatsAccum.totalCompletionTokens
+  };
+
+  // Append to in-memory history
+  analyticsHistory.push(record);
+  if (analyticsHistory.length > MAX_ANALYTICS_HISTORY) {
+    analyticsHistory.shift();
+  }
+
+  // Append to file
+  try {
+    if (!existsSync(ANALYTICS_DIR)) {
+      mkdirSync(ANALYTICS_DIR, { recursive: true });
+    }
+    appendFileSync(ANALYTICS_FILE, JSON.stringify(record) + '\n');
+  } catch (err) {
+    console.error('[analytics] Failed to write history:', err.message);
+  }
+
+  // Reset accumulator
+  requestStatsAccum.total = 0;
+  requestStatsAccum.ok = 0;
+  requestStatsAccum.err = 0;
+  requestStatsAccum.statusCodes = {};
+  requestStatsAccum.totalPromptTokens = 0;
+  requestStatsAccum.totalCompletionTokens = 0;
+}
+
+// Flush every 60 seconds
+setInterval(flushAnalyticsMinute, 60000);
 
 // Token stats aggregation
 const tokenStats = {
@@ -269,6 +396,10 @@ function recordTokenStats(stats) {
   tokenStats.totalPromptTokens += promptTokens || 0;
   tokenStats.totalCompletionTokens += completionTokens || 0;
   tokenStats.totalRequests++;
+
+  // Also accumulate into per-minute request stats
+  requestStatsAccum.totalPromptTokens += promptTokens || 0;
+  requestStatsAccum.totalCompletionTokens += completionTokens || 0;
 
   const requestRecord = {
     timestamp: Date.now(),
@@ -927,7 +1058,8 @@ app.get('/api/settings', (req, res) => {
       gpuLayers: config.gpuLayers || 99,
       requestLogging: config.requestLogging || false,
       defaultReasoningEffort: config.defaultReasoningEffort || null,
-      modelReasoningEffort: config.modelReasoningEffort || {}
+      modelReasoningEffort: config.modelReasoningEffort || {},
+      fullscreenInterval: config.fullscreenInterval || 30000
     },
     // Include environment defaults for reference
     defaults: {
@@ -939,7 +1071,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, defaultReasoningEffort, modelReasoningEffort } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, defaultReasoningEffort, modelReasoningEffort, fullscreenInterval } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -1004,6 +1136,15 @@ app.post('/api/settings', (req, res) => {
       }
     }
     config.modelReasoningEffort = modelReasoningEffort;
+  }
+
+  if (fullscreenInterval !== undefined) {
+    const interval = parseInt(fullscreenInterval);
+    if (interval >= 5000 && interval <= 300000) {
+      config.fullscreenInterval = interval;
+    } else {
+      return res.status(400).json({ error: 'Fullscreen interval must be between 5000 and 300000 ms' });
+    }
   }
 
   saveConfig(config);
@@ -2455,6 +2596,99 @@ app.get('/api/analytics', (req, res) => {
       averageTokensPerSecond: tokenStats.recentRequests.length > 0
         ? tokenStats.recentRequests.reduce((sum, r) => sum + r.tokensPerSecond, 0) / tokenStats.recentRequests.length
         : 0
+    }
+  });
+});
+
+// Get historical analytics data with downsampling
+app.get('/api/analytics/history', (req, res) => {
+  const range = req.query.range || '1h';
+  const now = Date.now();
+
+  // Determine time window and downsample interval
+  const rangeConfig = {
+    '1h':  { ms: 3600000,       step: 1 },      // every minute, 60 points
+    '1d':  { ms: 86400000,      step: 1 },      // every minute, 1440 points
+    '1w':  { ms: 604800000,     step: 5 },      // every 5 minutes, ~2016 points
+    '1m':  { ms: 2592000000,    step: 15 },     // every 15 minutes, ~2880 points
+    '1y':  { ms: 31536000000,   step: 60 }      // every 60 minutes, ~8760 points
+  };
+
+  const cfg = rangeConfig[range] || rangeConfig['1h'];
+  const cutoff = now - cfg.ms;
+
+  // Filter to time range
+  const filtered = analyticsHistory.filter(p => p.ts > cutoff);
+
+  // Downsample by averaging within step-minute buckets
+  let points;
+  if (cfg.step === 1) {
+    points = filtered;
+  } else {
+    const bucketMs = cfg.step * 60000;
+    const buckets = new Map();
+    for (const p of filtered) {
+      const bucketKey = Math.floor(p.ts / bucketMs) * bucketMs;
+      if (!buckets.has(bucketKey)) {
+        buckets.set(bucketKey, []);
+      }
+      buckets.get(bucketKey).push(p);
+    }
+
+    points = [];
+    for (const [ts, items] of buckets) {
+      const avg = (key) => items.reduce((s, p) => s + (p[key] || 0), 0) / items.length;
+      const sum = (key) => items.reduce((s, p) => s + (p[key] || 0), 0);
+      const maxVal = (key) => Math.max(...items.map(p => p[key] || 0));
+
+      // Merge status codes across bucket
+      const mergedSc = {};
+      for (const item of items) {
+        for (const [code, count] of Object.entries(item.sc || {})) {
+          mergedSc[code] = (mergedSc[code] || 0) + count;
+        }
+      }
+
+      points.push({
+        ts: ts + bucketMs / 2, // midpoint
+        pwr: Math.round(avg('pwr') * 10) / 10,
+        mv: Math.round(avg('mv') * 10) / 10,
+        mg: Math.round(avg('mg') * 10) / 10,
+        ms: Math.round(avg('ms') * 10) / 10,
+        tg: Math.round(avg('tg') * 10) / 10,
+        tc: Math.round(avg('tc') * 10) / 10,
+        tps: Math.round(avg('tps') * 10) / 10,
+        tpsMax: Math.round(maxVal('tpsMax') * 10) / 10,
+        rT: sum('rT'),
+        rOk: sum('rOk'),
+        rErr: sum('rErr'),
+        sc: mergedSc,
+        tp: sum('tp'),
+        tcc: sum('tcc')
+      });
+    }
+    points.sort((a, b) => a.ts - b.ts);
+  }
+
+  // Compute summary
+  const totalRequests = points.reduce((s, p) => s + (p.rT || 0), 0);
+  const totalErrors = points.reduce((s, p) => s + (p.rErr || 0), 0);
+  const tpsPoints = points.filter(p => p.tps > 0);
+  const avgTps = tpsPoints.length > 0 ? tpsPoints.reduce((s, p) => s + p.tps, 0) / tpsPoints.length : 0;
+  const allStatusCodes = {};
+  for (const p of points) {
+    for (const [code, count] of Object.entries(p.sc || {})) {
+      allStatusCodes[code] = (allStatusCodes[code] || 0) + count;
+    }
+  }
+
+  res.json({
+    points,
+    summary: {
+      totalRequests,
+      totalErrors,
+      avgTps: Math.round(avgTps * 10) / 10,
+      statusCodes: allStatusCodes
     }
   });
 });
