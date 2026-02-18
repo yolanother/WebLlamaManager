@@ -723,7 +723,7 @@ function Dashboard({ stats }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const fullscreenTimerRef = useRef(null);
-  const FULLSCREEN_PAGES = 4;
+  const FULLSCREEN_PAGES = 2;
 
   const fetchModels = useCallback(async () => {
     try {
@@ -868,124 +868,177 @@ function Dashboard({ stats }) {
         .sort((a, b) => b.count - a.count)
     : [];
 
-  // Fullscreen rendering
+  // Fullscreen rendering — 2 dense pages
   if (isFullscreen) {
     return (
       <div className="fullscreen-dashboard">
+        {/* Page 1: Live status + 5-min charts */}
         <div className={`fullscreen-page ${fullscreenPage === 0 ? 'active' : ''}`}>
-          <h3>Server Status & System Resources</h3>
-          <div className="status-grid" style={{ marginBottom: 24 }}>
-            <StatCard label="Status" value={isHealthy ? 'Running' : 'Stopped'} status={isHealthy ? 'success' : 'error'} icon="&#x1F7E2;" />
-            <StatCard label="Mode" value={isSingleMode ? 'Single Model' : 'Router (Multi)'} subValue={stats?.preset?.name || null} icon="&#x2699;&#xFE0F;" />
-            <StatCard label="Uptime" value={formatUptime(stats?.llama?.uptime)} icon="&#x23F1;&#xFE0F;" />
-          </div>
-          <div className="resources-grid">
-            <div className="resource-card">
-              <ProgressRing value={stats?.cpu?.usage || 0} color={stats?.cpu?.usage > 80 ? 'var(--error)' : 'var(--accent)'} />
-              <div className="resource-info">
-                <span className="resource-label">CPU</span>
-                <span className="resource-detail">{stats?.cpu?.cores || 0} cores</span>
+          <div className="fullscreen-top-bar">
+            <div className="fullscreen-status-row">
+              <StatCard label="Status" value={isHealthy ? 'Running' : 'Stopped'} status={isHealthy ? 'success' : 'error'} icon="&#x1F7E2;" />
+              <StatCard label="Mode" value={isSingleMode ? 'Single Model' : 'Router (Multi)'} subValue={stats?.preset?.name || null} icon="&#x1F3AF;" />
+              <StatCard label="Uptime" value={formatUptime(stats?.llama?.uptime)} icon="&#x23F1;&#xFE0F;" />
+              <div className="stat-card loaded-models-card">
+                <span className="stat-icon">&#x1F4E6;</span>
+                <div className="stat-content">
+                  <span className="stat-value">{serverModels.length} Loaded</span>
+                  <span className="stat-label">Models</span>
+                  {serverModels.length > 0 && (
+                    <div className="loaded-models-list">
+                      {serverModels.map((m, i) => (
+                        <span key={i} className="loaded-model-name">{formatModelName(m)}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
-            <div className="resource-card">
-              <ProgressRing value={stats?.memory?.usage || 0} color={stats?.memory?.usage > 80 ? 'var(--error)' : 'var(--success)'} />
-              <div className="resource-info">
-                <span className="resource-label">Memory</span>
-                <span className="resource-detail">{formatBytes(stats?.memory?.used)} / {formatBytes(stats?.memory?.total)}</span>
-              </div>
-            </div>
-            {stats?.gpu && (
+            <div className="fullscreen-resources-row">
               <div className="resource-card">
-                <ProgressRing value={stats.gpu.isAPU ? (stats.gpu.gtt?.usage || 0) : (stats.gpu.vram?.usage || 0)} color="var(--warning)" />
+                <ProgressRing value={stats?.cpu?.usage || 0} size={64} strokeWidth={6} color={stats?.cpu?.usage > 80 ? 'var(--error)' : 'var(--accent)'} />
                 <div className="resource-info">
-                  <span className="resource-label">{stats.gpu.isAPU ? 'GTT' : 'VRAM'}</span>
-                  <span className="resource-detail">{stats.gpu.isAPU ? `${formatBytes(stats.gpu.gtt?.used)} / ${formatBytes(stats.gpu.gtt?.total)}` : `${formatBytes(stats.gpu.vram?.used)} / ${formatBytes(stats.gpu.vram?.total)}`}</span>
+                  <span className="resource-label">CPU</span>
+                  <span className="resource-detail">{stats?.cpu?.cores || 0} cores @ {stats?.cpu?.loadAvg?.[0]?.toFixed(1) || '0.0'} load</span>
+                </div>
+              </div>
+              <div className="resource-card">
+                <ProgressRing value={stats?.memory?.usage || 0} size={64} strokeWidth={6} color={stats?.memory?.usage > 80 ? 'var(--error)' : 'var(--success)'} />
+                <div className="resource-info">
+                  <span className="resource-label">Memory</span>
+                  <span className="resource-detail">{formatBytes(stats?.memory?.used)} / {formatBytes(stats?.memory?.total)}</span>
+                </div>
+              </div>
+              {stats?.gpu && (
+                <div className="resource-card">
+                  <ProgressRing value={stats.gpu.isAPU ? (stats.gpu.gtt?.usage || 0) : (stats.gpu.vram?.usage || 0)} size={64} strokeWidth={6} color="var(--warning)" />
+                  <div className="resource-info">
+                    <span className="resource-label">{stats.gpu.isAPU ? 'GTT' : 'VRAM'}</span>
+                    <span className="resource-detail">{stats.gpu.isAPU ? `${formatBytes(stats.gpu.gtt?.used)} / ${formatBytes(stats.gpu.gtt?.total)}` : `${formatBytes(stats.gpu.vram?.used)} / ${formatBytes(stats.gpu.vram?.total)}`}</span>
+                  </div>
+                </div>
+              )}
+              {stats?.gpu?.power > 0 && (
+                <div className="resource-card">
+                  <div className="power-display" style={{ width: 64, height: 64 }}><div className="power-inner"><span className="power-value" style={{ fontSize: 18 }}>{stats.gpu.power.toFixed(0)}</span><span className="power-unit">W</span></div></div>
+                  <div className="resource-info"><span className="resource-label">Power</span><span className="resource-detail">{stats.gpu.temperature > 0 ? `${stats.gpu.temperature}°C` : ''}</span></div>
+                </div>
+              )}
+              <div className="resource-card">
+                <ProgressRing value={stats?.context?.usage || 0} size={64} strokeWidth={6} color="var(--info)" />
+                <div className="resource-info">
+                  <span className="resource-label">Context</span>
+                  <span className="resource-detail">{stats?.context?.totalContext > 0 ? `${(stats.context.usedContext || 0).toLocaleString()} / ${(stats.context.totalContext || 0).toLocaleString()}` : 'No models'}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="fullscreen-charts-grid">
+            <div className="chart-card">
+              <h4>Temperature <span className="chart-value">GPU: {stats?.gpu?.temperature?.toFixed(0) || 0}°C{stats?.cpu?.temperature ? ` / CPU: ${stats.cpu.temperature}°C` : ''}</span></h4>
+              <TemperatureChart data={analytics?.temperature || []} height={200} />
+            </div>
+            <div className="chart-card">
+              <h4>Power <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span></h4>
+              <PowerChart data={analytics?.power || []} height={200} />
+            </div>
+            <div className="chart-card">
+              <h4>Memory <span className="chart-value">{stats?.gpu?.isAPU ? `GTT: ${stats?.gpu?.gtt?.usage?.toFixed(0) || 0}%` : `VRAM: ${stats?.gpu?.vram?.usage?.toFixed(0) || 0}%`}</span></h4>
+              <MemoryChart data={analytics?.memory || []} primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'} height={200} />
+            </div>
+            <div className="chart-card">
+              <h4>Generation Speed <span className="chart-value">{analytics?.tokenStats?.averageTokensPerSecond?.toFixed(1) || 0} tok/s</span></h4>
+              <TokensChart data={analytics?.tokens || []} height={200} />
+            </div>
+          </div>
+        </div>
+
+        {/* Page 2: All historical charts */}
+        <div className={`fullscreen-page ${fullscreenPage === 1 ? 'active' : ''}`}>
+          <div className="fullscreen-top-bar">
+            <div className="fullscreen-history-header">
+              <h3>Historical Analytics</h3>
+              <TimeRangeSelector value={historyRange} onChange={setHistoryRange} />
+            </div>
+            {historyData?.summary && (
+              <div className="fullscreen-resources-row">
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.totalRequests.toLocaleString()}</span>
+                    <span className="resource-detail">Total Requests</span>
+                  </div>
+                </div>
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--error)' }}>{historyData.summary.totalErrors.toLocaleString()}</span>
+                    <span className="resource-detail">Errors</span>
+                  </div>
+                </div>
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.avgTps}</span>
+                    <span className="resource-detail">Avg tok/s</span>
+                  </div>
                 </div>
               </div>
             )}
-            {stats?.gpu?.power > 0 && (
-              <div className="resource-card">
-                <div className="power-display"><div className="power-inner"><span className="power-value">{stats.gpu.power.toFixed(0)}</span><span className="power-unit">W</span></div></div>
-                <div className="resource-info"><span className="resource-label">Power</span></div>
-              </div>
-            )}
           </div>
-        </div>
-
-        <div className={`fullscreen-page ${fullscreenPage === 1 ? 'active' : ''}`}>
-          <h3>Performance Analytics (5 min)</h3>
-          <div className="charts-grid">
-            <div className="chart-card"><h4>Temperature</h4><TemperatureChart data={analytics?.temperature || []} /></div>
-            <div className="chart-card"><h4>Power <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span></h4><PowerChart data={analytics?.power || []} /></div>
-            <div className="chart-card"><h4>Memory</h4><MemoryChart data={analytics?.memory || []} primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'} /></div>
-            <div className="chart-card"><h4>Generation Speed <span className="chart-value">{analytics?.tokenStats?.averageTokensPerSecond?.toFixed(1) || 0} tok/s</span></h4><TokensChart data={analytics?.tokens || []} /></div>
-          </div>
-        </div>
-
-        <div className={`fullscreen-page ${fullscreenPage === 2 ? 'active' : ''}`}>
-          <h3>Historical: Power & Memory</h3>
-          <div className="charts-grid-wide">
-            <div className="chart-card-wide">
+          <div className="fullscreen-charts-grid">
+            <div className="chart-card">
               <h4>Power Consumption</h4>
-              <div className="chart-container-wide">
+              <div className="chart-container" style={{ height: 200 }}>
                 {historyPoints.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <defs><linearGradient id="gradHistPwr" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.power} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.power} stopOpacity={0} /></linearGradient></defs>
+                      <defs><linearGradient id="gradFsPwr" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.power} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.power} stopOpacity={0} /></linearGradient></defs>
                       <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                       <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                       <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit="W" range={historyRange} />} />
-                      <Area type="monotone" dataKey="pwr" name="Power" stroke={CHART_COLORS.power} fill="url(#gradHistPwr)" strokeWidth={2} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="pwr" name="Power" stroke={CHART_COLORS.power} fill="url(#gradFsPwr)" strokeWidth={2} dot={false} animationDuration={500} />
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No historical data yet</div>}
               </div>
             </div>
-            <div className="chart-card-wide">
+            <div className="chart-card">
               <h4>Memory Usage</h4>
-              <div className="chart-container-wide">
+              <div className="chart-container" style={{ height: 200 }}>
                 {historyPoints.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <defs><linearGradient id="gradHistMg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.memory} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.memory} stopOpacity={0} /></linearGradient><linearGradient id="gradHistMs" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0.2} /><stop offset="95%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0} /></linearGradient></defs>
+                      <defs><linearGradient id="gradFsMem" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.memory} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.memory} stopOpacity={0} /></linearGradient><linearGradient id="gradFsSys" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0.2} /><stop offset="95%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0} /></linearGradient></defs>
                       <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                       <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                       <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
-                      <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={CHART_COLORS.memory} fill="url(#gradHistMg)" strokeWidth={2} dot={false} animationDuration={500} />
-                      <Area type="monotone" dataKey="ms" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradHistMs)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
+                      <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={CHART_COLORS.memory} fill="url(#gradFsMem)" strokeWidth={2} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="ms" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradFsSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No historical data yet</div>}
               </div>
             </div>
-          </div>
-        </div>
-
-        <div className={`fullscreen-page ${fullscreenPage === 3 ? 'active' : ''}`}>
-          <h3>Historical: Generation & Requests</h3>
-          <div className="charts-grid-wide">
-            <div className="chart-card-wide">
+            <div className="chart-card">
               <h4>Generation Speed</h4>
-              <div className="chart-container-wide">
+              <div className="chart-container" style={{ height: 200 }}>
                 {historyPoints.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <defs><linearGradient id="gradHistTps" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} /></linearGradient></defs>
+                      <defs><linearGradient id="gradFsTps" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} /></linearGradient></defs>
                       <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                       <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                       <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
-                      <Area type="monotone" dataKey="tps" name="Avg tok/s" stroke={CHART_COLORS.tokens} fill="url(#gradHistTps)" strokeWidth={2} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="tps" name="Avg tok/s" stroke={CHART_COLORS.tokens} fill="url(#gradFsTps)" strokeWidth={2} dot={false} animationDuration={500} />
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No historical data yet</div>}
               </div>
             </div>
-            <div className="chart-card-wide">
+            <div className="chart-card">
               <h4>Request Volume</h4>
-              <div className="chart-container-wide">
+              <div className="chart-container" style={{ height: 200 }}>
                 {historyPoints.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>

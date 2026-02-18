@@ -4549,24 +4549,85 @@ input::placeholder {
   bottom: 0;
   background: var(--bg-primary);
   z-index: 10000;
-  padding: 32px 40px;
-  overflow-y: auto;
+  overflow: hidden;
 }
 
 .fullscreen-page {
   display: none;
   animation: fadeIn 0.3s ease;
+  height: 100vh;
+  padding: 20px 32px;
+  overflow: hidden;
+  display: none;
+  flex-direction: column;
 }
 
 .fullscreen-page.active {
-  display: block;
+  display: flex;
 }
 
 .fullscreen-page h3 {
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 600;
-  margin-bottom: 24px;
+  margin-bottom: 0;
   color: var(--text-primary);
+}
+
+.fullscreen-top-bar {
+  flex-shrink: 0;
+  margin-bottom: 16px;
+}
+
+.fullscreen-status-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.fullscreen-status-row .stat-card {
+  padding: 14px 16px;
+}
+
+.fullscreen-resources-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.fullscreen-resources-row .resource-card {
+  padding: 12px 16px;
+  flex: 1;
+  min-width: 160px;
+}
+
+.fullscreen-history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.fullscreen-charts-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  min-height: 0;
+}
+
+.fullscreen-charts-grid .chart-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.fullscreen-charts-grid .chart-card h4 {
+  margin-bottom: 8px;
+}
+
+.fullscreen-charts-grid .chart-container {
+  flex: 1;
+  min-height: 0;
 }
 
 @keyframes fadeIn {
@@ -4576,11 +4637,11 @@ input::placeholder {
 
 .fullscreen-indicator {
   position: fixed;
-  bottom: 16px;
-  right: 24px;
+  bottom: 12px;
+  right: 20px;
   font-size: 12px;
   color: var(--text-secondary);
-  opacity: 0.5;
+  opacity: 0.4;
   font-family: monospace;
   z-index: 10001;
 }
@@ -4601,7 +4662,11 @@ input::placeholder {
     gap: 8px;
   }
 
-  .fullscreen-dashboard {
-    padding: 16px;
+  .fullscreen-page {
+    padding: 12px;
+  }
+
+  .fullscreen-charts-grid {
+    grid-template-columns: 1fr;
   }
 }
