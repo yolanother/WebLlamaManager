@@ -44,11 +44,12 @@ Llama Manager is a service for managing llama.cpp in multi-model router mode. It
 
 | Document | Description |
 |----------|-------------|
-| [Feature.md](Designs/Feature.md) | Template for documenting new features |
+| [ModelManagement.md](Designs/ModelManagement.md) | Model switching, preset system, OOM recovery, and memory management |
 | [ChatPage.md](Designs/ChatPage.md) | Full chat interface design |
 | [DocsPage.md](Designs/DocsPage.md) | In-app documentation page design |
 | [ApiDocs.md](Designs/ApiDocs.md) | API documentation enhancements |
 | [OpenCode.md](Designs/OpenCode.md) | OpenCode AI integration |
+| [Feature.md](Designs/Feature.md) | Template for documenting new features |
 
 ## Screenshots
 
