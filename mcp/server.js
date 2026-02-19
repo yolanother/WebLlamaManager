@@ -180,7 +180,7 @@ const tools = [
   },
   {
     name: 'llama_list_presets',
-    description: 'List available optimized model presets. Presets are pre-configured models with optimal settings.',
+    description: 'List available model presets. Presets are pre-configured models with specific settings.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -189,13 +189,13 @@ const tools = [
   },
   {
     name: 'llama_activate_preset',
-    description: 'Activate an optimized preset. This switches the server to single-model mode with the specified preset configuration.',
+    description: 'Activate a preset. This switches the server to single-model mode with the specified preset configuration.',
     inputSchema: {
       type: 'object',
       properties: {
         presetId: {
           type: 'string',
-          description: 'Preset ID to activate (e.g., gpt120, qwen3, qwen2.5)'
+          description: 'Preset ID to activate'
         }
       },
       required: ['presetId']

@@ -947,11 +947,6 @@ input::placeholder {
   flex: 1;
 }
 
-.preset-card.custom {
-  border-color: var(--accent);
-  border-style: solid;
-}
-
 /* Create Preset Form */
 .create-preset-form {
   background: var(--bg-secondary);

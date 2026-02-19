@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Wrapper script to start llama.cpp with a custom preset
+# Wrapper script to start llama.cpp with a preset
 # Supports both HuggingFace model references (-hf) and local file paths (--model)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +35,7 @@ if [ -z "$HF_REPO" ] && [ -z "$MODEL_PATH" ]; then
     exit 1
 fi
 
-echo "Starting llama.cpp with custom preset"
+echo "Starting llama.cpp with preset"
 if [ -n "$HF_REPO" ]; then
     echo "HF Model: $HF_REPO"
 else
@@ -97,7 +97,7 @@ exec $DISTROBOX enter "$CONTAINER_NAME" -- bash -c "
         CMD_ARGS+=(--chat-template-kwargs '$CHAT_TEMPLATE_KWARGS')
     fi
 
-    echo 'Starting llama-server with custom preset...'
+    echo 'Starting llama-server with preset...'
     echo \"Command: /home/yolan/.local/bin/llama-server \${CMD_ARGS[*]}\"
 
     exec /home/yolan/.local/bin/llama-server \"\${CMD_ARGS[@]}\"

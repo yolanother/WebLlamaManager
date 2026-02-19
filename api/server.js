@@ -423,15 +423,13 @@ function recordTokenStats(stats) {
   addAnalyticsPoint('tokens', requestRecord);
 }
 
-// Optimized single-model presets
-// These use specific configurations not supported in router mode
-const OPTIMIZED_PRESETS = {
+// Default presets - seeded on first run, can be deleted by user
+const DEFAULT_PRESETS = {
   gpt120: {
     id: 'gpt120',
     name: 'GPT-OSS 120B',
     description: 'Large reasoning model with high effort mode',
-    repo: 'Unsloth/gpt-oss-120b-GGUF',
-    quantization: 'Q5_K_M',
+    hfRepo: 'Unsloth/gpt-oss-120b-GGUF:Q5_K_M',
     context: 131072,
     config: {
       chatTemplateKwargs: '{"reasoning_effort": "high"}',
@@ -447,9 +445,8 @@ const OPTIMIZED_PRESETS = {
     id: 'qwen3',
     name: 'Qwen3 Coder 30B-A3B',
     description: 'Fast MoE coding model with 30B total / 3B active params',
-    repo: 'Unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF',
-    quantization: 'Q5_K_M',
-    context: 0, // Use model default
+    hfRepo: 'Unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_M',
+    context: 0,
     config: {
       chatTemplateKwargs: '',
       reasoningFormat: 'deepseek',
@@ -464,8 +461,7 @@ const OPTIMIZED_PRESETS = {
     id: 'qwen2.5',
     name: 'Qwen 2.5 Coder 32B',
     description: 'Dense 32B coding model, high quality',
-    repo: 'Qwen/Qwen2.5-Coder-32B-Instruct-GGUF',
-    quantization: 'Q5_K_M',
+    hfRepo: 'Qwen/Qwen2.5-Coder-32B-Instruct-GGUF:Q5_K_M',
     context: 0,
     config: {
       chatTemplateKwargs: '',
@@ -486,19 +482,34 @@ if (!existsSync(MODELS_DIR)) {
 
 // Load or initialize config
 function loadConfig() {
+  let cfg;
   if (existsSync(CONFIG_PATH)) {
-    return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+    cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+  } else {
+    // Use environment variables for defaults
+    cfg = {
+      autoStart: process.env.AUTO_START !== 'false',
+      modelsMax: parseInt(process.env.MODELS_MAX) || 2,
+      contextSize: parseInt(process.env.CONTEXT_SIZE) || 8192,
+      logFilters: [],
+      requestLogging: false
+    };
   }
-  // Use environment variables for defaults
-  const defaultConfig = {
-    autoStart: process.env.AUTO_START !== 'false',
-    modelsMax: parseInt(process.env.MODELS_MAX) || 2,
-    contextSize: parseInt(process.env.CONTEXT_SIZE) || 8192,
-    logFilters: [],
-    requestLogging: false
-  };
-  saveConfig(defaultConfig);
-  return defaultConfig;
+
+  // Migration: rename customPresets to presets
+  if (cfg.customPresets && !cfg.presets) {
+    cfg.presets = cfg.customPresets;
+    delete cfg.customPresets;
+    saveConfig(cfg);
+  }
+
+  // Seed default presets if presets is empty or doesn't exist
+  if (!cfg.presets || Object.keys(cfg.presets).length === 0) {
+    cfg.presets = { ...DEFAULT_PRESETS };
+    saveConfig(cfg);
+  }
+
+  return cfg;
 }
 
 function saveConfig(config) {
@@ -595,7 +606,7 @@ async function getSystemStats() {
     llamaPort: LLAMA_PORT,
     llamaUiUrl: LLAMA_UI_URL,
     mode: currentMode,
-    preset: currentPreset ? OPTIMIZED_PRESETS[currentPreset] : null,
+    preset: currentPreset ? config.presets[currentPreset] : null,
     downloads: Object.fromEntries(
       Array.from(downloadProcesses.entries()).map(([id, info]) => [
         id,
@@ -1172,7 +1183,7 @@ app.get('/api/status', async (req, res) => {
       llamaPort: LLAMA_PORT,
       modelsDir: MODELS_DIR,
       mode: currentMode,
-      currentPreset: currentPreset ? OPTIMIZED_PRESETS[currentPreset] : null,
+      currentPreset: currentPreset ? config.presets[currentPreset] : null,
       downloads: Object.fromEntries(
         Array.from(downloadProcesses.entries()).map(([id, info]) => [
           id,
@@ -1188,7 +1199,7 @@ app.get('/api/status', async (req, res) => {
       llamaPort: LLAMA_PORT,
       modelsDir: MODELS_DIR,
       mode: currentMode,
-      currentPreset: currentPreset ? OPTIMIZED_PRESETS[currentPreset] : null,
+      currentPreset: currentPreset ? config.presets[currentPreset] : null,
       error: error.message
     });
   }
@@ -1370,20 +1381,18 @@ app.post('/api/models/unload', async (req, res) => {
   }
 });
 
-// Get available presets (built-in + custom)
+// Get available presets
 app.get('/api/presets', (req, res) => {
-  const customPresets = config.customPresets || {};
+  const presets = config.presets || {};
   res.json({
-    presets: [...Object.values(OPTIMIZED_PRESETS), ...Object.values(customPresets)],
-    customPresets: Object.values(customPresets),
-    builtinPresets: Object.values(OPTIMIZED_PRESETS),
+    presets: Object.values(presets),
     currentPreset: currentPreset,
     mode: currentMode
   });
 });
 
-// Create a custom preset for a local model
-app.post('/api/presets/custom', (req, res) => {
+// Create a preset
+app.post('/api/presets', (req, res) => {
   const { id, name, description, modelPath, hfRepo, context, config: presetConfig } = req.body;
 
   // Either modelPath or hfRepo must be provided
@@ -1401,14 +1410,13 @@ app.post('/api/presets/custom', (req, res) => {
     }
   }
 
-  // Create the custom preset
+  // Create the preset
   const preset = {
     id,
     name,
-    description: description || `Custom preset for ${name}`,
+    description: description || `Preset for ${name}`,
     modelPath: fullModelPath,
     hfRepo: hfRepo || null, // e.g., "unsloth/Qwen3-Coder-Next-GGUF:Q5_K_M"
-    isCustom: true,
     context: context || 0,
     config: {
       chatTemplateKwargs: presetConfig?.chatTemplateKwargs || '',
@@ -1422,53 +1430,52 @@ app.post('/api/presets/custom', (req, res) => {
   };
 
   // Save to config
-  if (!config.customPresets) {
-    config.customPresets = {};
+  if (!config.presets) {
+    config.presets = {};
   }
-  config.customPresets[id] = preset;
+  config.presets[id] = preset;
   saveConfig(config);
 
   const modelInfo = hfRepo || modelPath;
-  console.log(`[presets] Created custom preset: ${id} for model ${modelInfo}`);
-  addLog('presets', `Created custom preset: ${name}`);
+  console.log(`[presets] Created preset: ${id} for model ${modelInfo}`);
+  addLog('presets', `Created preset: ${name}`);
 
   res.json({ success: true, preset });
 });
 
-// Update a custom preset
-app.put('/api/presets/custom/:presetId', (req, res) => {
+// Update a preset
+app.put('/api/presets/:presetId', (req, res) => {
   const { presetId } = req.params;
   const updates = req.body;
 
-  if (!config.customPresets || !config.customPresets[presetId]) {
-    return res.status(404).json({ error: `Custom preset '${presetId}' not found` });
+  if (!config.presets || !config.presets[presetId]) {
+    return res.status(404).json({ error: `Preset '${presetId}' not found` });
   }
 
   // Update the preset
-  config.customPresets[presetId] = {
-    ...config.customPresets[presetId],
+  config.presets[presetId] = {
+    ...config.presets[presetId],
     ...updates,
-    id: presetId, // Preserve ID
-    isCustom: true
+    id: presetId // Preserve ID
   };
   saveConfig(config);
 
-  console.log(`[presets] Updated custom preset: ${presetId}`);
-  res.json({ success: true, preset: config.customPresets[presetId] });
+  console.log(`[presets] Updated preset: ${presetId}`);
+  res.json({ success: true, preset: config.presets[presetId] });
 });
 
-// Delete a custom preset
-app.delete('/api/presets/custom/:presetId', (req, res) => {
+// Delete a preset
+app.delete('/api/presets/:presetId', (req, res) => {
   const { presetId } = req.params;
 
-  if (!config.customPresets || !config.customPresets[presetId]) {
-    return res.status(404).json({ error: `Custom preset '${presetId}' not found` });
+  if (!config.presets || !config.presets[presetId]) {
+    return res.status(404).json({ error: `Preset '${presetId}' not found` });
   }
 
-  delete config.customPresets[presetId];
+  delete config.presets[presetId];
   saveConfig(config);
 
-  console.log(`[presets] Deleted custom preset: ${presetId}`);
+  console.log(`[presets] Deleted preset: ${presetId}`);
   res.json({ success: true });
 });
 
@@ -1598,18 +1605,12 @@ app.post('/api/server/start', async (req, res) => {
   }
 });
 
-// Activate a preset (single-model mode) - supports both built-in and custom presets
+// Activate a preset (single-model mode)
 app.post('/api/presets/:presetId/activate', async (req, res) => {
   const { presetId } = req.params;
 
-  // Check built-in presets first, then custom presets
-  let preset = OPTIMIZED_PRESETS[presetId];
-  let isCustom = false;
-
-  if (!preset && config.customPresets && config.customPresets[presetId]) {
-    preset = config.customPresets[presetId];
-    isCustom = true;
-  }
+  // Look up preset in config
+  const preset = config.presets ? config.presets[presetId] : null;
 
   if (!preset) {
     return res.status(404).json({ error: `Preset '${presetId}' not found` });
@@ -1621,54 +1622,36 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
     currentMode = 'single';
     currentPreset = presetId;
 
-    if (isCustom) {
-      // Custom preset - supports both HF repo format and local model path
-      const startScript = join(PROJECT_ROOT, 'start-custom-preset.sh');
-      const env = {
-        ...process.env,
-        PORT: String(LLAMA_PORT),
-        MODELS_DIR,
-        // Use HF_REPO if available, otherwise MODEL_PATH
-        HF_REPO: preset.hfRepo || '',
-        MODEL_PATH: preset.hfRepo ? '' : (preset.modelPath || ''),
-        CONTEXT: String(preset.context || 0),
-        TEMP: String(preset.config?.temp ?? 0.7),
-        TOP_P: String(preset.config?.topP ?? 1.0),
-        TOP_K: String(preset.config?.topK ?? 20),
-        MIN_P: String(preset.config?.minP ?? 0),
-        CHAT_TEMPLATE_KWARGS: preset.config?.chatTemplateKwargs || '',
-        EXTRA_SWITCHES: preset.config?.extraSwitches || '--jinja'
-      };
+    // All presets use the same script with environment variables
+    const startScript = join(PROJECT_ROOT, 'start-preset.sh');
+    const env = {
+      ...process.env,
+      PORT: String(LLAMA_PORT),
+      MODELS_DIR,
+      // Use HF_REPO if available, otherwise MODEL_PATH
+      HF_REPO: preset.hfRepo || '',
+      MODEL_PATH: preset.hfRepo ? '' : (preset.modelPath || ''),
+      CONTEXT: String(preset.context || 0),
+      TEMP: String(preset.config?.temp ?? 0.7),
+      TOP_P: String(preset.config?.topP ?? 1.0),
+      TOP_K: String(preset.config?.topK ?? 20),
+      MIN_P: String(preset.config?.minP ?? 0),
+      CHAT_TEMPLATE_KWARGS: preset.config?.chatTemplateKwargs || '',
+      EXTRA_SWITCHES: preset.config?.extraSwitches || '--jinja'
+    };
 
-      const modelInfo = preset.hfRepo || preset.modelPath;
-      console.log(`[presets] Activating custom preset: ${presetId} with model ${modelInfo}`);
-      console.log(`[presets] EXTRA_SWITCHES: ${env.EXTRA_SWITCHES}`);
-      addLog('presets', `Activating custom preset: ${preset.name}`);
-      addLog('presets', `EXTRA_SWITCHES: ${env.EXTRA_SWITCHES}`);
+    const modelInfo = preset.hfRepo || preset.modelPath;
+    console.log(`[presets] Activating preset: ${presetId} with model ${modelInfo}`);
+    console.log(`[presets] EXTRA_SWITCHES: ${env.EXTRA_SWITCHES}`);
+    addLog('presets', `Activating preset: ${preset.name}`);
+    addLog('presets', `EXTRA_SWITCHES: ${env.EXTRA_SWITCHES}`);
 
-      llamaProcess = spawn('bash', [startScript], {
-        cwd: PROJECT_ROOT,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env,
-        detached: false
-      });
-    } else {
-      // Built-in preset - use existing script
-      const startScript = join(PROJECT_ROOT, 'start-single-model.sh');
-      const env = {
-        ...process.env,
-        PRESET_ID: presetId,
-        PORT: String(LLAMA_PORT),
-        MODELS_DIR
-      };
-
-      llamaProcess = spawn('bash', [startScript], {
-        cwd: PROJECT_ROOT,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env,
-        detached: false
-      });
-    }
+    llamaProcess = spawn('bash', [startScript], {
+      cwd: PROJECT_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
+      detached: false
+    });
 
     llamaProcess.stdout.on('data', (data) => {
       addLog('llama', data);
