@@ -1418,9 +1418,15 @@ app.post('/api/presets', (req, res) => {
     return res.status(400).json({ error: 'Missing required fields: id, name, and either modelPath or hfRepo' });
   }
 
+  // Check if preset ID already exists
+  if (config.presets && config.presets[id]) {
+    return res.status(409).json({ error: `Preset with ID '${id}' already exists. Use PUT to update or choose a different ID.` });
+  }
+
   let fullModelPath = null;
 
   // If using local file path, validate it exists
+  // When hfRepo is provided, we prioritize that and ignore modelPath
   if (modelPath && !hfRepo) {
     fullModelPath = modelPath.startsWith('/') ? modelPath : join(MODELS_DIR, modelPath);
     if (!existsSync(fullModelPath)) {
@@ -1429,6 +1435,8 @@ app.post('/api/presets', (req, res) => {
   }
 
   // Create the preset
+  // Note: When hfRepo is provided, modelPath is intentionally set to null
+  // as the model will be downloaded from Hugging Face
   const preset = {
     id,
     name,
@@ -1488,6 +1496,11 @@ app.delete('/api/presets/:presetId', (req, res) => {
 
   if (!config.presets || !config.presets[presetId]) {
     return res.status(404).json({ error: `Preset '${presetId}' not found` });
+  }
+
+  // Prevent deletion of currently active preset
+  if (currentPreset === presetId) {
+    return res.status(400).json({ error: `Cannot delete preset '${presetId}' while it is active. Switch to router mode or another preset first.` });
   }
 
   delete config.presets[presetId];

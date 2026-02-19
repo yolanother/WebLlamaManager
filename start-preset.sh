@@ -29,6 +29,7 @@ MIN_P="${MIN_P:-0}"
 CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS:-}"
 EXTRA_SWITCHES="${EXTRA_SWITCHES:---jinja}"
 MODELS_DIR="${MODELS_DIR:-$HOME/models}"
+LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$HOME/.local/bin/llama-server}"
 
 if [ -z "$HF_REPO" ] && [ -z "$MODEL_PATH" ]; then
     echo "Error: Either HF_REPO or MODEL_PATH environment variable must be set"
@@ -98,7 +99,7 @@ exec $DISTROBOX enter "$CONTAINER_NAME" -- bash -c "
     fi
 
     echo 'Starting llama-server with preset...'
-    echo \"Command: /home/yolan/.local/bin/llama-server \${CMD_ARGS[*]}\"
+    echo \"Command: $LLAMA_SERVER_BIN \${CMD_ARGS[*]}\"
 
-    exec /home/yolan/.local/bin/llama-server \"\${CMD_ARGS[@]}\"
+    exec $LLAMA_SERVER_BIN \"\${CMD_ARGS[@]}\"
 "

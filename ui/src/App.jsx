@@ -1621,10 +1621,10 @@ function PresetsPage({ stats }) {
         Pre-configured models with specific settings for different use cases.
       </p>
 
-      {/* Create Custom Preset Form */}
+      {/* Create Preset Form */}
       {showCreateForm && (
         <div className="create-preset-form">
-          <h3>Create Custom Preset</h3>
+          <h3>Create Preset</h3>
           <div className="form-grid">
             <div className="form-group">
               <label>Preset ID</label>
