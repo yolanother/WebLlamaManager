@@ -1638,7 +1638,7 @@ function PresetsPage({ stats }) {
   return (
     <div className="page">
       <div className="page-header">
-        <h2>Optimized Presets</h2>
+        <h2>Presets</h2>
         <div className="page-header-actions">
           <button className="btn-primary" onClick={() => setShowCreateForm(!showCreateForm)}>
             {showCreateForm ? 'Cancel' : '+ Create Preset'}
@@ -1647,7 +1647,7 @@ function PresetsPage({ stats }) {
       </div>
 
       <p className="page-description">
-        Pre-configured models with optimized settings for different use cases.
+        Pre-configured models with specific settings for different use cases.
       </p>
 
       {/* Create Custom Preset Form */}

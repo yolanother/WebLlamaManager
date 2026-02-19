@@ -497,15 +497,33 @@ function loadConfig() {
   }
 
   // Migration: rename customPresets to presets
-  if (cfg.customPresets && !cfg.presets) {
-    cfg.presets = cfg.customPresets;
+  if (cfg.customPresets) {
+    if (cfg.presets) {
+      // Both customPresets and presets exist; merge and log a warning.
+      console.warn(
+        'Config contains both "customPresets" and "presets". ' +
+        'Merging them and removing "customPresets".'
+      );
+      cfg.presets = { ...cfg.customPresets, ...cfg.presets };
+    } else {
+      cfg.presets = cfg.customPresets;
+    }
     delete cfg.customPresets;
     saveConfig(cfg);
   }
 
-  // Seed default presets if presets is empty or doesn't exist
-  if (!cfg.presets || Object.keys(cfg.presets).length === 0) {
-    cfg.presets = { ...DEFAULT_PRESETS };
+  // Seed default presets only once on first installation
+  if (!cfg.presetsSeeded) {
+    let updated = false;
+
+    // Only seed defaults if presets is empty or doesn't exist
+    if (!cfg.presets || Object.keys(cfg.presets).length === 0) {
+      cfg.presets = { ...DEFAULT_PRESETS };
+      updated = true;
+    }
+
+    cfg.presetsSeeded = true;
+    // Save if we seeded presets or if we're upgrading an old config to include the flag
     saveConfig(cfg);
   }
 
