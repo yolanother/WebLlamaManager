@@ -279,7 +279,7 @@ let lastLogCount = 0;
 // Default log patterns to filter out (noisy polling endpoints)
 const DEFAULT_LOG_FILTERS = [
   'GET /health.*200',
-  'GET /models\\s+200',
+  'GET /models.*200',
 ];
 
 function shouldFilterLog(line, customFilters = []) {
