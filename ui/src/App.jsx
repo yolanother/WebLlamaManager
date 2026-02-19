@@ -39,6 +39,28 @@ function formatModelName(model) {
     .replace(/\.gguf$/i, '');                 // Remove .gguf extension
 }
 
+// Clipboard utility with fallback for non-secure contexts (HTTP)
+async function copyTextToClipboard(text) {
+  // Try modern Clipboard API first (requires HTTPS or localhost)
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  
+  // Fallback for HTTP or older browsers using execCommand
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    document.execCommand('copy');
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
 // Code block component with syntax highlighting and copy button
 function CodeBlock({ code, language }) {
   const [copied, setCopied] = useState(false);
@@ -58,7 +80,7 @@ function CodeBlock({ code, language }) {
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(code);
+      await copyTextToClipboard(code);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
@@ -2546,7 +2568,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
 
   const handleCopyField = async (text, fieldId) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextToClipboard(text);
       setCopiedField(fieldId);
       setTimeout(() => setCopiedField(null), 2000);
     } catch (err) {
@@ -3755,7 +3777,7 @@ function ApiDocsPage() {
   const copyCurl = async () => {
     const curl = generateCurlExample(activeEndpoint, params);
     try {
-      await navigator.clipboard.writeText(curl);
+      await copyTextToClipboard(curl);
       setCopiedCurl(true);
       setTimeout(() => setCopiedCurl(false), 2000);
     } catch (err) {
@@ -4293,7 +4315,7 @@ function StatsHeader({ stats }) {
 
   const copyToClipboard = async (text, id) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextToClipboard(text);
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2000);
     } catch (err) {
@@ -4528,7 +4550,7 @@ function QueryPanel({ stats }) {
 
   const copyToClipboard = async (text, messageId) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextToClipboard(text);
       setCopiedId(messageId);
       setTimeout(() => setCopiedId(null), 2000);
     } catch (err) {
@@ -4918,7 +4940,7 @@ function DocsPage() {
 
   const copyCode = async (code, id) => {
     try {
-      await navigator.clipboard.writeText(code);
+      await copyTextToClipboard(code);
       setCopiedCode(id);
       setTimeout(() => setCopiedCode(null), 2000);
     } catch (err) {
@@ -5400,7 +5422,7 @@ function ChatPage({ stats }) {
 
   const copyToClipboard = async (text, messageId) => {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyTextToClipboard(text);
       setCopiedId(messageId);
       setTimeout(() => setCopiedId(null), 2000);
     } catch (err) {
