@@ -43,8 +43,12 @@ function formatModelName(model) {
 async function copyTextToClipboard(text) {
   // Try modern Clipboard API first (requires HTTPS or localhost)
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (e) {
+      // If Clipboard API fails (e.g., permissions, missing user gesture), fall back below
+    }
   }
   
   // Fallback for HTTP or older browsers using execCommand
@@ -55,7 +59,10 @@ async function copyTextToClipboard(text) {
   document.body.appendChild(textarea);
   textarea.select();
   try {
-    document.execCommand('copy');
+    const success = document.execCommand('copy');
+    if (!success) {
+      throw new Error('Copy command failed');
+    }
   } finally {
     document.body.removeChild(textarea);
   }
