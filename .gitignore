@@ -24,3 +24,7 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Editor/tool config
+opencode.json
+opencode.json~
