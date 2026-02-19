@@ -1924,27 +1924,51 @@ app.post('/api/pull', async (req, res) => {
     console.log(`[download] Starting: ${HF_CLI_PATH} ${hfArgs.join(' ')}`);
     addLog('download', `Starting download: ${repo} (${includePatterns.join(', ')})`);
 
+    // Helper to strip ANSI escape sequences from PTY output
+    const stripAnsi = (str) => str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+
     // Run huggingface-cli using node-pty to get real-time progress updates
     // PTY prevents output buffering that causes progress indicator to not update
-    const downloadProcess = pty.spawn(HF_CLI_PATH, hfArgs, {
-      cwd: PROJECT_ROOT,
-      env: {
-        ...process.env,
-        HF_HUB_ENABLE_HF_TRANSFER: '1',
-        HF_TOKEN: process.env.HF_TOKEN || '',
-        PYTHONUNBUFFERED: '1'
-      },
-      cols: 80,
-      rows: 24
-    });
+    let downloadProcess;
+    try {
+      downloadProcess = pty.spawn(HF_CLI_PATH, hfArgs, {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          HF_HUB_ENABLE_HF_TRANSFER: '1',
+          HF_TOKEN: process.env.HF_TOKEN || '',
+          PYTHONUNBUFFERED: '1'
+        },
+        cols: 80,
+        rows: 24
+      });
+    } catch (err) {
+      // Handle spawn failures (e.g., missing HF_CLI_PATH)
+      console.error(`[download] Process error: ${err.message}`);
+      downloadInfo.status = 'failed';
+      if (err.code === 'ENOENT') {
+        downloadInfo.error = `huggingface-cli not found. Run ./install.sh to set up the Python environment.`;
+      } else {
+        downloadInfo.error = `Failed to start download: ${err.message}`;
+      }
+      downloadInfo.output += `\nError: ${err.message}`;
+      addLog('download', `Download failed: ${repo} (${err.message})`);
+      setTimeout(() => downloadProcesses.delete(downloadId), 300000);
+      return res.status(500).json({ error: downloadInfo.error });
+    }
+
+    // Store process handle for cleanup
+    downloadInfo.process = downloadProcess;
 
     downloadProcess.onData((data) => {
-      downloadInfo.output += data;
+      // Strip ANSI escape sequences before storing output for web UI display
+      const cleanData = stripAnsi(data);
+      downloadInfo.output += cleanData;
       downloadInfo.status = 'downloading';
 
       // Parse progress from huggingface-cli output
-      // Split by carriage return and newline to handle in-place updates
-      const lines = data.split(/[\r\n]+/);
+      // Split by newline (handling optional carriage return) and filter out empty lines
+      const lines = cleanData.split(/\r?\n/).filter(line => line.length > 0);
       for (const line of lines) {
         // Look for patterns like "50%|" or "Downloading: 50%"
         const progressMatch = line.match(/(\d+)%/);
@@ -1981,7 +2005,7 @@ app.post('/api/pull', async (req, res) => {
         downloadInfo.progress = 100;
         addLog('download', `Download completed: ${repo}`);
       } else if (downloadInfo.status !== 'failed') {
-        // Only update if not already failed by error event
+        // Only update if status wasn't already set to 'failed' earlier
         downloadInfo.status = 'failed';
         // Provide helpful error messages for common exit codes
         let errorMsg = `Process exited with code ${exitCode}.`;
@@ -1993,7 +2017,8 @@ app.post('/api/pull', async (req, res) => {
         downloadInfo.error = errorMsg;
         addLog('download', `Download failed: ${repo} (code ${exitCode})`);
       }
-      // Keep the info for 5 minutes then clean up
+      // Clean up process reference and schedule deletion
+      downloadInfo.process = null;
       setTimeout(() => downloadProcesses.delete(downloadId), 300000);
     });
 
