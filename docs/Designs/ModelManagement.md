@@ -42,19 +42,9 @@ Activated by launching an optimized preset. Stops the router and starts llama.cp
 
 ## Preset System
 
-### Built-in Presets
+### Presets
 
-Defined in `OPTIMIZED_PRESETS` in `api/server.js`. Each preset specifies a HuggingFace repo, quantization, context size, and model-specific config:
-
-| Preset ID | Model | Key Config |
-|-----------|-------|------------|
-| `gpt120` | GPT-OSS 120B | reasoning_effort: high, deepseek format, 131K context |
-| `qwen3` | Qwen3 Coder 30B-A3B | deepseek reasoning, temp 0.7, topK 20 |
-| `qwen2.5` | Qwen 2.5 Coder 32B | deepseek reasoning, temp 0.7, topK 20 |
-
-### Custom Presets
-
-Users create custom presets via the web UI or API. Stored in `config.json` under the `customPresets` key. Each custom preset supports:
+Presets are stored in `config.json` under the `presets` key. Default presets are seeded on first run and can be deleted or modified by users. Each preset supports:
 
 | Field | Description |
 |-------|-------------|
@@ -73,10 +63,20 @@ Users create custom presets via the web UI or API. Stored in `config.json` under
 
 When both `hfRepo` and `modelPath` are set, `hfRepo` takes precedence.
 
+#### Default Presets
+
+The following presets are seeded on first installation:
+
+| Preset ID | Model | Key Config |
+|-----------|-------|------------|
+| `gpt120` | GPT-OSS 120B | reasoning_effort: high, deepseek format, 131K context |
+| `qwen3` | Qwen3 Coder 30B-A3B | deepseek reasoning, temp 0.7, topK 20 |
+| `qwen2.5` | Qwen 2.5 Coder 32B | deepseek reasoning, temp 0.7, topK 20 |
+
 ### Preset Activation Flow
 
 ```
-User clicks "Activate Preset"
+User or MCP tool activates preset
         │
         ▼
 POST /api/presets/:presetId/activate
@@ -84,7 +84,7 @@ POST /api/presets/:presetId/activate
         ▼
 ┌─────────────────────────┐
 │  Validate preset exists  │
-│  (built-in or custom)    │
+│  in config.presets       │
 └───────────┬─────────────┘
             │
             ▼
@@ -99,11 +99,9 @@ POST /api/presets/:presetId/activate
   currentMode = 'single'
   currentPreset = presetId
             │
-            ├── Built-in preset ──▶ spawn start-single-model.sh
-            │                       (enters distrobox, uses PRESET_ID env var)
-            │
-            └── Custom preset ──▶ spawn start-custom-preset.sh
-                                  (enters distrobox, passes all config as env vars)
+            ▼
+  spawn start-preset.sh
+  (enters distrobox, passes all config as env vars)
             │
             ▼
 ┌─────────────────────────┐
@@ -116,10 +114,10 @@ POST /api/presets/:presetId/activate
 
 ### Startup Scripts
 
-**`start-custom-preset.sh`** handles custom presets:
+**`start-preset.sh`** handles all presets:
 - Validates that `HF_REPO` or `MODEL_PATH` is set
 - Sets AMD GPU environment (`HSA_OVERRIDE_GFX_VERSION=11.5.1`)
-- Uses the correct binary at `~/.local/bin/llama-server` (not the outdated `/usr/local/bin/llama-server`)
+- Uses the correct binary at `~/.local/bin/llama-server`
 - Builds the command dynamically based on environment variables
 - If `HF_REPO` is set: uses `-hf 'repo'` flag (downloads/caches automatically)
 - If `MODEL_PATH` is set: uses `--model 'path'` flag

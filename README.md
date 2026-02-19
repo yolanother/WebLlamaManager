@@ -380,8 +380,8 @@ Replace `/path/to/llama-server` with the actual path to this repository.
 | `llama_stop_server` | Stop the llama server |
 | `llama_get_settings` | Get current server settings |
 | `llama_update_settings` | Update server settings |
-| `llama_list_presets` | List available optimized presets |
-| `llama_activate_preset` | Activate an optimized preset |
+| `llama_list_presets` | List available presets |
+| `llama_activate_preset` | Activate a preset |
 | `llama_search_models` | Search HuggingFace for GGUF models |
 | `llama_download_model` | Download a model from HuggingFace |
 | `llama_get_processes` | List running llama-server processes |

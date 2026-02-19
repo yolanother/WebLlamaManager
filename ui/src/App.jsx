@@ -1522,7 +1522,6 @@ function Dashboard({ stats }) {
 // Presets Page
 function PresetsPage({ stats }) {
   const [presets, setPresets] = useState([]);
-  const [customPresets, setCustomPresets] = useState([]);
   const [localModels, setLocalModels] = useState([]);
   const [loading, setLoading] = useState({});
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -1547,8 +1546,7 @@ function PresetsPage({ stats }) {
     try {
       const res = await fetch(`${API_BASE}/presets`);
       const data = await res.json();
-      setPresets(data.builtinPresets || []);
-      setCustomPresets(data.customPresets || []);
+      setPresets(data.presets || []);
     } catch (err) {
       console.error('Failed to fetch presets:', err);
     }
@@ -1569,34 +1567,14 @@ function PresetsPage({ stats }) {
     fetchModels();
   }, [fetchPresets, fetchModels]);
 
-  const activatePreset = async (presetId) => {
-    setLoading(l => ({ ...l, [presetId]: true }));
-    try {
-      await fetch(`${API_BASE}/presets/${presetId}/activate`, { method: 'POST' });
-    } catch (err) {
-      console.error('Failed to activate preset:', err);
-    }
-    setLoading(l => ({ ...l, [presetId]: false }));
-  };
-
-  const switchToRouterMode = async () => {
-    setLoading(l => ({ ...l, router: true }));
-    try {
-      await fetch(`${API_BASE}/server/start`, { method: 'POST' });
-    } catch (err) {
-      console.error('Failed to switch to router mode:', err);
-    }
-    setLoading(l => ({ ...l, router: false }));
-  };
-
-  const createCustomPreset = async () => {
+  const createPreset = async () => {
     if (!newPreset.id || !newPreset.name || !newPreset.modelPath) {
       alert('Please fill in ID, Name, and select a model');
       return;
     }
     setLoading(l => ({ ...l, create: true }));
     try {
-      const res = await fetch(`${API_BASE}/presets/custom`, {
+      const res = await fetch(`${API_BASE}/presets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newPreset)
@@ -1618,28 +1596,21 @@ function PresetsPage({ stats }) {
     setLoading(l => ({ ...l, create: false }));
   };
 
-  const deleteCustomPreset = async (presetId) => {
+  const deletePreset = async (presetId) => {
     if (!confirm(`Delete preset "${presetId}"?`)) return;
     try {
-      await fetch(`${API_BASE}/presets/custom/${presetId}`, { method: 'DELETE' });
+      await fetch(`${API_BASE}/presets/${presetId}`, { method: 'DELETE' });
       await fetchPresets();
     } catch (err) {
       console.error('Failed to delete preset:', err);
     }
   };
 
-  const isSingleMode = stats?.mode === 'single';
-  const activePreset = stats?.preset;
-  const isHealthy = stats?.llama?.status === 'ok';
-
   return (
     <div className="page">
       <div className="page-header">
         <h2>Optimized Presets</h2>
         <div className="page-header-actions">
-          {isSingleMode && (
-            <span className="mode-badge single">Single Model Mode</span>
-          )}
           <button className="btn-primary" onClick={() => setShowCreateForm(!showCreateForm)}>
             {showCreateForm ? 'Cancel' : '+ Create Preset'}
           </button>
@@ -1647,7 +1618,7 @@ function PresetsPage({ stats }) {
       </div>
 
       <p className="page-description">
-        Pre-configured models with optimized settings. Activating a preset runs the server in single-model mode with specific parameters.
+        Pre-configured models with optimized settings for different use cases.
       </p>
 
       {/* Create Custom Preset Form */}
@@ -1747,115 +1718,36 @@ function PresetsPage({ stats }) {
           </div>
           <div className="form-actions">
             <button className="btn-secondary" onClick={() => setShowCreateForm(false)}>Cancel</button>
-            <button className="btn-primary" onClick={createCustomPreset} disabled={loading.create}>
+            <button className="btn-primary" onClick={createPreset} disabled={loading.create}>
               {loading.create ? 'Creating...' : 'Create Preset'}
             </button>
           </div>
         </div>
       )}
 
-      {/* Custom Presets Section */}
-      {customPresets.length > 0 && (
-        <section className="page-section">
-          <h3>Custom Presets</h3>
-          <div className="presets-grid">
-            {customPresets.map((preset) => {
-              const isActive = activePreset?.id === preset.id;
-              const isLoading = loading[preset.id];
-              const isStarting = isActive && !isHealthy;
-
-              return (
-                <div key={preset.id} className={`preset-card custom ${isActive ? 'active' : ''} ${isLoading ? 'loading' : ''}`}>
-                  <div className="preset-header">
-                    <h3>{preset.name}</h3>
-                    <span className="badge info">Custom</span>
-                    {isActive && isHealthy && <span className="badge success">Active</span>}
-                    {isStarting && <span className="badge warning">Starting...</span>}
-                  </div>
-
-                  <p className="preset-description">{preset.description}</p>
-
-                  <div className="preset-details">
-                    <div className="detail-row">
-                      <span className="detail-label">Model</span>
-                      <span className="detail-value">{preset.modelPath?.split('/').pop()}</span>
-                    </div>
-                    {preset.context > 0 && (
-                      <div className="detail-row">
-                        <span className="detail-label">Context</span>
-                        <span className="detail-value">{preset.context.toLocaleString()}</span>
-                      </div>
-                    )}
-                  </div>
-
-                  {(isLoading || isStarting) && (
-                    <div className="preset-loading">
-                      <div className="loading-spinner" />
-                      <span>{isLoading ? 'Activating...' : 'Starting server...'}</span>
-                    </div>
-                  )}
-
-                  <div className="preset-actions">
-                    {isActive ? (
-                      <button
-                        className="btn-secondary full-width"
-                        onClick={switchToRouterMode}
-                        disabled={loading.router || isStarting}
-                      >
-                        {loading.router ? 'Switching...' : 'Switch to Router Mode'}
-                      </button>
-                    ) : (
-                      <>
-                        <button
-                          className="btn-primary"
-                          onClick={() => activatePreset(preset.id)}
-                          disabled={isLoading}
-                        >
-                          {isLoading ? 'Activating...' : 'Activate'}
-                        </button>
-                        <button
-                          className="btn-danger"
-                          onClick={() => deleteCustomPreset(preset.id)}
-                        >
-                          Delete
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {/* Built-in Presets Section */}
+      {/* Presets Section */}
       <section className="page-section">
-        <h3>Built-in Presets</h3>
+        <h3>Presets</h3>
         <div className="presets-grid">
           {presets.map((preset) => {
-            const isActive = activePreset?.id === preset.id;
-            const isLoading = loading[preset.id];
-            const isStarting = isActive && !isHealthy;
-
+            // Determine display values - support both hfRepo format and legacy repo/quantization
+            const modelDisplay = preset.hfRepo || 
+              (preset.repo ? `${preset.repo}:${preset.quantization || 'Q5_K_M'}` : null) ||
+              preset.modelPath?.split('/').pop() ||
+              'Unknown';
+            
             return (
-              <div key={preset.id} className={`preset-card ${isActive ? 'active' : ''} ${isLoading ? 'loading' : ''}`}>
+              <div key={preset.id} className="preset-card">
                 <div className="preset-header">
                   <h3>{preset.name}</h3>
-                  {isActive && isHealthy && <span className="badge success">Active</span>}
-                  {isStarting && <span className="badge warning">Starting...</span>}
                 </div>
 
                 <p className="preset-description">{preset.description}</p>
 
                 <div className="preset-details">
                   <div className="detail-row">
-                    <span className="detail-label">Repository</span>
-                    <span className="detail-value">{preset.repo}</span>
-                  </div>
-                  <div className="detail-row">
-                    <span className="detail-label">Quantization</span>
-                    <span className="detail-value quant">{preset.quantization}</span>
+                    <span className="detail-label">Model</span>
+                    <span className="detail-value">{modelDisplay}</span>
                   </div>
                   {preset.context > 0 && (
                     <div className="detail-row">
@@ -1865,31 +1757,13 @@ function PresetsPage({ stats }) {
                   )}
                 </div>
 
-                {(isLoading || isStarting) && (
-                  <div className="preset-loading">
-                    <div className="loading-spinner" />
-                    <span>{isLoading ? 'Activating...' : 'Starting server...'}</span>
-                  </div>
-                )}
-
                 <div className="preset-actions">
-                  {isActive ? (
-                    <button
-                      className="btn-secondary full-width"
-                      onClick={switchToRouterMode}
-                      disabled={loading.router || isStarting}
-                    >
-                      {loading.router ? 'Switching...' : 'Switch to Router Mode'}
-                    </button>
-                  ) : (
-                    <button
-                      className="btn-primary full-width"
-                      onClick={() => activatePreset(preset.id)}
-                      disabled={isLoading}
-                    >
-                      {isLoading ? 'Activating...' : 'Activate'}
-                    </button>
-                  )}
+                  <button
+                    className="btn-danger"
+                    onClick={() => deletePreset(preset.id)}
+                  >
+                    Delete
+                  </button>
                 </div>
               </div>
             );
@@ -5177,7 +5051,7 @@ Set reasonable context limits based on the model names (32k for most, 128k for m
                   <tr><td><code>llama_get_settings</code></td><td>Get current server settings</td></tr>
                   <tr><td><code>llama_update_settings</code></td><td>Update server settings</td></tr>
                   <tr><td><code>llama_list_presets</code></td><td>List available presets</td></tr>
-                  <tr><td><code>llama_activate_preset</code></td><td>Activate an optimized preset</td></tr>
+                  <tr><td><code>llama_activate_preset</code></td><td>Activate a preset</td></tr>
                   <tr><td><code>llama_get_processes</code></td><td>List running processes</td></tr>
                   <tr><td><code>llama_get_logs</code></td><td>Get recent server logs</td></tr>
                   <tr><td><code>llama_get_analytics</code></td><td>Get performance analytics</td></tr>

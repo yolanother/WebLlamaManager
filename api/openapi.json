@@ -257,7 +257,7 @@
       "post": {
         "operationId": "activatePreset",
         "summary": "Activate a preset",
-        "description": "Activate an optimized preset (switches to single-model mode)",
+        "description": "Activate a preset (switches to single-model mode)",
         "tags": ["Presets"],
         "parameters": [
           {
@@ -267,7 +267,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "Preset ID (e.g., gpt120, qwen3, qwen2.5)"
+            "description": "Preset ID"
           }
         ],
         "responses": {
