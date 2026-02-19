@@ -6,7 +6,7 @@
 | **Title**   | feat(routing): add external provider routing layer for multi-backend completions            |
 | **Status**  | Draft                                                                                       |
 | **Branch**  | `borealBytes:feat/external-provider-routing` → `yolanother:main`                           |
-| **PR URL**  | _pending creation_                                                                          |
+| **PR URL**  | [yolanother/WebLlamaManager#2](https://github.com/yolanother/WebLlamaManager/pull/2)       |
 | **Issue**   | [issue-00000001](../issues/issue-00000001-add-external-provider-routing.md)                 |
 | **Kanban**  | [project-wlm-001](../kanban/project-wlm-001-external-provider-routing.md)                  |
 | **Created** | 2026-02-19                                                                                  |
