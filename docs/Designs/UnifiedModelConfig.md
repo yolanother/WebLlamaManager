@@ -134,35 +134,38 @@ POST /v1/chat/completions
 │    Result: COMPATIBLE or INCOMPATIBLE                                  │
 └───────────────────────────────────────────────────────────────────────┘
         │
-        ├── COMPATIBLE ──────────────────────────────────────────────┐
-        │                                                             │
-        ▼                                                             │
-┌─────────────────────────────┐                                       │
-│ 3a. HOT-SWAP PATH           │                                       │
-│     - Map preset ID to      │                                       │
-│       file path             │                                       │
-│     - Forward to llama.cpp  │                                       │
-│       with model=filepath   │                                       │
-│     - Inject sampling       │                                       │
-│       params into request   │                                       │
-└─────────────────────────────┘                                       │
-        │                                                             │
-        │                                                             │
-        ├── INCOMPATIBLE ─────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│ 3b. RESTART PATH            │
-│     - Stop llama-server     │
-│     - Restart with new      │
-│       context/GPU config    │
-│     - Forward request       │
-│     - Update "current       │
-│       server config"        │
-└─────────────────────────────┘
-        │
-        ▼
-    Response to Client
+        ├─────────────── COMPATIBLE ───────────────┐
+        │                                          │
+        │                                          ▼
+        │                              ┌─────────────────────────────┐
+        │                              │ 3a. HOT-SWAP PATH           │
+        │                              │     - Map preset ID to      │
+        │                              │       file path             │
+        │                              │     - Forward to llama.cpp  │
+        │                              │       with model=filepath   │
+        │                              │     - Inject sampling       │
+        │                              │       params into request   │
+        │                              └─────────────────────────────┘
+        │                                          │
+        │                                          │
+ INCOMPATIBLE                                      │
+        │                                          │
+        ▼                                          │
+┌─────────────────────────────┐                    │
+│ 3b. RESTART PATH            │                    │
+│     - Stop llama-server     │                    │
+│     - Restart with new      │                    │
+│       context/GPU config    │                    │
+│     - Forward request       │                    │
+│     - Update "current       │                    │
+│       server config"        │                    │
+└─────────────────────────────┘                    │
+        │                                          │
+        │                                          │
+        └──────────────────┬───────────────────────┘
+                           │
+                           ▼
+                   Response to Client
 ```
 
 ### Configuration Compatibility Rules
