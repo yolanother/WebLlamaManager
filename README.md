@@ -87,7 +87,7 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
 ## Requirements
 
 - Node.js 18+
-- distrobox with the `llama-rocm-7rc-rocwmma` container
+- distrobox with the `llama-rocm-7rc-rocwmma` container (configurable via `DISTROBOX_CONTAINER` in `.env`)
 - llama.cpp compiled with ROCm support (inside the container)
 
 ## Quick Start
@@ -274,7 +274,7 @@ Check logs: `journalctl --user -u llama-manager -f`
 
 ### distrobox errors
 Ensure the container exists: `distrobox list`
-If not running, initialize it: `distrobox enter llama-rocm-7rc-rocwmma`
+If not running, initialize it: `distrobox enter llama-rocm-7rc-rocwmma` (or set `DISTROBOX_CONTAINER` in `.env` to use a different container)
 
 ### Permission denied
 ```bash

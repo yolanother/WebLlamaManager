@@ -12,6 +12,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PROJECT_ROOT = dirname(__dirname);
 
+// Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
+import dotenv from 'dotenv';
+dotenv.config({ path: join(PROJECT_ROOT, '.env') });
+
 const app = express();
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
@@ -128,7 +132,7 @@ if (existsSync(UI_BUILD_PATH)) {
 // Configuration
 const CONFIG_PATH = join(PROJECT_ROOT, 'config.json');
 const MODELS_DIR = process.env.MODELS_DIR || join(process.env.HOME, 'models');
-const CONTAINER_NAME = 'llama-rocm-7rc-rocwmma';
+const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
 const LLAMA_UI_URL = process.env.LLAMA_UI_URL || null; // Optional override for llama.cpp UI URL

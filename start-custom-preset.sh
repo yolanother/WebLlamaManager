@@ -5,7 +5,15 @@ set -euo pipefail
 # Supports both HuggingFace model references (-hf) and local file paths (--model)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONTAINER_NAME="llama-rocm-7rc-rocwmma"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# If a project .env exists, export its variables (simple KEY=VAL lines)
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    set -a
+    . "$PROJECT_ROOT/.env"
+    set +a
+fi
+
+CONTAINER_NAME="${DISTROBOX_CONTAINER:-llama-rocm-7rc-rocwmma}"
 
 # Get configuration from environment
 # For HF models: use HF_REPO (e.g., "unsloth/Qwen3-Coder-Next-GGUF:Q5_K_M")

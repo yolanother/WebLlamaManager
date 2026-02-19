@@ -4,7 +4,15 @@ set -euo pipefail
 # Wrapper script to start llama.cpp in single-model mode with optimized presets
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONTAINER_NAME="llama-rocm-7rc-rocwmma"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# If a project .env exists, export its variables (simple KEY=VAL lines)
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    set -a
+    . "$PROJECT_ROOT/.env"
+    set +a
+fi
+
+CONTAINER_NAME="${DISTROBOX_CONTAINER:-llama-rocm-7rc-rocwmma}"
 
 # Get preset from environment
 PRESET_ID="${PRESET_ID:-}"

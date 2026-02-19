@@ -10,6 +10,7 @@ config.json
 
 # Environment (use .env.example as template)
 .env
+.env~
 
 # Logs
 *.log
