@@ -7,6 +7,7 @@ import { dirname, join, basename } from 'path';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { cpus, totalmem, freemem, loadavg } from 'os';
+import pty from 'node-pty';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1923,73 +1924,54 @@ app.post('/api/pull', async (req, res) => {
     console.log(`[download] Starting: ${HF_CLI_PATH} ${hfArgs.join(' ')}`);
     addLog('download', `Starting download: ${repo} (${includePatterns.join(', ')})`);
 
-    // Run huggingface-cli from the project's venv
-    const downloadProcess = spawn(HF_CLI_PATH, hfArgs, {
+    // Run huggingface-cli using node-pty to get real-time progress updates
+    // PTY prevents output buffering that causes progress indicator to not update
+    const downloadProcess = pty.spawn(HF_CLI_PATH, hfArgs, {
       cwd: PROJECT_ROOT,
       env: {
         ...process.env,
         HF_HUB_ENABLE_HF_TRANSFER: '1',
-        HF_TOKEN: process.env.HF_TOKEN || ''
-      }
+        HF_TOKEN: process.env.HF_TOKEN || '',
+        PYTHONUNBUFFERED: '1'
+      },
+      cols: 80,
+      rows: 24
     });
 
-    downloadProcess.stdout.on('data', (data) => {
-      const output = data.toString();
-      downloadInfo.output += output;
+    downloadProcess.onData((data) => {
+      downloadInfo.output += data;
       downloadInfo.status = 'downloading';
 
       // Parse progress from huggingface-cli output
-      // Look for patterns like "50%|" or "Downloading: 50%"
-      const progressMatch = output.match(/(\d+)%/);
-      if (progressMatch) {
-        downloadInfo.progress = parseInt(progressMatch[1]);
-      }
+      // Split by carriage return and newline to handle in-place updates
+      const lines = data.split(/[\r\n]+/);
+      for (const line of lines) {
+        // Look for patterns like "50%|" or "Downloading: 50%"
+        const progressMatch = line.match(/(\d+)%/);
+        if (progressMatch) {
+          downloadInfo.progress = parseInt(progressMatch[1]);
+        }
 
-      // Check for completion indicators
-      if (output.includes('Download complete') || output.includes('already exists') || output.includes('Fetching')) {
-        if (output.includes('100%')) {
-          downloadInfo.progress = 100;
+        // Check for completion indicators
+        if (line.includes('Download complete') || line.includes('already exists') || line.includes('Fetching')) {
+          if (line.includes('100%')) {
+            downloadInfo.progress = 100;
+          }
+        }
+
+        // Log important messages
+        if (line.includes('Downloading') || line.includes('Error') || line.includes('complete')) {
+          console.log(`[download] ${line.trim()}`);
+        }
+
+        if (line.includes('Error') || line.includes('error')) {
+          console.error(`[download] ${line}`);
         }
       }
-
-      // Log important messages
-      if (output.includes('Downloading') || output.includes('Error') || output.includes('complete')) {
-        console.log(`[download] ${output.trim()}`);
-      }
     });
 
-    downloadProcess.stderr.on('data', (data) => {
-      const output = data.toString();
-      downloadInfo.output += output;
-      downloadInfo.status = 'downloading';
-
-      // HF CLI outputs progress to stderr
-      const progressMatch = output.match(/(\d+)%/);
-      if (progressMatch) {
-        downloadInfo.progress = parseInt(progressMatch[1]);
-      }
-
-      if (output.includes('Error') || output.includes('error')) {
-        console.error(`[download] ${output}`);
-      }
-    });
-
-    downloadProcess.on('error', (err) => {
-      console.error(`[download] Process error: ${err.message}`);
-      downloadInfo.status = 'failed';
-      if (err.code === 'ENOENT') {
-        downloadInfo.error = `huggingface-cli not found. Run ./install.sh to set up the Python environment.`;
-      } else {
-        downloadInfo.error = `Failed to start download: ${err.message}`;
-      }
-      downloadInfo.output += `\nError: ${err.message}`;
-      addLog('download', `Download failed: ${repo} (${err.message})`);
-      // Keep the info for 5 minutes then clean up
-      setTimeout(() => downloadProcesses.delete(downloadId), 300000);
-    });
-
-    downloadProcess.on('exit', (code) => {
-      if (code === 0) {
+    downloadProcess.onExit(({ exitCode }) => {
+      if (exitCode === 0) {
         // Flatten any nested GGUF files to one level deep
         const flattened = flattenGgufFiles(targetDir);
         if (flattened > 0) {
@@ -2002,14 +1984,14 @@ app.post('/api/pull', async (req, res) => {
         // Only update if not already failed by error event
         downloadInfo.status = 'failed';
         // Provide helpful error messages for common exit codes
-        let errorMsg = `Process exited with code ${code}.`;
-        if (code === 127) {
+        let errorMsg = `Process exited with code ${exitCode}.`;
+        if (exitCode === 127) {
           errorMsg = `Command not found (exit code 127). Run ./install.sh to set up the Python environment.`;
-        } else if (code === 1) {
+        } else if (exitCode === 1) {
           errorMsg = `Download failed (exit code 1). Check output for details - this may be an authentication issue (set HF_TOKEN env var) or network problem.`;
         }
         downloadInfo.error = errorMsg;
-        addLog('download', `Download failed: ${repo} (code ${code})`);
+        addLog('download', `Download failed: ${repo} (code ${exitCode})`);
       }
       // Keep the info for 5 minutes then clean up
       setTimeout(() => downloadProcesses.delete(downloadId), 300000);
