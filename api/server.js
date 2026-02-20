@@ -2256,16 +2256,38 @@ app.put('/api/presets/:presetId', (req, res) => {
     return res.status(404).json({ error: `Preset '${presetId}' not found` });
   }
 
-  // Update the preset
-  config.presets[presetId] = {
-    ...config.presets[presetId],
-    ...updates,
-    id: presetId // Preserve ID
-  };
-  saveConfig(config);
-
-  console.log(`[presets] Updated preset: ${presetId}`);
-  res.json({ success: true, preset: config.presets[presetId] });
+  // Check if ID is being changed
+  const newId = updates.id;
+  if (newId && newId !== presetId) {
+    // Validate new ID format
+    if (!/^[a-z0-9-]+$/.test(newId)) {
+      return res.status(400).json({ error: 'ID must contain only lowercase letters, numbers, and hyphens' });
+    }
+    // Check for conflicts
+    if (config.presets[newId]) {
+      return res.status(409).json({ error: `Preset '${newId}' already exists` });
+    }
+    // Rename: create with new ID, delete old
+    config.presets[newId] = {
+      ...config.presets[presetId],
+      ...updates,
+      id: newId
+    };
+    delete config.presets[presetId];
+    saveConfig(config);
+    console.log(`[presets] Renamed preset: ${presetId} -> ${newId}`);
+    res.json({ success: true, preset: config.presets[newId], renamed: true, oldId: presetId });
+  } else {
+    // Update in place
+    config.presets[presetId] = {
+      ...config.presets[presetId],
+      ...updates,
+      id: presetId
+    };
+    saveConfig(config);
+    console.log(`[presets] Updated preset: ${presetId}`);
+    res.json({ success: true, preset: config.presets[presetId] });
+  }
 });
 
 // Delete a preset

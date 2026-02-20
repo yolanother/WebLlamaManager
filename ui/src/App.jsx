@@ -1967,6 +1967,7 @@ function ModelsPage({ stats }) {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          id: newPreset.id,  // Include ID to allow renaming
           name: newPreset.name,
           description: newPreset.description,
           modelPath: newPreset.modelPath,
@@ -2040,10 +2041,10 @@ function ModelsPage({ stats }) {
                 placeholder="my-model-config"
                 value={newPreset.id}
                 onChange={(e) => setNewPreset(p => ({ ...p, id: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-') }))}
-                disabled={!!editingPreset}
-                className={editingPreset ? 'disabled' : ''}
               />
-              {editingPreset && <small className="hint">ID cannot be changed</small>}
+              {editingPreset && newPreset.id !== editingPreset.id && (
+                <small className="hint warning">Changing ID will update the API identifier</small>
+              )}
             </div>
             <div className="form-group">
               <label>Display Name</label>
