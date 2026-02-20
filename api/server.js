@@ -132,7 +132,9 @@ if (existsSync(UI_BUILD_PATH)) {
 
 // Configuration
 const CONFIG_PATH = join(PROJECT_ROOT, 'config.json');
-const MODELS_DIR = process.env.MODELS_DIR || join(process.env.HOME, 'models');
+// Expand ~ to home directory for MODELS_DIR
+const MODELS_DIR_RAW = process.env.MODELS_DIR || join(process.env.HOME, 'models');
+const MODELS_DIR = MODELS_DIR_RAW.startsWith('~') ? MODELS_DIR_RAW.replace(/^~/, process.env.HOME) : MODELS_DIR_RAW;
 const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
@@ -2207,8 +2209,30 @@ app.post('/api/presets', (req, res) => {
   // When hfRepo is provided, we prioritize that and ignore modelPath
   if (modelPath && !hfRepo) {
     fullModelPath = modelPath.startsWith('/') ? modelPath : join(MODELS_DIR, modelPath);
+    
+    // Check if file exists directly
     if (!existsSync(fullModelPath)) {
-      return res.status(404).json({ error: `Model file not found: ${modelPath}` });
+      // Check if this is a split model (name without part suffix)
+      // Try to find first part: model.gguf -> model-00001-of-*.gguf
+      const basePath = fullModelPath.replace(/\.gguf$/i, '');
+      const dirPath = dirname(fullModelPath);
+      let foundSplitModel = false;
+      
+      if (existsSync(dirPath)) {
+        const files = readdirSync(dirPath);
+        const splitFirstPart = files.find(f => 
+          f.startsWith(basename(basePath)) && 
+          /-00001-of-\d{5}\.gguf$/i.test(f)
+        );
+        if (splitFirstPart) {
+          fullModelPath = join(dirPath, splitFirstPart);
+          foundSplitModel = true;
+        }
+      }
+      
+      if (!foundSplitModel) {
+        return res.status(404).json({ error: `Model file not found: ${modelPath}` });
+      }
     }
   }
 
@@ -2254,6 +2278,38 @@ app.put('/api/presets/:presetId', (req, res) => {
 
   if (!config.presets || !config.presets[presetId]) {
     return res.status(404).json({ error: `Preset '${presetId}' not found` });
+  }
+
+  // If modelPath is being updated, convert relative path to full path
+  if (updates.modelPath) {
+    const modelPath = updates.modelPath;
+    let fullModelPath = modelPath.startsWith('/') ? modelPath : join(MODELS_DIR, modelPath);
+    
+    // Check if file exists directly
+    if (!existsSync(fullModelPath)) {
+      // Check if this is a split model (name without part suffix)
+      // Try to find first part: model.gguf -> model-00001-of-*.gguf
+      const basePath = fullModelPath.replace(/\.gguf$/i, '');
+      const dirPath = dirname(fullModelPath);
+      let foundSplitModel = false;
+      
+      if (existsSync(dirPath)) {
+        const files = readdirSync(dirPath);
+        const splitFirstPart = files.find(f => 
+          f.startsWith(basename(basePath)) && 
+          /-00001-of-\d{5}\.gguf$/i.test(f)
+        );
+        if (splitFirstPart) {
+          fullModelPath = join(dirPath, splitFirstPart);
+          foundSplitModel = true;
+        }
+      }
+      
+      if (!foundSplitModel) {
+        return res.status(404).json({ error: `Model file not found: ${modelPath}` });
+      }
+    }
+    updates.modelPath = fullModelPath;
   }
 
   // Check if ID is being changed
