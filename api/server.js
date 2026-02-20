@@ -551,9 +551,6 @@ function saveConfig(config) {
 
 let config = loadConfig();
 
-// Auto-create presets for any existing models that don't have one
-migrateExistingModels();
-
 // WebSocket stats broadcasting
 const STATS_INTERVAL = parseInt(process.env.STATS_INTERVAL) || 1000; // Default 1 second
 let statsInterval = null;
@@ -4622,6 +4619,9 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   console.log(`Models directory: ${MODELS_DIR}`);
   console.log(`Llama server will run on port ${LLAMA_PORT}`);
   console.log(`Stats interval: ${STATS_INTERVAL}ms`);
+
+  // Auto-create presets for any existing models that don't have one
+  migrateExistingModels();
 
   // Auto-start llama if configured
   if (config.autoStart) {
