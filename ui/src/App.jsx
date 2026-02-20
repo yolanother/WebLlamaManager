@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart,
@@ -754,6 +754,12 @@ function Dashboard({ stats }) {
   const fullscreenTimerRef = useRef(null);
   const FULLSCREEN_PAGES = 2;
 
+  // Filter to only show models that are actually loaded in llama.cpp
+  const loadedModels = useMemo(() =>
+    serverModels.filter(m => m.status?.value === 'loaded'),
+    [serverModels]
+  );
+
   const fetchModels = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/models`);
@@ -911,12 +917,12 @@ function Dashboard({ stats }) {
               <div className="stat-card loaded-models-card">
                 <span className="stat-icon">&#x1F4E6;</span>
                 <div className="stat-content">
-                  <span className="stat-value">{serverModels.length} Loaded</span>
+                  <span className="stat-value">{loadedModels.length} Loaded</span>
                   <span className="stat-label">Models</span>
-                  {serverModels.length > 0 && (
+                  {loadedModels.length > 0 && (
                     <div className="loaded-models-list">
-                      {serverModels.map((m, i) => (
-                        <span key={i} className="loaded-model-name">{formatModelName(m)}</span>
+                      {loadedModels.map((m) => (
+                        <span key={m.id || m.model || formatModelName(m)} className="loaded-model-name">{formatModelName(m)}</span>
                       ))}
                     </div>
                   )}
@@ -1131,12 +1137,12 @@ function Dashboard({ stats }) {
           <div className="stat-card loaded-models-card">
             <span className="stat-icon">&#x1F4E6;</span>
             <div className="stat-content">
-              <span className="stat-value">{serverModels.length} Loaded</span>
+              <span className="stat-value">{loadedModels.length} Loaded</span>
               <span className="stat-label">Models</span>
-              {serverModels.length > 0 ? (
+              {loadedModels.length > 0 ? (
                 <div className="loaded-models-list">
-                  {serverModels.map((m, i) => (
-                    <span key={i} className="loaded-model-name">{formatModelName(m)}</span>
+                  {loadedModels.map((m) => (
+                    <span key={m.id || m.model || formatModelName(m)} className="loaded-model-name">{formatModelName(m)}</span>
                   ))}
                 </div>
               ) : (
@@ -1812,6 +1818,12 @@ function ModelsPage({ stats }) {
   const [editingAlias, setEditingAlias] = useState(null);
   const [aliasInput, setAliasInput] = useState('');
 
+  // Filter to only show models that are actually loaded in llama.cpp
+  const loadedModels = useMemo(() =>
+    serverModels.filter(m => m.status?.value === 'loaded'),
+    [serverModels]
+  );
+
   const fetchModels = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/models`);
@@ -1881,7 +1893,7 @@ function ModelsPage({ stats }) {
   };
 
   const getModelStatus = (modelName) => {
-    return serverModels.some(m =>
+    return loadedModels.some(m =>
       m.id === modelName || m.model === modelName || (m.id && m.id.includes(modelName))
     ) ? 'loaded' : 'unloaded';
   };
@@ -1925,11 +1937,11 @@ function ModelsPage({ stats }) {
       </div>
 
       {/* Loaded Models */}
-      {serverModels.length > 0 && (
+      {loadedModels.length > 0 && (
         <section className="page-section">
           <h3>Loaded Models</h3>
           <div className="models-grid">
-            {serverModels.map((model) => {
+            {loadedModels.map((model) => {
               const alias = getAliasForLoadedModel(model.id);
               return (
                 <div key={model.id} className="model-card active">
