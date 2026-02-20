@@ -1202,6 +1202,11 @@ function getPresetStatus(preset, serverModels) {
     return 'available';
   }
 
+  // Check if this preset is the currently active one
+  if (currentPreset === preset.id) {
+    return 'loaded';  // This preset is specifically active
+  }
+
   // Get the model path that would be used for this preset
   const resolved = { type: 'preset', preset };
   const modelPath = resolveModelPath(resolved);
@@ -1211,6 +1216,9 @@ function getPresetStatus(preset, serverModels) {
     return 'not_downloaded';
   }
 
+  // Check if the preset would need a server restart
+  const compat = isCompatible(preset);
+  
   // Check if any loaded model matches this path
   for (const model of serverModels) {
     const modelId = model.id || '';
@@ -1221,7 +1229,14 @@ function getPresetStatus(preset, serverModels) {
         modelId.endsWith(modelPath) || 
         modelPath.endsWith(modelId) ||
         basename(modelId) === basename(modelPath)) {
-      if (status === 'loaded') return 'loaded';
+      if (status === 'loaded') {
+        // Model is loaded, but is this preset compatible with current config?
+        if (compat.compatible) {
+          return 'loaded';  // Can use immediately
+        } else {
+          return 'available';  // Would need restart, show as available
+        }
+      }
       if (status === 'loading') return 'loading';
     }
   }
@@ -1327,16 +1342,17 @@ function prepareProxyRequest(body) {
 function isCompatible(preset) {
   const reasons = [];
   
-  if (!preset || !preset.config) {
-    // No preset config means it can use defaults - compatible
+  if (!preset) {
+    // No preset means it can use defaults - compatible
     return { compatible: true, reasons: [] };
   }
   
-  const presetConfig = preset.config;
+  const presetConfig = preset.config || {};
   
-  // Context: preset can use less than or equal to current context
-  if (presetConfig.context && presetConfig.context > serverConfig.context) {
-    reasons.push(`Context ${presetConfig.context} > current ${serverConfig.context}`);
+  // Context: stored at preset level, not inside config
+  // Preset can use less than or equal to current context
+  if (preset.context && preset.context > serverConfig.context) {
+    reasons.push(`Context ${preset.context} > current ${serverConfig.context}`);
   }
   
   // GPU layers: must match if specified (affects VRAM allocation)
@@ -1444,7 +1460,8 @@ async function restartForPreset(preset) {
     }
     
     // Update serverConfig with new values
-    const newContext = presetConfig.context || config.defaultContext || 8192;
+    // Note: context is stored at preset level, not inside config
+    const newContext = preset.context || config.defaultContext || 8192;
     const newGpuLayers = presetConfig.gpuLayers !== undefined ? presetConfig.gpuLayers : (config.gpuLayers || 99);
     const newFlashAttn = presetConfig.flashAttn !== undefined ? presetConfig.flashAttn : (config.flashAttn || false);
     const newReasoningFormat = presetConfig.reasoningFormat || null;
@@ -1454,69 +1471,64 @@ async function restartForPreset(preset) {
     serverConfig.flashAttn = newFlashAttn;
     serverConfig.reasoningFormat = newReasoningFormat;
     
-    // Build llama-server arguments
-    const args = [
-      '--host', '0.0.0.0',
-      '--port', LLAMA_PORT.toString(),
-      '--model-store', MODELS_DIR,
-      '--ctx-size', newContext.toString(),
-      '--gpu-layers', newGpuLayers.toString(),
-      '--jinja'
-    ];
-    
+    // Build extra switches
+    let extraSwitches = '--jinja';
     if (newFlashAttn) {
-      args.push('--flash-attn');
+      extraSwitches += ' --flash-attn';
     }
-    
     if (newReasoningFormat) {
-      args.push('--reasoning-format', newReasoningFormat);
+      extraSwitches += ` --reasoning-format ${newReasoningFormat}`;
+    }
+    if (presetConfig.extraSwitches) {
+      extraSwitches += ` ${presetConfig.extraSwitches}`;
     }
     
-    // Add extra switches from config
-    if (config.extraSwitches) {
-      const extras = config.extraSwitches.split(' ').filter(s => s.trim());
-      args.push(...extras);
-    }
+    // Use start-preset.sh with environment variables (same as /api/presets/:presetId/activate)
+    const startScript = join(PROJECT_ROOT, 'start-preset.sh');
+    const env = {
+      ...process.env,
+      PORT: String(LLAMA_PORT),
+      MODELS_DIR,
+      // Use HF_REPO if available, otherwise MODEL_PATH
+      HF_REPO: preset.hfRepo || '',
+      MODEL_PATH: preset.hfRepo ? '' : (preset.modelPath || ''),
+      CONTEXT: String(newContext),
+      TEMP: String(presetConfig.temp ?? 0.7),
+      TOP_P: String(presetConfig.topP ?? 1.0),
+      TOP_K: String(presetConfig.topK ?? 20),
+      MIN_P: String(presetConfig.minP ?? 0),
+      CHAT_TEMPLATE_KWARGS: presetConfig.chatTemplateKwargs || '',
+      EXTRA_SWITCHES: extraSwitches
+    };
     
-    // Get the model path to load
-    const modelPath = resolveModelPath({ type: 'preset', preset });
-    if (modelPath) {
-      args.push('--model', join(MODELS_DIR, modelPath));
-      currentMode = 'single';
-      currentPreset = preset.id;
-    } else {
-      // Fall back to router mode if no specific model
-      args.push('--model-slot', (config.modelsMax || 2).toString());
-      currentMode = 'router';
-      currentPreset = null;
-    }
+    currentMode = 'single';
+    currentPreset = preset.id;
     
-    console.log(`[restartForPreset] Starting llama-server with args: ${args.join(' ')}`);
-    addLog('server', `Starting llama-server: ${LLAMA_SERVER_PATH} ${args.slice(0, 6).join(' ')}...`);
+    const modelInfo = preset.hfRepo || preset.modelPath;
+    console.log(`[restartForPreset] Starting server for preset "${preset.id}" with model ${modelInfo}`);
+    console.log(`[restartForPreset] Context: ${newContext}, Extra switches: ${extraSwitches}`);
+    addLog('server', `Restarting for preset "${preset.id}" with context=${newContext}`);
     
-    // Start the server
+    // Start the server using start-preset.sh
     const { spawn } = await import('child_process');
-    llamaProcess = spawn(LLAMA_SERVER_PATH, args, {
-      env: { ...process.env },
-      stdio: ['ignore', 'pipe', 'pipe']
+    llamaProcess = spawn('bash', [startScript], {
+      cwd: PROJECT_ROOT,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false
     });
     
     llamaProcess.stdout.on('data', (data) => {
-      const line = data.toString().trim();
-      if (line) {
-        console.log(`[llama-server] ${line}`);
-      }
+      addLog('llama', data);
     });
     
     llamaProcess.stderr.on('data', (data) => {
-      const line = data.toString().trim();
-      if (line) {
-        console.error(`[llama-server] ${line}`);
-      }
+      addLog('llama', data);
     });
     
     llamaProcess.on('exit', (code, signal) => {
-      console.log(`[llama-server] Process exited with code ${code}, signal ${signal}`);
+      console.log(`[restartForPreset] llama-server exited with code ${code}, signal ${signal}`);
+      addLog('system', `llama-server exited with code ${code}`);
       llamaProcess = null;
     });
     
