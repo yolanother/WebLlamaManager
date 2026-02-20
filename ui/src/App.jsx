@@ -1922,11 +1922,16 @@ function ModelsPage({ stats }) {
 
   const duplicatePreset = (preset) => {
     setDuplicatingPreset(preset);
+    // Extract relative model path (remove models directory prefix if present)
+    const fullPath = preset.modelPath || preset.resolvedPath || '';
+    const relativePath = fullPath.includes('/models/') 
+      ? fullPath.split('/models/').pop() 
+      : fullPath;
     setNewPreset({
       id: `${preset.id}-copy`,
       name: `${preset.name} (Copy)`,
       description: preset.description || '',
-      modelPath: preset.modelPath || preset.resolvedPath || '',
+      modelPath: relativePath,
       context: preset.context || 0,
       config: {
         temp: preset.config?.temp ?? 0.7,
@@ -1943,11 +1948,16 @@ function ModelsPage({ stats }) {
   const startEditingPreset = (preset) => {
     setEditingPreset(preset);
     setDuplicatingPreset(null);
+    // Extract relative model path (remove models directory prefix if present)
+    const fullPath = preset.modelPath || preset.resolvedPath || '';
+    const relativePath = fullPath.includes('/models/') 
+      ? fullPath.split('/models/').pop() 
+      : fullPath;
     setNewPreset({
       id: preset.id,
       name: preset.name || '',
       description: preset.description || '',
-      modelPath: preset.modelPath || preset.resolvedPath || '',
+      modelPath: relativePath,
       context: preset.context || 0,
       config: {
         temp: preset.config?.temp ?? 0.7,
@@ -2074,7 +2084,7 @@ function ModelsPage({ stats }) {
               <SearchableSelect
                 value={newPreset.modelPath}
                 onChange={(val) => setNewPreset(p => ({ ...p, modelPath: val }))}
-                options={localModels.map(m => ({ value: m.path, label: formatModelName(m) }))}
+                options={localModels.map(m => ({ value: m.name, label: formatModelName(m) }))}
                 placeholder="Select a local model..."
                 storageKey={editingPreset ? null : "lastPresetModel"}
               />
