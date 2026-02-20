@@ -2072,7 +2072,7 @@ function ModelsPage({ stats }) {
               <SearchableSelect
                 value={newPreset.modelPath}
                 onChange={(val) => setNewPreset(p => ({ ...p, modelPath: val }))}
-                options={localModels.map(m => ({ value: m.name, label: formatModelName(m) }))}
+                options={localModels.map(m => ({ value: m.path, label: formatModelName(m) }))}
                 placeholder="Select a local model..."
                 storageKey="lastPresetModel"
               />
