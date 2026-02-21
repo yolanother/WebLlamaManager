@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { BrowserRouter, Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart,
   BarChart, Bar
@@ -192,7 +192,7 @@ function SearchableSelect({
   const containerRef = useRef(null);
   const inputRef = useRef(null);
 
-  // Load from localStorage on mount if storageKey provided
+  // Load from localStorage on mount if storageKey provided and no value set
   useEffect(() => {
     if (storageKey && !value) {
       const saved = localStorage.getItem(storageKey);
@@ -200,7 +200,9 @@ function SearchableSelect({
         onChange(saved);
       }
     }
-  }, [storageKey, options]);
+    // Only run on mount, not when value changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageKey, options.length]);
 
   // Save to localStorage when value changes
   useEffect(() => {
@@ -414,10 +416,6 @@ function Sidebar({ stats }) {
         <NavLink to="/models" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
           <span className="nav-icon">&#x1F4E6;</span>
           Models
-        </NavLink>
-        <NavLink to="/presets" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x2728;</span>
-          Presets
         </NavLink>
         <NavLink to="/download" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
           <span className="nav-icon">&#x2B07;</span>
@@ -754,6 +752,12 @@ function Dashboard({ stats }) {
   const fullscreenTimerRef = useRef(null);
   const FULLSCREEN_PAGES = 2;
 
+  // Filter to only show models that are actually loaded in llama.cpp
+  const loadedModels = useMemo(() =>
+    serverModels.filter(m => m.status?.value === 'loaded'),
+    [serverModels]
+  );
+
   const fetchModels = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/models`);
@@ -911,11 +915,11 @@ function Dashboard({ stats }) {
               <div className="stat-card loaded-models-card">
                 <span className="stat-icon">&#x1F4E6;</span>
                 <div className="stat-content">
-                  <span className="stat-value">{serverModels.length} Loaded</span>
+                  <span className="stat-value">{loadedModels.length} Loaded</span>
                   <span className="stat-label">Models</span>
-                  {serverModels.length > 0 && (
+                  {loadedModels.length > 0 && (
                     <div className="loaded-models-list">
-                      {serverModels.map((m, i) => (
+                      {loadedModels.map((m, i) => (
                         <span key={i} className="loaded-model-name">{formatModelName(m)}</span>
                       ))}
                     </div>
@@ -1131,11 +1135,11 @@ function Dashboard({ stats }) {
           <div className="stat-card loaded-models-card">
             <span className="stat-icon">&#x1F4E6;</span>
             <div className="stat-content">
-              <span className="stat-value">{serverModels.length} Loaded</span>
+              <span className="stat-value">{loadedModels.length} Loaded</span>
               <span className="stat-label">Models</span>
-              {serverModels.length > 0 ? (
+              {loadedModels.length > 0 ? (
                 <div className="loaded-models-list">
-                  {serverModels.map((m, i) => (
+                  {loadedModels.map((m, i) => (
                     <span key={i} className="loaded-model-name">{formatModelName(m)}</span>
                   ))}
                 </div>
@@ -1803,20 +1807,36 @@ function PresetsPage({ stats }) {
   );
 }
 
-// Models Page
+// Unified Models Page - Presets as primary model abstraction
 function ModelsPage({ stats }) {
-  const [serverModels, setServerModels] = useState([]);
-  const [localModels, setLocalModels] = useState([]);
+  const [models, setModels] = useState([]);  // Presets with status
+  const [localModels, setLocalModels] = useState([]);  // Raw files for preset creation
   const [modelsDir, setModelsDir] = useState('');
   const [loading, setLoading] = useState({});
-  const [editingAlias, setEditingAlias] = useState(null);
-  const [aliasInput, setAliasInput] = useState('');
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [duplicatingPreset, setDuplicatingPreset] = useState(null);
+  const [editingPreset, setEditingPreset] = useState(null);  // Preset being edited
+  const [newPreset, setNewPreset] = useState({
+    id: '',
+    name: '',
+    description: '',
+    modelPath: '',
+    context: 0,
+    config: {
+      temp: 0.7,
+      topP: 1.0,
+      topK: 20,
+      minP: 0,
+      chatTemplateKwargs: '',
+      extraSwitches: '--jinja'
+    }
+  });
 
   const fetchModels = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/models`);
       const data = await res.json();
-      setServerModels(data.serverModels || []);
+      setModels(data.models || []);  // Presets with status
       setLocalModels(data.localModels || []);
       setModelsDir(data.modelsDir || '');
     } catch (err) {
@@ -1826,217 +1846,524 @@ function ModelsPage({ stats }) {
 
   useEffect(() => {
     fetchModels();
-    const interval = setInterval(fetchModels, 10000);
+    const interval = setInterval(fetchModels, 5000);
     return () => clearInterval(interval);
   }, [fetchModels]);
 
-  const loadModel = async (modelName) => {
-    setLoading(l => ({ ...l, [modelName]: true }));
+  const loadModel = async (presetId) => {
+    setLoading(l => ({ ...l, [presetId]: 'loading' }));
     try {
       await fetch(`${API_BASE}/models/load`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelName })
+        body: JSON.stringify({ model: presetId })
       });
       await fetchModels();
     } catch (err) {
       console.error('Failed to load model:', err);
     }
-    setLoading(l => ({ ...l, [modelName]: false }));
+    setLoading(l => ({ ...l, [presetId]: null }));
   };
 
-  const unloadModel = async (modelName) => {
-    setLoading(l => ({ ...l, [modelName]: true }));
+  const unloadModel = async (presetId) => {
+    setLoading(l => ({ ...l, [presetId]: 'unloading' }));
     try {
+      // Find the resolved path for this preset
+      const model = models.find(m => m.id === presetId);
+      const pathToUnload = model?.resolvedPath || presetId;
       await fetch(`${API_BASE}/models/unload`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelName })
+        body: JSON.stringify({ model: pathToUnload })
       });
       await fetchModels();
     } catch (err) {
       console.error('Failed to unload model:', err);
     }
-    setLoading(l => ({ ...l, [modelName]: false }));
+    setLoading(l => ({ ...l, [presetId]: null }));
   };
 
-  const saveAlias = async (modelName) => {
+  const createPreset = async () => {
+    if (!newPreset.id || !newPreset.name || !newPreset.modelPath) {
+      alert('Please fill in ID, Name, and select a model');
+      return;
+    }
+    setLoading(l => ({ ...l, create: true }));
     try {
-      await fetch(`${API_BASE}/models/aliases/${encodeURIComponent(modelName)}`, {
-        method: 'PUT',
+      const res = await fetch(`${API_BASE}/presets`, {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ alias: aliasInput.trim() || null })
+        body: JSON.stringify(newPreset)
       });
+      if (res.ok) {
+        await fetchModels();
+        setShowCreateForm(false);
+        setDuplicatingPreset(null);
+        resetNewPreset();
+      } else {
+        const err = await res.json();
+        alert(err.error || 'Failed to create preset');
+      }
+    } catch (err) {
+      console.error('Failed to create preset:', err);
+    }
+    setLoading(l => ({ ...l, create: false }));
+  };
+
+  const deletePreset = async (presetId) => {
+    if (!confirm(`Delete preset "${presetId}"?`)) return;
+    try {
+      await fetch(`${API_BASE}/presets/${presetId}`, { method: 'DELETE' });
       await fetchModels();
     } catch (err) {
-      console.error('Failed to save alias:', err);
+      console.error('Failed to delete preset:', err);
     }
-    setEditingAlias(null);
-    setAliasInput('');
   };
 
-  const startEditAlias = (model) => {
-    setEditingAlias(model.name);
-    setAliasInput(model.alias || '');
+  const duplicatePreset = (preset) => {
+    setDuplicatingPreset(preset);
+    // Extract relative model path (remove models directory prefix if present)
+    const fullPath = preset.modelPath || preset.resolvedPath || '';
+    const relativePath = fullPath.includes('/models/') 
+      ? fullPath.split('/models/').pop() 
+      : fullPath;
+    setNewPreset({
+      id: `${preset.id}-copy`,
+      name: `${preset.name} (Copy)`,
+      description: preset.description || '',
+      modelPath: relativePath,
+      context: preset.context || 0,
+      config: {
+        temp: preset.config?.temp ?? 0.7,
+        topP: preset.config?.topP ?? 1.0,
+        topK: preset.config?.topK ?? 20,
+        minP: preset.config?.minP ?? 0,
+        chatTemplateKwargs: preset.config?.chatTemplateKwargs || '',
+        extraSwitches: preset.config?.extraSwitches || '--jinja'
+      }
+    });
+    setShowCreateForm(true);
   };
 
-  const getModelStatus = (modelName) => {
-    return serverModels.some(m =>
-      m.id === modelName || m.model === modelName || (m.id && m.id.includes(modelName))
-    ) ? 'loaded' : 'unloaded';
+  const startEditingPreset = (preset) => {
+    setEditingPreset(preset);
+    setDuplicatingPreset(null);
+    // Extract relative model path (remove models directory prefix if present)
+    const fullPath = preset.modelPath || preset.resolvedPath || '';
+    const relativePath = fullPath.includes('/models/') 
+      ? fullPath.split('/models/').pop() 
+      : fullPath;
+    setNewPreset({
+      id: preset.id,
+      name: preset.name || '',
+      description: preset.description || '',
+      modelPath: relativePath,
+      context: preset.context || 0,
+      config: {
+        temp: preset.config?.temp ?? 0.7,
+        topP: preset.config?.topP ?? 1.0,
+        topK: preset.config?.topK ?? 20,
+        minP: preset.config?.minP ?? 0,
+        chatTemplateKwargs: preset.config?.chatTemplateKwargs || '',
+        extraSwitches: preset.config?.extraSwitches || '--jinja'
+      }
+    });
+    setShowCreateForm(true);
   };
 
-  // Get display name (alias or short name)
-  const getDisplayName = (model) => {
-    if (model.alias) return model.alias;
-    // Extract just the filename from the path
-    const parts = model.name.split('/');
-    return parts[parts.length - 1];
+  const updatePreset = async () => {
+    if (!editingPreset) return;
+    setLoading(l => ({ ...l, update: true }));
+    try {
+      const res = await fetch(`${API_BASE}/presets/${editingPreset.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: newPreset.id,  // Include ID to allow renaming
+          name: newPreset.name,
+          description: newPreset.description,
+          modelPath: newPreset.modelPath,
+          context: newPreset.context,
+          config: newPreset.config
+        })
+      });
+      if (res.ok) {
+        await fetchModels();
+        setShowCreateForm(false);
+        setEditingPreset(null);
+        resetNewPreset();
+      } else {
+        const err = await res.json();
+        alert(err.error || 'Failed to update preset');
+      }
+    } catch (err) {
+      console.error('Failed to update preset:', err);
+    }
+    setLoading(l => ({ ...l, update: false }));
   };
 
-  // Find alias for a loaded model
-  const getAliasForLoadedModel = (modelId) => {
-    const localModel = localModels.find(m => m.name === modelId);
-    return localModel?.alias || null;
+  const resetNewPreset = () => {
+    setNewPreset({
+      id: '', name: '', description: '', modelPath: '', context: 0,
+      config: { temp: 0.7, topP: 1.0, topK: 20, minP: 0, chatTemplateKwargs: '', extraSwitches: '--jinja' }
+    });
   };
 
   const isHealthy = stats?.llama?.status === 'ok';
-  const isSingleMode = stats?.mode === 'single';
 
-  if (isSingleMode) {
-    return (
-      <div className="page">
-        <div className="page-header">
-          <h2>Models</h2>
-        </div>
-        <div className="empty-state">
-          <p>Model management is disabled in single-model mode.</p>
-          <p className="hint">Switch to router mode from the Presets page to manage multiple models.</p>
-        </div>
-      </div>
-    );
-  }
+  // Sort by name alphabetically (case-insensitive)
+  const sortByName = (a, b) => (a.name || a.id).toLowerCase().localeCompare((b.name || b.id).toLowerCase());
+
+  // Group models by status and sort alphabetically
+  const loadedModels = models.filter(m => m.status === 'loaded').sort(sortByName);
+  const availableModels = models.filter(m => m.status === 'available' || m.status === 'loading').sort(sortByName);
+  const notDownloadedModels = models.filter(m => m.status === 'not_downloaded').sort(sortByName);
+
+  const getStatusBadge = (status) => {
+    switch (status) {
+      case 'loaded': return <span className="badge success">Loaded</span>;
+      case 'loading': return <span className="badge info">Loading</span>;
+      case 'available': return <span className="badge">Available</span>;
+      case 'not_downloaded': return <span className="badge warning">Not Downloaded</span>;
+      default: return null;
+    }
+  };
 
   return (
     <div className="page">
       <div className="page-header">
         <h2>Models</h2>
-        <span className="models-dir">{modelsDir}</span>
+        <div className="page-header-actions">
+          <button className="btn-primary" onClick={() => { setShowCreateForm(!showCreateForm); if (!showCreateForm) { setDuplicatingPreset(null); setEditingPreset(null); resetNewPreset(); } }}>
+            {showCreateForm ? 'Cancel' : '+ New Configuration'}
+          </button>
+        </div>
       </div>
 
+      <p className="page-description">
+        Model configurations with specific settings. Use presets as model IDs in your API calls.
+      </p>
+
+      {/* Create/Edit/Duplicate Preset Form */}
+      {showCreateForm && (
+        <div className="create-preset-form">
+          <h3>{editingPreset ? `Edit: ${editingPreset.name}` : duplicatingPreset ? `Duplicate: ${duplicatingPreset.name}` : 'Create Configuration'}</h3>
+          <div className="form-grid">
+            <div className="form-group">
+              <label>Configuration ID (used in API calls)</label>
+              <input
+                type="text"
+                placeholder="my-model-config"
+                value={newPreset.id}
+                onChange={(e) => setNewPreset(p => ({ ...p, id: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-') }))}
+              />
+              {editingPreset && newPreset.id !== editingPreset.id && (
+                <small className="hint warning">Changing ID will update the API identifier</small>
+              )}
+            </div>
+            <div className="form-group">
+              <label>Display Name</label>
+              <input
+                type="text"
+                placeholder="My Model Configuration"
+                value={newPreset.name}
+                onChange={(e) => setNewPreset(p => ({ ...p, name: e.target.value }))}
+              />
+            </div>
+            <div className="form-group full-width">
+              <label>Description</label>
+              <input
+                type="text"
+                placeholder="Optional description"
+                value={newPreset.description}
+                onChange={(e) => setNewPreset(p => ({ ...p, description: e.target.value }))}
+              />
+            </div>
+            <div className="form-group full-width">
+              <label>Model File</label>
+              <SearchableSelect
+                value={newPreset.modelPath}
+                onChange={(val) => setNewPreset(p => ({ ...p, modelPath: val }))}
+                options={localModels.map(m => ({ value: m.name, label: formatModelName(m) }))}
+                placeholder="Select a local model..."
+                storageKey={editingPreset ? null : "lastPresetModel"}
+              />
+            </div>
+            <div className="form-group">
+              <label>Context Size (0 = default)</label>
+              <input
+                type="number"
+                value={newPreset.context}
+                onChange={(e) => setNewPreset(p => ({ ...p, context: parseInt(e.target.value) || 0 }))}
+              />
+            </div>
+            <div className="form-group">
+              <label>Temperature</label>
+              <input
+                type="number"
+                step="0.1"
+                value={newPreset.config.temp}
+                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, temp: parseFloat(e.target.value) || 0.7 } }))}
+              />
+            </div>
+            <div className="form-group">
+              <label>Top P</label>
+              <input
+                type="number"
+                step="0.1"
+                value={newPreset.config.topP}
+                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, topP: parseFloat(e.target.value) || 1.0 } }))}
+              />
+            </div>
+            <div className="form-group">
+              <label>Top K</label>
+              <input
+                type="number"
+                value={newPreset.config.topK}
+                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, topK: parseInt(e.target.value) || 0 } }))}
+              />
+            </div>
+            <div className="form-group full-width">
+              <label>Extra Switches</label>
+              <input
+                type="text"
+                placeholder="--jinja"
+                value={newPreset.config.extraSwitches}
+                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, extraSwitches: e.target.value } }))}
+              />
+            </div>
+            <div className="form-group full-width">
+              <label>Chat Template Kwargs (JSON)</label>
+              <input
+                type="text"
+                placeholder='{"reasoning_effort": "high"}'
+                value={newPreset.config.chatTemplateKwargs}
+                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, chatTemplateKwargs: e.target.value } }))}
+              />
+            </div>
+          </div>
+          <div className="form-actions">
+            <button className="btn-secondary" onClick={() => { setShowCreateForm(false); setDuplicatingPreset(null); setEditingPreset(null); resetNewPreset(); }}>Cancel</button>
+            {editingPreset ? (
+              <button className="btn-primary" onClick={updatePreset} disabled={loading.update}>
+                {loading.update ? 'Saving...' : 'Save Changes'}
+              </button>
+            ) : (
+              <button className="btn-primary" onClick={createPreset} disabled={loading.create}>
+                {loading.create ? 'Creating...' : (duplicatingPreset ? 'Create Copy' : 'Create Configuration')}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Loaded Models */}
-      {serverModels.length > 0 && (
+      {loadedModels.length > 0 && (
         <section className="page-section">
-          <h3>Loaded Models</h3>
-          <div className="models-grid">
-            {serverModels.map((model) => {
-              const alias = getAliasForLoadedModel(model.id);
-              return (
-                <div key={model.id} className="model-card active">
-                  <div className="model-header">
-                    <h4 title={model.id}>{alias || model.id.split('/').pop()}</h4>
-                    <span className="badge success">Loaded</span>
+          <h3>Loaded</h3>
+          <div className="presets-grid">
+            {loadedModels.map((model) => (
+              <div key={model.id} className="preset-card active">
+                <div className="preset-header">
+                  <h3>{model.name}</h3>
+                  {getStatusBadge(model.status)}
+                </div>
+                <p className="preset-description">{model.description || 'No description'}</p>
+                <div className="preset-details">
+                  <div className="detail-row">
+                    <span className="detail-label">ID</span>
+                    <span className="detail-value code">{model.id}</span>
                   </div>
-                  {alias && <div className="model-path">{model.id}</div>}
-                  <div className="model-actions">
-                    <button
-                      className="btn-secondary"
-                      onClick={() => unloadModel(model.id)}
-                      disabled={loading[model.id]}
-                    >
-                      {loading[model.id] ? 'Unloading...' : 'Unload'}
-                    </button>
+                  <div className="detail-row">
+                    <span className="detail-label">Model</span>
+                    <span className="detail-value">{model.modelPath ? model.modelPath.split('/').pop() : model.resolvedPath?.split('/').pop() || 'Not set'}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Context</span>
+                    <span className="detail-value">{model.context > 0 ? model.context.toLocaleString() : 'Default'}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Temp</span>
+                    <span className="detail-value">{model.config?.temp ?? 0.7}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Top P</span>
+                    <span className="detail-value">{model.config?.topP ?? 1.0}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Top K</span>
+                    <span className="detail-value">{model.config?.topK ?? 20}</span>
                   </div>
                 </div>
-              );
-            })}
+                <div className="preset-actions">
+                  <button
+                    className="btn-secondary"
+                    onClick={() => startEditingPreset(model)}
+                    title="Edit configuration settings"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    className="btn-secondary"
+                    onClick={() => duplicatePreset(model)}
+                    title="Create a copy with different settings"
+                  >
+                    Duplicate
+                  </button>
+                  <button
+                    className="btn-secondary"
+                    onClick={() => unloadModel(model.id)}
+                    disabled={loading[model.id] || !isHealthy}
+                  >
+                    {loading[model.id] === 'unloading' ? 'Unloading...' : 'Unload'}
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         </section>
       )}
 
-      {/* Local Models */}
-      <section className="page-section">
-        <h3>Local Models</h3>
-        {localModels.length === 0 ? (
-          <div className="empty-state">
-            <p>No models found in {modelsDir}</p>
-            <p className="hint">Download models from the Download page</p>
-          </div>
-        ) : (
-          <div className="models-grid">
-            {localModels.map((model) => {
-              const status = getModelStatus(model.name);
-              const isLoaded = status === 'loaded';
-              const isEditing = editingAlias === model.name;
-
-              return (
-                <div key={model.path} className={`model-card ${isLoaded ? 'active' : ''} ${model.incomplete ? 'incomplete' : ''}`}>
-                  <div className="model-header">
-                    {isEditing ? (
-                      <div className="alias-edit">
-                        <input
-                          type="text"
-                          value={aliasInput}
-                          onChange={(e) => setAliasInput(e.target.value)}
-                          placeholder="Enter alias..."
-                          autoFocus
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') saveAlias(model.name);
-                            if (e.key === 'Escape') { setEditingAlias(null); setAliasInput(''); }
-                          }}
-                        />
-                        <button className="btn-small" onClick={() => saveAlias(model.name)}>Save</button>
-                        <button className="btn-small btn-secondary" onClick={() => { setEditingAlias(null); setAliasInput(''); }}>Cancel</button>
-                      </div>
-                    ) : (
-                      <>
-                        <h4 title={model.name}>
-                          {getDisplayName(model)}
-                          <button
-                            className="alias-edit-btn"
-                            onClick={() => startEditAlias(model)}
-                            title={model.alias ? 'Edit alias' : 'Set alias'}
-                          >
-                            ✎
-                          </button>
-                        </h4>
-                        {isLoaded && <span className="badge success">Loaded</span>}
-                        {model.incomplete && <span className="badge warning">Incomplete</span>}
-                        {model.isSplit && !model.incomplete && <span className="badge info">{model.partCount} parts</span>}
-                      </>
-                    )}
+      {/* Available Models */}
+      {availableModels.length > 0 && (
+        <section className="page-section">
+          <h3>Available</h3>
+          <div className="presets-grid">
+            {availableModels.map((model) => (
+              <div key={model.id} className="preset-card">
+                <div className="preset-header">
+                  <h3>{model.name}</h3>
+                  {getStatusBadge(model.status)}
+                </div>
+                <p className="preset-description">{model.description || 'No description'}</p>
+                <div className="preset-details">
+                  <div className="detail-row">
+                    <span className="detail-label">ID</span>
+                    <span className="detail-value code">{model.id}</span>
                   </div>
-                  {model.alias && !isEditing && (
-                    <div className="model-path">{model.name}</div>
-                  )}
-                  <div className="model-info">
-                    <span>{formatBytes(model.size)}</span>
+                  <div className="detail-row">
+                    <span className="detail-label">Model</span>
+                    <span className="detail-value">{model.modelPath ? model.modelPath.split('/').pop() : model.resolvedPath?.split('/').pop() || 'Not set'}</span>
                   </div>
-                  <div className="model-actions">
-                    {isLoaded ? (
-                      <button
-                        className="btn-secondary"
-                        onClick={() => unloadModel(model.name)}
-                        disabled={loading[model.name] || !isHealthy}
-                      >
-                        {loading[model.name] ? 'Unloading...' : 'Unload'}
-                      </button>
-                    ) : (
-                      <button
-                        className="btn-primary"
-                        onClick={() => loadModel(model.name)}
-                        disabled={loading[model.name] || !isHealthy || model.incomplete}
-                      >
-                        {loading[model.name] ? 'Loading...' : 'Load'}
-                      </button>
-                    )}
+                  <div className="detail-row">
+                    <span className="detail-label">Context</span>
+                    <span className="detail-value">{model.context > 0 ? model.context.toLocaleString() : 'Default'}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Temp</span>
+                    <span className="detail-value">{model.config?.temp ?? 0.7}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Top P</span>
+                    <span className="detail-value">{model.config?.topP ?? 1.0}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Top K</span>
+                    <span className="detail-value">{model.config?.topK ?? 20}</span>
                   </div>
                 </div>
-              );
-            })}
+                <div className="preset-actions">
+                  <button
+                    className="btn-secondary"
+                    onClick={() => startEditingPreset(model)}
+                    title="Edit configuration settings"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    className="btn-secondary"
+                    onClick={() => duplicatePreset(model)}
+                    title="Create a copy with different settings"
+                  >
+                    Duplicate
+                  </button>
+                  <button
+                    className="btn-primary"
+                    onClick={() => loadModel(model.id)}
+                    disabled={loading[model.id] || !isHealthy}
+                  >
+                    {loading[model.id] === 'loading' ? 'Loading...' : 'Load'}
+                  </button>
+                  <button
+                    className="btn-danger"
+                    onClick={() => deletePreset(model.id)}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
-        )}
-      </section>
+        </section>
+      )}
+
+      {/* Not Downloaded */}
+      {notDownloadedModels.length > 0 && (
+        <section className="page-section">
+          <h3>Not Downloaded</h3>
+          <div className="presets-grid">
+            {notDownloadedModels.map((model) => (
+              <div key={model.id} className="preset-card incomplete">
+                <div className="preset-header">
+                  <h3>{model.name}</h3>
+                  {getStatusBadge(model.status)}
+                </div>
+                <p className="preset-description">{model.description || 'No description'}</p>
+                <div className="preset-details">
+                  <div className="detail-row">
+                    <span className="detail-label">ID</span>
+                    <span className="detail-value code">{model.id}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Model</span>
+                    <span className="detail-value">{model.modelPath ? model.modelPath.split('/').pop() : model.hfRepo || 'Not set'}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Context</span>
+                    <span className="detail-value">{model.context > 0 ? model.context.toLocaleString() : 'Default'}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Temp</span>
+                    <span className="detail-value">{model.config?.temp ?? 0.7}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Top P</span>
+                    <span className="detail-value">{model.config?.topP ?? 1.0}</span>
+                  </div>
+                  <div className="detail-row">
+                    <span className="detail-label">Top K</span>
+                    <span className="detail-value">{model.config?.topK ?? 20}</span>
+                  </div>
+                </div>
+                <div className="preset-actions">
+                  <button
+                    className="btn-danger"
+                    onClick={() => deletePreset(model.id)}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Empty state */}
+      {models.length === 0 && (
+        <div className="empty-state">
+          <p>No model configurations found.</p>
+          <p className="hint">Download models from the Download page to get started, or create a new configuration.</p>
+        </div>
+      )}
+
+      {/* Models directory info */}
+      {modelsDir && (
+        <div className="models-dir-info">
+          <span className="label">Models directory:</span>
+          <span className="path">{modelsDir}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -5702,7 +6029,7 @@ function App() {
           <Routes>
             <Route path="/" element={<Dashboard stats={stats} />} />
             <Route path="/chat" element={<ChatPage stats={stats} />} />
-            <Route path="/presets" element={<PresetsPage stats={stats} />} />
+            <Route path="/presets" element={<Navigate to="/models" replace />} />
             <Route path="/models" element={<ModelsPage stats={stats} />} />
             <Route path="/download" element={<DownloadPage stats={stats} />} />
             <Route path="/logs" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />

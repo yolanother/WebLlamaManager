@@ -5,7 +5,8 @@ set -euo pipefail
 # Supports both HuggingFace model references (-hf) and local file paths (--model)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Script is in the project root, so PROJECT_ROOT is the same as SCRIPT_DIR
+PROJECT_ROOT="$SCRIPT_DIR"
 # If a project .env exists, export its variables (simple KEY=VAL lines)
 if [ -f "$PROJECT_ROOT/.env" ]; then
     set -a

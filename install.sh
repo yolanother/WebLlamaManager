@@ -185,7 +185,7 @@ EOF
 systemctl --user daemon-reload
 
 echo
-echo "[5/6] Restarting service..."
+echo "[5/6] Starting service..."
 
 # Re-enable if it was enabled before
 if [ "$SERVICE_WAS_ENABLED" = true ]; then
@@ -193,8 +193,8 @@ if [ "$SERVICE_WAS_ENABLED" = true ]; then
     echo "  Service enabled."
 fi
 
-# Restart if it was running before
-if [ "$SERVICE_WAS_RUNNING" = true ]; then
+# Start if service is enabled (regardless of previous running state)
+if systemctl --user is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
     systemctl --user start "$SERVICE_NAME"
     echo "  Service started."
 
@@ -207,7 +207,8 @@ if [ "$SERVICE_WAS_RUNNING" = true ]; then
         echo "    journalctl --user -u $SERVICE_NAME -f"
     fi
 else
-    echo "  Service was not running before. Start manually with:"
+    echo "  Service is not enabled. Start manually with:"
+    echo "    systemctl --user enable $SERVICE_NAME"
     echo "    systemctl --user start $SERVICE_NAME"
 fi
 
@@ -225,7 +226,7 @@ echo "  Llama API:  http://localhost:$LLAMA_PORT"
 echo "              http://${IP_ADDRESS}:$LLAMA_PORT"
 echo
 
-if [ "$SERVICE_WAS_RUNNING" = false ]; then
+if ! systemctl --user is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
     echo "=== Next Steps ==="
     echo
     echo "1. Enable the service to start on boot:"

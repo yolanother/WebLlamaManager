@@ -28,3 +28,22 @@ Thumbs.db
 # Editor/tool config
 opencode.json
 opencode.json~
+AGENTS.md
+.githooks/
+
+##################################
+Worklog Specific Ignores
+##################################
+
+# Ignore Worklog directory by default
+.worklog/
+
+# Keep defaults and plugins tracked
+!.worklog/config.defaults.yaml
+!.worklog/plugins/
+!.worklog/plugins/**
+
+# opencode temporary files
+.opencode/tmp/
+
+### End of Worklog Specific Ignores

@@ -132,7 +132,9 @@ if (existsSync(UI_BUILD_PATH)) {
 
 // Configuration
 const CONFIG_PATH = join(PROJECT_ROOT, 'config.json');
-const MODELS_DIR = process.env.MODELS_DIR || join(process.env.HOME, 'models');
+// Expand ~ to home directory for MODELS_DIR
+const MODELS_DIR_RAW = process.env.MODELS_DIR || join(process.env.HOME, 'models');
+const MODELS_DIR = MODELS_DIR_RAW.startsWith('~') ? MODELS_DIR_RAW.replace(/^~/, process.env.HOME) : MODELS_DIR_RAW;
 const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
@@ -150,6 +152,20 @@ let llamaProcess = null;
 let downloadProcesses = new Map();
 let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
+
+// Track current llama-server configuration for compatibility checks
+// Updated when server starts in router or preset mode
+let serverConfig = {
+  context: 8192,        // Context window size (-c)
+  gpuLayers: 99,        // GPU layers for offloading (-ngl)
+  flashAttn: false,     // Flash attention enabled (--flash-attn)
+  modelsMax: 2,         // Max models for router mode (--model-slot)
+  reasoningFormat: null, // Reasoning format (--reasoning-format)
+  extraSwitches: '--jinja' // Additional llama-server switches
+};
+
+// Mutex to prevent concurrent server restarts
+let serverRestartLock = false;
 
 // Analytics data storage (circular buffers for time-series data)
 const MAX_ANALYTICS_POINTS = 300; // 5 minutes at 1 second intervals
@@ -1078,7 +1094,758 @@ function scanLocalModels() {
   }));
 }
 
+// ============================================================================
+// Unified Model Configuration: Preset Resolution Layer
+// ============================================================================
+
+/**
+ * Resolve a model ID to a preset configuration or file path.
+ * 
+ * Resolution order:
+ * 1. Check if modelId matches a preset ID in config.presets
+ * 2. Fall back to file path lookup in MODELS_DIR (with deprecation warning)
+ * 3. Return null if not found
+ * 
+ * @param {string} modelId - The model identifier (preset ID or file path)
+ * @returns {object|null} - { type: 'preset', preset: {...} } or { type: 'file', path: '...' } or null
+ */
+function resolveModel(modelId) {
+  if (!modelId) return null;
+
+  // 1. Check if it's a preset ID
+  if (config.presets && config.presets[modelId]) {
+    const preset = config.presets[modelId];
+    console.log(`[resolveModel] Resolved "${modelId}" to preset: ${preset.name}`);
+    return { type: 'preset', preset };
+  }
+
+  // 2. Check for file path (backward compatibility)
+  const fullPath = modelId.startsWith('/') ? modelId : join(MODELS_DIR, modelId);
+  if (existsSync(fullPath) && fullPath.endsWith('.gguf')) {
+    console.log(`[resolveModel] DEPRECATION WARNING: Using file path "${modelId}" directly. Consider creating a preset for this model.`);
+    addLog('models', `DEPRECATION: Direct file path "${modelId}" used. Create a preset for better configuration.`);
+    return { type: 'file', path: fullPath, relativePath: modelId };
+  }
+
+  // 3. Check if a preset references this model path (reverse lookup)
+  if (config.presets) {
+    for (const preset of Object.values(config.presets)) {
+      const presetModelPath = preset.modelPath ? basename(preset.modelPath) : null;
+      if (presetModelPath && (modelId === presetModelPath || modelId.endsWith(presetModelPath))) {
+        console.log(`[resolveModel] Resolved file path "${modelId}" to preset: ${preset.id}`);
+        return { type: 'preset', preset };
+      }
+    }
+  }
+
+  console.log(`[resolveModel] Model "${modelId}" not found`);
+  return null;
+}
+
+/**
+ * Get the model path to use for llama.cpp from a resolved model.
+ * For presets with hfRepo, returns the expected download path.
+ * For presets with modelPath, returns the relative path.
+ * For file paths, returns as-is.
+ * 
+ * @param {object} resolved - Result from resolveModel()
+ * @returns {string|null} - The model path for llama.cpp
+ */
+function resolveModelPath(resolved) {
+  if (!resolved) return null;
+
+  if (resolved.type === 'file') {
+    // For file-based resolution, return just the folder name as the model ID
+    // llama.cpp router mode uses folder names as model IDs
+    const relativePath = resolved.relativePath;
+    const folderName = relativePath.split('/')[0];
+    return folderName;
+  }
+
+  if (resolved.type === 'preset') {
+    const preset = resolved.preset;
+    
+    // If preset has a direct model path, extract the folder name for llama.cpp
+    if (preset.modelPath) {
+      let relativePath;
+      if (preset.modelPath.startsWith(MODELS_DIR)) {
+        relativePath = preset.modelPath.replace(MODELS_DIR + '/', '');
+      } else {
+        relativePath = preset.modelPath;
+      }
+      // Return just the folder name as the model ID for llama.cpp router mode
+      const folderName = relativePath.split('/')[0];
+      return folderName;
+    }
+
+    // If preset uses hfRepo, return the hfRepo as the model ID
+    // llama.cpp router mode can load directly from HuggingFace
+    if (preset.hfRepo) {
+      return preset.hfRepo;
+    }
+
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * Check if a preset's model is currently loaded in llama.cpp.
+ * 
+ * @param {object} preset - The preset configuration
+ * @param {Array} serverModels - Array of models from llama.cpp /models endpoint
+ * @returns {string} - 'loaded', 'loading', or 'available'
+ */
+function getPresetStatus(preset, serverModels) {
+  if (!preset || !serverModels || serverModels.length === 0) {
+    return 'available';
+  }
+
+  // Check if this preset is the currently active one
+  if (currentPreset === preset.id) {
+    return 'loaded';  // This preset is specifically active
+  }
+
+  // Get the model path that would be used for this preset
+  const resolved = { type: 'preset', preset };
+  const modelPath = resolveModelPath(resolved);
+  
+  if (!modelPath) {
+    // Model not downloaded yet
+    return 'not_downloaded';
+  }
+
+  // Check if the preset would need a server restart
+  const compat = isCompatible(preset);
+  
+  // Check if any loaded model matches this path
+  for (const model of serverModels) {
+    const modelId = model.id || '';
+    const status = model.status?.value || 'unknown';
+    
+    // Match by path (could be full path or relative)
+    if (modelId === modelPath || 
+        modelId.endsWith(modelPath) || 
+        modelPath.endsWith(modelId) ||
+        basename(modelId) === basename(modelPath)) {
+      if (status === 'loaded') {
+        // Model is loaded, but is this preset compatible with current config?
+        if (compat.compatible) {
+          return 'loaded';  // Can use immediately
+        } else {
+          return 'available';  // Would need restart, show as available
+        }
+      }
+      if (status === 'loading') return 'loading';
+    }
+  }
+
+  return 'available';
+}
+
+/**
+ * Apply preset configuration to a request body.
+ * Injects sampling parameters, chat_template_kwargs, etc.
+ * 
+ * @param {object} body - The original request body
+ * @param {object} preset - The preset configuration
+ * @returns {object} - Modified request body with preset params applied
+ */
+function applyPresetToRequest(body, preset) {
+  if (!preset || !preset.config) return body;
+
+  const result = { ...body };
+
+  // Apply sampling parameters if not already set in request
+  if (preset.config.temp !== undefined && result.temperature === undefined) {
+    result.temperature = preset.config.temp;
+  }
+  if (preset.config.topP !== undefined && result.top_p === undefined) {
+    result.top_p = preset.config.topP;
+  }
+  if (preset.config.topK !== undefined && result.top_k === undefined) {
+    result.top_k = preset.config.topK;
+  }
+  if (preset.config.minP !== undefined && result.min_p === undefined) {
+    result.min_p = preset.config.minP;
+  }
+
+  // Apply chat_template_kwargs if preset has them configured
+  if (preset.config.chatTemplateKwargs) {
+    try {
+      const presetKwargs = typeof preset.config.chatTemplateKwargs === 'string' 
+        ? JSON.parse(preset.config.chatTemplateKwargs)
+        : preset.config.chatTemplateKwargs;
+      
+      result.chat_template_kwargs = {
+        ...presetKwargs,
+        ...result.chat_template_kwargs  // Request values take precedence
+      };
+    } catch (e) {
+      console.error(`[applyPresetToRequest] Failed to parse chatTemplateKwargs: ${e.message}`);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Resolve model ID and prepare request body for proxying to llama.cpp.
+ * This is the main helper function used by all proxy endpoints.
+ * 
+ * @param {object} body - The original request body
+ * @returns {object} - { body: modifiedBody, resolved: resolvedModel, modelPath: string }
+ */
+function prepareProxyRequest(body) {
+  const modelId = body.model;
+  const resolved = resolveModel(modelId);
+  
+  if (!resolved) {
+    // Model not found, return as-is and let llama.cpp handle the error
+    return { body, resolved: null, modelPath: modelId };
+  }
+
+  let modifiedBody = { ...body };
+  let modelPath = modelId;
+
+  if (resolved.type === 'preset') {
+    // Resolve the actual model path for llama.cpp
+    modelPath = resolveModelPath(resolved);
+    if (modelPath) {
+      modifiedBody.model = modelPath;
+    }
+
+    // Apply preset configuration to request
+    modifiedBody = applyPresetToRequest(modifiedBody, resolved.preset);
+
+    console.log(`[prepareProxyRequest] Preset "${resolved.preset.id}" -> model "${modelPath}"`);
+  } else if (resolved.type === 'file') {
+    modelPath = resolved.relativePath;
+    modifiedBody.model = modelPath;
+  }
+
+  return { body: modifiedBody, resolved, modelPath };
+}
+
+// ============================================================================
+// Server Compatibility and Smart Restart
+// ============================================================================
+
+/**
+ * Check if a preset can be served with the current llama-server configuration.
+ * Returns true if the preset is compatible (no restart needed), false otherwise.
+ * 
+ * @param {object} preset - The preset configuration
+ * @returns {object} - { compatible: boolean, reasons: string[] }
+ */
+function isCompatible(preset) {
+  const reasons = [];
+  
+  if (!preset) {
+    // No preset means it can use defaults - compatible
+    return { compatible: true, reasons: [] };
+  }
+  
+  const presetConfig = preset.config || {};
+  
+  // Context: requires server restart to change
+  // If preset specifies a context (non-zero), it must match current context
+  // Context 0 means "use default/current" so it's always compatible
+  if (preset.context && preset.context !== serverConfig.context) {
+    reasons.push(`Context ${preset.context} != current ${serverConfig.context}`);
+  }
+  
+  // GPU layers: must match if specified (affects VRAM allocation)
+  if (presetConfig.gpuLayers !== undefined && 
+      presetConfig.gpuLayers !== serverConfig.gpuLayers) {
+    reasons.push(`GPU layers ${presetConfig.gpuLayers} != current ${serverConfig.gpuLayers}`);
+  }
+  
+  // Flash attention: must match if server was started with/without it
+  if (presetConfig.flashAttn !== undefined && 
+      presetConfig.flashAttn !== serverConfig.flashAttn) {
+    reasons.push(`Flash attention ${presetConfig.flashAttn} != current ${serverConfig.flashAttn}`);
+  }
+  
+  // Reasoning format: requires restart if different
+  if (presetConfig.reasoningFormat && 
+      presetConfig.reasoningFormat !== serverConfig.reasoningFormat) {
+    reasons.push(`Reasoning format "${presetConfig.reasoningFormat}" != current "${serverConfig.reasoningFormat || 'none'}"`);
+  }
+  
+  // Note: temperature, top_p, top_k, min_p are NOT checked here
+  // because they can be passed per-request to the llama.cpp API
+  
+  return {
+    compatible: reasons.length === 0,
+    reasons
+  };
+}
+
+/**
+ * Wait for llama-server to become healthy after restart.
+ * 
+ * @param {number} timeoutMs - Maximum time to wait in milliseconds
+ * @returns {Promise<boolean>} - true if server is healthy, false if timeout
+ */
+async function waitForServerHealth(timeoutMs = 30000) {
+  const startTime = Date.now();
+  const checkInterval = 500;
+  
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      const response = await fetch(`${LLAMA_SERVER_URL}/health`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.status === 'ok' || data.status === 'no slot available') {
+          return true;
+        }
+      }
+    } catch {
+      // Server not ready yet
+    }
+    await new Promise(resolve => setTimeout(resolve, checkInterval));
+  }
+  
+  return false;
+}
+
+/**
+ * Restart llama-server with new configuration for a preset.
+ * Uses a mutex to prevent concurrent restarts.
+ * 
+ * @param {object} preset - The preset requiring the restart
+ * @returns {Promise<object>} - { success: boolean, error?: string }
+ */
+async function restartForPreset(preset) {
+  // Check mutex
+  if (serverRestartLock) {
+    console.log('[restartForPreset] Restart already in progress, waiting...');
+    // Wait for current restart to complete (poll every 500ms, max 60s)
+    const waitStart = Date.now();
+    while (serverRestartLock && Date.now() - waitStart < 60000) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    if (serverRestartLock) {
+      return { success: false, error: 'Timeout waiting for concurrent restart' };
+    }
+    // Restart completed, check if we're now compatible
+    const compat = isCompatible(preset);
+    if (compat.compatible) {
+      return { success: true };
+    }
+  }
+  
+  // Acquire mutex
+  serverRestartLock = true;
+  
+  try {
+    const presetConfig = preset.config || {};
+    console.log(`[restartForPreset] Restarting server for preset "${preset.id}"`);
+    addLog('server', `Restarting llama-server for preset "${preset.id}"`);
+    
+    // Stop current server
+    if (llamaProcess) {
+      console.log('[restartForPreset] Stopping current llama-server...');
+      llamaProcess.kill('SIGTERM');
+      
+      // Wait for process to exit (max 10 seconds)
+      const stopStart = Date.now();
+      while (llamaProcess && Date.now() - stopStart < 10000) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+      if (llamaProcess) {
+        console.log('[restartForPreset] Force killing llama-server...');
+        llamaProcess.kill('SIGKILL');
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+    
+    // Calculate new values (but don't update serverConfig yet - wait for success)
+    // Note: context is stored at preset level, not inside config
+    const newContext = preset.context || config.defaultContext || 8192;
+    const newGpuLayers = presetConfig.gpuLayers !== undefined ? presetConfig.gpuLayers : (config.gpuLayers || 99);
+    const newFlashAttn = presetConfig.flashAttn !== undefined ? presetConfig.flashAttn : (config.flashAttn || false);
+    const newReasoningFormat = presetConfig.reasoningFormat || null;
+    
+    // Save old values to restore on failure
+    const oldServerConfig = { ...serverConfig };
+    const oldMode = currentMode;
+    const oldPreset = currentPreset;
+    
+    // Build extra switches - start with preset's extraSwitches, ensure --jinja is included
+    let extraSwitches = presetConfig.extraSwitches || '--jinja';
+    // Ensure --jinja is always present
+    if (!extraSwitches.includes('--jinja')) {
+      extraSwitches = '--jinja ' + extraSwitches;
+    }
+    if (newFlashAttn && !extraSwitches.includes('--flash-attn')) {
+      extraSwitches += ' --flash-attn';
+    }
+    if (newReasoningFormat && !extraSwitches.includes('--reasoning-format')) {
+      extraSwitches += ` --reasoning-format ${newReasoningFormat}`;
+    }
+    
+    // Use start-preset.sh with environment variables (same as /api/presets/:presetId/activate)
+    const startScript = join(PROJECT_ROOT, 'start-preset.sh');
+    const env = {
+      ...process.env,
+      PORT: String(LLAMA_PORT),
+      MODELS_DIR,
+      // Use HF_REPO if available, otherwise MODEL_PATH
+      HF_REPO: preset.hfRepo || '',
+      MODEL_PATH: preset.hfRepo ? '' : (preset.modelPath || ''),
+      CONTEXT: String(newContext),
+      TEMP: String(presetConfig.temp ?? 0.7),
+      TOP_P: String(presetConfig.topP ?? 1.0),
+      TOP_K: String(presetConfig.topK ?? 20),
+      MIN_P: String(presetConfig.minP ?? 0),
+      CHAT_TEMPLATE_KWARGS: presetConfig.chatTemplateKwargs || '',
+      EXTRA_SWITCHES: extraSwitches
+    };
+    
+    currentMode = 'single';
+    currentPreset = preset.id;
+    
+    const modelInfo = preset.hfRepo || preset.modelPath;
+    console.log(`[restartForPreset] Starting server for preset "${preset.id}" with model ${modelInfo}`);
+    console.log(`[restartForPreset] Context: ${newContext}, Extra switches: ${extraSwitches}`);
+    addLog('server', `Restarting for preset "${preset.id}" with context=${newContext}`);
+    
+    // Start the server using start-preset.sh
+    const { spawn } = await import('child_process');
+    llamaProcess = spawn('bash', [startScript], {
+      cwd: PROJECT_ROOT,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false
+    });
+    
+    llamaProcess.stdout.on('data', (data) => {
+      addLog('llama', data);
+    });
+    
+    llamaProcess.stderr.on('data', (data) => {
+      addLog('llama', data);
+    });
+    
+    llamaProcess.on('exit', (code, signal) => {
+      console.log(`[restartForPreset] llama-server exited with code ${code}, signal ${signal}`);
+      addLog('system', `llama-server exited with code ${code}`);
+      llamaProcess = null;
+    });
+    
+    // Wait for server to be healthy
+    console.log('[restartForPreset] Waiting for server to become healthy...');
+    const healthy = await waitForServerHealth(60000);
+    
+    if (!healthy) {
+      console.error('[restartForPreset] Server failed to become healthy');
+      addLog('server', 'Server restart failed: health check timeout');
+      // Restore old config values since restart failed
+      Object.assign(serverConfig, oldServerConfig);
+      currentMode = oldMode;
+      currentPreset = oldPreset;
+      return { success: false, error: 'Server health check timeout' };
+    }
+    
+    // Success! Now commit the new config values
+    serverConfig.context = newContext;
+    serverConfig.gpuLayers = newGpuLayers;
+    serverConfig.flashAttn = newFlashAttn;
+    serverConfig.reasoningFormat = newReasoningFormat;
+    
+    console.log(`[restartForPreset] Server restarted successfully for preset "${preset.id}"`);
+    addLog('server', `Server restarted successfully for preset "${preset.id}"`);
+    
+    return { success: true };
+    
+  } catch (err) {
+    console.error(`[restartForPreset] Error: ${err.message}`);
+    addLog('server', `Server restart error: ${err.message}`);
+    // Restore old config values on error
+    Object.assign(serverConfig, oldServerConfig);
+    currentMode = oldMode;
+    currentPreset = oldPreset;
+    return { success: false, error: err.message };
+    
+  } finally {
+    // Release mutex
+    serverRestartLock = false;
+  }
+}
+
+// ============================================================================
+// Auto-Preset Creation: Generate presets for downloaded models
+// ============================================================================
+
+/**
+ * Common quantization suffixes to strip from model names.
+ * Order matters - longer/more specific patterns first.
+ */
+const QUANTIZATION_PATTERNS = [
+  // IQ patterns (importance quantization)
+  /-IQ\d_[A-Z]+$/i,
+  /-IQ\d[A-Z]+$/i,
+  // Q patterns with size indicators
+  /-Q\d_K_[A-Z]+$/i,
+  /-Q\d_K$/i,
+  /-Q\d_[A-Z]+$/i,
+  /-Q\d[A-Z]+$/i,
+  /-Q\d$/i,
+  // F patterns (float)
+  /-F\d\d$/i,
+  /-F\d$/i,
+  /-FP\d\d$/i,
+  // BF16
+  /-BF16$/i,
+  // Common suffixes
+  /-GGUF$/i,
+  /-gguf$/i,
+];
+
+/**
+ * Generate a human-readable preset ID from a model filename or HuggingFace repo.
+ * 
+ * Examples:
+ * - "Qwen2.5-Coder-32B-Instruct-Q5_K_M.gguf" -> "qwen2.5-coder-32b-instruct"
+ * - "Unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q5_K_M" -> "qwen3-coder-30b-a3b-instruct"
+ * 
+ * @param {string} input - Model filename or HuggingFace repo string
+ * @returns {string} - A clean, lowercase preset ID
+ */
+function generatePresetId(input) {
+  let name = input;
+  
+  // Handle HuggingFace repo format: "org/repo:quant" or "org/repo"
+  if (input.includes('/')) {
+    // Extract repo name (after /)
+    const parts = input.split('/');
+    name = parts[parts.length - 1];
+    // Remove quantization after colon
+    if (name.includes(':')) {
+      name = name.split(':')[0];
+    }
+  }
+  
+  // Strip .gguf extension
+  name = name.replace(/\.gguf$/i, '');
+  
+  // Strip quantization suffixes
+  for (const pattern of QUANTIZATION_PATTERNS) {
+    name = name.replace(pattern, '');
+  }
+  
+  // Strip trailing numbers that might be part numbers (e.g., "-00001-of-00004")
+  name = name.replace(/-\d{5}-of-\d{5}$/i, '');
+  
+  // Convert to lowercase
+  name = name.toLowerCase();
+  
+  // Replace underscores and spaces with hyphens
+  name = name.replace(/[_\s]+/g, '-');
+  
+  // Remove any double hyphens
+  name = name.replace(/--+/g, '-');
+  
+  // Remove trailing hyphens
+  name = name.replace(/-+$/, '');
+  
+  return name;
+}
+
+/**
+ * Extract a human-readable display name from a model filename or repo.
+ * 
+ * @param {string} input - Model filename or HuggingFace repo string
+ * @returns {string} - A human-readable name (preserves case, removes extension)
+ */
+function extractModelName(input, { includeQuantization = false } = {}) {
+  let name = input;
+  let quantSuffix = '';
+  
+  // Handle HuggingFace repo format
+  if (input.includes('/')) {
+    const parts = input.split('/');
+    name = parts[parts.length - 1];
+    if (name.includes(':')) {
+      name = name.split(':')[0];
+    }
+  }
+  
+  // Strip .gguf extension
+  name = name.replace(/\.gguf$/i, '');
+  
+  // Strip quantization suffixes (preserve case) but optionally capture them
+  for (const pattern of QUANTIZATION_PATTERNS) {
+    const match = name.match(pattern);
+    if (match) {
+      if (includeQuantization && !quantSuffix) {
+        // Capture the first quantization pattern found (cleaned up)
+        quantSuffix = match[0].replace(/^-/, ' ');
+      }
+      name = name.replace(pattern, '');
+    }
+  }
+  
+  // Strip part numbers
+  name = name.replace(/-\d{5}-of-\d{5}$/i, '');
+  
+  // Replace underscores with spaces for readability
+  name = name.replace(/_/g, ' ');
+  
+  // Remove trailing hyphens
+  name = name.replace(/-+$/, '');
+  
+  // Append quantization if requested
+  if (includeQuantization && quantSuffix) {
+    name = name + quantSuffix;
+  }
+  
+  return name;
+}
+
+/**
+ * Ensure a preset ID is unique by appending a numeric suffix if needed.
+ * 
+ * @param {string} baseId - The base preset ID
+ * @returns {string} - A unique preset ID
+ */
+function ensureUniquePresetId(baseId) {
+  if (!config.presets || !config.presets[baseId]) {
+    return baseId;
+  }
+  
+  // Find the next available suffix
+  let suffix = 2;
+  while (config.presets[`${baseId}-${suffix}`]) {
+    suffix++;
+  }
+  
+  return `${baseId}-${suffix}`;
+}
+
+/**
+ * Create a default preset for a model.
+ * 
+ * @param {object} options - Configuration options
+ * @param {string} options.modelPath - Full path to the model file (optional)
+ * @param {string} options.hfRepo - HuggingFace repo string (optional)
+ * @param {string} options.filename - Model filename (for generating ID/name)
+ * @returns {object} - A preset object ready to save
+ */
+function createDefaultPreset({ modelPath, hfRepo, filename }) {
+  const source = hfRepo || filename || basename(modelPath || '');
+  const baseId = generatePresetId(source);
+  const id = ensureUniquePresetId(baseId);
+  // Include quantization in the display name so users can distinguish variants
+  const name = extractModelName(source, { includeQuantization: true });
+  const baseName = extractModelName(source);  // Without quantization for description
+  
+  const preset = {
+    id,
+    name,
+    description: `Auto-generated preset for ${baseName}`,
+    modelPath: modelPath || null,
+    hfRepo: hfRepo || null,
+    context: 0,  // 0 means use server default
+    config: {
+      chatTemplateKwargs: '',
+      reasoningFormat: '',
+      temp: 0.7,
+      topP: 1.0,
+      topK: 20,
+      minP: 0,
+      extraSwitches: '--jinja'
+    },
+    autoGenerated: true,
+    createdAt: new Date().toISOString()
+  };
+  
+  return preset;
+}
+
+/**
+ * Auto-create a preset for a model file if one doesn't already exist.
+ * 
+ * @param {object} options - Configuration options
+ * @param {string} options.modelPath - Full path to the model file
+ * @param {string} options.hfRepo - HuggingFace repo string (optional)
+ * @param {string} options.filename - Model filename
+ * @returns {object|null} - The created preset, or null if already exists
+ */
+function autoCreatePreset({ modelPath, hfRepo, filename }) {
+  // Check if a preset already exists for this model
+  if (config.presets) {
+    for (const preset of Object.values(config.presets)) {
+      // Match by model path
+      if (modelPath && preset.modelPath === modelPath) {
+        console.log(`[presets] Preset already exists for ${filename}: ${preset.id}`);
+        return null;
+      }
+      // Match by hfRepo
+      if (hfRepo && preset.hfRepo === hfRepo) {
+        console.log(`[presets] Preset already exists for ${hfRepo}: ${preset.id}`);
+        return null;
+      }
+    }
+  }
+  
+  // Create new preset
+  const preset = createDefaultPreset({ modelPath, hfRepo, filename });
+  
+  // Save to config
+  if (!config.presets) {
+    config.presets = {};
+  }
+  config.presets[preset.id] = preset;
+  saveConfig(config);
+  
+  console.log(`[presets] Auto-created preset "${preset.id}" for ${filename}`);
+  addLog('presets', `Auto-created preset: ${preset.name} (${preset.id})`);
+  
+  return preset;
+}
+
+/**
+ * Migrate existing models to presets on server startup.
+ * Creates presets for any .gguf files that don't have one.
+ */
+function migrateExistingModels() {
+  const localModels = scanLocalModels();
+  let created = 0;
+  
+  for (const model of localModels) {
+    if (model.incomplete) continue;  // Skip incomplete split models
+    
+    // Skip mmproj (multimodal projection) files - these are auxiliary files, not chat models
+    const filename = basename(model.path);
+    if (filename.toLowerCase().startsWith('mmproj-') || filename.toLowerCase().startsWith('mmproj_')) {
+      console.log(`[presets] Skipping mmproj file: ${model.name}`);
+      continue;
+    }
+    
+    const preset = autoCreatePreset({
+      modelPath: model.path,
+      filename: model.name
+    });
+    
+    if (preset) {
+      created++;
+    }
+  }
+  
+  if (created > 0) {
+    console.log(`[presets] Migration complete: created ${created} preset(s) for existing models`);
+    addLog('presets', `Migration: created ${created} preset(s) for existing models`);
+  }
+}
+
+// ============================================================================
 // API Routes
+// ============================================================================
 
 // Get settings
 app.get('/api/settings', (req, res) => {
@@ -1272,6 +2039,7 @@ app.delete('/api/models/aliases/:modelName(*)', (req, res) => {
 });
 
 // Get models from llama-server (loaded/available)
+// Returns presets as the primary model list, with status information
 app.get('/api/models', async (req, res) => {
   try {
     // Get models from llama-server
@@ -1289,10 +2057,35 @@ app.get('/api/models', async (req, res) => {
     // Get local models from filesystem
     const localModels = scanLocalModels();
 
+    // Build presets list with status information
+    // This is the primary model list for unified model configuration
+    const presets = config.presets ? Object.values(config.presets).map(preset => {
+      const status = getPresetStatus(preset, serverModels);
+      const modelPath = resolveModelPath({ type: 'preset', preset });
+      
+      return {
+        id: preset.id,
+        name: preset.name,
+        description: preset.description || '',
+        modelPath: preset.modelPath || null,
+        hfRepo: preset.hfRepo || null,
+        context: preset.context || 0,
+        config: preset.config || {},
+        status,  // 'loaded' | 'loading' | 'available' | 'not_downloaded'
+        resolvedPath: modelPath  // The actual path used for llama.cpp
+      };
+    }) : [];
+
     res.json({
+      // Primary model list: presets with status
+      models: presets,
+      // Keep for backward compatibility during transition
       serverModels,
       localModels,
-      modelsDir: MODELS_DIR
+      modelsDir: MODELS_DIR,
+      // Current mode info
+      mode: currentMode,
+      currentPreset: currentPreset
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1302,6 +2095,7 @@ app.get('/api/models', async (req, res) => {
 // Load a model in llama-server (router mode)
 // In router mode, models are loaded on-demand when chat completions are requested.
 // This endpoint pre-loads a model by making a minimal completion request.
+// Accepts both preset IDs and file paths (backward compatible)
 app.post('/api/models/load', async (req, res) => {
   const { model } = req.body;
 
@@ -1309,17 +2103,43 @@ app.post('/api/models/load', async (req, res) => {
     return res.status(400).json({ error: 'Missing model parameter' });
   }
 
-  // Resolve model name to full path to verify it exists
-  const modelPath = join(MODELS_DIR, model);
   console.log(`[models/load] Attempting to load model: ${model}`);
-  console.log(`[models/load] Full path: ${modelPath}`);
-  addLog('models', `Loading model: ${model} (${modelPath})`);
 
-  // Verify model exists
-  if (!existsSync(modelPath)) {
-    console.error(`[models/load] Model file not found: ${modelPath}`);
-    addLog('models', `Model file not found: ${modelPath}`);
-    return res.status(404).json({ error: `Model file not found: ${model}` });
+  // Use unified model resolution
+  const resolved = resolveModel(model);
+  let modelPathForLlama = model;
+  let displayName = model;
+
+  if (resolved) {
+    if (resolved.type === 'preset') {
+      const presetModelPath = resolveModelPath(resolved);
+      if (!presetModelPath) {
+        // Model not downloaded yet
+        return res.status(404).json({ 
+          error: `Preset "${model}" references a model that is not downloaded yet.`,
+          preset: resolved.preset.id,
+          hfRepo: resolved.preset.hfRepo
+        });
+      }
+      modelPathForLlama = presetModelPath;
+      displayName = resolved.preset.name;
+      console.log(`[models/load] Resolved preset "${model}" to path: ${modelPathForLlama}`);
+      addLog('models', `Loading preset: ${resolved.preset.name} (${modelPathForLlama})`);
+    } else if (resolved.type === 'file') {
+      modelPathForLlama = resolved.relativePath;
+      console.log(`[models/load] Using file path: ${modelPathForLlama}`);
+      addLog('models', `Loading model file: ${modelPathForLlama}`);
+    }
+  } else {
+    // Not found in presets, try as direct file path (backward compat)
+    const fullPath = join(MODELS_DIR, model);
+    if (!existsSync(fullPath)) {
+      console.error(`[models/load] Model not found: ${model}`);
+      addLog('models', `Model not found: ${model}`);
+      return res.status(404).json({ error: `Model not found: ${model}. Check preset ID or file path.` });
+    }
+    console.log(`[models/load] Using direct file path: ${model}`);
+    addLog('models', `Loading model: ${model}`);
   }
 
   try {
@@ -1329,7 +2149,7 @@ app.post('/api/models/load', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: model,
+        model: modelPathForLlama,
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 1
       })
@@ -1345,9 +2165,14 @@ app.post('/api/models/load', async (req, res) => {
     // Consume the response
     await response.text();
 
-    console.log(`[models/load] Model loaded successfully: ${model}`);
-    addLog('models', `Model loaded: ${model}`);
-    res.json({ success: true, model });
+    console.log(`[models/load] Model loaded successfully: ${displayName}`);
+    addLog('models', `Model loaded: ${displayName}`);
+    res.json({ 
+      success: true, 
+      model: modelPathForLlama,
+      preset: resolved?.type === 'preset' ? resolved.preset.id : null,
+      displayName
+    });
   } catch (error) {
     console.error(`[models/load] Error: ${error.message}`);
     addLog('models', `Error loading model: ${error.message}`);
@@ -1430,8 +2255,30 @@ app.post('/api/presets', (req, res) => {
   // When hfRepo is provided, we prioritize that and ignore modelPath
   if (modelPath && !hfRepo) {
     fullModelPath = modelPath.startsWith('/') ? modelPath : join(MODELS_DIR, modelPath);
+    
+    // Check if file exists directly
     if (!existsSync(fullModelPath)) {
-      return res.status(404).json({ error: `Model file not found: ${modelPath}` });
+      // Check if this is a split model (name without part suffix)
+      // Try to find first part: model.gguf -> model-00001-of-*.gguf
+      const basePath = fullModelPath.replace(/\.gguf$/i, '');
+      const dirPath = dirname(fullModelPath);
+      let foundSplitModel = false;
+      
+      if (existsSync(dirPath)) {
+        const files = readdirSync(dirPath);
+        const splitFirstPart = files.find(f => 
+          f.startsWith(basename(basePath)) && 
+          /-00001-of-\d{5}\.gguf$/i.test(f)
+        );
+        if (splitFirstPart) {
+          fullModelPath = join(dirPath, splitFirstPart);
+          foundSplitModel = true;
+        }
+      }
+      
+      if (!foundSplitModel) {
+        return res.status(404).json({ error: `Model file not found: ${modelPath}` });
+      }
     }
   }
 
@@ -1475,20 +2322,86 @@ app.put('/api/presets/:presetId', (req, res) => {
   const { presetId } = req.params;
   const updates = req.body;
 
+  // Log the update request for debugging
+  const existingPreset = config.presets?.[presetId];
+  if (existingPreset) {
+    console.log(`[presets] PUT ${presetId} - incoming changes:`);
+    if (updates.context !== undefined && updates.context !== existingPreset.context) {
+      console.log(`  context: ${existingPreset.context} -> ${updates.context}`);
+    }
+    if (updates.config?.extraSwitches !== undefined && updates.config?.extraSwitches !== existingPreset.config?.extraSwitches) {
+      console.log(`  extraSwitches: "${existingPreset.config?.extraSwitches}" -> "${updates.config?.extraSwitches}"`);
+    }
+  }
+
   if (!config.presets || !config.presets[presetId]) {
     return res.status(404).json({ error: `Preset '${presetId}' not found` });
   }
 
-  // Update the preset
-  config.presets[presetId] = {
-    ...config.presets[presetId],
-    ...updates,
-    id: presetId // Preserve ID
-  };
-  saveConfig(config);
+  // If modelPath is being updated, convert relative path to full path
+  if (updates.modelPath) {
+    const modelPath = updates.modelPath;
+    let fullModelPath = modelPath.startsWith('/') ? modelPath : join(MODELS_DIR, modelPath);
+    
+    // Check if file exists directly
+    if (!existsSync(fullModelPath)) {
+      // Check if this is a split model (name without part suffix)
+      // Try to find first part: model.gguf -> model-00001-of-*.gguf
+      const basePath = fullModelPath.replace(/\.gguf$/i, '');
+      const dirPath = dirname(fullModelPath);
+      let foundSplitModel = false;
+      
+      if (existsSync(dirPath)) {
+        const files = readdirSync(dirPath);
+        const splitFirstPart = files.find(f => 
+          f.startsWith(basename(basePath)) && 
+          /-00001-of-\d{5}\.gguf$/i.test(f)
+        );
+        if (splitFirstPart) {
+          fullModelPath = join(dirPath, splitFirstPart);
+          foundSplitModel = true;
+        }
+      }
+      
+      if (!foundSplitModel) {
+        return res.status(404).json({ error: `Model file not found: ${modelPath}` });
+      }
+    }
+    updates.modelPath = fullModelPath;
+  }
 
-  console.log(`[presets] Updated preset: ${presetId}`);
-  res.json({ success: true, preset: config.presets[presetId] });
+  // Check if ID is being changed
+  const newId = updates.id;
+  if (newId && newId !== presetId) {
+    // Validate new ID format
+    if (!/^[a-z0-9-]+$/.test(newId)) {
+      return res.status(400).json({ error: 'ID must contain only lowercase letters, numbers, and hyphens' });
+    }
+    // Check for conflicts
+    if (config.presets[newId]) {
+      return res.status(409).json({ error: `Preset '${newId}' already exists` });
+    }
+    // Rename: create with new ID, delete old
+    config.presets[newId] = {
+      ...config.presets[presetId],
+      ...updates,
+      id: newId
+    };
+    delete config.presets[presetId];
+    saveConfig(config);
+    console.log(`[presets] Renamed preset: ${presetId} -> ${newId}`);
+    res.json({ success: true, preset: config.presets[newId], renamed: true, oldId: presetId });
+  } else {
+    // Update in place
+    config.presets[presetId] = {
+      ...config.presets[presetId],
+      ...updates,
+      id: presetId
+    };
+    saveConfig(config);
+    console.log(`[presets] Updated preset: ${presetId}`);
+    res.json({ success: true, preset: config.presets[presetId] });
+  }
 });
 
 // Delete a preset
@@ -1601,15 +2514,20 @@ app.post('/api/server/start', async (req, res) => {
     currentPreset = null;
 
     const startScript = join(PROJECT_ROOT, 'start-llama.sh');
+    const contextSize = config.contextSize || 8192;
+    const gpuLayers = config.gpuLayers || 99;
+    const flashAttn = config.flashAttn || false;
+    const modelsMax = config.modelsMax || 2;
+    
     const env = {
       ...process.env,
       MODELS_DIR,
-      MODELS_MAX: String(config.modelsMax || 2),
-      CONTEXT: String(config.contextSize || 8192),
+      MODELS_MAX: String(modelsMax),
+      CONTEXT: String(contextSize),
       PORT: String(LLAMA_PORT),
       NO_WARMUP: config.noWarmup ? '1' : '',
-      FLASH_ATTN: config.flashAttn ? '1' : '',
-      GPU_LAYERS: String(config.gpuLayers || 99),
+      FLASH_ATTN: flashAttn ? '1' : '',
+      GPU_LAYERS: String(gpuLayers),
       HF_TOKEN: process.env.HF_TOKEN || ''
     };
 
@@ -1630,6 +2548,15 @@ app.post('/api/server/start', async (req, res) => {
     llamaProcess.on('exit', (code) => {
       addLog('system', `llama-server exited with code ${code}`);
     });
+
+    // Record server configuration for compatibility checks
+    serverConfig.context = contextSize;
+    serverConfig.gpuLayers = gpuLayers;
+    serverConfig.flashAttn = flashAttn;
+    serverConfig.modelsMax = modelsMax;
+    serverConfig.reasoningFormat = null;
+    serverConfig.extraSwitches = '--jinja';
+    console.log(`[server/start] Router mode: context=${contextSize}, gpuLayers=${gpuLayers}, flashAttn=${flashAttn}`);
 
     res.json({ success: true, mode: 'router', pid: llamaProcess.pid });
   } catch (error) {
@@ -1699,6 +2626,21 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
         currentPreset = null;
       }
     });
+
+    // Record server configuration for compatibility checks
+    const presetContext = preset.context || config.contextSize || 8192;
+    const presetGpuLayers = preset.config?.gpuLayers !== undefined ? preset.config.gpuLayers : (config.gpuLayers || 99);
+    const presetFlashAttn = preset.config?.flashAttn !== undefined ? preset.config.flashAttn : (config.flashAttn || false);
+    const presetReasoningFormat = preset.config?.reasoningFormat || null;
+    const presetExtraSwitches = preset.config?.extraSwitches || '--jinja';
+    
+    serverConfig.context = presetContext;
+    serverConfig.gpuLayers = presetGpuLayers;
+    serverConfig.flashAttn = presetFlashAttn;
+    serverConfig.modelsMax = 1; // Single model mode
+    serverConfig.reasoningFormat = presetReasoningFormat;
+    serverConfig.extraSwitches = presetExtraSwitches;
+    console.log(`[presets/activate] Preset mode: context=${presetContext}, gpuLayers=${presetGpuLayers}, flashAttn=${presetFlashAttn}`);
 
     res.json({
       success: true,
@@ -2015,6 +2957,21 @@ app.post('/api/pull', async (req, res) => {
         if (flattened > 0) {
           addLog('download', `Flattened ${flattened} nested GGUF file(s)`);
         }
+        
+        // Auto-create presets for downloaded GGUF files
+        try {
+          const ggufFiles = readdirSync(targetDir).filter(f => f.endsWith('.gguf'));
+          for (const ggufFile of ggufFiles) {
+            const relativePath = join(basename(targetDir), ggufFile);
+            const preset = autoCreatePreset(relativePath);
+            if (preset) {
+              addLog('download', `Auto-created preset "${preset.id}" for ${ggufFile}`);
+            }
+          }
+        } catch (presetErr) {
+          console.error(`[download] Failed to auto-create presets: ${presetErr.message}`);
+        }
+        
         downloadInfo.status = 'completed';
         downloadInfo.progress = 100;
         addLog('download', `Download completed: ${repo}`);
@@ -2718,48 +3675,72 @@ app.get('/api/analytics/history', (req, res) => {
   });
 });
 
-// OpenAI-compatible models endpoint - returns models from llama.cpp that can be loaded
+// OpenAI-compatible models endpoint - returns presets as the primary model list
+// Presets are the unified model abstraction; clients use preset IDs as model identifiers
 app.get('/api/v1/models', async (req, res) => {
   try {
-    // Get models from llama.cpp - these are the models that can actually be loaded
-    const response = await fetch(`http://localhost:${LLAMA_PORT}/models`);
-    if (!response.ok) {
-      throw new Error(`llama.cpp returned ${response.status}`);
+    // Get loaded models from llama.cpp for status info
+    let loadedModels = {};
+    try {
+      const response = await fetch(`http://localhost:${LLAMA_PORT}/models`);
+      if (response.ok) {
+        const llamaModels = await response.json();
+        // Build a map of model path -> status for quick lookup
+        for (const m of (llamaModels.data || [])) {
+          loadedModels[m.id] = m.status?.value || 'available';
+        }
+      }
+    } catch (e) {
+      // llama.cpp not running, all models will show as 'available'
     }
-    const llamaModels = await response.json();
 
-    // Get aliases from config
-    const aliases = config.modelAliases || {};
+    // Return presets as the model list
+    const presets = config.presets || {};
+    const presetList = Object.values(presets);
 
-    // Format with our extra info
+    // Helper to determine if a preset's model is loaded
+    const getPresetStatus = (preset) => {
+      // Check by model path (relative or absolute)
+      const modelPath = preset.modelPath || '';
+      const relativePath = modelPath.replace(MODELS_DIR + '/', '').replace(MODELS_DIR, '');
+      
+      // Check if this model is loaded in llama.cpp
+      for (const [id, status] of Object.entries(loadedModels)) {
+        if (id === relativePath || id === modelPath || modelPath.endsWith('/' + id)) {
+          return status === 'loaded' ? 'loaded' : 'available';
+        }
+      }
+      return 'available';
+    };
+
     const data = {
       object: 'list',
-      data: (llamaModels.data || []).map(m => {
-        // Extract runtime context size from loaded model's args
-        const args = m.status?.args || [];
-        const ctxIndex = args.indexOf('--ctx-size');
-        const n_ctx = ctxIndex >= 0 ? parseInt(args[ctxIndex + 1]) : null;
-
-        return {
-          id: m.id,
-          object: 'model',
-          created: m.created || Math.floor(Date.now() / 1000),
-          owned_by: m.owned_by || 'llamacpp',
-          // Model metadata from GGUF (includes n_ctx_train, n_params, etc.)
-          meta: m.meta || null,
-          // Runtime context size (configured via --ctx-size)
-          n_ctx: n_ctx || config.contextSize || null,
-          // Include extra info for UI
-          displayName: m.id,
-          status: m.status?.value || 'unknown',
-          alias: aliases[m.id] || null
-        };
-      })
+      data: presetList.map(preset => ({
+        // Preset ID is the model identifier for API requests
+        id: preset.id,
+        object: 'model',
+        created: preset.createdAt ? Math.floor(new Date(preset.createdAt).getTime() / 1000) : Math.floor(Date.now() / 1000),
+        owned_by: 'llama-manager',
+        // Preset metadata
+        meta: {
+          name: preset.name,
+          description: preset.description,
+          modelPath: preset.modelPath,
+          hfRepo: preset.hfRepo,
+          context: preset.context,
+          autoGenerated: preset.autoGenerated
+        },
+        n_ctx: preset.context || config.contextSize || 8192,
+        // Display info
+        displayName: preset.name || preset.id,
+        status: getPresetStatus(preset),
+        // For backward compat
+        alias: preset.name !== preset.id ? preset.name : null
+      }))
     };
     res.json(data);
   } catch (error) {
-    console.error('[v1/models] Error fetching from llama.cpp:', error.message);
-    // Fallback to empty list if llama.cpp is not available
+    console.error('[v1/models] Error building preset list:', error.message);
     res.json({ object: 'list', data: [] });
   }
 });
@@ -2881,6 +3862,7 @@ function injectReasoningEffort(body) {
 }
 
 // OpenAI-compatible chat completions (streaming and non-streaming)
+// Supports preset IDs and file paths as model identifiers
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
@@ -2888,8 +3870,38 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
 
-  // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
-  const proxyBody = injectReasoningEffort(req.body);
+  // Resolve preset ID to model path and apply preset configuration
+  const { body: resolvedBody, resolved, modelPath } = prepareProxyRequest(req.body);
+  
+  // Check if preset requires server restart due to incompatible config
+  if (resolved?.type === 'preset') {
+    const compat = isCompatible(resolved.preset);
+    if (!compat.compatible) {
+      console.log(`[chat/completions] Preset "${resolved.preset.id}" incompatible: ${compat.reasons.join(', ')}`);
+      addLog('chat', `Restarting server for preset "${resolved.preset.id}": ${compat.reasons.join(', ')}`);
+      
+      const restartResult = await restartForPreset(resolved.preset);
+      if (!restartResult.success) {
+        console.error(`[chat/completions] Server restart failed: ${restartResult.error}`);
+        return res.status(503).json({
+          error: {
+            message: `Server restart failed: ${restartResult.error}`,
+            type: 'server_error',
+            code: 'restart_failed'
+          }
+        });
+      }
+    }
+  }
+  
+  // Inject reasoning_effort if configured (after preset resolution)
+  const proxyBody = injectReasoningEffort(resolvedBody);
+
+  // Log preset resolution for debugging
+  if (resolved?.type === 'preset') {
+    console.log(`[chat/completions] Preset "${resolved.preset.id}" resolved to "${modelPath}"`);
+    addLog('chat', `Using preset: ${resolved.preset.name}`);
+  }
 
   async function doFetch(body) {
     return fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
@@ -3097,16 +4109,39 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 });
 
 // OpenAI-compatible completions (legacy endpoint)
+// Supports preset IDs and file paths as model identifiers
 app.post('/api/v1/completions', async (req, res) => {
   const startTime = Date.now();
   const requestedModel = req.body.model || 'unknown';
   const isStreaming = req.body.stream === true;
 
+  // Resolve preset ID to model path and apply preset configuration
+  const { body: proxyBody, resolved, modelPath } = prepareProxyRequest(req.body);
+
+  // Check if preset requires server restart due to incompatible config
+  if (resolved?.type === 'preset') {
+    const compat = isCompatible(resolved.preset);
+    if (!compat.compatible) {
+      console.log(`[completions] Preset "${resolved.preset.id}" incompatible: ${compat.reasons.join(', ')}`);
+      const restartResult = await restartForPreset(resolved.preset);
+      if (!restartResult.success) {
+        return res.status(503).json({
+          error: { message: `Server restart failed: ${restartResult.error}`, type: 'server_error', code: 'restart_failed' }
+        });
+      }
+    }
+  }
+
+  // Log preset resolution for debugging
+  if (resolved?.type === 'preset') {
+    console.log(`[completions] Preset "${resolved.preset.id}" resolved to "${modelPath}"`);
+  }
+
   try {
     const response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(proxyBody)
     }, { label: 'completions' });
 
     if (!response.ok) {
@@ -3215,12 +4250,35 @@ app.post('/api/v1/completions', async (req, res) => {
 });
 
 // OpenAI-compatible embeddings endpoint
+// Supports preset IDs and file paths as model identifiers
 app.post('/api/v1/embeddings', async (req, res) => {
+  // Resolve preset ID to model path
+  const { body: proxyBody, resolved, modelPath } = prepareProxyRequest(req.body);
+
+  // Check if preset requires server restart due to incompatible config
+  if (resolved?.type === 'preset') {
+    const compat = isCompatible(resolved.preset);
+    if (!compat.compatible) {
+      console.log(`[embeddings] Preset "${resolved.preset.id}" incompatible: ${compat.reasons.join(', ')}`);
+      const restartResult = await restartForPreset(resolved.preset);
+      if (!restartResult.success) {
+        return res.status(503).json({
+          error: { message: `Server restart failed: ${restartResult.error}`, type: 'server_error', code: 'restart_failed' }
+        });
+      }
+    }
+  }
+
+  // Log preset resolution for debugging
+  if (resolved?.type === 'preset') {
+    console.log(`[embeddings] Preset "${resolved.preset.id}" resolved to "${modelPath}"`);
+  }
+
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(proxyBody)
     });
 
     if (!response.ok) {
@@ -3273,6 +4331,7 @@ app.get('/api/v1/models/:model', async (req, res) => {
 });
 
 // OpenAI Responses API (proxied to llama.cpp)
+// Supports preset IDs and file paths as model identifiers
 app.post('/api/v1/responses', async (req, res) => {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
@@ -3280,8 +4339,33 @@ app.post('/api/v1/responses', async (req, res) => {
 
   console.log(`[responses] Request for model: ${requestedModel}`);
 
-  // Inject reasoning_effort if configured
-  const proxyBody = injectReasoningEffort(req.body);
+  // Resolve preset ID to model path and apply preset configuration
+  const { body: resolvedBody, resolved, modelPath } = prepareProxyRequest(req.body);
+
+  // Check if preset requires server restart due to incompatible config
+  if (resolved?.type === 'preset') {
+    const compat = isCompatible(resolved.preset);
+    if (!compat.compatible) {
+      console.log(`[responses] Preset "${resolved.preset.id}" incompatible: ${compat.reasons.join(', ')}`);
+      addLog('responses', `Restarting server for preset "${resolved.preset.id}": ${compat.reasons.join(', ')}`);
+      
+      const restartResult = await restartForPreset(resolved.preset);
+      if (!restartResult.success) {
+        return res.status(503).json({
+          error: { message: `Server restart failed: ${restartResult.error}`, type: 'server_error', code: 'restart_failed' }
+        });
+      }
+    }
+  }
+
+  // Log preset resolution for debugging
+  if (resolved?.type === 'preset') {
+    console.log(`[responses] Preset "${resolved.preset.id}" resolved to "${modelPath}"`);
+    addLog('responses', `Using preset: ${resolved.preset.name}`);
+  }
+
+  // Inject reasoning_effort if configured (after preset resolution)
+  const proxyBody = injectReasoningEffort(resolvedBody);
 
   try {
     let response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
@@ -3436,6 +4520,7 @@ app.post('/api/v1/responses', async (req, res) => {
 });
 
 // Anthropic Messages API compatibility (proxied to llama.cpp)
+// Supports preset IDs and file paths as model identifiers
 app.post('/api/v1/messages', async (req, res) => {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
@@ -3443,8 +4528,33 @@ app.post('/api/v1/messages', async (req, res) => {
 
   console.log(`[messages] Request for model: ${requestedModel}`);
 
-  // Inject reasoning_effort if configured
-  const proxyBody = injectReasoningEffort(req.body);
+  // Resolve preset ID to model path and apply preset configuration
+  const { body: resolvedBody, resolved, modelPath } = prepareProxyRequest(req.body);
+
+  // Check if preset requires server restart due to incompatible config
+  if (resolved?.type === 'preset') {
+    const compat = isCompatible(resolved.preset);
+    if (!compat.compatible) {
+      console.log(`[messages] Preset "${resolved.preset.id}" incompatible: ${compat.reasons.join(', ')}`);
+      addLog('messages', `Restarting server for preset "${resolved.preset.id}": ${compat.reasons.join(', ')}`);
+      
+      const restartResult = await restartForPreset(resolved.preset);
+      if (!restartResult.success) {
+        return res.status(503).json({
+          error: { message: `Server restart failed: ${restartResult.error}`, type: 'server_error', code: 'restart_failed' }
+        });
+      }
+    }
+  }
+
+  // Log preset resolution for debugging
+  if (resolved?.type === 'preset') {
+    console.log(`[messages] Preset "${resolved.preset.id}" resolved to "${modelPath}"`);
+    addLog('messages', `Using preset: ${resolved.preset.name}`);
+  }
+
+  // Inject reasoning_effort if configured (after preset resolution)
+  const proxyBody = injectReasoningEffort(resolvedBody);
 
   try {
     let response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
@@ -3669,6 +4779,9 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   console.log(`Models directory: ${MODELS_DIR}`);
   console.log(`Llama server will run on port ${LLAMA_PORT}`);
   console.log(`Stats interval: ${STATS_INTERVAL}ms`);
+
+  // Auto-create presets for any existing models that don't have one
+  migrateExistingModels();
 
   // Auto-start llama if configured
   if (config.autoStart) {
