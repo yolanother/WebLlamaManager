@@ -932,6 +932,20 @@ async function broadcastStats() {
       });
     }
 
+    // Add a zero-value token point if no recent token data exists,
+    // so the chart shows a continuous timeline instead of "Collecting data..."
+    const now = Date.now();
+    const lastTokenPoint = analyticsData.tokens[analyticsData.tokens.length - 1];
+    if (!lastTokenPoint || (now - lastTokenPoint.timestamp) > 2000) {
+      addAnalyticsPoint('tokens', {
+        promptTokens: 0,
+        completionTokens: 0,
+        tokensPerSecond: 0,
+        model: '',
+        duration: 0
+      });
+    }
+
     const message = JSON.stringify({ type: 'stats', data: stats });
 
     for (const client of connectedClients) {
@@ -2887,6 +2901,18 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   const requestedModel = req.body.model || 'default';
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
+
+  // Normalize messages: accept stringified JSON arrays for compatibility
+  if (typeof req.body.messages === 'string') {
+    try {
+      req.body.messages = JSON.parse(req.body.messages);
+    } catch {
+      return res.status(400).json({ error: { message: 'messages must be a JSON array, got unparseable string', type: 'invalid_request_error' } });
+    }
+  }
+  if (!Array.isArray(req.body.messages)) {
+    return res.status(400).json({ error: { message: 'messages must be an array', type: 'invalid_request_error' } });
+  }
 
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectReasoningEffort(req.body);

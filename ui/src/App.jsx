@@ -3643,7 +3643,11 @@ function ApiDocsPage() {
       const bodyParams = {};
       for (const param of endpoint.params) {
         if (!['path', 'query'].includes(param.type) && currentParams[param.name] !== undefined && currentParams[param.name] !== '') {
-          bodyParams[param.name] = currentParams[param.name];
+          let val = currentParams[param.name];
+          if (param.type === 'json' && typeof val === 'string') {
+            try { val = JSON.parse(val); } catch { /* use as-is */ }
+          }
+          bodyParams[param.name] = val;
         }
       }
 
@@ -3927,7 +3931,11 @@ function ApiDocsPage() {
         } else if (param.type === 'query') {
           queryParams.push(`${param.name}=${encodeURIComponent(value)}`);
         } else {
-          bodyParams[param.name] = value;
+          let val = value;
+          if (param.type === 'json' && typeof val === 'string') {
+            try { val = JSON.parse(val); } catch { /* use as-is */ }
+          }
+          bodyParams[param.name] = val;
         }
       }
 
