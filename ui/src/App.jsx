@@ -2814,7 +2814,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
             <div className="llm-logs-list">
               {filteredLlmLogs.map((log) => {
                 const isExpanded = expandedLlmLogs.has(log.id);
-                const isError = log.status >= 400;
+                const isError = log.status >= 400 || !!log.error;
                 return (
                   <div key={log.id} className={`llm-log-card ${isError ? 'error' : ''}`}>
                     <div className="llm-log-summary" onClick={() => toggleLlmLogExpand(log.id)}>
@@ -2830,7 +2830,8 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                       )}
                       <span className={`llm-log-endpoint ${log.endpoint}`}>{log.endpoint}</span>
                       {log.stream && <span className="llm-log-badge stream">stream</span>}
-                      {isError && <span className="llm-log-badge error">{log.status}</span>}
+                      {log.retries > 0 && <span className="llm-log-badge retry">{log.retries} {log.retries === 1 ? 'retry' : 'retries'}</span>}
+                      {isError && <span className="llm-log-badge error">{log.status || 'ERR'}</span>}
                     </div>
                     {isExpanded && (
                       <div className="llm-log-detail">
@@ -2880,36 +2881,69 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                             </div>
                           </div>
                         )}
-                        {log.response && (
-                          <div className="llm-log-response-section">
-                            <div className="llm-log-section-title">Response</div>
-                            <div className="llm-log-response-content">
-                              {parseMessageWithCodeBlocks(log.response)}
+                        <div className={`llm-log-response-section ${isError ? 'has-error' : ''}`}>
+                          <div className="llm-log-section-title">
+                            Response
+                            {log.response && (
+                              <button
+                                className="copy-field-btn"
+                                onClick={(e) => { e.stopPropagation(); handleCopyField(log.response, `resp-${log.id}`); }}
+                              >{copiedField === `resp-${log.id}` ? 'Copied' : 'Copy'}</button>
+                            )}
+                          </div>
+                          <div className="llm-log-response-content">
+                            {log.response
+                              ? parseMessageWithCodeBlocks(log.response)
+                              : <span className="llm-log-empty">{isError ? 'No response (request failed)' : 'No response captured'}</span>
+                            }
+                          </div>
+                        </div>
+                        {log.retries > 0 && (
+                          <div className="llm-log-retry-section">
+                            <div className="llm-log-section-title">Retries</div>
+                            <div className="llm-log-retry-content">
+                              <span>Retried {log.retries} time{log.retries !== 1 ? 's' : ''} before {log.error ? 'failing' : 'succeeding'}</span>
+                              {log.retryErrors && log.retryErrors.length > 0 && (
+                                <ul className="llm-log-retry-errors">
+                                  {log.retryErrors.map((err, ri) => (
+                                    <li key={ri}><span className="retry-attempt">Attempt {ri + 1}:</span> {err.slice(0, 300)}</li>
+                                  ))}
+                                </ul>
+                              )}
                             </div>
                           </div>
                         )}
-                        {log.error && (
+                        {isError && (
                           <div className="llm-log-error-section">
                             <div className="llm-log-section-title">
                               Error
-                              <button
-                                className="copy-field-btn"
-                                onClick={(e) => { e.stopPropagation(); handleCopyField(log.error, `error-${log.id}`); }}
-                              >{copiedField === `error-${log.id}` ? 'Copied' : 'Copy'}</button>
+                              {log.error && (
+                                <button
+                                  className="copy-field-btn"
+                                  onClick={(e) => { e.stopPropagation(); handleCopyField(log.error, `error-${log.id}`); }}
+                                >{copiedField === `error-${log.id}` ? 'Copied' : 'Copy'}</button>
+                              )}
                             </div>
-                            <div className="llm-log-error-content">{log.error}</div>
+                            <div className="llm-log-error-content">{log.error || `Status ${log.status || 'unknown'}`}</div>
                           </div>
                         )}
-                        {log.requestBody && (
+                        {(log.requestBody || (isError && (log.messages || log.prompt))) && (() => {
+                          const displayBody = log.requestBody || {
+                            model: log.model,
+                            ...(log.messages ? { messages: log.messages } : {}),
+                            ...(log.prompt ? { prompt: log.prompt } : {}),
+                            ...(log.stream ? { stream: true } : {})
+                          };
+                          return (
                           <div className="llm-log-request-body-section">
                             <div className="llm-log-section-title">
-                              Full Request Body
+                              {log.requestBody ? 'Full Request Body' : 'Request (reconstructed)'}
                               <button
                                 className="copy-field-btn"
-                                onClick={(e) => { e.stopPropagation(); handleCopyField(JSON.stringify(log.requestBody, null, 2), `body-${log.id}`); }}
+                                onClick={(e) => { e.stopPropagation(); handleCopyField(JSON.stringify(displayBody, null, 2), `body-${log.id}`); }}
                               >{copiedField === `body-${log.id}` ? 'Copied' : 'Copy'}</button>
                             </div>
-                            <pre className="llm-log-request-body">{JSON.stringify(log.requestBody, null, 2)}</pre>
+                            <pre className="llm-log-request-body">{JSON.stringify(displayBody, null, 2)}</pre>
                             <div className="llm-log-resubmit-row">
                               <button
                                 className="btn-secondary resubmit-btn"
@@ -2925,7 +2959,8 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                               )}
                             </div>
                           </div>
-                        )}
+                          );
+                        })()}
                       </div>
                     )}
                   </div>

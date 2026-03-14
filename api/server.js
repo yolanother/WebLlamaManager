@@ -2805,16 +2805,77 @@ function isTemplateSanitizable(errorText) {
     errorText.includes('Cannot pass both content and thinking');
 }
 
+// Detect transient proxy/connection errors from llama.cpp (500 with connection-related messages)
+function isProxyConnectionError(status, text) {
+  if (status !== 500 || typeof text !== 'string') return false;
+  const lower = text.toLowerCase();
+  return lower.includes('could not establish connection') ||
+    lower.includes('connection refused') ||
+    lower.includes('econnrefused') ||
+    lower.includes('econnreset') ||
+    lower.includes('socket hang up');
+}
+
+// Wait for llama.cpp server to become healthy again (e.g. after OOM model reload)
+async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label = 'proxy' } = {}) {
+  const deadline = Date.now() + maxWait;
+  console.log(`[${label}] Waiting up to ${maxWait / 1000}s for llama server to become ready...`);
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://localhost:${LLAMA_PORT}/health`);
+      if (res.ok) {
+        console.log(`[${label}] Llama server is ready`);
+        return true;
+      }
+    } catch { /* server not up yet */ }
+    await new Promise(r => setTimeout(r, pollInterval));
+  }
+  console.error(`[${label}] Llama server did not become ready within ${maxWait / 1000}s`);
+  return false;
+}
+
 // Retry fetch with backoff for transient connection failures (e.g. model switching in router mode)
-async function fetchWithRetry(url, options, { retries = 3, baseDelay = 1000, label = 'proxy' } = {}) {
+// Also retries on proxy connection errors (500) with server health polling
+// Returns { response, retries, retryErrors } so callers can log retry info
+async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy' } = {}) {
+  const retryErrors = [];
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await fetch(url, options);
+      const response = await fetch(url, options);
+
+      // Check for proxy connection errors (server may be reloading after OOM)
+      if (response.status === 500 && attempt < retries) {
+        // Clone before reading so we can return the original if it's not a proxy error
+        const cloned = response.clone();
+        const text = await cloned.text();
+        if (isProxyConnectionError(500, text)) {
+          const msg = text.slice(0, 300);
+          console.log(`[${label}] Proxy connection error (attempt ${attempt + 1}/${retries + 1}): ${msg}`);
+          addLog(label, `Proxy connection error, waiting for server to recover (attempt ${attempt + 1}/${retries + 1})`);
+          retryErrors.push(msg);
+          await waitForServerReady({ label });
+          continue;
+        }
+        // Not a proxy error — return the original unconsumed response
+        return { response, retries: attempt, retryErrors };
+      }
+
+      return { response, retries: attempt, retryErrors };
     } catch (err) {
-      if (attempt === retries) throw err;
+      retryErrors.push(err.message);
+      if (attempt === retries) {
+        err.retries = attempt;
+        err.retryErrors = retryErrors;
+        throw err;
+      }
       const delay = baseDelay * Math.pow(2, attempt);
       console.log(`[${label}] Connection failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms: ${err.message}`);
-      await new Promise(r => setTimeout(r, delay));
+      // Wait for server to come back if connection was refused
+      if (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') {
+        await waitForServerReady({ label });
+      } else {
+        await new Promise(r => setTimeout(r, delay));
+      }
     }
   }
 }
@@ -2917,12 +2978,18 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectReasoningEffort(req.body);
 
+  let retryInfo = { retries: 0, retryErrors: [] };
+  function logLlm(entry) {
+    addLlmLog({ ...entry, retries: retryInfo.retries, retryErrors: retryInfo.retryErrors, requestBody: entry.requestBody || req.body });
+  }
   async function doFetch(body) {
-    return fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
+    const result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     }, { label: 'chat/completions' });
+    retryInfo = { retries: result.retries, retryErrors: result.retryErrors };
+    return result.response;
   }
 
   try {
@@ -2947,12 +3014,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             } else {
               console.error(`[chat/completions] Still failing after unload for ${requestedModel}: ${retryError}`);
               addLog('chat', `Chat completion failed for model ${requestedModel}: ${retryError}`);
-              addLlmLog({
+              logLlm({
                 endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
                 status: response.status, duration: Date.now() - startTime,
                 promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-                messages: req.body.messages || null, prompt: null, response: null, error: retryError,
-                requestBody: req.body
+                messages: req.body.messages || null, prompt: null, response: null, error: retryError
               });
               return res.status(response.status).send(retryError);
             }
@@ -2961,12 +3027,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           // Couldn't unload, return original error
           console.error(`[chat/completions] Error ${response.status} for model ${requestedModel}: ${errorText}`);
           addLog('chat', `Chat completion failed for model ${requestedModel}: ${errorText}`);
-          addLlmLog({
+          logLlm({
             endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
             status: response.status, duration: Date.now() - startTime,
             promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-            messages: req.body.messages || null, prompt: null, response: null, error: errorText,
-            requestBody: req.body
+            messages: req.body.messages || null, prompt: null, response: null, error: errorText
           });
           return res.status(response.status).send(errorText);
         }
@@ -2979,12 +3044,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       } else {
         console.error(`[chat/completions] Error ${response.status} for model ${requestedModel}: ${errorText}`);
         addLog('chat', `Chat completion failed for model ${requestedModel}: ${errorText}`);
-        addLlmLog({
+        logLlm({
           endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
           status: response.status, duration: Date.now() - startTime,
           promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-          messages: req.body.messages || null, prompt: null, response: null, error: errorText,
-          requestBody: req.body
+          messages: req.body.messages || null, prompt: null, response: null, error: errorText
         });
         return res.status(response.status).send(errorText);
       }
@@ -2994,12 +3058,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       const error = await response.text();
       console.error(`[chat/completions] Error ${response.status} for model ${requestedModel}: ${error}`);
       addLog('chat', `Chat completion failed for model ${requestedModel}: ${error}`);
-      addLlmLog({
+      logLlm({
         endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
         status: response.status, duration: Date.now() - startTime,
         promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
-        messages: req.body.messages || null, prompt: null, response: null, error,
-        requestBody: req.body
+        messages: req.body.messages || null, prompt: null, response: null, error
       });
       return res.status(response.status).send(error);
     }
@@ -3032,9 +3095,13 @@ app.post('/api/v1/chat/completions', async (req, res) => {
               if (line.startsWith('data: ') && line !== 'data: [DONE]') {
                 try {
                   const data = JSON.parse(line.slice(6));
-                  if (data.choices?.[0]?.delta?.content) {
-                    completionTokens++;
-                    responseText += data.choices[0].delta.content;
+                  const delta = data.choices?.[0]?.delta;
+                  if (delta) {
+                    const text = delta.content || delta.reasoning_content || '';
+                    if (text) {
+                      completionTokens++;
+                      responseText += text;
+                    }
                   }
                   if (data.usage) {
                     promptTokens = data.usage.prompt_tokens || promptTokens;
@@ -3061,15 +3128,23 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             model,
             duration
           });
-          addLlmLog({
+          logLlm({
             endpoint: 'chat/completions', model, stream: true,
             status: 200, duration, promptTokens, completionTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.messages || null, prompt: null,
-            response: responseText, error: null, requestBody: null
+            response: responseText, error: null
           });
         } catch (e) {
           console.error('[proxy] Stream error:', e);
+          const duration = Date.now() - startTime;
+          logLlm({
+            endpoint: 'chat/completions', model, stream: true,
+            status: 500, duration, promptTokens, completionTokens,
+            tokensPerSecond: 0,
+            messages: req.body.messages || null, prompt: null,
+            response: responseText || null, error: `Stream error: ${e.message}`
+          });
           res.end();
         }
       };
@@ -3094,12 +3169,12 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         duration
       });
 
-      addLlmLog({
+      logLlm({
         endpoint: 'chat/completions', model: data.model || req.body.model || 'unknown',
         stream: false, status: 200, duration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
-        response: data.choices?.[0]?.message?.content || null, error: null, requestBody: null
+        response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || null, error: null
       });
 
       // Add our tracking info to response
@@ -3111,12 +3186,13 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       res.json(data);
     }
   } catch (error) {
-    addLlmLog({
+    if (error.retryErrors) retryInfo = { retries: error.retries, retryErrors: error.retryErrors };
+    logLlm({
       endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
       status: 502, duration: Date.now() - startTime,
       promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
       messages: req.body.messages || null, prompt: null,
-      response: null, error: error.message, requestBody: req.body
+      response: null, error: error.message
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
@@ -3129,11 +3205,12 @@ app.post('/api/v1/completions', async (req, res) => {
   const isStreaming = req.body.stream === true;
 
   try {
-    const response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
+    const { response, retries: fetchRetries, retryErrors: fetchRetryErrors } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body)
     }, { label: 'completions' });
+    const retryFields = { retries: fetchRetries, retryErrors: fetchRetryErrors, requestBody: req.body };
 
     if (!response.ok) {
       const error = await response.text();
@@ -3142,7 +3219,7 @@ app.post('/api/v1/completions', async (req, res) => {
         status: response.status, duration: Date.now() - startTime,
         promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
         messages: null, prompt: req.body.prompt || null, response: null, error,
-        requestBody: req.body
+        ...retryFields
       });
       return res.status(response.status).send(error);
     }
@@ -3194,7 +3271,7 @@ app.post('/api/v1/completions', async (req, res) => {
             status: 200, duration, promptTokens: 0, completionTokens: tokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: null, prompt: req.body.prompt || null,
-            response: responseText, error: null, requestBody: null
+            response: responseText, error: null, ...retryFields
           });
         } catch (e) {
           res.end();
@@ -3223,7 +3300,7 @@ app.post('/api/v1/completions', async (req, res) => {
         stream: false, status: 200, duration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: null, prompt: req.body.prompt || null,
-        response: data.choices?.[0]?.text || null, error: null, requestBody: null
+        response: data.choices?.[0]?.text || null, error: null, ...retryFields
       });
 
       res.json(data);
@@ -3234,7 +3311,8 @@ app.post('/api/v1/completions', async (req, res) => {
       status: 502, duration: Date.now() - startTime,
       promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
       messages: null, prompt: req.body.prompt || null,
-      response: null, error: error.message, requestBody: req.body
+      response: null, error: error.message, requestBody: req.body,
+      retries: error.retries || 0, retryErrors: error.retryErrors || []
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
@@ -3309,12 +3387,18 @@ app.post('/api/v1/responses', async (req, res) => {
   // Inject reasoning_effort if configured
   const proxyBody = injectReasoningEffort(req.body);
 
+  let totalRetries = 0;
+  let allRetryErrors = [];
   try {
-    let response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
+    let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(proxyBody)
     }, { label: 'responses' });
+    let response = result.response;
+    totalRetries = result.retries;
+    allRetryErrors = [...result.retryErrors];
+    const retryFields = () => ({ retries: totalRetries, retryErrors: allRetryErrors, requestBody: req.body });
 
     // If model failed to load, unload others and retry
     if (!response.ok) {
@@ -3323,11 +3407,14 @@ app.post('/api/v1/responses', async (req, res) => {
         console.log(`[responses] Model load failure for ${requestedModel}, attempting to free memory`);
         const unloaded = await unloadOtherModels(requestedModel);
         if (unloaded) {
-          response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
+          result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(proxyBody)
           }, { label: 'responses' });
+          response = result.response;
+          totalRetries += result.retries;
+          allRetryErrors.push(...result.retryErrors);
         }
       }
       if (!response.ok) {
@@ -3339,7 +3426,7 @@ app.post('/api/v1/responses', async (req, res) => {
           status: response.status, duration: Date.now() - startTime,
           promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
           messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-          prompt: null, response: null, error: retryError, requestBody: req.body
+          prompt: null, response: null, error: retryError, ...retryFields()
         });
         return res.status(response.status).send(retryError);
       }
@@ -3398,7 +3485,7 @@ app.post('/api/v1/responses', async (req, res) => {
             status: 200, duration, promptTokens, completionTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-            prompt: null, response: responseText, error: null, requestBody: null
+            prompt: null, response: responseText, error: null, ...retryFields()
           });
         } catch (e) {
           console.error('[responses] Stream error:', e);
@@ -3439,7 +3526,7 @@ app.post('/api/v1/responses', async (req, res) => {
         stream: false, status: 200, duration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-        prompt: null, response: respText, error: null, requestBody: null
+        prompt: null, response: respText, error: null, ...retryFields()
       });
 
       data._llama_manager = {
@@ -3455,7 +3542,8 @@ app.post('/api/v1/responses', async (req, res) => {
       status: 502, duration: Date.now() - startTime,
       promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
       messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
-      prompt: null, response: null, error: error.message, requestBody: req.body
+      prompt: null, response: null, error: error.message, requestBody: req.body,
+      retries: error.retries || totalRetries, retryErrors: error.retryErrors || allRetryErrors
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
@@ -3472,12 +3560,18 @@ app.post('/api/v1/messages', async (req, res) => {
   // Inject reasoning_effort if configured
   const proxyBody = injectReasoningEffort(req.body);
 
+  let totalRetries = 0;
+  let allRetryErrors = [];
   try {
-    let response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
+    let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(proxyBody)
     }, { label: 'messages' });
+    let response = result.response;
+    totalRetries = result.retries;
+    allRetryErrors = [...result.retryErrors];
+    const retryFields = () => ({ retries: totalRetries, retryErrors: allRetryErrors, requestBody: req.body });
 
     // If model failed to load, unload others and retry
     if (!response.ok) {
@@ -3486,11 +3580,14 @@ app.post('/api/v1/messages', async (req, res) => {
         console.log(`[messages] Model load failure for ${requestedModel}, attempting to free memory`);
         const unloaded = await unloadOtherModels(requestedModel);
         if (unloaded) {
-          response = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
+          result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(proxyBody)
           }, { label: 'messages' });
+          response = result.response;
+          totalRetries += result.retries;
+          allRetryErrors.push(...result.retryErrors);
         }
       }
       if (!response.ok) {
@@ -3502,7 +3599,7 @@ app.post('/api/v1/messages', async (req, res) => {
           status: response.status, duration: Date.now() - startTime,
           promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
           messages: req.body.messages || null, prompt: null, response: null, error: retryError,
-          requestBody: req.body
+          ...retryFields()
         });
         return res.status(response.status).send(retryError);
       }
@@ -3563,7 +3660,7 @@ app.post('/api/v1/messages', async (req, res) => {
             status: 200, duration, promptTokens: inputTokens, completionTokens: outputTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.messages || null, prompt: null,
-            response: responseText, error: null, requestBody: null
+            response: responseText, error: null, ...retryFields()
           });
         } catch (e) {
           console.error('[messages] Stream error:', e);
@@ -3594,7 +3691,7 @@ app.post('/api/v1/messages', async (req, res) => {
         promptTokens: inputTokens, completionTokens: outputTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
-        response: data.content?.[0]?.text || null, error: null, requestBody: null
+        response: data.content?.[0]?.text || null, error: null, ...retryFields()
       });
 
       data._llama_manager = {
@@ -3610,7 +3707,8 @@ app.post('/api/v1/messages', async (req, res) => {
       status: 502, duration: Date.now() - startTime,
       promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
       messages: req.body.messages || null, prompt: null,
-      response: null, error: error.message, requestBody: req.body
+      response: null, error: error.message, requestBody: req.body,
+      retries: error.retries || totalRetries, retryErrors: error.retryErrors || allRetryErrors
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }

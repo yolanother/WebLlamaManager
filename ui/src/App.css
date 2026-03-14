@@ -2041,6 +2041,43 @@ input::placeholder {
   color: var(--error);
 }
 
+.llm-log-badge.retry {
+  background: rgba(245, 158, 11, 0.2);
+  color: var(--warning);
+}
+
+.llm-log-retry-section {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 6px;
+}
+
+.llm-log-retry-content {
+  font-size: 0.85rem;
+  color: var(--warning);
+}
+
+.llm-log-retry-errors {
+  list-style: none;
+  padding: 4px 0 0 0;
+  margin: 4px 0 0 0;
+}
+
+.llm-log-retry-errors li {
+  padding: 4px 0;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.retry-attempt {
+  color: var(--warning);
+  font-weight: 600;
+  margin-right: 6px;
+}
+
 .llm-log-detail {
   border-top: 1px solid var(--border);
   padding: 14px;
@@ -2158,6 +2195,12 @@ input::placeholder {
   word-break: break-word;
   max-height: 400px;
   overflow-y: auto;
+}
+
+.llm-log-empty {
+  color: var(--text-secondary);
+  font-style: italic;
+  font-size: 0.85rem;
 }
 
 /* Prompt section */
