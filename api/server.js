@@ -1606,6 +1606,104 @@ async function stopLlamaServer() {
   console.log('[stop] Llama server stopped');
 }
 
+// Restart llama server in its current mode (router or preset)
+// Used by fetchWithRetry when the server appears to have crashed
+let restartInProgress = false;
+async function restartLlamaServer() {
+  if (restartInProgress) {
+    console.log('[restart] Restart already in progress, waiting for it to complete...');
+    // Wait for the in-progress restart to finish
+    while (restartInProgress) {
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    return;
+  }
+
+  restartInProgress = true;
+  try {
+    console.log(`[restart] Restarting llama server (mode: ${currentMode}, preset: ${currentPreset || 'none'})...`);
+    addLog('system', `Auto-restarting llama server (mode: ${currentMode}, preset: ${currentPreset || 'none'})`);
+
+    await stopLlamaServer();
+
+    if (currentMode === 'single' && currentPreset && config.presets?.[currentPreset]) {
+      const preset = config.presets[currentPreset];
+      const startScript = join(PROJECT_ROOT, 'start-preset.sh');
+      const env = {
+        ...process.env,
+        PORT: String(LLAMA_PORT),
+        MODELS_DIR,
+        HF_REPO: preset.hfRepo || '',
+        MODEL_PATH: preset.hfRepo ? '' : (preset.modelPath || ''),
+        CONTEXT: String(preset.context || 0),
+        TEMP: String(preset.config?.temp ?? 0.7),
+        TOP_P: String(preset.config?.topP ?? 1.0),
+        TOP_K: String(preset.config?.topK ?? 20),
+        MIN_P: String(preset.config?.minP ?? 0),
+        CHAT_TEMPLATE_KWARGS: preset.config?.chatTemplateKwargs || '',
+        EXTRA_SWITCHES: preset.config?.extraSwitches || '--jinja'
+      };
+
+      console.log(`[restart] Starting preset: ${currentPreset}`);
+      llamaProcess = spawn('bash', [startScript], {
+        cwd: PROJECT_ROOT,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env,
+        detached: false
+      });
+    } else {
+      const startScript = join(PROJECT_ROOT, 'start-llama.sh');
+      const env = {
+        ...process.env,
+        MODELS_DIR,
+        MODELS_MAX: String(config.modelsMax || 2),
+        CONTEXT: String(config.contextSize || 8192),
+        PORT: String(LLAMA_PORT),
+        NO_WARMUP: config.noWarmup ? '1' : '',
+        FLASH_ATTN: config.flashAttn ? '1' : '',
+        GPU_LAYERS: String(config.gpuLayers || 99),
+        HF_TOKEN: process.env.HF_TOKEN || ''
+      };
+
+      console.log('[restart] Starting router mode');
+      currentMode = 'router';
+      currentPreset = null;
+      llamaProcess = spawn('bash', [startScript], {
+        cwd: PROJECT_ROOT,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env,
+        detached: false
+      });
+    }
+
+    llamaProcess.stdout.on('data', (data) => {
+      addLog('llama', data);
+    });
+    llamaProcess.stderr.on('data', (data) => {
+      addLog('llama', data);
+    });
+    llamaProcess.on('exit', (code) => {
+      addLog('system', `llama-server exited with code ${code}`);
+      if (code !== 0 && currentMode === 'single') {
+        currentMode = 'router';
+        currentPreset = null;
+      }
+    });
+
+    // Wait for server to become healthy
+    const ready = await waitForServerReady({ maxWait: 60000, label: 'restart' });
+    if (ready) {
+      console.log('[restart] Llama server restarted successfully');
+      addLog('system', 'Llama server restarted successfully');
+    } else {
+      console.error('[restart] Llama server failed to become ready after restart');
+      addLog('system', 'Llama server failed to become ready after restart');
+    }
+  } finally {
+    restartInProgress = false;
+  }
+}
+
 // Start llama server in router mode (multi-model)
 app.post('/api/server/start', async (req, res) => {
   await stopLlamaServer();
@@ -2839,6 +2937,7 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
 // Returns { response, retries, retryErrors } so callers can log retry info
 async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy' } = {}) {
   const retryErrors = [];
+  let hasRestarted = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const response = await fetch(url, options);
@@ -2853,7 +2952,15 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
           console.log(`[${label}] Proxy connection error (attempt ${attempt + 1}/${retries + 1}): ${msg}`);
           addLog(label, `Proxy connection error, waiting for server to recover (attempt ${attempt + 1}/${retries + 1})`);
           retryErrors.push(msg);
-          await waitForServerReady({ label });
+          // After 2 consecutive proxy errors, restart the server
+          if (attempt >= 1 && !hasRestarted) {
+            console.log(`[${label}] Multiple proxy errors, restarting llama server...`);
+            addLog(label, 'Multiple proxy errors detected, restarting llama server');
+            hasRestarted = true;
+            await restartLlamaServer();
+          } else {
+            await waitForServerReady({ label });
+          }
           continue;
         }
         // Not a proxy error — return the original unconsumed response
@@ -2870,9 +2977,17 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
       }
       const delay = baseDelay * Math.pow(2, attempt);
       console.log(`[${label}] Connection failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms: ${err.message}`);
-      // Wait for server to come back if connection was refused
+      // If connection refused/reset, server may have crashed
       if (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') {
-        await waitForServerReady({ label });
+        // After 2 consecutive connection failures, restart the server
+        if (attempt >= 1 && !hasRestarted) {
+          console.log(`[${label}] Server appears crashed (${err.code}), restarting llama server...`);
+          addLog(label, `Server appears crashed (${err.code}), restarting llama server`);
+          hasRestarted = true;
+          await restartLlamaServer();
+        } else {
+          await waitForServerReady({ label });
+        }
       } else {
         await new Promise(r => setTimeout(r, delay));
       }
