@@ -212,6 +212,62 @@ const ANALYTICS_FILE = join(ANALYTICS_DIR, 'analytics.jsonl');
 const MAX_ANALYTICS_HISTORY = 525600; // 1 year of minute-level data
 let analyticsHistory = [];
 
+// Crash event log — tracks which models were active when crashes occur
+const CRASH_LOG_FILE = join(ANALYTICS_DIR, 'crashes.jsonl');
+let crashHistory = [];
+
+function loadCrashHistory() {
+  try {
+    if (existsSync(CRASH_LOG_FILE)) {
+      const lines = readFileSync(CRASH_LOG_FILE, 'utf-8').split('\n').filter(l => l.trim());
+      for (const line of lines) {
+        try { crashHistory.push(JSON.parse(line)); } catch { /* skip */ }
+      }
+      console.log(`[analytics] Loaded ${crashHistory.length} crash events`);
+    }
+  } catch (err) {
+    console.error('[analytics] Failed to load crash history:', err.message);
+  }
+}
+
+function recordCrashEvent({ exitCode, trigger, model }) {
+  // Gather info about what was running at crash time
+  const activeReqs = Array.from(activeRequests.values()).map(r => ({
+    model: r.model, endpoint: r.endpoint, tokens: r.tokens,
+    duration: Date.now() - r.startTime
+  }));
+
+  const event = {
+    ts: Date.now(),
+    exitCode,
+    trigger, // 'exit_handler' or 'fetch_retry'
+    mode: currentMode,
+    preset: currentPreset || null,
+    model: model || null, // model that triggered the crash (from fetch context)
+    activeRequests: activeReqs,
+    activeModels: [...new Set(activeReqs.map(r => r.model))],
+    queueActive: llamaQueue.active,
+    queuePending: llamaQueue.pending
+  };
+
+  crashHistory.push(event);
+  try {
+    if (!existsSync(ANALYTICS_DIR)) mkdirSync(ANALYTICS_DIR, { recursive: true });
+    appendFileSync(CRASH_LOG_FILE, JSON.stringify(event) + '\n');
+  } catch (err) {
+    console.error('[analytics] Failed to write crash event:', err.message);
+  }
+
+  // Broadcast to dashboard
+  const message = JSON.stringify({ type: 'crashEvent', data: event });
+  for (const client of connectedClients) {
+    if (client.readyState === client.OPEN) client.send(message);
+  }
+
+  console.log(`[crash] Recorded crash event: trigger=${trigger}, models=${event.activeModels.join(',') || 'none'}, mode=${currentMode}`);
+  return event;
+}
+
 // Load existing analytics history on startup
 function loadAnalyticsHistory() {
   try {
@@ -237,6 +293,7 @@ function loadAnalyticsHistory() {
   }
 }
 loadAnalyticsHistory();
+loadCrashHistory();
 
 // Request stats accumulator (per-minute tallies)
 const requestStatsAccum = {
@@ -1873,6 +1930,7 @@ function attachLlamaExitHandler(proc) {
     if (!intentionalStop && !restartInProgress && code !== 0) {
       console.log(`[auto-restart] llama-server crashed (exit code ${code}), scheduling restart...`);
       addLog('system', `llama-server crashed (exit code ${code}), auto-restarting in 3s...`);
+      recordCrashEvent({ exitCode: code, trigger: 'exit_handler' });
       setTimeout(() => {
         if (!restartInProgress && !intentionalStop) {
           restartLlamaServer().catch(err => {
@@ -3020,6 +3078,36 @@ app.get('/api/analytics/history', (req, res) => {
   });
 });
 
+// Get crash event history
+app.get('/api/analytics/crashes', (req, res) => {
+  const range = req.query.range || '1w';
+  const now = Date.now();
+  const rangeMs = { '1h': 3600000, '1d': 86400000, '1w': 604800000, '1m': 2592000000, '1y': 31536000000 };
+  const cutoff = now - (rangeMs[range] || rangeMs['1w']);
+  const events = crashHistory.filter(e => e.ts > cutoff);
+
+  // Aggregate crashes by model
+  const byModel = {};
+  for (const e of events) {
+    const models = e.activeModels?.length ? e.activeModels : [e.model || e.preset || 'unknown'];
+    for (const m of models) {
+      byModel[m] = (byModel[m] || 0) + 1;
+    }
+  }
+
+  res.json({
+    events,
+    summary: {
+      total: events.length,
+      byModel,
+      byTrigger: {
+        exit_handler: events.filter(e => e.trigger === 'exit_handler').length,
+        fetch_retry: events.filter(e => e.trigger === 'fetch_retry').length
+      }
+    }
+  });
+});
+
 // OpenAI-compatible models endpoint - returns models from llama.cpp that can be loaded
 app.get('/api/v1/models', async (req, res) => {
   try {
@@ -3125,7 +3213,7 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
 // Retry fetch with backoff for transient connection failures (e.g. model switching in router mode)
 // Also retries on proxy connection errors (500) with server health polling
 // Returns { response, retries, retryErrors } so callers can log retry info
-async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy' } = {}) {
+async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model } = {}) {
   // Acquire queue slot — blocks if at concurrency limit
   const queueStart = Date.now();
   await llamaQueue.acquire();
@@ -3134,13 +3222,13 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
     console.log(`[${label}] Queued for ${queueWait}ms (active: ${llamaQueue.active}, pending: ${llamaQueue.pending})`);
   }
   try {
-  return await _fetchWithRetryInner(url, options, { retries, baseDelay, label });
+  return await _fetchWithRetryInner(url, options, { retries, baseDelay, label, model });
   } finally {
     llamaQueue.release();
   }
 }
 
-async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 1000, label = 'proxy' } = {}) {
+async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model } = {}) {
   const retryErrors = [];
   let hasRestarted = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -3166,6 +3254,7 @@ async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 100
             addLog(label, 'Multiple proxy errors detected, restarting llama server');
             hasRestarted = true;
             requestStatsAccum.restarts++;
+            recordCrashEvent({ exitCode: 500, trigger: 'fetch_retry', model });
             await restartLlamaServer();
           } else {
             await waitForServerReady({ label });
@@ -3202,6 +3291,7 @@ async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 100
           addLog(label, `Server appears crashed (${realCode || err.message}), restarting llama server`);
           hasRestarted = true;
           requestStatsAccum.restarts++;
+          recordCrashEvent({ exitCode: realCode || 'CONNFAIL', trigger: 'fetch_retry', model });
           await restartLlamaServer();
         } else {
           await waitForServerReady({ label });
@@ -3328,7 +3418,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
-    }, { label: 'chat/completions' });
+    }, { label: 'chat/completions', model: body.model });
     retryInfo = { retries: result.retries, retryErrors: result.retryErrors, restarted: result.restarted };
     req._retryInfo = retryInfo;
     return result.response;
@@ -3556,7 +3646,7 @@ app.post('/api/v1/completions', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body)
-    }, { label: 'completions' });
+    }, { label: 'completions', model: req.body.model });
     req._retryInfo = { retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted };
     const retryFields = { retries: fetchRetries, retryErrors: fetchRetryErrors, requestBody: req.body };
 
@@ -3743,7 +3833,7 @@ app.post('/api/v1/responses', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(proxyBody)
-    }, { label: 'responses' });
+    }, { label: 'responses', model: proxyBody.model });
     let response = result.response;
     totalRetries = result.retries;
     allRetryErrors = [...result.retryErrors];
@@ -3762,7 +3852,7 @@ app.post('/api/v1/responses', async (req, res) => {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(proxyBody)
-          }, { label: 'responses' });
+          }, { label: 'responses', model: proxyBody.model });
           response = result.response;
           totalRetries += result.retries;
           allRetryErrors.push(...result.retryErrors);
@@ -3921,7 +4011,7 @@ app.post('/api/v1/messages', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(proxyBody)
-    }, { label: 'messages' });
+    }, { label: 'messages', model: proxyBody.model });
     let response = result.response;
     totalRetries = result.retries;
     allRetryErrors = [...result.retryErrors];
@@ -3940,7 +4030,7 @@ app.post('/api/v1/messages', async (req, res) => {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(proxyBody)
-          }, { label: 'messages' });
+          }, { label: 'messages', model: proxyBody.model });
           response = result.response;
           totalRetries += result.retries;
           allRetryErrors.push(...result.retryErrors);

@@ -840,6 +840,7 @@ function Dashboard({ stats, activeRequest }) {
   const [analytics, setAnalytics] = useState(null);
   const [historyRange, setHistoryRange] = useState('1h');
   const [historyData, setHistoryData] = useState(null);
+  const [crashData, setCrashData] = useState(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const fullscreenTimerRef = useRef(null);
@@ -867,9 +868,12 @@ function Dashboard({ stats, activeRequest }) {
 
   const fetchHistory = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/analytics/history?range=${historyRange}`);
-      const data = await res.json();
-      setHistoryData(data);
+      const [histRes, crashRes] = await Promise.all([
+        fetch(`${API_BASE}/analytics/history?range=${historyRange}`),
+        fetch(`${API_BASE}/analytics/crashes?range=${historyRange}`)
+      ]);
+      setHistoryData(await histRes.json());
+      setCrashData(await crashRes.json());
     } catch (err) {
       console.error('Failed to fetch history:', err);
     }
@@ -998,6 +1002,13 @@ function Dashboard({ stats, activeRequest }) {
     ? Object.entries(historyData.summary.statusCodes)
         .filter(([code]) => parseInt(code) >= 400 || isNaN(parseInt(code)))
         .map(([code, count]) => ({ code, count }))
+        .sort((a, b) => b.count - a.count)
+    : [];
+
+  // Build crash-by-model bar chart data
+  const crashByModelData = crashData?.summary?.byModel
+    ? Object.entries(crashData.summary.byModel)
+        .map(([model, count]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, count, fullModel: model }))
         .sort((a, b) => b.count - a.count)
     : [];
 
@@ -1609,6 +1620,10 @@ function Dashboard({ stats, activeRequest }) {
               <div className="token-stat-label">Restarts</div>
             </div>
             <div className="token-stat-card">
+              <div className="token-stat-value" style={{ color: '#dc2626' }}>{(crashData?.summary?.total || 0).toLocaleString()}</div>
+              <div className="token-stat-label">Crashes</div>
+            </div>
+            <div className="token-stat-card">
               <div className="token-stat-value">{historyData.summary.avgTps}</div>
               <div className="token-stat-label">Avg tok/s</div>
             </div>
@@ -1834,6 +1849,37 @@ function Dashboard({ stats, activeRequest }) {
                   </BarChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No errors in this time range</div>}
+            </div>
+          </div>
+
+          {/* Crashes by Model */}
+          <div className="chart-card-wide">
+            <h4>Crashes by Model <span className="chart-value">{crashData?.summary?.total || 0} total</span></h4>
+            <div className="chart-container-wide">
+              {crashByModelData.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={crashByModelData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }} layout="vertical">
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <YAxis type="category" dataKey="model" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} width={180} />
+                    <Tooltip content={({ active, payload }) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0].payload;
+                      return (
+                        <div className="chart-tooltip">
+                          <div className="chart-tooltip-time">{d.fullModel}</div>
+                          <div className="chart-tooltip-row">
+                            <span className="chart-tooltip-dot" style={{ background: '#f97316' }} />
+                            <span className="chart-tooltip-label">Crashes:</span>
+                            <span className="chart-tooltip-value">{d.count}</span>
+                          </div>
+                        </div>
+                      );
+                    }} />
+                    <Bar dataKey="count" name="Crashes" fill="#f97316" radius={[0, 4, 4, 0]} animationDuration={500} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No crashes in this time range</div>}
             </div>
           </div>
         </div>
