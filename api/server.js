@@ -446,6 +446,63 @@ function broadcastLlmLog(entry) {
   }
 }
 
+// Active request tracking — broadcast to dashboard via WebSocket
+let activeRequests = new Map(); // id -> { id, model, endpoint, userMessage, responseText, startTime, status }
+let activeRequestIdCounter = 0;
+
+function broadcastActiveRequest(event, data) {
+  const message = JSON.stringify({ type: 'activeRequest', event, data });
+  for (const client of connectedClients) {
+    if (client.readyState === client.OPEN) {
+      client.send(message);
+    }
+  }
+}
+
+function startActiveRequest({ model, endpoint, messages, prompt }) {
+  const id = ++activeRequestIdCounter;
+  // Extract last user message for display
+  let userMessage = '';
+  if (messages && Array.isArray(messages)) {
+    const lastUser = [...messages].reverse().find(m => m.role === 'user');
+    userMessage = lastUser?.content || '';
+    if (typeof userMessage !== 'string') {
+      // Handle array content (e.g. vision messages)
+      userMessage = Array.isArray(userMessage)
+        ? userMessage.filter(c => c.type === 'text').map(c => c.text).join(' ')
+        : String(userMessage);
+    }
+  } else if (prompt) {
+    userMessage = typeof prompt === 'string' ? prompt : String(prompt);
+  }
+  const entry = { id, model, endpoint, userMessage, responseText: '', startTime: Date.now(), status: 'processing', tokens: 0 };
+  activeRequests.set(id, entry);
+  broadcastActiveRequest('start', entry);
+  return id;
+}
+
+function updateActiveRequest(id, text) {
+  const entry = activeRequests.get(id);
+  if (!entry) return;
+  entry.responseText += text;
+  entry.tokens++;
+  // Throttle updates: broadcast every 5 tokens to avoid flooding
+  if (entry.tokens % 5 === 0 || text.includes('\n')) {
+    broadcastActiveRequest('update', { id, responseText: entry.responseText, tokens: entry.tokens, duration: Date.now() - entry.startTime });
+  }
+}
+
+function endActiveRequest(id, { status = 'complete', tokens = 0, responseText } = {}) {
+  const entry = activeRequests.get(id);
+  if (!entry) return;
+  entry.status = status;
+  if (tokens) entry.tokens = tokens;
+  if (responseText !== undefined) entry.responseText = responseText;
+  entry.duration = Date.now() - entry.startTime;
+  broadcastActiveRequest('end', { id, status, tokens: entry.tokens, duration: entry.duration });
+  activeRequests.delete(id);
+}
+
 // Add analytics data point
 function addAnalyticsPoint(category, data) {
   const point = { timestamp: Date.now(), ...data };
@@ -3254,6 +3311,14 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectReasoningEffort(req.body);
 
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages });
+  // Ensure active request is cleaned up on any exit path
+  res.on('finish', () => {
+    if (activeRequests.has(activeReqId)) {
+      endActiveRequest(activeReqId, { status: res.statusCode >= 400 ? 'error' : 'complete' });
+    }
+  });
+
   let retryInfo = { retries: 0, retryErrors: [], restarted: false };
   function logLlm(entry) {
     addLlmLog({ ...entry, retries: retryInfo.retries, retryErrors: retryInfo.retryErrors, requestBody: entry.requestBody || req.body });
@@ -3378,6 +3443,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                     if (text) {
                       completionTokens++;
                       responseText += text;
+                      updateActiveRequest(activeReqId, text);
                     }
                   }
                   if (data.usage) {
@@ -3412,6 +3478,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             messages: req.body.messages || null, prompt: null,
             response: responseText, error: null
           });
+          endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
         } catch (e) {
           console.error('[proxy] Stream error:', e);
           const duration = Date.now() - startTime;
@@ -3422,6 +3489,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             messages: req.body.messages || null, prompt: null,
             response: responseText || null, error: `Stream error: ${e.message}`
           });
+          endActiveRequest(activeReqId, { status: 'error' });
           res.end();
         }
       };
@@ -3460,9 +3528,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10
       };
 
+      endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
       res.json(data);
     }
   } catch (error) {
+    endActiveRequest(activeReqId, { status: 'error' });
     if (error.retryErrors) retryInfo = { retries: error.retries, retryErrors: error.retryErrors };
     logLlm({
       endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,

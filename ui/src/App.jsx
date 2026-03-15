@@ -298,6 +298,7 @@ function useWebSocket() {
   const [logs, setLogs] = useState([]);
   const [requestLogs, setRequestLogs] = useState([]);
   const [llmLogs, setLlmLogs] = useState([]);
+  const [activeRequest, setActiveRequest] = useState(null);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
@@ -345,6 +346,22 @@ function useWebSocket() {
               const newLogs = [...prev, message.data];
               return newLogs.slice(-MAX_LLM_LOGS);
             });
+          } else if (message.type === 'activeRequest') {
+            const { event, data } = message;
+            if (event === 'start') {
+              setActiveRequest(data);
+            } else if (event === 'update') {
+              setActiveRequest(prev => prev && prev.id === data.id ? { ...prev, ...data } : prev);
+            } else if (event === 'end') {
+              setActiveRequest(prev => {
+                if (prev && prev.id === data.id) {
+                  // Mark as ended but keep briefly for UI transition
+                  setTimeout(() => setActiveRequest(cur => cur && cur.id === data.id && cur.status !== 'processing' ? null : cur), 2000);
+                  return { ...prev, ...data };
+                }
+                return prev;
+              });
+            }
           }
         } catch (e) {
           console.error('[ws] Parse error:', e);
@@ -378,7 +395,7 @@ function useWebSocket() {
   const clearRequestLogs = useCallback(() => setRequestLogs([]), []);
   const clearLlmLogs = useCallback(() => setLlmLogs([]), []);
 
-  return { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs };
+  return { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs, activeRequest };
 }
 
 // Sidebar Navigation
@@ -692,6 +709,74 @@ function TokensChart({ data, height = 140 }) {
   );
 }
 
+// Active Request Panel — shows current request being processed
+function ActiveRequestPanel({ request, isFullscreen }) {
+  const [expanded, setExpanded] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const responseRef = useRef(null);
+
+  // Auto-scroll response when streaming
+  useEffect(() => {
+    if (expanded && responseRef.current) {
+      responseRef.current.scrollTop = responseRef.current.scrollHeight;
+    }
+  }, [expanded, request?.responseText]);
+
+  // Auto-dismiss when request ends (unless pinned)
+  const isActive = request?.status === 'processing';
+
+  if (!request) return null;
+
+  const elapsed = request.duration || (Date.now() - request.startTime);
+  const userMsg = request.userMessage || '';
+  const truncated = userMsg.length > 120 ? userMsg.slice(0, 120) + '...' : userMsg;
+
+  return (
+    <div className={`active-request-panel ${isFullscreen ? 'fullscreen' : ''} ${expanded ? 'expanded' : ''} ${isActive ? 'active' : 'ended'}`}>
+      <div className="active-request-header" onClick={() => setExpanded(!expanded)}>
+        <div className="active-request-indicator">
+          {isActive ? <span className="active-dot pulse" /> : <span className="active-dot done" />}
+        </div>
+        <div className="active-request-info">
+          <span className="active-request-model">{request.model}</span>
+          <span className="active-request-prompt">{truncated || 'Processing...'}</span>
+        </div>
+        <div className="active-request-meta">
+          {request.tokens > 0 && <span className="active-request-tokens">{request.tokens} tok</span>}
+          <span className="active-request-time">{(elapsed / 1000).toFixed(1)}s</span>
+        </div>
+        {(expanded || pinned) && (
+          <button className="active-request-close" onClick={(e) => { e.stopPropagation(); setPinned(false); setExpanded(false); }}>
+            {'\u2715'}
+          </button>
+        )}
+      </div>
+      {expanded && (
+        <div className="active-request-body">
+          <div className="active-request-section">
+            <div className="active-request-label">Input</div>
+            <div className="active-request-content user-input">{userMsg}</div>
+          </div>
+          <div className="active-request-section">
+            <div className="active-request-label">
+              Response
+              {isActive && <span className="streaming-indicator">streaming...</span>}
+            </div>
+            <div className="active-request-content response-output" ref={responseRef}>
+              {request.responseText || (isActive ? 'Waiting for response...' : 'No response')}
+            </div>
+          </div>
+          {!pinned && (
+            <button className="active-request-pin" onClick={() => setPinned(true)}>
+              Pin open
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Format timestamp for historical charts based on range
 function formatHistoryTime(ts, range) {
   const date = new Date(ts);
@@ -749,7 +834,7 @@ function TimeRangeSelector({ value, onChange }) {
 }
 
 // Dashboard Page
-function Dashboard({ stats }) {
+function Dashboard({ stats, activeRequest }) {
   const [serverModels, setServerModels] = useState([]);
   const [loading, setLoading] = useState({});
   const [analytics, setAnalytics] = useState(null);
@@ -1121,6 +1206,7 @@ function Dashboard({ stats }) {
         <div className="fullscreen-indicator">
           {fullscreenPage + 1} / {FULLSCREEN_PAGES}
         </div>
+        <ActiveRequestPanel request={activeRequest} isFullscreen={true} />
       </div>
     );
   }
@@ -1752,6 +1838,7 @@ function Dashboard({ stats }) {
           </div>
         </div>
       </section>
+      <ActiveRequestPanel request={activeRequest} />
     </div>
   );
 }
@@ -5981,7 +6068,7 @@ function ChatPage({ stats }) {
 
 // Main App
 function App() {
-  const { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs } = useWebSocket();
+  const { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs, activeRequest } = useWebSocket();
 
   return (
     <BrowserRouter>
@@ -5995,7 +6082,7 @@ function App() {
           )}
           <StatsHeader stats={stats} />
           <Routes>
-            <Route path="/" element={<Dashboard stats={stats} />} />
+            <Route path="/" element={<Dashboard stats={stats} activeRequest={activeRequest} />} />
             <Route path="/chat" element={<ChatPage stats={stats} />} />
             <Route path="/presets" element={<PresetsPage stats={stats} />} />
             <Route path="/models" element={<ModelsPage stats={stats} />} />
