@@ -1030,9 +1030,18 @@ function Dashboard({ stats, activeRequest }) {
                   <span className="stat-label">Models</span>
                   {serverModels.length > 0 && (
                     <div className="loaded-models-list">
-                      {serverModels.map((m, i) => (
-                        <span key={i} className="loaded-model-name">{formatModelName(m)}</span>
-                      ))}
+                      {serverModels.map((m, i) => {
+                        const modelId = m.id || m.model || '';
+                        const isActive = stats?.activeModel && modelId === stats.activeModel;
+                        const isLastUsed = !isActive && stats?.lastUsedModel && modelId === stats.lastUsedModel;
+                        return (
+                          <span key={i} className={`loaded-model-name ${isActive ? 'model-active' : ''} ${isLastUsed ? 'model-last-used' : ''}`}>
+                            {isActive && <span className="model-indicator active-indicator" title="Currently processing" />}
+                            {isLastUsed && <span className="model-indicator last-used-indicator" title="Most recently used" />}
+                            {formatModelName(m)}
+                          </span>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -1255,8 +1264,9 @@ function Dashboard({ stats, activeRequest }) {
           <StatCard
             label="Mode"
             value={isSingleMode ? 'Single Model' : 'Router (Multi)'}
-            subValue={stats?.preset?.name || null}
+            subValue={stats?.activeModel ? formatModelName({ id: stats.activeModel }) : (stats?.preset?.name || (stats?.lastUsedModel ? formatModelName({ id: stats.lastUsedModel }) : null))}
             icon="&#x1F3AF;"
+            status={stats?.activeModel ? 'active' : undefined}
           />
           <div className="stat-card loaded-models-card">
             <span className="stat-icon">&#x1F4E6;</span>
@@ -1265,9 +1275,18 @@ function Dashboard({ stats, activeRequest }) {
               <span className="stat-label">Models</span>
               {serverModels.length > 0 ? (
                 <div className="loaded-models-list">
-                  {serverModels.map((m, i) => (
-                    <span key={i} className="loaded-model-name">{formatModelName(m)}</span>
-                  ))}
+                  {serverModels.map((m, i) => {
+                    const modelId = m.id || m.model || '';
+                    const isActive = stats?.activeModel && modelId === stats.activeModel;
+                    const isLastUsed = !isActive && stats?.lastUsedModel && modelId === stats.lastUsedModel;
+                    return (
+                      <span key={i} className={`loaded-model-name ${isActive ? 'model-active' : ''} ${isLastUsed ? 'model-last-used' : ''}`}>
+                        {isActive && <span className="model-indicator active-indicator" title="Currently processing" />}
+                        {isLastUsed && <span className="model-indicator last-used-indicator" title="Most recently used" />}
+                        {formatModelName(m)}
+                      </span>
+                    );
+                  })}
                 </div>
               ) : (
                 <span className="loaded-model-none">No models loaded</span>

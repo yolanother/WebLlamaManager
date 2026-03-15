@@ -153,6 +153,8 @@ let llamaProcess = null;
 let downloadProcesses = new Map();
 let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
+let lastUsedModel = null;   // most recently used model name
+let lastUsedModelTime = 0;  // timestamp of last use
 
 // Request concurrency limiter for llama.cpp upstream requests
 class RequestQueue {
@@ -556,6 +558,11 @@ function endActiveRequest(id, { status = 'complete', tokens = 0, responseText } 
   if (tokens) entry.tokens = tokens;
   if (responseText !== undefined) entry.responseText = responseText;
   entry.duration = Date.now() - entry.startTime;
+  // Track last used model
+  if (entry.model && status === 'complete') {
+    lastUsedModel = entry.model;
+    lastUsedModelTime = Date.now();
+  }
   broadcastActiveRequest('end', { id, status, tokens: entry.tokens, duration: entry.duration });
   activeRequests.delete(id);
 }
@@ -809,6 +816,9 @@ async function getSystemStats() {
       concurrency: llamaQueue.concurrency,
       totalQueued: llamaQueue.queuedCount
     },
+    activeModel: activeRequests.size > 0 ? [...activeRequests.values()][0]?.model : null,
+    lastUsedModel,
+    lastUsedModelTime,
     llamaPort: LLAMA_PORT,
     llamaUiUrl: LLAMA_UI_URL,
     mode: currentMode,
@@ -1526,7 +1536,9 @@ app.get('/api/models', async (req, res) => {
     res.json({
       serverModels,
       localModels,
-      modelsDir: MODELS_DIR
+      modelsDir: MODELS_DIR,
+      lastUsedModel,
+      lastUsedModelTime
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

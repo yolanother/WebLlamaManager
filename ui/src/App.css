@@ -4838,6 +4838,35 @@ input::placeholder {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 200px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.loaded-model-name.model-active {
+  color: #06b6d4;
+  font-weight: 600;
+}
+
+.loaded-model-name.model-last-used {
+  color: #a78bfa;
+}
+
+.model-indicator {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.active-indicator {
+  background: #06b6d4;
+  animation: dotPulse 1.5s ease-in-out infinite;
+}
+
+.last-used-indicator {
+  background: #a78bfa;
 }
 
 .loaded-model-none {
