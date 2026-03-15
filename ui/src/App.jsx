@@ -2903,31 +2903,61 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                 <tbody>
                   {filteredRequestLogs.map((log, i) => {
                     const hasError = log.error && log.status >= 400;
+                    const hasRetries = log.retries > 0;
+                    const isExpandable = hasError || hasRetries;
                     const isExpanded = expandedRequestLogs.has(log.id);
                     return (
                       <React.Fragment key={log.id || i}>
                         <tr
-                          className={`${getStatusClass(log.status)} ${hasError ? 'clickable' : ''}`}
-                          onClick={() => hasError && setExpandedRequestLogs(prev => {
+                          className={`${getStatusClass(log.status)} ${isExpandable ? 'clickable' : ''} ${hasRetries && !hasError ? 'has-retries' : ''}`}
+                          onClick={() => isExpandable && setExpandedRequestLogs(prev => {
                             const next = new Set(prev);
                             if (next.has(log.id)) next.delete(log.id); else next.add(log.id);
                             return next;
                           })}
                         >
                           <td className="log-time">
-                            {hasError && <span className="request-expand">{isExpanded ? '\u25BC' : '\u25B6'}</span>}
+                            {isExpandable && <span className="request-expand">{isExpanded ? '\u25BC' : '\u25B6'}</span>}
                             {formatTime(log.timestamp)}
                           </td>
                           <td className="request-method">{log.method}</td>
                           <td className="request-path" title={log.path}>{log.path}</td>
-                          <td className={`request-status ${getStatusClass(log.status)}`}>{log.status}</td>
+                          <td className={`request-status ${getStatusClass(log.status)}`}>
+                            {log.status}
+                            {hasRetries && (
+                              <span className="retry-badge" title={`${log.retries} ${log.retries === 1 ? 'retry' : 'retries'}${log.restarted ? ' + restart' : ''}`}>
+                                {log.retries}R{log.restarted ? '+S' : ''}
+                              </span>
+                            )}
+                          </td>
                           <td className="request-duration">{log.duration}ms</td>
                           <td className="request-model">{log.model || '-'}</td>
                         </tr>
                         {isExpanded && (
                           <tr className="request-error-row">
                             <td colSpan="6">
-                              <div className="request-error-content">{log.error}</div>
+                              {hasRetries && (
+                                <div className="request-retry-details">
+                                  <div className="retry-summary">
+                                    <strong>{log.retries} {log.retries === 1 ? 'retry' : 'retries'}</strong>
+                                    {log.restarted && <span className="restart-badge">server restarted</span>}
+                                    <span className="retry-outcome">{'\u2192'} final status: {log.status}</span>
+                                  </div>
+                                  {log.retryErrors && log.retryErrors.length > 0 && (
+                                    <div className="retry-errors-list">
+                                      {log.retryErrors.map((err, j) => (
+                                        <div key={j} className="retry-error-item">
+                                          <span className="retry-attempt">attempt {j + 1}</span>
+                                          <span className="retry-error-msg">{err}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              {hasError && (
+                                <div className="request-error-content">{log.error}</div>
+                              )}
                             </td>
                           </tr>
                         )}

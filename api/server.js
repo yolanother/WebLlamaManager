@@ -104,7 +104,10 @@ app.use((req, res, next) => {
       userAgent: req.headers['user-agent'] || '',
       model: req.body?.model || null,
       stream: req.body?.stream || false,
-      error: errorMessage
+      error: errorMessage,
+      retries: req._retryInfo?.retries || 0,
+      retryErrors: req._retryInfo?.retryErrors || [],
+      restarted: req._retryInfo?.restarted || false
     };
 
     // Track request stats for analytics
@@ -1548,6 +1551,7 @@ app.delete('/api/presets/:presetId', (req, res) => {
 // Helper to stop llama server
 async function stopLlamaServer() {
   console.log('[stop] Stopping llama server...');
+  intentionalStop = true;
 
   // First, kill the Node.js spawned process if any
   if (llamaProcess && !llamaProcess.killed) {
@@ -1702,13 +1706,8 @@ async function restartLlamaServer() {
     llamaProcess.stderr.on('data', (data) => {
       addLog('llama', data);
     });
-    llamaProcess.on('exit', (code) => {
-      addLog('system', `llama-server exited with code ${code}`);
-      if (code !== 0 && currentMode === 'single') {
-        currentMode = 'router';
-        currentPreset = null;
-      }
-    });
+    attachLlamaExitHandler(llamaProcess);
+    intentionalStop = false;
 
     // Wait for server to become healthy
     const ready = await waitForServerReady({ maxWait: 60000, label: 'restart' });
@@ -1722,6 +1721,31 @@ async function restartLlamaServer() {
   } finally {
     restartInProgress = false;
   }
+}
+
+// Auto-restart llama server on unexpected exit
+let intentionalStop = false; // Set true during stopLlamaServer to suppress auto-restart
+function attachLlamaExitHandler(proc) {
+  proc.on('exit', (code) => {
+    addLog('system', `llama-server exited with code ${code}`);
+    if (code !== 0 && currentMode === 'single') {
+      currentMode = 'router';
+      currentPreset = null;
+    }
+    // Auto-restart if the exit was unexpected (not during intentional stop/restart)
+    if (!intentionalStop && !restartInProgress && code !== 0) {
+      console.log(`[auto-restart] llama-server crashed (exit code ${code}), scheduling restart...`);
+      addLog('system', `llama-server crashed (exit code ${code}), auto-restarting in 3s...`);
+      setTimeout(() => {
+        if (!restartInProgress && !intentionalStop) {
+          restartLlamaServer().catch(err => {
+            console.error('[auto-restart] Failed to restart:', err.message);
+            addLog('system', `Auto-restart failed: ${err.message}`);
+          });
+        }
+      }, 3000);
+    }
+  });
 }
 
 // Start llama server in router mode (multi-model)
@@ -1759,9 +1783,8 @@ app.post('/api/server/start', async (req, res) => {
       addLog('llama', data);
     });
 
-    llamaProcess.on('exit', (code) => {
-      addLog('system', `llama-server exited with code ${code}`);
-    });
+    attachLlamaExitHandler(llamaProcess);
+    intentionalStop = false;
 
     res.json({ success: true, mode: 'router', pid: llamaProcess.pid });
   } catch (error) {
@@ -1824,13 +1847,8 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
       addLog('llama', data);
     });
 
-    llamaProcess.on('exit', (code) => {
-      addLog('system', `llama-server exited with code ${code}`);
-      if (code !== 0) {
-        currentMode = 'router';
-        currentPreset = null;
-      }
-    });
+    attachLlamaExitHandler(llamaProcess);
+    intentionalStop = false;
 
     res.json({
       success: true,
@@ -2998,29 +3016,33 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
           continue;
         }
         // Not a proxy error — return the original unconsumed response
-        return { response, retries: attempt, retryErrors };
+        return { response, retries: attempt, retryErrors, restarted: hasRestarted };
       }
 
-      return { response, retries: attempt, retryErrors };
+      return { response, retries: attempt, retryErrors, restarted: hasRestarted };
     } catch (err) {
       retryErrors.push(err.message);
       requestStatsAccum.retries++;
-      // Track connection errors in status codes (use 0 for connection-level failures)
-      const errCode = (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') ? err.code : '500';
-      requestStatsAccum.statusCodes[errCode] = (requestStatsAccum.statusCodes[errCode] || 0) + 1;
+      // Node's fetch wraps errors: err.code may be undefined, real code is in err.cause.code
+      const realCode = err.code || err.cause?.code || '';
+      const isConnectionError = realCode === 'ECONNREFUSED' || realCode === 'ECONNRESET' ||
+        err.message === 'fetch failed' || err.message?.includes('ECONNREFUSED') || err.message?.includes('ECONNRESET');
+      // Track connection errors in status codes
+      const errCodeLabel = isConnectionError ? (realCode || 'CONNFAIL') : '500';
+      requestStatsAccum.statusCodes[errCodeLabel] = (requestStatsAccum.statusCodes[errCodeLabel] || 0) + 1;
       if (attempt === retries) {
         err.retries = attempt;
         err.retryErrors = retryErrors;
         throw err;
       }
       const delay = baseDelay * Math.pow(2, attempt);
-      console.log(`[${label}] Connection failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms: ${err.message}`);
-      // If connection refused/reset, server may have crashed
-      if (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') {
+      console.log(`[${label}] Connection failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms: ${err.message} (code: ${realCode || 'none'})`);
+      // If connection failed, server may have crashed
+      if (isConnectionError) {
         // After 2 consecutive connection failures, restart the server
         if (attempt >= 1 && !hasRestarted) {
-          console.log(`[${label}] Server appears crashed (${err.code}), restarting llama server...`);
-          addLog(label, `Server appears crashed (${err.code}), restarting llama server`);
+          console.log(`[${label}] Server appears crashed (${realCode || err.message}), restarting llama server...`);
+          addLog(label, `Server appears crashed (${realCode || err.message}), restarting llama server`);
           hasRestarted = true;
           requestStatsAccum.restarts++;
           await restartLlamaServer();
@@ -3132,7 +3154,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectReasoningEffort(req.body);
 
-  let retryInfo = { retries: 0, retryErrors: [] };
+  let retryInfo = { retries: 0, retryErrors: [], restarted: false };
   function logLlm(entry) {
     addLlmLog({ ...entry, retries: retryInfo.retries, retryErrors: retryInfo.retryErrors, requestBody: entry.requestBody || req.body });
   }
@@ -3142,7 +3164,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     }, { label: 'chat/completions' });
-    retryInfo = { retries: result.retries, retryErrors: result.retryErrors };
+    retryInfo = { retries: result.retries, retryErrors: result.retryErrors, restarted: result.restarted };
+    req._retryInfo = retryInfo;
     return result.response;
   }
 
@@ -3359,11 +3382,12 @@ app.post('/api/v1/completions', async (req, res) => {
   const isStreaming = req.body.stream === true;
 
   try {
-    const { response, retries: fetchRetries, retryErrors: fetchRetryErrors } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
+    const { response, retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body)
     }, { label: 'completions' });
+    req._retryInfo = { retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted };
     const retryFields = { retries: fetchRetries, retryErrors: fetchRetryErrors, requestBody: req.body };
 
     if (!response.ok) {
@@ -3543,6 +3567,7 @@ app.post('/api/v1/responses', async (req, res) => {
 
   let totalRetries = 0;
   let allRetryErrors = [];
+  let anyRestarted = false;
   try {
     let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
       method: 'POST',
@@ -3552,6 +3577,8 @@ app.post('/api/v1/responses', async (req, res) => {
     let response = result.response;
     totalRetries = result.retries;
     allRetryErrors = [...result.retryErrors];
+    anyRestarted = anyRestarted || result.restarted;
+    req._retryInfo = { retries: totalRetries, retryErrors: allRetryErrors, restarted: anyRestarted };
     const retryFields = () => ({ retries: totalRetries, retryErrors: allRetryErrors, requestBody: req.body });
 
     // If model failed to load, unload others and retry
@@ -3569,6 +3596,8 @@ app.post('/api/v1/responses', async (req, res) => {
           response = result.response;
           totalRetries += result.retries;
           allRetryErrors.push(...result.retryErrors);
+          anyRestarted = anyRestarted || result.restarted;
+          req._retryInfo = { retries: totalRetries, retryErrors: allRetryErrors, restarted: anyRestarted };
         }
       }
       if (!response.ok) {
@@ -3716,6 +3745,7 @@ app.post('/api/v1/messages', async (req, res) => {
 
   let totalRetries = 0;
   let allRetryErrors = [];
+  let anyRestarted = false;
   try {
     let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
       method: 'POST',
@@ -3725,6 +3755,8 @@ app.post('/api/v1/messages', async (req, res) => {
     let response = result.response;
     totalRetries = result.retries;
     allRetryErrors = [...result.retryErrors];
+    anyRestarted = anyRestarted || result.restarted;
+    req._retryInfo = { retries: totalRetries, retryErrors: allRetryErrors, restarted: anyRestarted };
     const retryFields = () => ({ retries: totalRetries, retryErrors: allRetryErrors, requestBody: req.body });
 
     // If model failed to load, unload others and retry
@@ -3742,6 +3774,8 @@ app.post('/api/v1/messages', async (req, res) => {
           response = result.response;
           totalRetries += result.retries;
           allRetryErrors.push(...result.retryErrors);
+          anyRestarted = anyRestarted || result.restarted;
+          req._retryInfo = { retries: totalRetries, retryErrors: allRetryErrors, restarted: anyRestarted };
         }
       }
       if (!response.ok) {

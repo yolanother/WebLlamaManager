@@ -1942,6 +1942,82 @@ input::placeholder {
   overflow-y: auto;
 }
 
+.has-retries {
+  border-left: 3px solid #f59e0b !important;
+}
+
+.retry-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+
+.request-retry-details {
+  background: rgba(245, 158, 11, 0.06);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.retry-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: #f59e0b;
+}
+
+.retry-outcome {
+  color: var(--text-secondary);
+}
+
+.restart-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(249, 115, 22, 0.2);
+  color: #f97316;
+  border-radius: 4px;
+}
+
+.retry-errors-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.retry-error-item {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 8px;
+  background: rgba(239, 68, 68, 0.05);
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 11px;
+}
+
+.retry-attempt {
+  color: var(--text-secondary);
+  font-size: 10px;
+  white-space: nowrap;
+  min-width: 60px;
+}
+
+.retry-error-msg {
+  color: var(--error);
+  word-break: break-word;
+}
+
 /* LLM Conversation Log */
 .llm-logs-container {
   padding: 12px;
