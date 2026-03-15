@@ -197,6 +197,8 @@ const requestStatsAccum = {
   total: 0,
   ok: 0,
   err: 0,
+  retries: 0,
+  restarts: 0,
   statusCodes: {},
   totalPromptTokens: 0,
   totalCompletionTokens: 0
@@ -229,6 +231,8 @@ function flushAnalyticsMinute() {
     rT: requestStatsAccum.total,
     rOk: requestStatsAccum.ok,
     rErr: requestStatsAccum.err,
+    rRt: requestStatsAccum.retries,
+    rRs: requestStatsAccum.restarts,
     sc: { ...requestStatsAccum.statusCodes },
     tp: requestStatsAccum.totalPromptTokens,
     tcc: requestStatsAccum.totalCompletionTokens
@@ -254,6 +258,8 @@ function flushAnalyticsMinute() {
   requestStatsAccum.total = 0;
   requestStatsAccum.ok = 0;
   requestStatsAccum.err = 0;
+  requestStatsAccum.retries = 0;
+  requestStatsAccum.restarts = 0;
   requestStatsAccum.statusCodes = {};
   requestStatsAccum.totalPromptTokens = 0;
   requestStatsAccum.totalCompletionTokens = 0;
@@ -2799,6 +2805,8 @@ app.get('/api/analytics/history', (req, res) => {
         rT: sum('rT'),
         rOk: sum('rOk'),
         rErr: sum('rErr'),
+        rRt: sum('rRt'),
+        rRs: sum('rRs'),
         sc: mergedSc,
         tp: sum('tp'),
         tcc: sum('tcc')
@@ -2810,6 +2818,8 @@ app.get('/api/analytics/history', (req, res) => {
   // Compute summary
   const totalRequests = points.reduce((s, p) => s + (p.rT || 0), 0);
   const totalErrors = points.reduce((s, p) => s + (p.rErr || 0), 0);
+  const totalRetries = points.reduce((s, p) => s + (p.rRt || 0), 0);
+  const totalRestarts = points.reduce((s, p) => s + (p.rRs || 0), 0);
   const tpsPoints = points.filter(p => p.tps > 0);
   const avgTps = tpsPoints.length > 0 ? tpsPoints.reduce((s, p) => s + p.tps, 0) / tpsPoints.length : 0;
   const allStatusCodes = {};
@@ -2824,6 +2834,8 @@ app.get('/api/analytics/history', (req, res) => {
     summary: {
       totalRequests,
       totalErrors,
+      totalRetries,
+      totalRestarts,
       avgTps: Math.round(avgTps * 10) / 10,
       statusCodes: allStatusCodes
     }
@@ -2952,11 +2964,13 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
           console.log(`[${label}] Proxy connection error (attempt ${attempt + 1}/${retries + 1}): ${msg}`);
           addLog(label, `Proxy connection error, waiting for server to recover (attempt ${attempt + 1}/${retries + 1})`);
           retryErrors.push(msg);
+          requestStatsAccum.retries++;
           // After 2 consecutive proxy errors, restart the server
           if (attempt >= 1 && !hasRestarted) {
             console.log(`[${label}] Multiple proxy errors, restarting llama server...`);
             addLog(label, 'Multiple proxy errors detected, restarting llama server');
             hasRestarted = true;
+            requestStatsAccum.restarts++;
             await restartLlamaServer();
           } else {
             await waitForServerReady({ label });
@@ -2970,6 +2984,7 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
       return { response, retries: attempt, retryErrors };
     } catch (err) {
       retryErrors.push(err.message);
+      requestStatsAccum.retries++;
       if (attempt === retries) {
         err.retries = attempt;
         err.retryErrors = retryErrors;
@@ -2984,6 +2999,7 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
           console.log(`[${label}] Server appears crashed (${err.code}), restarting llama server...`);
           addLog(label, `Server appears crashed (${err.code}), restarting llama server`);
           hasRestarted = true;
+          requestStatsAccum.restarts++;
           await restartLlamaServer();
         } else {
           await waitForServerReady({ label });

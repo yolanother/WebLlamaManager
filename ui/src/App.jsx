@@ -522,7 +522,9 @@ const CHART_COLORS = {
   memorySecondary: '#8b5cf6',
   tokens: '#3b82f6',
   requestOk: '#22c55e',
-  requestErr: '#ef4444'
+  requestErr: '#ef4444',
+  requestRetry: '#f59e0b',
+  requestRestart: '#f97316'
 };
 
 // Custom tooltip for charts
@@ -1005,6 +1007,18 @@ function Dashboard({ stats }) {
                 </div>
                 <div className="resource-card">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: '#f59e0b' }}>{(historyData.summary.totalRetries || 0).toLocaleString()}</span>
+                    <span className="resource-detail">Retries</span>
+                  </div>
+                </div>
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: '#f97316' }}>{(historyData.summary.totalRestarts || 0).toLocaleString()}</span>
+                    <span className="resource-detail">Restarts</span>
+                  </div>
+                </div>
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
                     <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.avgTps}</span>
                     <span className="resource-detail">Avg tok/s</span>
                   </div>
@@ -1077,6 +1091,8 @@ function Dashboard({ stats }) {
                       <Tooltip content={<HistoryTooltip range={historyRange} />} />
                       <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
                       <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                      <Area type="monotone" dataKey="rRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="rRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No historical data yet</div>}
@@ -1414,6 +1430,14 @@ function Dashboard({ stats }) {
               <div className="token-stat-label">Total Errors</div>
             </div>
             <div className="token-stat-card">
+              <div className="token-stat-value" style={{ color: '#f59e0b' }}>{(historyData.summary.totalRetries || 0).toLocaleString()}</div>
+              <div className="token-stat-label">Retries</div>
+            </div>
+            <div className="token-stat-card">
+              <div className="token-stat-value" style={{ color: '#f97316' }}>{(historyData.summary.totalRestarts || 0).toLocaleString()}</div>
+              <div className="token-stat-label">Restarts</div>
+            </div>
+            <div className="token-stat-card">
               <div className="token-stat-value">{historyData.summary.avgTps}</div>
               <div className="token-stat-label">Avg tok/s</div>
             </div>
@@ -1515,6 +1539,8 @@ function Dashboard({ stats }) {
                     <Tooltip content={<HistoryTooltip range={historyRange} />} />
                     <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
                     <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    <Area type="monotone" dataKey="rRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="rRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet</div>}
@@ -1522,6 +1548,8 @@ function Dashboard({ stats }) {
             <div className="chart-legend">
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestOk }}></span>Success</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestErr }}></span>Errors</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRetry }}></span>Retries</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRestart }}></span>Restarts</div>
             </div>
           </div>
 
