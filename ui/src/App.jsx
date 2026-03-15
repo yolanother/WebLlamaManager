@@ -526,7 +526,9 @@ const CHART_COLORS = {
   requestRetry: '#f59e0b',
   requestRestart: '#f97316',
   contextUsed: '#a78bfa',
-  contextTotal: '#4c1d95'
+  contextTotal: '#4c1d95',
+  queueActive: '#06b6d4',
+  queuePending: '#f59e0b'
 };
 
 // Custom tooltip for charts
@@ -1458,6 +1460,40 @@ function Dashboard({ stats }) {
               ) : <div className="chart-empty">No context data yet</div>}
             </div>
           </div>
+
+          {/* Request Queue Chart */}
+          <div className="chart-card">
+            <h4>
+              Request Queue
+              <span className="chart-value">
+                {stats?.queue?.active || 0} active, {stats?.queue?.pending || 0} pending
+              </span>
+            </h4>
+            <div className="chart-container">
+              {(analytics?.queue || []).length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={analytics.queue} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <defs>
+                      <linearGradient id="gradQActive" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.queueActive} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={CHART_COLORS.queueActive} stopOpacity={0} />
+                      </linearGradient>
+                      <linearGradient id="gradQPending" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.queuePending} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={CHART_COLORS.queuePending} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="timestamp" hide />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Area type="monotone" dataKey="active" name="Active" stroke={CHART_COLORS.queueActive} fill="url(#gradQActive)" strokeWidth={2} dot={false} />
+                    <Area type="monotone" dataKey="pending" name="Pending" stroke={CHART_COLORS.queuePending} fill="url(#gradQPending)" strokeWidth={2} dot={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No queue data yet</div>}
+            </div>
+          </div>
         </div>
       </section>
 
@@ -1605,6 +1641,41 @@ function Dashboard({ stats }) {
             <div className="chart-legend">
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.contextUsed }}></span>Used</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.contextTotal }}></span>Total</div>
+            </div>
+          </div>
+
+          {/* Request Queue History */}
+          <div className="chart-card-wide">
+            <h4>Request Queue <span className="chart-value">active &amp; pending</span></h4>
+            <div className="chart-container-wide">
+              {historyPoints.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <defs>
+                      <linearGradient id="gradHistQA" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.queueActive} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={CHART_COLORS.queueActive} stopOpacity={0} />
+                      </linearGradient>
+                      <linearGradient id="gradHistQP" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.queuePending} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={CHART_COLORS.queuePending} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <Tooltip content={<HistoryTooltip range={historyRange} />} />
+                    <Area type="monotone" dataKey="qA" name="Avg Active" stroke={CHART_COLORS.queueActive} fill="url(#gradHistQA)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="qP" name="Avg Pending" stroke={CHART_COLORS.queuePending} fill="url(#gradHistQP)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Line type="monotone" dataKey="qMx" name="Peak Active" stroke={CHART_COLORS.queueActive} strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
+                    <Line type="monotone" dataKey="qMxP" name="Peak Pending" stroke={CHART_COLORS.queuePending} strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No historical data yet</div>}
+            </div>
+            <div className="chart-legend">
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.queueActive }}></span>Active</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.queuePending }}></span>Pending</div>
             </div>
           </div>
 

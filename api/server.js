@@ -202,7 +202,8 @@ const analyticsData = {
   power: [],         // { timestamp, watts }
   memory: [],        // { timestamp, vram, gtt, system }
   tokens: [],        // { timestamp, promptTokens, completionTokens, tokensPerSecond, model }
-  context: []        // { timestamp, usedContext, totalContext, usage }
+  context: [],       // { timestamp, usedContext, totalContext, usage }
+  queue: []          // { timestamp, active, pending, concurrency }
 };
 
 // Persistent analytics storage (minute-level aggregates in JSONL file)
@@ -260,6 +261,7 @@ function flushAnalyticsMinute() {
   const memPoints = analyticsData.memory.filter(p => p.timestamp > cutoff);
   const tokenPoints = analyticsData.tokens.filter(p => p.timestamp > cutoff);
   const ctxPoints = analyticsData.context.filter(p => p.timestamp > cutoff);
+  const queuePoints = analyticsData.queue.filter(p => p.timestamp > cutoff);
 
   const avg = (arr, key) => arr.length > 0 ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
   const max = (arr, key) => arr.length > 0 ? Math.max(...arr.map(p => p[key] || 0)) : 0;
@@ -274,6 +276,10 @@ function flushAnalyticsMinute() {
     tc: Math.round(avg(tempPoints, 'cpu') * 10) / 10,
     tps: Math.round(avg(tokenPoints, 'tokensPerSecond') * 10) / 10,
     tpsMax: Math.round(max(tokenPoints, 'tokensPerSecond') * 10) / 10,
+    qA: Math.round(avg(queuePoints, 'active') * 10) / 10,
+    qP: Math.round(avg(queuePoints, 'pending') * 10) / 10,
+    qMx: Math.round(max(queuePoints, 'active')),
+    qMxP: Math.round(max(queuePoints, 'pending')),
     cxU: Math.round(avg(ctxPoints, 'usedContext')),
     cxT: Math.round(avg(ctxPoints, 'totalContext')),
     cxP: Math.round(avg(ctxPoints, 'usage') * 10) / 10,
@@ -683,6 +689,12 @@ async function getSystemStats() {
     gpu: gpuStats,
     llama: llamaStats,
     context: contextStats,
+    queue: {
+      active: llamaQueue.active,
+      pending: llamaQueue.pending,
+      concurrency: llamaQueue.concurrency,
+      totalQueued: llamaQueue.queuedCount
+    },
     llamaPort: LLAMA_PORT,
     llamaUiUrl: LLAMA_UI_URL,
     mode: currentMode,
@@ -1001,6 +1013,13 @@ async function broadcastStats() {
         usage: stats.context.usage || 0
       });
     }
+
+    // Record queue stats
+    addAnalyticsPoint('queue', {
+      active: llamaQueue.active,
+      pending: llamaQueue.pending,
+      concurrency: llamaQueue.concurrency
+    });
 
     // Add a zero-value token point if no recent token data exists,
     // so the chart shows a continuous timeline instead of "Collecting data..."
@@ -2826,6 +2845,7 @@ app.get('/api/analytics', (req, res) => {
     memory: analyticsData.memory.filter(p => p.timestamp > cutoff),
     tokens: analyticsData.tokens.filter(p => p.timestamp > cutoff),
     context: analyticsData.context.filter(p => p.timestamp > cutoff),
+    queue: analyticsData.queue.filter(p => p.timestamp > cutoff),
     tokenStats: {
       totalPromptTokens: tokenStats.totalPromptTokens,
       totalCompletionTokens: tokenStats.totalCompletionTokens,
@@ -2901,6 +2921,10 @@ app.get('/api/analytics/history', (req, res) => {
         rErr: sum('rErr'),
         rRt: sum('rRt'),
         rRs: sum('rRs'),
+        qA: Math.round(avg('qA') * 10) / 10,
+        qP: Math.round(avg('qP') * 10) / 10,
+        qMx: Math.round(maxVal('qMx')),
+        qMxP: Math.round(maxVal('qMxP')),
         cxU: Math.round(avg('cxU')),
         cxT: Math.round(avg('cxT')),
         cxP: Math.round(avg('cxP') * 10) / 10,
