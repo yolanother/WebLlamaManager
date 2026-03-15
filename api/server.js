@@ -154,6 +154,47 @@ let downloadProcesses = new Map();
 let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
 
+// Request concurrency limiter for llama.cpp upstream requests
+class RequestQueue {
+  constructor(concurrency = 1) {
+    this.concurrency = concurrency;
+    this.running = 0;
+    this.queue = [];
+    this.queuedCount = 0; // total requests that had to wait
+  }
+
+  setConcurrency(n) {
+    this.concurrency = Math.max(1, n);
+    this._drain();
+  }
+
+  async acquire() {
+    if (this.running < this.concurrency) {
+      this.running++;
+      return;
+    }
+    this.queuedCount++;
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+
+  release() {
+    this.running--;
+    this._drain();
+  }
+
+  _drain() {
+    while (this.queue.length > 0 && this.running < this.concurrency) {
+      this.running++;
+      this.queue.shift()();
+    }
+  }
+
+  get pending() { return this.queue.length; }
+  get active() { return this.running; }
+}
+
+const llamaQueue = new RequestQueue(1); // default: 1 concurrent request
+
 // Analytics data storage (circular buffers for time-series data)
 const MAX_ANALYTICS_POINTS = 300; // 5 minutes at 1 second intervals
 const analyticsData = {
@@ -507,7 +548,8 @@ function loadConfig() {
       modelsMax: parseInt(process.env.MODELS_MAX) || 2,
       contextSize: parseInt(process.env.CONTEXT_SIZE) || 8192,
       logFilters: [],
-      requestLogging: false
+      requestLogging: false,
+      maxConcurrentRequests: 1
     };
   }
 
@@ -550,6 +592,11 @@ function saveConfig(config) {
 }
 
 let config = loadConfig();
+
+// Apply configured concurrency limit
+if (config.maxConcurrentRequests) {
+  llamaQueue.setConcurrency(config.maxConcurrentRequests);
+}
 
 // WebSocket stats broadcasting
 const STATS_INTERVAL = parseInt(process.env.STATS_INTERVAL) || 1000; // Default 1 second
@@ -1128,6 +1175,7 @@ app.get('/api/settings', (req, res) => {
       flashAttn: config.flashAttn || false,
       gpuLayers: config.gpuLayers || 99,
       requestLogging: config.requestLogging || false,
+      maxConcurrentRequests: config.maxConcurrentRequests || 1,
       defaultReasoningEffort: config.defaultReasoningEffort || null,
       modelReasoningEffort: config.modelReasoningEffort || {},
       fullscreenInterval: config.fullscreenInterval || 30000
@@ -1142,7 +1190,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, defaultReasoningEffort, modelReasoningEffort, fullscreenInterval } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, defaultReasoningEffort, modelReasoningEffort, fullscreenInterval } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -1186,6 +1234,16 @@ app.post('/api/settings', (req, res) => {
 
   if (requestLogging !== undefined) {
     config.requestLogging = Boolean(requestLogging);
+  }
+
+  if (maxConcurrentRequests !== undefined) {
+    const n = parseInt(maxConcurrentRequests);
+    if (n >= 1 && n <= 32) {
+      config.maxConcurrentRequests = n;
+      llamaQueue.setConcurrency(n);
+    } else {
+      return res.status(400).json({ error: 'Max concurrent requests must be between 1 and 32' });
+    }
   }
 
   if (defaultReasoningEffort !== undefined) {
@@ -1245,7 +1303,13 @@ app.get('/api/status', async (req, res) => {
           id,
           { progress: info.progress, status: info.status, error: info.error }
         ])
-      )
+      ),
+      queue: {
+        concurrency: llamaQueue.concurrency,
+        active: llamaQueue.active,
+        pending: llamaQueue.pending,
+        totalQueued: llamaQueue.queuedCount
+      }
     });
   } catch (error) {
     res.json({
@@ -1727,11 +1791,8 @@ async function restartLlamaServer() {
 let intentionalStop = false; // Set true during stopLlamaServer to suppress auto-restart
 function attachLlamaExitHandler(proc) {
   proc.on('exit', (code) => {
-    addLog('system', `llama-server exited with code ${code}`);
-    if (code !== 0 && currentMode === 'single') {
-      currentMode = 'router';
-      currentPreset = null;
-    }
+    addLog('system', `llama-server exited with code ${code} (mode: ${currentMode}, preset: ${currentPreset || 'none'})`);
+    // Do NOT reset currentMode/currentPreset here — restartLlamaServer needs them to restore the same mode
     // Auto-restart if the exit was unexpected (not during intentional stop/restart)
     if (!intentionalStop && !restartInProgress && code !== 0) {
       console.log(`[auto-restart] llama-server crashed (exit code ${code}), scheduling restart...`);
@@ -2984,6 +3045,21 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
 // Also retries on proxy connection errors (500) with server health polling
 // Returns { response, retries, retryErrors } so callers can log retry info
 async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy' } = {}) {
+  // Acquire queue slot — blocks if at concurrency limit
+  const queueStart = Date.now();
+  await llamaQueue.acquire();
+  const queueWait = Date.now() - queueStart;
+  if (queueWait > 100) {
+    console.log(`[${label}] Queued for ${queueWait}ms (active: ${llamaQueue.active}, pending: ${llamaQueue.pending})`);
+  }
+  try {
+  return await _fetchWithRetryInner(url, options, { retries, baseDelay, label });
+  } finally {
+    llamaQueue.release();
+  }
+}
+
+async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 1000, label = 'proxy' } = {}) {
   const retryErrors = [];
   let hasRestarted = false;
   for (let attempt = 0; attempt <= retries; attempt++) {

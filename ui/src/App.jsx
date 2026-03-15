@@ -3649,6 +3649,20 @@ function SettingsPage() {
               Log HTTP requests with method, path, status, and timing. View in the Logs page under Request Logs tab.
             </p>
           </div>
+          <div className="setting-item">
+            <label htmlFor="maxConcurrentRequests">Max Concurrent Requests</label>
+            <p className="setting-hint">
+              Maximum number of requests sent to llama.cpp simultaneously. Set to 1 to queue requests (recommended for limited memory).
+            </p>
+            <input
+              type="number"
+              id="maxConcurrentRequests"
+              min="1"
+              max="32"
+              value={settings?.maxConcurrentRequests || 1}
+              onChange={(e) => updateSetting('maxConcurrentRequests', parseInt(e.target.value))}
+            />
+          </div>
         </div>
       </section>
 
