@@ -157,7 +157,8 @@ const analyticsData = {
   temperature: [],   // { timestamp, gpu, cpu }
   power: [],         // { timestamp, watts }
   memory: [],        // { timestamp, vram, gtt, system }
-  tokens: []         // { timestamp, promptTokens, completionTokens, tokensPerSecond, model }
+  tokens: [],        // { timestamp, promptTokens, completionTokens, tokensPerSecond, model }
+  context: []        // { timestamp, usedContext, totalContext, usage }
 };
 
 // Persistent analytics storage (minute-level aggregates in JSONL file)
@@ -214,6 +215,7 @@ function flushAnalyticsMinute() {
   const powerPoints = analyticsData.power.filter(p => p.timestamp > cutoff);
   const memPoints = analyticsData.memory.filter(p => p.timestamp > cutoff);
   const tokenPoints = analyticsData.tokens.filter(p => p.timestamp > cutoff);
+  const ctxPoints = analyticsData.context.filter(p => p.timestamp > cutoff);
 
   const avg = (arr, key) => arr.length > 0 ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
   const max = (arr, key) => arr.length > 0 ? Math.max(...arr.map(p => p[key] || 0)) : 0;
@@ -228,6 +230,9 @@ function flushAnalyticsMinute() {
     tc: Math.round(avg(tempPoints, 'cpu') * 10) / 10,
     tps: Math.round(avg(tokenPoints, 'tokensPerSecond') * 10) / 10,
     tpsMax: Math.round(max(tokenPoints, 'tokensPerSecond') * 10) / 10,
+    cxU: Math.round(avg(ctxPoints, 'usedContext')),
+    cxT: Math.round(avg(ctxPoints, 'totalContext')),
+    cxP: Math.round(avg(ctxPoints, 'usage') * 10) / 10,
     rT: requestStatsAccum.total,
     rOk: requestStatsAccum.ok,
     rErr: requestStatsAccum.err,
@@ -935,6 +940,15 @@ async function broadcastStats() {
       addAnalyticsPoint('temperature', {
         gpu: 0,
         cpu: stats.cpu.temperature
+      });
+    }
+
+    // Record context usage
+    if (stats.context) {
+      addAnalyticsPoint('context', {
+        usedContext: stats.context.usedContext || 0,
+        totalContext: stats.context.totalContext || 0,
+        usage: stats.context.usage || 0
       });
     }
 
@@ -2732,6 +2746,7 @@ app.get('/api/analytics', (req, res) => {
     power: analyticsData.power.filter(p => p.timestamp > cutoff),
     memory: analyticsData.memory.filter(p => p.timestamp > cutoff),
     tokens: analyticsData.tokens.filter(p => p.timestamp > cutoff),
+    context: analyticsData.context.filter(p => p.timestamp > cutoff),
     tokenStats: {
       totalPromptTokens: tokenStats.totalPromptTokens,
       totalCompletionTokens: tokenStats.totalCompletionTokens,
@@ -2807,6 +2822,9 @@ app.get('/api/analytics/history', (req, res) => {
         rErr: sum('rErr'),
         rRt: sum('rRt'),
         rRs: sum('rRs'),
+        cxU: Math.round(avg('cxU')),
+        cxT: Math.round(avg('cxT')),
+        cxP: Math.round(avg('cxP') * 10) / 10,
         sc: mergedSc,
         tp: sum('tp'),
         tcc: sum('tcc')
@@ -2965,6 +2983,8 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
           addLog(label, `Proxy connection error, waiting for server to recover (attempt ${attempt + 1}/${retries + 1})`);
           retryErrors.push(msg);
           requestStatsAccum.retries++;
+          // Track the upstream 500 in status codes so it appears in error code breakdown
+          requestStatsAccum.statusCodes['500'] = (requestStatsAccum.statusCodes['500'] || 0) + 1;
           // After 2 consecutive proxy errors, restart the server
           if (attempt >= 1 && !hasRestarted) {
             console.log(`[${label}] Multiple proxy errors, restarting llama server...`);
@@ -2985,6 +3005,9 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
     } catch (err) {
       retryErrors.push(err.message);
       requestStatsAccum.retries++;
+      // Track connection errors in status codes (use 0 for connection-level failures)
+      const errCode = (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') ? err.code : '500';
+      requestStatsAccum.statusCodes[errCode] = (requestStatsAccum.statusCodes[errCode] || 0) + 1;
       if (attempt === retries) {
         err.retries = attempt;
         err.retryErrors = retryErrors;

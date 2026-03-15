@@ -524,7 +524,9 @@ const CHART_COLORS = {
   requestOk: '#22c55e',
   requestErr: '#ef4444',
   requestRetry: '#f59e0b',
-  requestRestart: '#f97316'
+  requestRestart: '#f97316',
+  contextUsed: '#a78bfa',
+  contextTotal: '#4c1d95'
 };
 
 // Custom tooltip for charts
@@ -891,10 +893,23 @@ function Dashboard({ stats }) {
     time: formatHistoryTime(p.ts, historyRange)
   }));
 
+  // Compute percentage breakdown for request health chart (0-100% stacked)
+  const requestHealthPoints = historyPoints.map(p => {
+    const total = (p.rOk || 0) + (p.rErr || 0) + (p.rRt || 0) + (p.rRs || 0);
+    if (total === 0) return { time: p.time, pctOk: 100, pctErr: 0, pctRt: 0, pctRs: 0 };
+    return {
+      time: p.time,
+      pctOk: Math.round((p.rOk || 0) / total * 1000) / 10,
+      pctErr: Math.round((p.rErr || 0) / total * 1000) / 10,
+      pctRt: Math.round((p.rRt || 0) / total * 1000) / 10,
+      pctRs: Math.round((p.rRs || 0) / total * 1000) / 10
+    };
+  });
+
   // Build error code breakdown data from summary
   const errorCodeData = historyData?.summary?.statusCodes
     ? Object.entries(historyData.summary.statusCodes)
-        .filter(([code]) => parseInt(code) >= 400)
+        .filter(([code]) => parseInt(code) >= 400 || isNaN(parseInt(code)))
         .map(([code, count]) => ({ code, count }))
         .sort((a, b) => b.count - a.count)
     : [];
@@ -1409,6 +1424,40 @@ function Dashboard({ stats }) {
               </div>
             </div>
           </div>
+
+          {/* Context Usage Chart */}
+          <div className="chart-card">
+            <h4>
+              Context Usage
+              <span className="chart-value">
+                {(stats?.context?.usedContext || 0).toLocaleString()} / {(stats?.context?.totalContext || 0).toLocaleString()} tokens
+              </span>
+            </h4>
+            <div className="chart-container">
+              {(analytics?.context || []).length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={analytics.context} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <defs>
+                      <linearGradient id="gradCtxTotal" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.contextTotal} stopOpacity={0.2} />
+                        <stop offset="95%" stopColor={CHART_COLORS.contextTotal} stopOpacity={0} />
+                      </linearGradient>
+                      <linearGradient id="gradCtxUsed" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.contextUsed} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={CHART_COLORS.contextUsed} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="timestamp" hide />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : v} />
+                    <Tooltip content={<ChartTooltip unit=" tokens" />} />
+                    <Area type="monotone" dataKey="totalContext" name="Total" stroke={CHART_COLORS.contextTotal} fill="url(#gradCtxTotal)" strokeWidth={1} strokeDasharray="4 2" dot={false} />
+                    <Area type="monotone" dataKey="usedContext" name="Used" stroke={CHART_COLORS.contextUsed} fill="url(#gradCtxUsed)" strokeWidth={2} dot={false} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No context data yet</div>}
+            </div>
+          </div>
         </div>
       </section>
 
@@ -1526,6 +1575,39 @@ function Dashboard({ stats }) {
             </div>
           </div>
 
+          {/* Context Usage History */}
+          <div className="chart-card-wide">
+            <h4>Context Usage <span className="chart-value">tokens used / total</span></h4>
+            <div className="chart-container-wide">
+              {historyPoints.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <defs>
+                      <linearGradient id="gradHistCtxTotal" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.contextTotal} stopOpacity={0.2} />
+                        <stop offset="95%" stopColor={CHART_COLORS.contextTotal} stopOpacity={0} />
+                      </linearGradient>
+                      <linearGradient id="gradHistCtxUsed" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.contextUsed} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={CHART_COLORS.contextUsed} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : v} />
+                    <Tooltip content={<HistoryTooltip unit=" tokens" range={historyRange} />} />
+                    <Area type="monotone" dataKey="cxT" name="Total" stroke={CHART_COLORS.contextTotal} fill="url(#gradHistCtxTotal)" strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="cxU" name="Used" stroke={CHART_COLORS.contextUsed} fill="url(#gradHistCtxUsed)" strokeWidth={2} dot={false} animationDuration={500} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No historical data yet</div>}
+            </div>
+            <div className="chart-legend">
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.contextUsed }}></span>Used</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.contextTotal }}></span>Total</div>
+            </div>
+          </div>
+
           {/* Request Volume History */}
           <div className="chart-card-wide">
             <h4>Request Volume <span className="chart-value">success vs errors</span></h4>
@@ -1550,6 +1632,33 @@ function Dashboard({ stats }) {
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestErr }}></span>Errors</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRetry }}></span>Retries</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRestart }}></span>Restarts</div>
+            </div>
+          </div>
+
+          {/* Request Health % */}
+          <div className="chart-card-wide">
+            <h4>Request Health <span className="chart-value">% breakdown</span></h4>
+            <div className="chart-container-wide">
+              {requestHealthPoints.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={requestHealthPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }} stackOffset="none">
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `${v}%`} />
+                    <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
+                    <Area type="monotone" dataKey="pctOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No historical data yet</div>}
+            </div>
+            <div className="chart-legend">
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestOk }}></span>Success</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRetry }}></span>Retries</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRestart }}></span>Restarts</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestErr }}></span>Errors</div>
             </div>
           </div>
 
