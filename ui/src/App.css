@@ -1946,8 +1946,8 @@ input::placeholder {
 .active-request-panel {
   position: fixed;
   bottom: 0;
-  left: 220px;
-  right: 0;
+  left: var(--sidebar-width);
+  right: 8px;
   z-index: 100;
   background: var(--card-bg);
   border-top: 2px solid #06b6d4;
