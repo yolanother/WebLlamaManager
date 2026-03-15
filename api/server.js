@@ -305,6 +305,7 @@ const requestStatsAccum = {
   retries: 0,
   restarts: 0,
   statusCodes: {},
+  modelCounts: {},  // per-model request counts for this minute
   totalPromptTokens: 0,
   totalCompletionTokens: 0
 };
@@ -349,7 +350,8 @@ function flushAnalyticsMinute() {
     rRs: requestStatsAccum.restarts,
     sc: { ...requestStatsAccum.statusCodes },
     tp: requestStatsAccum.totalPromptTokens,
-    tcc: requestStatsAccum.totalCompletionTokens
+    tcc: requestStatsAccum.totalCompletionTokens,
+    mc: { ...requestStatsAccum.modelCounts }
   };
 
   // Append to in-memory history
@@ -375,6 +377,7 @@ function flushAnalyticsMinute() {
   requestStatsAccum.retries = 0;
   requestStatsAccum.restarts = 0;
   requestStatsAccum.statusCodes = {};
+  requestStatsAccum.modelCounts = {};
   requestStatsAccum.totalPromptTokens = 0;
   requestStatsAccum.totalCompletionTokens = 0;
 }
@@ -587,6 +590,8 @@ function recordTokenStats(stats) {
   // Also accumulate into per-minute request stats
   requestStatsAccum.totalPromptTokens += promptTokens || 0;
   requestStatsAccum.totalCompletionTokens += completionTokens || 0;
+  const modelKey = model || 'unknown';
+  requestStatsAccum.modelCounts[modelKey] = (requestStatsAccum.modelCounts[modelKey] || 0) + 1;
 
   const requestRecord = {
     timestamp: Date.now(),
@@ -3027,9 +3032,13 @@ app.get('/api/analytics/history', (req, res) => {
 
       // Merge status codes across bucket
       const mergedSc = {};
+      const mergedMc = {};
       for (const item of items) {
         for (const [code, count] of Object.entries(item.sc || {})) {
           mergedSc[code] = (mergedSc[code] || 0) + count;
+        }
+        for (const [model, count] of Object.entries(item.mc || {})) {
+          mergedMc[model] = (mergedMc[model] || 0) + count;
         }
       }
 
@@ -3056,6 +3065,7 @@ app.get('/api/analytics/history', (req, res) => {
         cxT: Math.round(avg('cxT')),
         cxP: Math.round(avg('cxP') * 10) / 10,
         sc: mergedSc,
+        mc: mergedMc,
         tp: sum('tp'),
         tcc: sum('tcc')
       });
@@ -3071,9 +3081,13 @@ app.get('/api/analytics/history', (req, res) => {
   const tpsPoints = points.filter(p => p.tps > 0);
   const avgTps = tpsPoints.length > 0 ? tpsPoints.reduce((s, p) => s + p.tps, 0) / tpsPoints.length : 0;
   const allStatusCodes = {};
+  const allModelCounts = {};
   for (const p of points) {
     for (const [code, count] of Object.entries(p.sc || {})) {
       allStatusCodes[code] = (allStatusCodes[code] || 0) + count;
+    }
+    for (const [model, count] of Object.entries(p.mc || {})) {
+      allModelCounts[model] = (allModelCounts[model] || 0) + count;
     }
   }
 
@@ -3085,7 +3099,8 @@ app.get('/api/analytics/history', (req, res) => {
       totalRetries,
       totalRestarts,
       avgTps: Math.round(avgTps * 10) / 10,
-      statusCodes: allStatusCodes
+      statusCodes: allStatusCodes,
+      modelCounts: allModelCounts
     }
   });
 });

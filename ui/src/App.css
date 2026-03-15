@@ -4785,6 +4785,21 @@ input::placeholder {
 }
 
 /* Wide chart cards (2-column span) */
+.analytics-section-header {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+  margin: 20px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.analytics-section-header:first-of-type {
+  margin-top: 0;
+}
+
 .charts-grid-wide {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

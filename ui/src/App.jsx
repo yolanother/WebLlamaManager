@@ -1005,6 +1005,13 @@ function Dashboard({ stats, activeRequest }) {
         .sort((a, b) => b.count - a.count)
     : [];
 
+  // Build model usage bar chart data
+  const modelUsageData = historyData?.summary?.modelCounts
+    ? Object.entries(historyData.summary.modelCounts)
+        .map(([model, count]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, count, fullModel: model }))
+        .sort((a, b) => b.count - a.count)
+    : [];
+
   // Build crash-by-model bar chart data
   const crashByModelData = crashData?.summary?.byModel
     ? Object.entries(crashData.summary.byModel)
@@ -1649,6 +1656,7 @@ function Dashboard({ stats, activeRequest }) {
           </div>
         )}
 
+        <h4 className="analytics-section-header">System Resources</h4>
         <div className="charts-grid-wide">
           {/* Power History */}
           <div className="chart-card-wide">
@@ -1731,6 +1739,10 @@ function Dashboard({ stats, activeRequest }) {
             </div>
           </div>
 
+        </div>
+
+        <h4 className="analytics-section-header">Inference</h4>
+        <div className="charts-grid-wide">
           {/* Context Usage History */}
           <div className="chart-card-wide">
             <h4>Context Usage <span className="chart-value">tokens used / total</span></h4>
@@ -1799,6 +1811,10 @@ function Dashboard({ stats, activeRequest }) {
             </div>
           </div>
 
+        </div>
+
+        <h4 className="analytics-section-header">Request Health &amp; Errors</h4>
+        <div className="charts-grid-wide">
           {/* Request Volume History */}
           <div className="chart-card-wide">
             <h4>Request Volume <span className="chart-value">success vs errors</span></h4>
@@ -1868,6 +1884,41 @@ function Dashboard({ stats, activeRequest }) {
                   </BarChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No errors in this time range</div>}
+            </div>
+          </div>
+
+        </div>
+
+        <h4 className="analytics-section-header">Model Analytics</h4>
+        <div className="charts-grid-wide">
+          {/* Model Usage */}
+          <div className="chart-card-wide">
+            <h4>Requests by Model <span className="chart-value">{Object.values(historyData?.summary?.modelCounts || {}).reduce((a, b) => a + b, 0)} total</span></h4>
+            <div className="chart-container-wide">
+              {modelUsageData.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={modelUsageData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }} layout="vertical">
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <YAxis type="category" dataKey="model" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} width={180} />
+                    <Tooltip content={({ active, payload }) => {
+                      if (!active || !payload?.length) return null;
+                      const d = payload[0].payload;
+                      return (
+                        <div className="chart-tooltip">
+                          <div className="chart-tooltip-time">{d.fullModel}</div>
+                          <div className="chart-tooltip-row">
+                            <span className="chart-tooltip-dot" style={{ background: CHART_COLORS.tokens }} />
+                            <span className="chart-tooltip-label">Requests:</span>
+                            <span className="chart-tooltip-value">{d.count}</span>
+                          </div>
+                        </div>
+                      );
+                    }} />
+                    <Bar dataKey="count" name="Requests" fill={CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No model usage data in this time range</div>}
             </div>
           </div>
 
