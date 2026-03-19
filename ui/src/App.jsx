@@ -1005,6 +1005,15 @@ function Dashboard({ stats, activeRequest }) {
         .sort((a, b) => b.count - a.count)
     : [];
 
+  // Build cumulative request growth data
+  const requestGrowthData = React.useMemo(() => {
+    let cumulative = 0;
+    return historyPoints.map(p => {
+      cumulative += (p.rT || 0);
+      return { time: p.time, total: cumulative };
+    });
+  }, [historyPoints]);
+
   // Build model usage bar chart data
   const modelUsageData = historyData?.summary?.modelCounts
     ? Object.entries(historyData.summary.modelCounts)
@@ -1815,6 +1824,30 @@ function Dashboard({ stats, activeRequest }) {
 
         <h4 className="analytics-section-header">Request Health &amp; Errors</h4>
         <div className="charts-grid-wide">
+          {/* Total Requests Over Time (cumulative growth) */}
+          <div className="chart-card-wide">
+            <h4>Total Requests <span className="chart-value">cumulative growth</span></h4>
+            <div className="chart-container-wide">
+              {requestGrowthData.length > 0 && requestGrowthData[requestGrowthData.length - 1].total > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={requestGrowthData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <defs>
+                      <linearGradient id="gradGrowth" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} />
+                        <stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <Tooltip content={<HistoryTooltip unit=" requests" range={historyRange} />} />
+                    <Area type="monotone" dataKey="total" name="Total Requests" stroke={CHART_COLORS.tokens} fill="url(#gradGrowth)" strokeWidth={2} dot={false} animationDuration={500} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No request data yet</div>}
+            </div>
+          </div>
+
           {/* Request Volume History */}
           <div className="chart-card-wide">
             <h4>Request Volume <span className="chart-value">success vs errors</span></h4>
