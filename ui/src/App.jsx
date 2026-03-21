@@ -997,6 +997,28 @@ function Dashboard({ stats, activeRequest }) {
     };
   });
 
+  // Bucket request volume into regular intervals for readability
+  const requestVolumeData = React.useMemo(() => {
+    const points = historyData?.points || [];
+    if (points.length === 0) return [];
+    // Choose bucket size based on range: aim for ~20-40 bars
+    const bucketMinutes = { '1h': 5, '1d': 60, '1w': 360, '1m': 1440, '1y': 10080 };
+    const bucketMs = (bucketMinutes[historyRange] || 5) * 60000;
+    const buckets = new Map();
+    for (const p of points) {
+      const key = Math.floor(p.ts / bucketMs) * bucketMs;
+      if (!buckets.has(key)) buckets.set(key, { ts: key, rOk: 0, rErr: 0, rRt: 0, rRs: 0 });
+      const b = buckets.get(key);
+      b.rOk += p.rOk || 0;
+      b.rErr += p.rErr || 0;
+      b.rRt += p.rRt || 0;
+      b.rRs += p.rRs || 0;
+    }
+    return [...buckets.values()]
+      .sort((a, b) => a.ts - b.ts)
+      .map(b => ({ ...b, time: formatHistoryTime(b.ts, historyRange) }));
+  }, [historyData, historyRange]);
+
   // Build error code breakdown data from summary
   const errorCodeData = historyData?.summary?.statusCodes
     ? Object.entries(historyData.summary.statusCodes)
@@ -1850,20 +1872,20 @@ function Dashboard({ stats, activeRequest }) {
 
           {/* Request Volume History */}
           <div className="chart-card-wide">
-            <h4>Request Volume <span className="chart-value">success vs errors</span></h4>
+            <h4>Request Volume <span className="chart-value">per {historyRange === '1h' ? '5 min' : historyRange === '1d' ? 'hour' : historyRange === '1w' ? '6 hours' : historyRange === '1m' ? 'day' : 'week'}</span></h4>
             <div className="chart-container-wide">
-              {historyPoints.length > 0 ? (
+              {requestVolumeData.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                  <BarChart data={requestVolumeData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                     <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <Tooltip content={<HistoryTooltip range={historyRange} />} />
-                    <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
-                    <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
-                    <Area type="monotone" dataKey="rRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
-                    <Area type="monotone" dataKey="rRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
-                  </AreaChart>
+                    <Bar dataKey="rOk" name="Success" fill={CHART_COLORS.requestOk} stackId="req" radius={[0, 0, 0, 0]} animationDuration={500} />
+                    <Bar dataKey="rErr" name="Errors" fill={CHART_COLORS.requestErr} stackId="req" animationDuration={500} />
+                    <Bar dataKey="rRt" name="Retries" fill={CHART_COLORS.requestRetry} stackId="req" animationDuration={500} />
+                    <Bar dataKey="rRs" name="Restarts" fill={CHART_COLORS.requestRestart} stackId="req" radius={[4, 4, 0, 0]} animationDuration={500} />
+                  </BarChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet</div>}
             </div>
