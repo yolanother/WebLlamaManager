@@ -1876,16 +1876,16 @@ function Dashboard({ stats, activeRequest }) {
             <div className="chart-container-wide">
               {requestVolumeData.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={requestVolumeData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                  <AreaChart data={requestVolumeData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                     <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                     <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <Tooltip content={<HistoryTooltip range={historyRange} />} />
-                    <Bar dataKey="rOk" name="Success" fill={CHART_COLORS.requestOk} stackId="req" radius={[0, 0, 0, 0]} animationDuration={500} />
-                    <Bar dataKey="rErr" name="Errors" fill={CHART_COLORS.requestErr} stackId="req" animationDuration={500} />
-                    <Bar dataKey="rRt" name="Retries" fill={CHART_COLORS.requestRetry} stackId="req" animationDuration={500} />
-                    <Bar dataKey="rRs" name="Restarts" fill={CHART_COLORS.requestRestart} stackId="req" radius={[4, 4, 0, 0]} animationDuration={500} />
-                  </BarChart>
+                    <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    <Area type="monotone" dataKey="rRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="rRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
+                  </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet</div>}
             </div>
