@@ -25,7 +25,7 @@ app.use(cors());
 app.use(express.json({ limit: '200mb' }));
 
 // Request logging middleware
-const REQUEST_LOG_SKIP_PATHS = new Set(['/ws', '/api/stats', '/api/analytics', '/api/analytics/history']);
+const REQUEST_LOG_SKIP_PATHS = new Set(['/ws', '/api/stats', '/api/analytics', '/api/analytics/history', '/health', '/api/v1/health']);
 const STATIC_EXTENSIONS = /\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map)$/;
 
 app.use((req, res, next) => {
@@ -155,6 +155,7 @@ let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
 let lastUsedModel = null;   // most recently used model name
 let lastUsedModelTime = 0;  // timestamp of last use
+let idleShutdown = false;   // true when server was stopped due to idle timeout
 
 // Request concurrency limiter for llama.cpp upstream requests
 class RequestQueue {
@@ -176,7 +177,16 @@ class RequestQueue {
       return;
     }
     this.queuedCount++;
-    return new Promise(resolve => this.queue.push(resolve));
+    return new Promise((resolve, reject) => this.queue.push({ resolve, reject }));
+  }
+
+  flush() {
+    const count = this.queue.length;
+    for (const entry of this.queue) {
+      entry.reject(new Error('Queue flushed'));
+    }
+    this.queue = [];
+    return count;
   }
 
   release() {
@@ -187,7 +197,7 @@ class RequestQueue {
   _drain() {
     while (this.queue.length > 0 && this.running < this.concurrency) {
       this.running++;
-      this.queue.shift()();
+      this.queue.shift().resolve();
     }
   }
 
@@ -1482,6 +1492,67 @@ async function fetchLlamaStatus() {
   }
 }
 
+// Health check for the manager API itself — lightweight, suitable for load balancers
+app.get('/health', async (req, res) => {
+  const llamaRunning = llamaProcess !== null && !llamaProcess.killed;
+  const llamaStatus = await fetchLlamaStatus();
+  const memPercent = getSystemMemoryPercent();
+
+  const status = idleShutdown ? 'idle' : llamaRunning && llamaStatus.healthy ? 'healthy' : llamaRunning ? 'degraded' : 'down';
+  const httpStatus = status === 'down' ? 503 : 200;
+
+  res.status(httpStatus).json({
+    status,
+    uptime: process.uptime(),
+    llama: {
+      running: llamaRunning,
+      healthy: llamaStatus.healthy,
+      mode: currentMode,
+      preset: currentPreset || null
+    },
+    queue: {
+      active: llamaQueue.active,
+      pending: llamaQueue.pending,
+      concurrency: llamaQueue.concurrency,
+      totalQueued: llamaQueue.queuedCount
+    },
+    system: {
+      memoryPercent: Math.round(memPercent * 10) / 10,
+      watchdog: {
+        threshold: MEM_WATCHDOG_THRESHOLD,
+        cooldown: memWatchdogCooldown
+      },
+      idle: {
+        shutdown: idleShutdown,
+        timeoutMinutes: IDLE_SHUTDOWN_MINUTES,
+        idleMinutes: lastUsedModelTime ? Math.round((Date.now() - lastUsedModelTime) / 60_000) : null
+      }
+    }
+  });
+});
+
+// Proxy llama.cpp backend /health — returns raw llama-server health status
+app.get('/api/v1/health', async (req, res) => {
+  try {
+    const response = await fetch(`http://localhost:${LLAMA_PORT}/health`, {
+      signal: AbortSignal.timeout(5000)
+    });
+    const data = await response.json().catch(() => null);
+    res.status(response.status).json(data || { status: response.ok ? 'ok' : 'error' });
+  } catch (err) {
+    res.status(503).json({ status: 'unavailable', error: err.message });
+  }
+});
+
+// Flush the request queue — reject all pending requests
+app.post('/api/queue/flush', (req, res) => {
+  const flushed = llamaQueue.flush();
+  const msg = `Queue flushed: ${flushed} pending request(s) cancelled`;
+  console.log(`[queue] ${msg}`);
+  addLog('system', msg);
+  res.json({ flushed });
+});
+
 // Get model aliases
 app.get('/api/models/aliases', (req, res) => {
   res.json({ aliases: config.modelAliases || {} });
@@ -1962,6 +2033,7 @@ function attachLlamaExitHandler(proc) {
 
 // Start llama server in router mode (multi-model)
 app.post('/api/server/start', async (req, res) => {
+  idleShutdown = false;
   await stopLlamaServer();
 
   try {
@@ -2711,6 +2783,8 @@ app.get('/api/info', (req, res) => {
     openapi: '/api/openapi.json',
     mcp: '/mcp',
     endpoints: {
+      health: 'GET /health',
+      llamaHealth: 'GET /api/v1/health',
       status: 'GET /api/status',
       stats: 'GET /api/stats',
       analytics: 'GET /api/analytics',
@@ -3241,6 +3315,15 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
 // Also retries on proxy connection errors (500) with server health polling
 // Returns { response, retries, retryErrors } so callers can log retry info
 async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model } = {}) {
+  // Wake from idle shutdown if needed
+  if (idleShutdown && (!llamaProcess || llamaProcess.killed)) {
+    const msg = 'Waking llama-server from idle shutdown for incoming request...';
+    console.log(`[idle] ${msg}`);
+    addLog('system', msg);
+    idleShutdown = false;
+    await restartLlamaServer();
+  }
+
   // Acquire queue slot — blocks if at concurrency limit
   const queueStart = Date.now();
   await llamaQueue.acquire();
@@ -4280,6 +4363,87 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
     }, 1000);
   }
 });
+
+// Memory watchdog — restart llama-server if system memory >= 95% and it's the heaviest process
+const MEM_WATCHDOG_INTERVAL = 30_000; // check every 30s
+const MEM_WATCHDOG_THRESHOLD = 95; // percent
+let memWatchdogCooldown = false;
+
+function getSystemMemoryPercent() {
+  try {
+    const meminfo = readFileSync('/proc/meminfo', 'utf8');
+    const total = parseInt(meminfo.match(/MemTotal:\s+(\d+)/)?.[1] || '0', 10);
+    const available = parseInt(meminfo.match(/MemAvailable:\s+(\d+)/)?.[1] || '0', 10);
+    if (total === 0) return 0;
+    return ((total - available) / total) * 100;
+  } catch {
+    return 0;
+  }
+}
+
+function isLlamaServerHeaviestProcess() {
+  try {
+    // Get top process by RSS, excluding kernel threads (pid 0) and this node process
+    const output = execSync('ps -eo pid,rss,comm --sort=-rss --no-headers', { encoding: 'utf8', timeout: 5000 });
+    const lines = output.trim().split('\n');
+    if (lines.length === 0) return false;
+    const top = lines[0].trim().split(/\s+/);
+    // top = [pid, rss_kb, command]
+    const topComm = top.slice(2).join(' ');
+    return topComm.includes('llama-server');
+  } catch {
+    return false;
+  }
+}
+
+setInterval(() => {
+  if (!llamaProcess || memWatchdogCooldown || restartInProgress) return;
+
+  const memPercent = getSystemMemoryPercent();
+  if (memPercent >= MEM_WATCHDOG_THRESHOLD) {
+    if (isLlamaServerHeaviestProcess()) {
+      memWatchdogCooldown = true;
+      const msg = `Memory watchdog triggered: system at ${memPercent.toFixed(1)}% and llama-server is heaviest process. Restarting...`;
+      console.warn(`[mem-watchdog] ${msg}`);
+      addLog('system', msg);
+      recordCrashEvent({ exitCode: null, trigger: 'memory_watchdog' });
+
+      restartLlamaServer()
+        .then(() => {
+          addLog('system', 'Memory watchdog restart completed successfully');
+        })
+        .catch(err => {
+          console.error('[mem-watchdog] Restart failed:', err.message);
+          addLog('system', `Memory watchdog restart failed: ${err.message}`);
+        })
+        .finally(() => {
+          // Cooldown for 60s to avoid rapid-fire restarts
+          setTimeout(() => { memWatchdogCooldown = false; }, 60_000);
+        });
+    }
+  }
+}, MEM_WATCHDOG_INTERVAL);
+
+// Idle shutdown — stop llama-server after 15 min with no requests
+const IDLE_SHUTDOWN_MINUTES = 15;
+const IDLE_CHECK_INTERVAL = 60_000; // check every minute
+
+setInterval(async () => {
+  if (!llamaProcess || llamaProcess.killed || restartInProgress) return;
+  if (activeRequests.size > 0) return; // requests in flight
+  if (llamaQueue.active > 0 || llamaQueue.pending > 0) return;
+
+  const idleMs = Date.now() - (lastUsedModelTime || 0);
+  if (idleMs >= IDLE_SHUTDOWN_MINUTES * 60_000) {
+    const msg = `Idle shutdown: no requests for ${Math.round(idleMs / 60_000)} minutes. Stopping llama-server to save resources.`;
+    console.log(`[idle] ${msg}`);
+    addLog('system', msg);
+    idleShutdown = true;
+    intentionalStop = true;
+    await stopLlamaServer();
+    intentionalStop = false;
+  }
+}, IDLE_CHECK_INTERVAL);
 
 // Graceful shutdown with forced exit timeout
 function shutdownWithTimeout(signal) {

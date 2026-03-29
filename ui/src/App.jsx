@@ -844,7 +844,7 @@ function Dashboard({ stats, activeRequest }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const fullscreenTimerRef = useRef(null);
-  const FULLSCREEN_PAGES = 2;
+  const FULLSCREEN_PAGES = 3;
 
   const fetchModels = useCallback(async () => {
     try {
@@ -973,6 +973,16 @@ function Dashboard({ stats, activeRequest }) {
     setLoading(l => ({ ...l, server: false }));
   };
 
+  const flushQueue = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/queue/flush`, { method: 'POST' });
+      const data = await res.json();
+      console.log(`Queue flushed: ${data.flushed} request(s) cancelled`);
+    } catch (err) {
+      console.error('Failed to flush queue:', err);
+    }
+  };
+
   const isHealthy = stats?.llama?.status === 'ok';
   const isSingleMode = stats?.mode === 'single';
   const llamaPort = stats?.llamaPort || 5251;
@@ -1043,6 +1053,52 @@ function Dashboard({ stats, activeRequest }) {
         .sort((a, b) => b.count - a.count)
     : [];
 
+  // Build model usage over time (top 5 models as line series)
+  const MODEL_LINE_COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a78bfa'];
+  const modelUsageOverTime = React.useMemo(() => {
+    const points = historyData?.points || [];
+    if (points.length === 0) return { data: [], models: [] };
+
+    // Count total requests per model across all points
+    const totals = {};
+    for (const p of points) {
+      for (const [model, count] of Object.entries(p.mc || {})) {
+        totals[model] = (totals[model] || 0) + count;
+      }
+    }
+
+    // Top 5 models by total count
+    const top5 = Object.entries(totals)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([model]) => model);
+
+    if (top5.length === 0) return { data: [], models: [] };
+
+    // Bucket into same intervals as request volume
+    const bucketMinutes = { '1h': 5, '1d': 60, '1w': 360, '1m': 1440, '1y': 10080 };
+    const bucketMs = (bucketMinutes[historyRange] || 5) * 60000;
+    const buckets = new Map();
+    for (const p of points) {
+      const key = Math.floor(p.ts / bucketMs) * bucketMs;
+      if (!buckets.has(key)) {
+        const entry = { ts: key };
+        for (const m of top5) entry[m] = 0;
+        buckets.set(key, entry);
+      }
+      const b = buckets.get(key);
+      for (const m of top5) {
+        b[m] += (p.mc || {})[m] || 0;
+      }
+    }
+
+    const data = [...buckets.values()]
+      .sort((a, b) => a.ts - b.ts)
+      .map(b => ({ ...b, time: formatHistoryTime(b.ts, historyRange) }));
+
+    return { data, models: top5 };
+  }, [historyData, historyRange]);
+
   // Build crash-by-model bar chart data
   const crashByModelData = crashData?.summary?.byModel
     ? Object.entries(crashData.summary.byModel)
@@ -1054,6 +1110,61 @@ function Dashboard({ stats, activeRequest }) {
   if (isFullscreen) {
     return (
       <div className="fullscreen-dashboard">
+        {/* Persistent header — visible on all pages */}
+        <div className="fullscreen-persistent-header">
+          <div className="fullscreen-resources-row">
+            <div className="resource-card">
+              <ProgressRing value={stats?.cpu?.usage || 0} size={56} strokeWidth={5} color={stats?.cpu?.usage > 80 ? 'var(--error)' : 'var(--accent)'} />
+              <div className="resource-info">
+                <span className="resource-label">CPU</span>
+                <span className="resource-detail">{stats?.cpu?.cores || 0} cores @ {stats?.cpu?.loadAvg?.[0]?.toFixed(1) || '0.0'} load</span>
+              </div>
+            </div>
+            <div className="resource-card">
+              <ProgressRing value={stats?.memory?.usage || 0} size={56} strokeWidth={5} color={stats?.memory?.usage > 80 ? 'var(--error)' : 'var(--success)'} />
+              <div className="resource-info">
+                <span className="resource-label">Memory</span>
+                <span className="resource-detail">{formatBytes(stats?.memory?.used)} / {formatBytes(stats?.memory?.total)}</span>
+              </div>
+            </div>
+            {stats?.gpu && (
+              <div className="resource-card">
+                <ProgressRing value={stats.gpu.isAPU ? (stats.gpu.gtt?.usage || 0) : (stats.gpu.vram?.usage || 0)} size={56} strokeWidth={5} color="var(--warning)" />
+                <div className="resource-info">
+                  <span className="resource-label">{stats.gpu.isAPU ? 'GTT' : 'VRAM'}</span>
+                  <span className="resource-detail">{stats.gpu.isAPU ? `${formatBytes(stats.gpu.gtt?.used)} / ${formatBytes(stats.gpu.gtt?.total)}` : `${formatBytes(stats.gpu.vram?.used)} / ${formatBytes(stats.gpu.vram?.total)}`}</span>
+                </div>
+              </div>
+            )}
+            {stats?.gpu?.power > 0 && (
+              <div className="resource-card">
+                <div className="power-display" style={{ width: 56, height: 56 }}><div className="power-inner"><span className="power-value" style={{ fontSize: 16 }}>{stats.gpu.power.toFixed(0)}</span><span className="power-unit">W</span></div></div>
+                <div className="resource-info"><span className="resource-label">Power</span><span className="resource-detail">{stats.gpu.temperature > 0 ? `${stats.gpu.temperature}°C` : ''}</span></div>
+              </div>
+            )}
+            <div className="resource-card">
+              <ProgressRing value={stats?.context?.usage || 0} size={56} strokeWidth={5} color="var(--info)" />
+              <div className="resource-info">
+                <span className="resource-label">Context</span>
+                <span className="resource-detail">{stats?.context?.totalContext > 0 ? `${(stats.context.usedContext || 0).toLocaleString()} / ${(stats.context.totalContext || 0).toLocaleString()}` : 'No models'}</span>
+              </div>
+            </div>
+            <div className="resource-card persistent-queue-card">
+              <div className="resource-info">
+                <span className="resource-label">Queue</span>
+                <span className="resource-detail">
+                  <span className={`queue-count ${(stats?.queue?.active || 0) > 0 ? 'queue-active' : ''}`}>{stats?.queue?.active || 0} active</span>
+                  {' / '}
+                  <span className={`queue-count ${(stats?.queue?.pending || 0) > 0 ? 'queue-pending' : ''}`}>{stats?.queue?.pending || 0} pending</span>
+                </span>
+                {(stats?.queue?.pending || 0) > 0 && (
+                  <button className="persistent-flush-btn" onClick={flushQueue}>Flush</button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
         {/* Page 1: Live status + 5-min charts */}
         <div className={`fullscreen-page ${fullscreenPage === 0 ? 'active' : ''}`}>
           <div className="fullscreen-top-bar">
@@ -1082,44 +1193,6 @@ function Dashboard({ stats, activeRequest }) {
                       })}
                     </div>
                   )}
-                </div>
-              </div>
-            </div>
-            <div className="fullscreen-resources-row">
-              <div className="resource-card">
-                <ProgressRing value={stats?.cpu?.usage || 0} size={64} strokeWidth={6} color={stats?.cpu?.usage > 80 ? 'var(--error)' : 'var(--accent)'} />
-                <div className="resource-info">
-                  <span className="resource-label">CPU</span>
-                  <span className="resource-detail">{stats?.cpu?.cores || 0} cores @ {stats?.cpu?.loadAvg?.[0]?.toFixed(1) || '0.0'} load</span>
-                </div>
-              </div>
-              <div className="resource-card">
-                <ProgressRing value={stats?.memory?.usage || 0} size={64} strokeWidth={6} color={stats?.memory?.usage > 80 ? 'var(--error)' : 'var(--success)'} />
-                <div className="resource-info">
-                  <span className="resource-label">Memory</span>
-                  <span className="resource-detail">{formatBytes(stats?.memory?.used)} / {formatBytes(stats?.memory?.total)}</span>
-                </div>
-              </div>
-              {stats?.gpu && (
-                <div className="resource-card">
-                  <ProgressRing value={stats.gpu.isAPU ? (stats.gpu.gtt?.usage || 0) : (stats.gpu.vram?.usage || 0)} size={64} strokeWidth={6} color="var(--warning)" />
-                  <div className="resource-info">
-                    <span className="resource-label">{stats.gpu.isAPU ? 'GTT' : 'VRAM'}</span>
-                    <span className="resource-detail">{stats.gpu.isAPU ? `${formatBytes(stats.gpu.gtt?.used)} / ${formatBytes(stats.gpu.gtt?.total)}` : `${formatBytes(stats.gpu.vram?.used)} / ${formatBytes(stats.gpu.vram?.total)}`}</span>
-                  </div>
-                </div>
-              )}
-              {stats?.gpu?.power > 0 && (
-                <div className="resource-card">
-                  <div className="power-display" style={{ width: 64, height: 64 }}><div className="power-inner"><span className="power-value" style={{ fontSize: 18 }}>{stats.gpu.power.toFixed(0)}</span><span className="power-unit">W</span></div></div>
-                  <div className="resource-info"><span className="resource-label">Power</span><span className="resource-detail">{stats.gpu.temperature > 0 ? `${stats.gpu.temperature}°C` : ''}</span></div>
-                </div>
-              )}
-              <div className="resource-card">
-                <ProgressRing value={stats?.context?.usage || 0} size={64} strokeWidth={6} color="var(--info)" />
-                <div className="resource-info">
-                  <span className="resource-label">Context</span>
-                  <span className="resource-detail">{stats?.context?.totalContext > 0 ? `${(stats.context.usedContext || 0).toLocaleString()} / ${(stats.context.totalContext || 0).toLocaleString()}` : 'No models'}</span>
                 </div>
               </div>
             </div>
@@ -1261,8 +1334,139 @@ function Dashboard({ stats, activeRequest }) {
           </div>
         </div>
 
-        <div className="fullscreen-indicator">
-          {fullscreenPage + 1} / {FULLSCREEN_PAGES}
+        {/* Page 3: Model Analytics */}
+        <div className={`fullscreen-page ${fullscreenPage === 2 ? 'active' : ''}`}>
+          <div className="fullscreen-top-bar">
+            <div className="fullscreen-history-header">
+              <h3>Model Analytics</h3>
+              <TimeRangeSelector value={historyRange} onChange={setHistoryRange} />
+            </div>
+            {historyData?.summary && (
+              <div className="fullscreen-resources-row">
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.totalRequests.toLocaleString()}</span>
+                    <span className="resource-detail">Total Requests</span>
+                  </div>
+                </div>
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{Object.keys(historyData.summary.modelCounts || {}).length}</span>
+                    <span className="resource-detail">Models Used</span>
+                  </div>
+                </div>
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--error)' }}>{(crashData?.summary?.total || 0).toLocaleString()}</span>
+                    <span className="resource-detail">Crashes</span>
+                  </div>
+                </div>
+                <div className="resource-card">
+                  <div className="resource-info" style={{ textAlign: 'center' }}>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.avgTps}</span>
+                    <span className="resource-detail">Avg tok/s</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="fullscreen-charts-grid">
+            <div className="chart-card">
+              <h4>Requests by Model</h4>
+              <div className="chart-container" style={{ height: 200 }}>
+                {modelUsageData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={modelUsageData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} />
+                      <YAxis dataKey="name" type="category" tick={{ fill: '#ccc', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
+                      <Tooltip content={<HistoryTooltip unit=" requests" range={historyRange} />} />
+                      <Bar dataKey="count" name="Requests" fill="var(--accent)" radius={[0, 4, 4, 0]} animationDuration={500} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No model data in this time range</div>}
+              </div>
+            </div>
+            <div className="chart-card">
+              <h4>Model Usage Over Time</h4>
+              <div className="chart-container" style={{ height: 200 }}>
+                {modelUsageOverTime.data.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={modelUsageOverTime.data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                      <Tooltip content={<HistoryTooltip range={historyRange} />} />
+                      {modelUsageOverTime.models.map((model, i) => (
+                        <Line key={model} type="monotone" dataKey={model} name={model.length > 30 ? model.slice(0, 27) + '...' : model} stroke={MODEL_LINE_COLORS[i]} strokeWidth={2} dot={false} animationDuration={500} />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No model usage data in this time range</div>}
+              </div>
+              <div className="chart-legend">
+                {modelUsageOverTime.models.map((model, i) => (
+                  <div key={model} className="chart-legend-item">
+                    <span className="chart-legend-dot" style={{ background: MODEL_LINE_COLORS[i] }}></span>
+                    {model.length > 30 ? model.slice(0, 27) + '...' : model}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="chart-card">
+              <h4>Crashes by Model</h4>
+              <div className="chart-container" style={{ height: 200 }}>
+                {crashByModelData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={crashByModelData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} allowDecimals={false} />
+                      <YAxis dataKey="name" type="category" tick={{ fill: '#ccc', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
+                      <Tooltip content={<HistoryTooltip unit=" crashes" range={historyRange} />} />
+                      <Bar dataKey="count" name="Crashes" fill="var(--error)" radius={[0, 4, 4, 0]} animationDuration={500} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No crash data</div>}
+              </div>
+            </div>
+            <div className="chart-card">
+              <h4>Generation Speed</h4>
+              <div className="chart-container" style={{ height: 200 }}>
+                {historyPoints.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                      <defs><linearGradient id="gradFsTps3" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} /></linearGradient></defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
+                      <Area type="monotone" dataKey="tps" name="Avg tok/s" stroke={CHART_COLORS.tokens} fill="url(#gradFsTps3)" strokeWidth={2} dot={false} animationDuration={500} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No historical data yet</div>}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Persistent bottom bar — active request + page indicator */}
+        <div className="fullscreen-persistent-bar">
+          {activeRequest ? (
+            <div className="persistent-bar-request">
+              <span className={`active-dot ${activeRequest.status === 'processing' ? 'pulse' : 'done'}`} />
+              <span className="persistent-bar-model">{activeRequest.model}</span>
+              <span className="persistent-bar-prompt">
+                {(activeRequest.userMessage || 'Processing...').slice(0, 80)}{(activeRequest.userMessage || '').length > 80 ? '...' : ''}
+              </span>
+              {activeRequest.tokens > 0 && <span className="persistent-bar-tokens">{activeRequest.tokens} tok</span>}
+              <span className="persistent-bar-elapsed">{((activeRequest.duration || (Date.now() - activeRequest.startTime)) / 1000).toFixed(1)}s</span>
+            </div>
+          ) : (
+            <div className="persistent-bar-idle">No active requests</div>
+          )}
+          <div className="fullscreen-indicator-inline">
+            {fullscreenPage + 1} / {FULLSCREEN_PAGES}
+          </div>
         </div>
         <ActiveRequestPanel request={activeRequest} isFullscreen={true} />
       </div>
@@ -1277,6 +1481,11 @@ function Dashboard({ stats, activeRequest }) {
           <button className="btn-secondary" onClick={enterFullscreen} title="Fullscreen Dashboard">
             &#x26F6;
           </button>
+          {(stats?.queue?.pending || 0) > 0 && (
+            <button className="btn-warning" onClick={flushQueue} title="Cancel all pending requests">
+              Flush Queue ({stats.queue.pending})
+            </button>
+          )}
           {isHealthy ? (
             <button className="btn-danger" onClick={stopServer} disabled={loading.server}>
               {loading.server ? 'Stopping...' : 'Stop Server'}
@@ -1974,6 +2183,43 @@ function Dashboard({ stats, activeRequest }) {
                   </BarChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No model usage data in this time range</div>}
+            </div>
+          </div>
+
+          {/* Model Usage Over Time */}
+          <div className="chart-card-wide">
+            <h4>Model Usage Over Time <span className="chart-value">top {modelUsageOverTime.models.length} models</span></h4>
+            <div className="chart-container-wide">
+              {modelUsageOverTime.data.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={modelUsageOverTime.data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <Tooltip content={<HistoryTooltip range={historyRange} />} />
+                    {modelUsageOverTime.models.map((model, i) => (
+                      <Line
+                        key={model}
+                        type="monotone"
+                        dataKey={model}
+                        name={model.length > 30 ? model.slice(0, 27) + '...' : model}
+                        stroke={MODEL_LINE_COLORS[i]}
+                        strokeWidth={2}
+                        dot={false}
+                        animationDuration={500}
+                      />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : <div className="chart-empty">No model usage data in this time range</div>}
+            </div>
+            <div className="chart-legend">
+              {modelUsageOverTime.models.map((model, i) => (
+                <div key={model} className="chart-legend-item">
+                  <span className="chart-legend-dot" style={{ background: MODEL_LINE_COLORS[i] }}></span>
+                  {model.length > 30 ? model.slice(0, 27) + '...' : model}
+                </div>
+              ))}
             </div>
           </div>
 
