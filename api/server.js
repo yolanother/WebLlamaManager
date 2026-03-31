@@ -207,6 +207,231 @@ class RequestQueue {
 
 const llamaQueue = new RequestQueue(1); // default: 1 concurrent request
 
+// Remote backend load balancing
+const backendQueues = new Map();  // backend.id -> RequestQueue
+const backendStats = new Map();   // backend.id -> { totalRequests, successRequests, errorRequests, ... }
+let offloadCounter = 0; // rolling counter for percentage-based offloading
+
+function initBackendQueues() {
+  backendQueues.clear();
+  const dir = config?.backends?.directory || [];
+  for (const backend of dir) {
+    backendQueues.set(backend.id, new RequestQueue(backend.maxConcurrentRequests || 5));
+    if (!backendStats.has(backend.id)) {
+      backendStats.set(backend.id, {
+        id: backend.id,
+        totalRequests: 0,
+        successRequests: 0,
+        errorRequests: 0,
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        totalCostUsd: 0,
+        totalDurationMs: 0,
+        avgTokPerSec: 0,
+        lastUsed: null,
+        recentLatencies: []
+      });
+    }
+  }
+}
+
+// Resolve which backend should handle a request
+function resolveBackend(requestedModel, endpoint) {
+  const backends = config.backends || {};
+  if (!backends.enabled || !backends.directory?.length) {
+    return { remote: false };
+  }
+
+  // Check for explicit backend prefix: "backendId/modelName"
+  const slashIdx = requestedModel.indexOf('/');
+  if (slashIdx > 0) {
+    const prefix = requestedModel.substring(0, slashIdx);
+    const explicitBackend = backends.directory.find(b => b.id === prefix && b.enabled);
+    if (explicitBackend) {
+      const remoteModel = requestedModel.substring(slashIdx + 1);
+      return buildRemoteRouting(explicitBackend, remoteModel, endpoint);
+    }
+  }
+
+  // Evaluate offload policy
+  const policy = backends.offloadPolicy || 'overflow';
+  let shouldOffload = false;
+
+  if (policy === 'manual') {
+    // Only offload via explicit prefix (handled above)
+    return { remote: false };
+  } else if (policy === 'overflow') {
+    // Offload when local queue is full
+    shouldOffload = llamaQueue.active >= llamaQueue.concurrency && llamaQueue.pending > 0;
+  } else if (policy === 'threshold') {
+    const queueDepth = backends.offloadThresholdQueueDepth ?? 2;
+    const waitMs = backends.offloadThresholdWaitMs ?? 5000;
+    shouldOffload = llamaQueue.pending >= queueDepth;
+    // Estimate wait based on average recent request duration
+    if (!shouldOffload && waitMs > 0) {
+      const recentDurations = tokenStats.recentRequests.slice(-10).map(r => r.duration || 0);
+      if (recentDurations.length > 0) {
+        const avgDuration = recentDurations.reduce((a, b) => a + b, 0) / recentDurations.length;
+        const estimatedWait = llamaQueue.pending * avgDuration;
+        shouldOffload = estimatedWait > waitMs;
+      }
+    }
+  } else if (policy === 'percentage') {
+    const pct = backends.offloadPercentage || 0;
+    if (pct > 0) {
+      offloadCounter = (offloadCounter + 1) % 100;
+      shouldOffload = offloadCounter < pct;
+    }
+  }
+
+  if (!shouldOffload) {
+    return { remote: false };
+  }
+
+  // Pick best backend
+  const endpointKey = endpoint.replace(/\//g, '/');
+  const candidates = backends.directory.filter(b => {
+    if (!b.enabled) return false;
+    if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
+    // Check model mapping
+    if (!b.modelMapping) return false;
+    const hasMapping = b.modelMapping[requestedModel] || b.modelMapping['*'];
+    return !!hasMapping;
+  });
+
+  if (candidates.length === 0) {
+    return { remote: false };
+  }
+
+  // Sort by priority, then sharedResourceWeight, then lowest active count
+  candidates.sort((a, b) => {
+    const pa = a.priority ?? 50;
+    const pb = b.priority ?? 50;
+    if (pa !== pb) return pa - pb;
+    const wa = a.sharedResourceWeight ?? 0;
+    const wb = b.sharedResourceWeight ?? 0;
+    if (wa !== wb) return wa - wb;
+    const qa = backendQueues.get(a.id)?.active || 0;
+    const qb = backendQueues.get(b.id)?.active || 0;
+    return qa - qb;
+  });
+
+  const chosen = candidates[0];
+  const remoteModel = chosen.modelMapping[requestedModel] || chosen.modelMapping['*'];
+  return buildRemoteRouting(chosen, remoteModel, endpoint);
+}
+
+function buildRemoteRouting(backend, remoteModel, endpoint) {
+  const baseUrl = backend.url.replace(/\/+$/, '');
+  const apiKey = backend.apiKeyEnvVar ? process.env[backend.apiKeyEnvVar] : null;
+  const headers = { 'Content-Type': 'application/json' };
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+  // Forward extra headers if configured
+  if (backend.extraHeaders) {
+    Object.assign(headers, backend.extraHeaders);
+  }
+  return {
+    remote: true,
+    backend,
+    targetUrl: `${baseUrl}/${endpoint}`,
+    targetModel: remoteModel,
+    headers
+  };
+}
+
+// Fetch from a remote backend with retry and per-backend queue
+async function fetchRemoteBackend(backend, url, options, { label = 'remote', model } = {}) {
+  const queue = backendQueues.get(backend.id);
+  if (!queue) {
+    throw new Error(`No queue for backend ${backend.id}`);
+  }
+
+  const queueStart = Date.now();
+  await queue.acquire();
+  const queueWait = Date.now() - queueStart;
+  if (queueWait > 100) {
+    console.log(`[${label}][${backend.name}] Queued for ${queueWait}ms`);
+  }
+
+  const stats = backendStats.get(backend.id);
+  const startTime = Date.now();
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || 120000);
+    const fetchOptions = { ...options, signal: controller.signal };
+
+    let lastError;
+    const maxRetries = 3;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await fetch(url, fetchOptions);
+        clearTimeout(timeout);
+
+        const duration = Date.now() - startTime;
+        if (stats) {
+          stats.totalRequests++;
+          stats.lastUsed = Date.now();
+          if (response.ok) {
+            stats.successRequests++;
+          } else {
+            stats.errorRequests++;
+          }
+          stats.totalDurationMs += duration;
+          stats.recentLatencies.push(duration);
+          if (stats.recentLatencies.length > 20) stats.recentLatencies.shift();
+        }
+
+        return { response, retries: attempt, backend };
+      } catch (err) {
+        clearTimeout(timeout);
+        lastError = err;
+        if (attempt < maxRetries) {
+          const delay = 1000 * Math.pow(2, attempt);
+          console.log(`[${label}][${backend.name}] Retry ${attempt + 1}/${maxRetries}: ${err.message}`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+
+    if (stats) {
+      stats.totalRequests++;
+      stats.errorRequests++;
+      stats.lastUsed = Date.now();
+    }
+    throw lastError;
+  } finally {
+    queue.release();
+  }
+}
+
+// Calculate cost for a remote backend request
+function calculateBackendCost(backend, promptTokens, completionTokens) {
+  const costs = backend.costs || {};
+  const inputCost = (promptTokens / 1_000_000) * (costs.inputTokenCostPer1M || 0);
+  const outputCost = (completionTokens / 1_000_000) * (costs.outputTokenCostPer1M || 0);
+  return inputCost + outputCost;
+}
+
+// Update backend stats after a completed request with token info
+function updateBackendTokenStats(backendId, promptTokens, completionTokens, duration, backend) {
+  const stats = backendStats.get(backendId);
+  if (!stats) return;
+  stats.totalPromptTokens += promptTokens;
+  stats.totalCompletionTokens += completionTokens;
+  if (duration > 0 && completionTokens > 0) {
+    const tps = completionTokens / (duration / 1000);
+    // Exponential moving average for tok/s
+    stats.avgTokPerSec = stats.avgTokPerSec === 0 ? tps : stats.avgTokPerSec * 0.8 + tps * 0.2;
+  }
+  if (backend) {
+    const cost = calculateBackendCost(backend, promptTokens, completionTokens);
+    stats.totalCostUsd += cost;
+  }
+}
+
 // Analytics data storage (circular buffers for time-series data)
 const MAX_ANALYTICS_POINTS = 300; // 5 minutes at 1 second intervals
 const analyticsData = {
@@ -361,7 +586,13 @@ function flushAnalyticsMinute() {
     sc: { ...requestStatsAccum.statusCodes },
     tp: requestStatsAccum.totalPromptTokens,
     tcc: requestStatsAccum.totalCompletionTokens,
-    mc: { ...requestStatsAccum.modelCounts }
+    mc: { ...requestStatsAccum.modelCounts },
+    // Per-backend stats for this minute
+    be: Object.fromEntries([...backendStats.entries()].map(([id, s]) => [id, {
+      rT: s.totalRequests, tPS: Math.round(s.avgTokPerSec * 10) / 10,
+      pT: s.totalPromptTokens, cT: s.totalCompletionTokens,
+      cost: Math.round(s.totalCostUsd * 10000) / 10000
+    }]))
   };
 
   // Append to in-memory history
@@ -740,6 +971,9 @@ if (config.maxConcurrentRequests) {
   llamaQueue.setConcurrency(config.maxConcurrentRequests);
 }
 
+// Initialize remote backend queues
+initBackendQueues();
+
 // WebSocket stats broadcasting
 const STATS_INTERVAL = parseInt(process.env.STATS_INTERVAL) || 1000; // Default 1 second
 let statsInterval = null;
@@ -843,7 +1077,17 @@ async function getSystemStats() {
         id,
         { progress: info.progress, status: info.status, error: info.error, output: info.output, startedAt: info.startedAt }
       ])
-    )
+    ),
+    backends: config.backends?.enabled ? Object.fromEntries(
+      [...backendStats.entries()].map(([id, s]) => [id, {
+        active: backendQueues.get(id)?.active || 0,
+        pending: backendQueues.get(id)?.pending || 0,
+        tokPerSec: Math.round(s.avgTokPerSec * 10) / 10,
+        totalCost: Math.round(s.totalCostUsd * 10000) / 10000,
+        totalRequests: s.totalRequests,
+        errors: s.errorRequests
+      }])
+    ) : null
   };
 }
 
@@ -1336,7 +1580,19 @@ app.get('/api/settings', (req, res) => {
       maxConcurrentRequests: config.maxConcurrentRequests || 1,
       defaultReasoningEffort: config.defaultReasoningEffort || null,
       modelReasoningEffort: config.modelReasoningEffort || {},
-      fullscreenInterval: config.fullscreenInterval || 30000
+      fullscreenInterval: config.fullscreenInterval || 30000,
+      backends: {
+        enabled: config.backends?.enabled || false,
+        offloadPolicy: config.backends?.offloadPolicy || 'overflow',
+        offloadThresholdQueueDepth: config.backends?.offloadThresholdQueueDepth ?? 2,
+        offloadThresholdWaitMs: config.backends?.offloadThresholdWaitMs ?? 5000,
+        offloadPercentage: config.backends?.offloadPercentage || 0,
+        preferLocal: config.backends?.preferLocal !== false,
+        directory: (config.backends?.directory || []).map(b => ({
+          ...b,
+          apiKeyConfigured: !!(b.apiKeyEnvVar && process.env[b.apiKeyEnvVar])
+        }))
+      }
     },
     // Include environment defaults for reference
     defaults: {
@@ -1442,6 +1698,260 @@ app.post('/api/settings', (req, res) => {
     settings: config,
     message: 'Settings saved. Restart the server for changes to take effect.'
   });
+});
+
+// ========== Remote Backend Management ==========
+
+// List all backends with status
+app.get('/api/backends', (req, res) => {
+  const dir = config.backends?.directory || [];
+  const result = dir.map(b => ({
+    ...b,
+    apiKeyConfigured: !!(b.apiKeyEnvVar && process.env[b.apiKeyEnvVar]),
+    queue: {
+      active: backendQueues.get(b.id)?.active || 0,
+      pending: backendQueues.get(b.id)?.pending || 0,
+      concurrency: b.maxConcurrentRequests || 5
+    },
+    stats: backendStats.get(b.id) || null
+  }));
+  res.json({ backends: result, routing: {
+    enabled: config.backends?.enabled || false,
+    offloadPolicy: config.backends?.offloadPolicy || 'overflow',
+    offloadThresholdQueueDepth: config.backends?.offloadThresholdQueueDepth ?? 2,
+    offloadThresholdWaitMs: config.backends?.offloadThresholdWaitMs ?? 5000,
+    offloadPercentage: config.backends?.offloadPercentage || 0,
+    preferLocal: config.backends?.preferLocal !== false
+  }});
+});
+
+// Add a new backend
+app.post('/api/backends', (req, res) => {
+  const { name, url, enabled, priority, apiKeyEnvVar, modelMapping, supportedEndpoints, costs, sharedResourceWeight, maxConcurrentRequests, timeoutMs, extraHeaders } = req.body;
+
+  if (!name || !url) {
+    return res.status(400).json({ error: 'name and url are required' });
+  }
+
+  const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') + '-' + Date.now().toString(36);
+  const backend = {
+    id,
+    name,
+    url: url.replace(/\/+$/, ''),
+    enabled: enabled !== false,
+    priority: Math.max(1, Math.min(100, parseInt(priority) || 10)),
+    apiKeyEnvVar: apiKeyEnvVar || '',
+    modelMapping: modelMapping || { '*': '' },
+    supportedEndpoints: supportedEndpoints || ['chat/completions', 'completions', 'embeddings'],
+    costs: {
+      inputTokenCostPer1M: parseFloat(costs?.inputTokenCostPer1M) || 0,
+      outputTokenCostPer1M: parseFloat(costs?.outputTokenCostPer1M) || 0,
+      currency: costs?.currency || 'USD'
+    },
+    sharedResourceWeight: Math.max(0, Math.min(100, parseInt(sharedResourceWeight) || 0)),
+    maxConcurrentRequests: Math.max(1, Math.min(100, parseInt(maxConcurrentRequests) || 5)),
+    timeoutMs: Math.max(5000, Math.min(600000, parseInt(timeoutMs) || 120000))
+  };
+  if (extraHeaders) backend.extraHeaders = extraHeaders;
+
+  if (!config.backends) {
+    config.backends = { enabled: false, offloadPolicy: 'overflow', offloadThresholdQueueDepth: 2, offloadThresholdWaitMs: 5000, offloadPercentage: 0, preferLocal: true, directory: [] };
+  }
+  config.backends.directory.push(backend);
+  saveConfig(config);
+  initBackendQueues();
+  addLog('backends', `Added backend: ${backend.name} (${backend.id})`);
+  res.json({ success: true, backend });
+});
+
+// Update a backend
+app.put('/api/backends/:id', (req, res) => {
+  if (!config.backends?.directory) {
+    return res.status(404).json({ error: 'No backends configured' });
+  }
+  const idx = config.backends.directory.findIndex(b => b.id === req.params.id);
+  if (idx === -1) {
+    return res.status(404).json({ error: 'Backend not found' });
+  }
+
+  const existing = config.backends.directory[idx];
+  const updates = req.body;
+
+  // Merge updates into existing backend
+  if (updates.name !== undefined) existing.name = updates.name;
+  if (updates.url !== undefined) existing.url = updates.url.replace(/\/+$/, '');
+  if (updates.enabled !== undefined) existing.enabled = Boolean(updates.enabled);
+  if (updates.priority !== undefined) existing.priority = Math.max(1, Math.min(100, parseInt(updates.priority) || 10));
+  if (updates.apiKeyEnvVar !== undefined) existing.apiKeyEnvVar = updates.apiKeyEnvVar;
+  if (updates.modelMapping !== undefined) existing.modelMapping = updates.modelMapping;
+  if (updates.supportedEndpoints !== undefined) existing.supportedEndpoints = updates.supportedEndpoints;
+  if (updates.costs !== undefined) {
+    existing.costs = {
+      inputTokenCostPer1M: parseFloat(updates.costs.inputTokenCostPer1M) || 0,
+      outputTokenCostPer1M: parseFloat(updates.costs.outputTokenCostPer1M) || 0,
+      currency: updates.costs.currency || 'USD'
+    };
+  }
+  if (updates.sharedResourceWeight !== undefined) existing.sharedResourceWeight = Math.max(0, Math.min(100, parseInt(updates.sharedResourceWeight) || 0));
+  if (updates.maxConcurrentRequests !== undefined) existing.maxConcurrentRequests = Math.max(1, Math.min(100, parseInt(updates.maxConcurrentRequests) || 5));
+  if (updates.timeoutMs !== undefined) existing.timeoutMs = Math.max(5000, Math.min(600000, parseInt(updates.timeoutMs) || 120000));
+  if (updates.extraHeaders !== undefined) existing.extraHeaders = updates.extraHeaders;
+
+  config.backends.directory[idx] = existing;
+  saveConfig(config);
+  initBackendQueues();
+  addLog('backends', `Updated backend: ${existing.name} (${existing.id})`);
+  res.json({ success: true, backend: existing });
+});
+
+// Delete a backend
+app.delete('/api/backends/:id', (req, res) => {
+  if (!config.backends?.directory) {
+    return res.status(404).json({ error: 'No backends configured' });
+  }
+  const idx = config.backends.directory.findIndex(b => b.id === req.params.id);
+  if (idx === -1) {
+    return res.status(404).json({ error: 'Backend not found' });
+  }
+  const removed = config.backends.directory.splice(idx, 1)[0];
+  saveConfig(config);
+  backendQueues.delete(removed.id);
+  backendStats.delete(removed.id);
+  addLog('backends', `Removed backend: ${removed.name} (${removed.id})`);
+  res.json({ success: true, removed });
+});
+
+// Test backend connectivity
+app.post('/api/backends/:id/test', async (req, res) => {
+  const backend = config.backends?.directory?.find(b => b.id === req.params.id);
+  if (!backend) {
+    return res.status(404).json({ error: 'Backend not found' });
+  }
+
+  const apiKey = backend.apiKeyEnvVar ? process.env[backend.apiKeyEnvVar] : null;
+  const headers = { 'Content-Type': 'application/json' };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  if (backend.extraHeaders) Object.assign(headers, backend.extraHeaders);
+
+  const baseUrl = backend.url.replace(/\/+$/, '');
+  const testModel = backend.modelMapping?.['*'] || Object.values(backend.modelMapping || {})[0] || 'test';
+  const startTime = Date.now();
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: testModel,
+        messages: [{ role: 'user', content: 'Hello' }],
+        max_tokens: 5,
+        stream: false
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+
+    const duration = Date.now() - startTime;
+    const body = await response.text();
+
+    if (response.ok) {
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { parsed = null; }
+      res.json({
+        success: true,
+        status: response.status,
+        latencyMs: duration,
+        model: parsed?.model || testModel,
+        message: `Connected successfully in ${duration}ms`
+      });
+    } else {
+      res.json({
+        success: false,
+        status: response.status,
+        latencyMs: duration,
+        error: body.slice(0, 500),
+        message: `Backend returned ${response.status}`
+      });
+    }
+  } catch (err) {
+    const duration = Date.now() - startTime;
+    res.json({
+      success: false,
+      status: 0,
+      latencyMs: duration,
+      error: err.message,
+      message: `Connection failed: ${err.message}`
+    });
+  }
+});
+
+// Get per-backend stats
+app.get('/api/backends/stats', (req, res) => {
+  const stats = {};
+  for (const [id, s] of backendStats) {
+    stats[id] = { ...s };
+  }
+  // Add local stats
+  stats.local = {
+    id: 'local',
+    totalRequests: tokenStats.totalRequests,
+    totalPromptTokens: tokenStats.totalPromptTokens,
+    totalCompletionTokens: tokenStats.totalCompletionTokens,
+    totalCostUsd: 0,
+    avgTokPerSec: tokenStats.recentRequests.length > 0
+      ? tokenStats.recentRequests.slice(-10).reduce((a, r) => a + (r.tokensPerSecond || 0), 0) / Math.min(10, tokenStats.recentRequests.length)
+      : 0,
+    queue: { active: llamaQueue.active, pending: llamaQueue.pending, concurrency: llamaQueue.concurrency }
+  };
+  res.json({ stats });
+});
+
+// Get/set routing policy
+app.get('/api/backends/routing', (req, res) => {
+  res.json({
+    enabled: config.backends?.enabled || false,
+    offloadPolicy: config.backends?.offloadPolicy || 'overflow',
+    offloadThresholdQueueDepth: config.backends?.offloadThresholdQueueDepth ?? 2,
+    offloadThresholdWaitMs: config.backends?.offloadThresholdWaitMs ?? 5000,
+    offloadPercentage: config.backends?.offloadPercentage || 0,
+    preferLocal: config.backends?.preferLocal !== false
+  });
+});
+
+app.post('/api/backends/routing', (req, res) => {
+  if (!config.backends) {
+    config.backends = { enabled: false, offloadPolicy: 'overflow', offloadThresholdQueueDepth: 2, offloadThresholdWaitMs: 5000, offloadPercentage: 0, preferLocal: true, directory: [] };
+  }
+
+  const { enabled, offloadPolicy, offloadThresholdQueueDepth, offloadThresholdWaitMs, offloadPercentage, preferLocal } = req.body;
+
+  if (enabled !== undefined) config.backends.enabled = Boolean(enabled);
+  if (offloadPolicy !== undefined) {
+    const validPolicies = ['overflow', 'threshold', 'percentage', 'manual'];
+    if (!validPolicies.includes(offloadPolicy)) {
+      return res.status(400).json({ error: `Invalid policy. Must be one of: ${validPolicies.join(', ')}` });
+    }
+    config.backends.offloadPolicy = offloadPolicy;
+  }
+  if (offloadThresholdQueueDepth !== undefined) {
+    const v = parseInt(offloadThresholdQueueDepth);
+    if (v >= 0 && v <= 100) config.backends.offloadThresholdQueueDepth = v;
+  }
+  if (offloadThresholdWaitMs !== undefined) {
+    const v = parseInt(offloadThresholdWaitMs);
+    if (v >= 0 && v <= 300000) config.backends.offloadThresholdWaitMs = v;
+  }
+  if (offloadPercentage !== undefined) {
+    const v = parseInt(offloadPercentage);
+    if (v >= 0 && v <= 100) config.backends.offloadPercentage = v;
+  }
+  if (preferLocal !== undefined) config.backends.preferLocal = Boolean(preferLocal);
+
+  saveConfig(config);
+  addLog('backends', `Routing policy updated: ${JSON.stringify(req.body)}`);
+  res.json({ success: true, routing: config.backends });
 });
 
 // Get server status
@@ -3519,9 +4029,132 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     }
   });
 
+  // Resolve backend routing (local vs remote)
+  const routing = resolveBackend(requestedModel, 'chat/completions');
+
+  // ===== REMOTE BACKEND PATH =====
+  if (routing.remote) {
+    const remoteBody = { ...proxyBody, model: routing.targetModel };
+    console.log(`[chat/completions] Routing to remote backend: ${routing.backend.name} (model: ${routing.targetModel})`);
+    addLog('backends', `Routing chat/completions to ${routing.backend.name} (queue: local=${llamaQueue.pending} pending)`);
+
+    try {
+      const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+        method: 'POST',
+        headers: { ...routing.headers },
+        body: JSON.stringify(remoteBody)
+      }, { label: 'chat/completions', model: routing.targetModel });
+
+      if (!response.ok) {
+        const error = await response.text();
+        addLlmLog({
+          endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
+          status: response.status, duration: Date.now() - startTime,
+          promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
+          messages: req.body.messages || null, prompt: null, response: null, error,
+          backend: backend.id, requestBody: req.body
+        });
+        endActiveRequest(activeReqId, { status: 'error' });
+        return res.status(response.status).send(error);
+      }
+
+      if (isStreaming) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let completionTokens = 0;
+        let promptTokens = 0;
+        let model = routing.targetModel;
+        let responseText = '';
+
+        const processStream = async () => {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const chunk = decoder.decode(value);
+              res.write(chunk);
+              const lines = chunk.split('\n');
+              for (const line of lines) {
+                if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                  try {
+                    const data = JSON.parse(line.slice(6));
+                    const delta = data.choices?.[0]?.delta;
+                    if (delta) {
+                      const text = delta.content || delta.reasoning_content || '';
+                      if (text) { completionTokens++; responseText += text; updateActiveRequest(activeReqId, text); }
+                    }
+                    if (data.usage) { promptTokens = data.usage.prompt_tokens || promptTokens; completionTokens = data.usage.completion_tokens || completionTokens; }
+                    if (data.model) model = data.model;
+                  } catch { /* skip */ }
+                }
+              }
+            }
+            res.end();
+            const duration = Date.now() - startTime;
+            const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration });
+            updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
+            addLlmLog({
+              endpoint: 'chat/completions', model, stream: true, status: 200, duration, promptTokens, completionTokens,
+              tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+              messages: req.body.messages || null, prompt: null, response: responseText, error: null,
+              backend: backend.id, requestBody: req.body
+            });
+            endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
+          } catch (e) {
+            const duration = Date.now() - startTime;
+            addLlmLog({
+              endpoint: 'chat/completions', model, stream: true, status: 500, duration, promptTokens, completionTokens, tokensPerSecond: 0,
+              messages: req.body.messages || null, prompt: null, response: responseText || null, error: `Stream error: ${e.message}`,
+              backend: backend.id, requestBody: req.body
+            });
+            endActiveRequest(activeReqId, { status: 'error' });
+            res.end();
+          }
+        };
+        processStream();
+      } else {
+        const data = await response.json();
+        const duration = Date.now() - startTime;
+        const usage = data.usage || {};
+        const promptTokens = usage.prompt_tokens || 0;
+        const completionTokens = usage.completion_tokens || 0;
+        const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration });
+        updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
+        addLlmLog({
+          endpoint: 'chat/completions', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens,
+          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+          messages: req.body.messages || null, prompt: null,
+          response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || null, error: null,
+          backend: backend.id, requestBody: req.body
+        });
+        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
+        res.json(data);
+      }
+    } catch (error) {
+      endActiveRequest(activeReqId, { status: 'error' });
+      addLlmLog({
+        endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
+        status: 502, duration: Date.now() - startTime,
+        promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
+        messages: req.body.messages || null, prompt: null, response: null, error: error.message,
+        backend: routing.backend.id, requestBody: req.body
+      });
+      res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+    }
+    return;
+  }
+
+  // ===== LOCAL BACKEND PATH (existing logic) =====
   let retryInfo = { retries: 0, retryErrors: [], restarted: false };
   function logLlm(entry) {
-    addLlmLog({ ...entry, retries: retryInfo.retries, retryErrors: retryInfo.retryErrors, requestBody: entry.requestBody || req.body });
+    addLlmLog({ ...entry, retries: retryInfo.retries, retryErrors: retryInfo.retryErrors, backend: 'local', requestBody: entry.requestBody || req.body });
   }
   async function doFetch(body) {
     const result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
@@ -3725,7 +4358,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       // Add our tracking info to response
       data._llama_manager = {
         duration,
-        tokensPerSecond: Math.round(tokensPerSecond * 10) / 10
+        tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+        backend: 'local'
       };
 
       endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
@@ -3750,6 +4384,58 @@ app.post('/api/v1/completions', async (req, res) => {
   const startTime = Date.now();
   const requestedModel = req.body.model || 'unknown';
   const isStreaming = req.body.stream === true;
+
+  // Route to remote backend if applicable
+  const routing = resolveBackend(requestedModel, 'completions');
+  if (routing.remote) {
+    const remoteBody = { ...req.body, model: routing.targetModel };
+    try {
+      const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+        method: 'POST', headers: { ...routing.headers }, body: JSON.stringify(remoteBody)
+      }, { label: 'completions', model: routing.targetModel });
+
+      if (!response.ok) {
+        const error = await response.text();
+        addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: response.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error, backend: backend.id, requestBody: req.body });
+        return res.status(response.status).send(error);
+      }
+      if (isStreaming) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let tokens = 0, responseText = '';
+        const processStream = async () => {
+          try {
+            while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = decoder.decode(value); res.write(chunk); const lines = chunk.split('\n'); for (const line of lines) { if (line.startsWith('data: ') && line !== 'data: [DONE]') { try { const data = JSON.parse(line.slice(6)); if (data.choices?.[0]?.text) responseText += data.choices[0].text; } catch { /* skip */ } } } tokens++; }
+            res.end();
+            const duration = Date.now() - startTime;
+            const tokensPerSecond = duration > 0 ? tokens / (duration / 1000) : 0;
+            recordTokenStats({ promptTokens: 0, completionTokens: tokens, tokensPerSecond, model: requestedModel, duration });
+            updateBackendTokenStats(backend.id, 0, tokens, duration, backend);
+            addLlmLog({ endpoint: 'completions', model: requestedModel, stream: true, status: 200, duration, promptTokens: 0, completionTokens: tokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: req.body.prompt || null, response: responseText, error: null, backend: backend.id, requestBody: req.body });
+          } catch { res.end(); }
+        };
+        processStream();
+      } else {
+        const data = await response.json();
+        const duration = Date.now() - startTime;
+        const usage = data.usage || {};
+        const promptTokens = usage.prompt_tokens || 0;
+        const completionTokens = usage.completion_tokens || 0;
+        const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || requestedModel, duration });
+        updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
+        addLlmLog({ endpoint: 'completions', model: data.model || requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: req.body.prompt || null, response: data.choices?.[0]?.text || null, error: null, backend: backend.id, requestBody: req.body });
+        res.json(data);
+      }
+    } catch (error) {
+      addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error: error.message, backend: routing.backend.id, requestBody: req.body });
+      res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+    }
+    return;
+  }
 
   try {
     const { response, retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
@@ -3868,6 +4554,28 @@ app.post('/api/v1/completions', async (req, res) => {
 
 // OpenAI-compatible embeddings endpoint
 app.post('/api/v1/embeddings', async (req, res) => {
+  const requestedModel = req.body.model || 'default';
+
+  // Route to remote backend if applicable
+  const routing = resolveBackend(requestedModel, 'embeddings');
+  if (routing.remote) {
+    const remoteBody = { ...req.body, model: routing.targetModel };
+    try {
+      const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+        method: 'POST', headers: { ...routing.headers }, body: JSON.stringify(remoteBody)
+      }, { label: 'embeddings', model: routing.targetModel });
+      if (!response.ok) {
+        const error = await response.text();
+        return res.status(response.status).send(error);
+      }
+      const data = await response.json();
+      res.json(data);
+    } catch (error) {
+      res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+    }
+    return;
+  }
+
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/embeddings`, {
       method: 'POST',
@@ -3934,6 +4642,58 @@ app.post('/api/v1/responses', async (req, res) => {
 
   // Inject reasoning_effort if configured
   const proxyBody = injectReasoningEffort(req.body);
+
+  // Route to remote backend if applicable
+  const routing = resolveBackend(requestedModel, 'responses');
+  if (routing.remote) {
+    const remoteBody = { ...proxyBody, model: routing.targetModel };
+    try {
+      const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+        method: 'POST', headers: { ...routing.headers }, body: JSON.stringify(remoteBody)
+      }, { label: 'responses', model: routing.targetModel });
+      if (!response.ok) {
+        const error = await response.text();
+        addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: response.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: null, response: null, error, backend: backend.id, requestBody: req.body });
+        return res.status(response.status).send(error);
+      }
+      if (isStreaming) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let completionTokens = 0, promptTokens = 0, model = routing.targetModel, responseText = '';
+        const processStream = async () => {
+          try {
+            while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = decoder.decode(value); res.write(chunk); const lines = chunk.split('\n'); for (const line of lines) { if (line.startsWith('data: ') && line !== 'data: [DONE]') { try { const data = JSON.parse(line.slice(6)); if (data.type === 'response.output_text.delta' && data.delta) responseText += data.delta; if (data.usage) { promptTokens = data.usage.input_tokens || data.usage.prompt_tokens || promptTokens; completionTokens = data.usage.output_tokens || data.usage.completion_tokens || completionTokens; } if (data.model) model = data.model; } catch { /* skip */ } } } }
+            res.end();
+            const duration = Date.now() - startTime;
+            const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration });
+            updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
+            addLlmLog({ endpoint: 'responses', model, stream: true, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: null, response: responseText, error: null, backend: backend.id, requestBody: req.body });
+          } catch (e) { res.end(); }
+        };
+        processStream();
+      } else {
+        const data = await response.json();
+        const duration = Date.now() - startTime;
+        const usage = data.usage || {};
+        const promptTokens = usage.input_tokens || usage.prompt_tokens || 0;
+        const completionTokens = usage.output_tokens || usage.completion_tokens || 0;
+        const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration });
+        updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
+        addLlmLog({ endpoint: 'responses', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: null, response: null, error: null, backend: backend.id, requestBody: req.body });
+        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        res.json(data);
+      }
+    } catch (error) {
+      addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: null, response: null, error: error.message, backend: routing.backend.id, requestBody: req.body });
+      res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+    }
+    return;
+  }
 
   let totalRetries = 0;
   let allRetryErrors = [];
@@ -4112,6 +4872,58 @@ app.post('/api/v1/messages', async (req, res) => {
 
   // Inject reasoning_effort if configured
   const proxyBody = injectReasoningEffort(req.body);
+
+  // Route to remote backend if applicable
+  const routing = resolveBackend(requestedModel, 'messages');
+  if (routing.remote) {
+    const remoteBody = { ...proxyBody, model: routing.targetModel };
+    try {
+      const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+        method: 'POST', headers: { ...routing.headers }, body: JSON.stringify(remoteBody)
+      }, { label: 'messages', model: routing.targetModel });
+      if (!response.ok) {
+        const error = await response.text();
+        addLlmLog({ endpoint: 'messages', model: requestedModel, stream: isStreaming, status: response.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error, backend: backend.id, requestBody: req.body });
+        return res.status(response.status).send(error);
+      }
+      if (isStreaming) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let completionTokens = 0, promptTokens = 0, model = routing.targetModel, responseText = '';
+        const processStream = async () => {
+          try {
+            while (true) { const { done, value } = await reader.read(); if (done) break; const chunk = decoder.decode(value); res.write(chunk); const lines = chunk.split('\n'); for (const line of lines) { if (line.startsWith('data: ') && line !== 'data: [DONE]') { try { const data = JSON.parse(line.slice(6)); if (data.type === 'content_block_delta' && data.delta?.text) { responseText += data.delta.text; completionTokens++; } if (data.usage) { promptTokens = data.usage.input_tokens || promptTokens; completionTokens = data.usage.output_tokens || completionTokens; } if (data.model) model = data.model; } catch { /* skip */ } } } }
+            res.end();
+            const duration = Date.now() - startTime;
+            const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration });
+            updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
+            addLlmLog({ endpoint: 'messages', model, stream: true, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: req.body.messages || null, prompt: null, response: responseText, error: null, backend: backend.id, requestBody: req.body });
+          } catch (e) { res.end(); }
+        };
+        processStream();
+      } else {
+        const data = await response.json();
+        const duration = Date.now() - startTime;
+        const usage = data.usage || {};
+        const promptTokens = usage.input_tokens || 0;
+        const completionTokens = usage.output_tokens || 0;
+        const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration });
+        updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
+        addLlmLog({ endpoint: 'messages', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: req.body.messages || null, prompt: null, response: null, error: null, backend: backend.id, requestBody: req.body });
+        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        res.json(data);
+      }
+    } catch (error) {
+      addLlmLog({ endpoint: 'messages', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: error.message, backend: routing.backend.id, requestBody: req.body });
+      res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+    }
+    return;
+  }
 
   let totalRetries = 0;
   let allRetryErrors = [];

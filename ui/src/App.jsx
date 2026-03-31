@@ -1162,6 +1162,20 @@ function Dashboard({ stats, activeRequest }) {
                 )}
               </div>
             </div>
+            {stats?.backends && Object.keys(stats.backends).length > 0 && (
+              <div className="resource-card" style={{ minWidth: 'auto' }}>
+                <div className="resource-info">
+                  <span className="resource-label">Remote Backends</span>
+                  <span className="resource-detail" style={{ fontSize: '0.8em' }}>
+                    {Object.entries(stats.backends).map(([id, b]) => (
+                      <span key={id} style={{ marginRight: '12px' }}>
+                        {id}: {b.active}/{b.active + b.pending} {b.tokPerSec > 0 ? `${b.tokPerSec} t/s` : ''} {b.totalCost > 0 ? `$${b.totalCost.toFixed(4)}` : ''}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -3571,6 +3585,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                         <span className="llm-log-tps">{log.tokensPerSecond} t/s</span>
                       )}
                       <span className={`llm-log-endpoint ${log.endpoint}`}>{log.endpoint}</span>
+                      {log.backend && log.backend !== 'local' && <span className="llm-log-badge" style={{ background: 'var(--info-bg, #1a2a3a)', color: 'var(--info, #60a5fa)' }}>{log.backend}</span>}
                       {log.stream && <span className="llm-log-badge stream">stream</span>}
                       {log.retries > 0 && <span className="llm-log-badge retry">{log.retries} {log.retries === 1 ? 'retry' : 'retries'}</span>}
                       {isError && <span className="llm-log-badge error">{log.status || 'ERR'}</span>}
@@ -4261,6 +4276,8 @@ function SettingsPage() {
         </div>
       </section>
 
+      <BackendsSection settings={settings} updateSetting={updateSetting} setMessage={setMessage} />
+
       <LlamaCppUpdateSection />
 
       <section className="page-section">
@@ -4269,6 +4286,478 @@ function SettingsPage() {
           {JSON.stringify(settings, null, 2)}
         </pre>
       </section>
+    </div>
+  );
+}
+
+// Remote Backends Management Section
+function BackendsSection({ settings, updateSetting, setMessage }) {
+  const [backends, setBackends] = useState([]);
+  const [backendsStats, setBackendsStats] = useState({});
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [testResults, setTestResults] = useState({});
+  const [newBackend, setNewBackend] = useState({
+    name: '', url: '', apiKeyEnvVar: '', priority: 10,
+    modelMapping: { '*': '' },
+    supportedEndpoints: ['chat/completions', 'completions', 'embeddings'],
+    costs: { inputTokenCostPer1M: 0, outputTokenCostPer1M: 0, currency: 'USD' },
+    sharedResourceWeight: 0, maxConcurrentRequests: 5, timeoutMs: 120000
+  });
+
+  const backendsConfig = settings?.backends || {};
+  const directory = backendsConfig.directory || [];
+
+  const fetchBackends = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/backends`);
+      const data = await res.json();
+      setBackends(data.backends || []);
+    } catch { /* ignore */ }
+  }, []);
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/backends/stats`);
+      const data = await res.json();
+      setBackendsStats(data.stats || {});
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    fetchBackends();
+    fetchStats();
+  }, [fetchBackends, fetchStats]);
+
+  const updateRouting = (key, value) => {
+    const updated = { ...backendsConfig, [key]: value };
+    updateSetting('backends', updated);
+  };
+
+  const addBackend = async () => {
+    if (!newBackend.name || !newBackend.url) {
+      setMessage({ type: 'error', text: 'Backend name and URL are required' });
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE}/backends`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newBackend)
+      });
+      const data = await res.json();
+      if (data.success) {
+        setMessage({ type: 'success', text: `Backend "${data.backend.name}" added` });
+        setShowAddForm(false);
+        setNewBackend({ name: '', url: '', apiKeyEnvVar: '', priority: 10, modelMapping: { '*': '' }, supportedEndpoints: ['chat/completions', 'completions', 'embeddings'], costs: { inputTokenCostPer1M: 0, outputTokenCostPer1M: 0, currency: 'USD' }, sharedResourceWeight: 0, maxConcurrentRequests: 5, timeoutMs: 120000 });
+        fetchBackends();
+      } else {
+        setMessage({ type: 'error', text: data.error });
+      }
+    } catch (err) {
+      setMessage({ type: 'error', text: `Failed to add backend: ${err.message}` });
+    }
+  };
+
+  const deleteBackend = async (id, name) => {
+    if (!confirm(`Delete backend "${name}"?`)) return;
+    try {
+      const res = await fetch(`${API_BASE}/backends/${id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (data.success) {
+        setMessage({ type: 'success', text: `Backend "${name}" removed` });
+        fetchBackends();
+      }
+    } catch (err) {
+      setMessage({ type: 'error', text: `Failed to delete: ${err.message}` });
+    }
+  };
+
+  const toggleBackend = async (id, enabled) => {
+    try {
+      await fetch(`${API_BASE}/backends/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+      });
+      fetchBackends();
+    } catch { /* ignore */ }
+  };
+
+  const testBackend = async (id) => {
+    setTestResults(prev => ({ ...prev, [id]: { testing: true } }));
+    try {
+      const res = await fetch(`${API_BASE}/backends/${id}/test`, { method: 'POST' });
+      const data = await res.json();
+      setTestResults(prev => ({ ...prev, [id]: data }));
+    } catch (err) {
+      setTestResults(prev => ({ ...prev, [id]: { success: false, message: err.message } }));
+    }
+  };
+
+  const saveRoutingPolicy = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/backends/routing`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: backendsConfig.enabled,
+          offloadPolicy: backendsConfig.offloadPolicy,
+          offloadThresholdQueueDepth: backendsConfig.offloadThresholdQueueDepth,
+          offloadThresholdWaitMs: backendsConfig.offloadThresholdWaitMs,
+          offloadPercentage: backendsConfig.offloadPercentage,
+          preferLocal: backendsConfig.preferLocal
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setMessage({ type: 'success', text: 'Routing policy saved' });
+      }
+    } catch (err) {
+      setMessage({ type: 'error', text: `Failed to save routing: ${err.message}` });
+    }
+  };
+
+  const updateBackendField = async (id, field, value) => {
+    try {
+      await fetch(`${API_BASE}/backends/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [field]: value })
+      });
+      fetchBackends();
+    } catch { /* ignore */ }
+  };
+
+  return (
+    <section className="page-section">
+      <h3>Remote Backends</h3>
+      <p className="setting-hint" style={{ marginBottom: '16px' }}>
+        Configure remote OpenAI-compatible API endpoints for load balancing. When the local server is busy, requests can be offloaded to these backends.
+      </p>
+
+      <div className="settings-grid">
+        <div className="setting-item">
+          <label>
+            <input
+              type="checkbox"
+              checked={backendsConfig.enabled || false}
+              onChange={(e) => updateRouting('enabled', e.target.checked)}
+            />
+            {' '}Enable Remote Backend Offloading
+          </label>
+        </div>
+      </div>
+
+      {backendsConfig.enabled && (
+        <>
+          <div className="settings-grid" style={{ marginTop: '16px' }}>
+            <div className="setting-item">
+              <label htmlFor="offloadPolicy">Offload Policy</label>
+              <p className="setting-hint">
+                When to send requests to remote backends instead of local.
+              </p>
+              <select
+                id="offloadPolicy"
+                value={backendsConfig.offloadPolicy || 'overflow'}
+                onChange={(e) => updateRouting('offloadPolicy', e.target.value)}
+              >
+                <option value="overflow">Overflow - Only when local queue is full</option>
+                <option value="threshold">Threshold - When queue depth/wait exceeds limits</option>
+                <option value="percentage">Percentage - Fixed % of requests go remote</option>
+                <option value="manual">Manual - Only via explicit backend prefix</option>
+              </select>
+            </div>
+
+            {backendsConfig.offloadPolicy === 'threshold' && (
+              <>
+                <div className="setting-item">
+                  <label htmlFor="thresholdQueueDepth">Queue Depth Threshold</label>
+                  <p className="setting-hint">Offload when pending queue exceeds this depth.</p>
+                  <input
+                    type="number"
+                    id="thresholdQueueDepth"
+                    value={backendsConfig.offloadThresholdQueueDepth ?? 2}
+                    onChange={(e) => updateRouting('offloadThresholdQueueDepth', parseInt(e.target.value))}
+                    min={0} max={100}
+                  />
+                </div>
+                <div className="setting-item">
+                  <label htmlFor="thresholdWaitMs">Wait Time Threshold (ms)</label>
+                  <p className="setting-hint">Offload when estimated wait exceeds this time.</p>
+                  <input
+                    type="number"
+                    id="thresholdWaitMs"
+                    value={backendsConfig.offloadThresholdWaitMs ?? 5000}
+                    onChange={(e) => updateRouting('offloadThresholdWaitMs', parseInt(e.target.value))}
+                    min={0} max={300000} step={1000}
+                  />
+                </div>
+              </>
+            )}
+
+            {backendsConfig.offloadPolicy === 'percentage' && (
+              <div className="setting-item">
+                <label htmlFor="offloadPercentage">
+                  Offload Percentage: {backendsConfig.offloadPercentage || 0}%
+                </label>
+                <p className="setting-hint">Percentage of requests to send to remote backends.</p>
+                <input
+                  type="range"
+                  id="offloadPercentage"
+                  value={backendsConfig.offloadPercentage || 0}
+                  onChange={(e) => updateRouting('offloadPercentage', parseInt(e.target.value))}
+                  min={0} max={100}
+                />
+              </div>
+            )}
+
+            <div className="setting-item">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={backendsConfig.preferLocal !== false}
+                  onChange={(e) => updateRouting('preferLocal', e.target.checked)}
+                />
+                {' '}Prefer Local (always try local first)
+              </label>
+            </div>
+          </div>
+
+          <div style={{ marginTop: '12px', marginBottom: '16px' }}>
+            <button className="btn-primary" onClick={saveRoutingPolicy} style={{ marginRight: '8px' }}>
+              Save Routing Policy
+            </button>
+          </div>
+
+          {/* Backend Directory */}
+          <h4 style={{ marginTop: '24px', marginBottom: '12px' }}>Backend Directory</h4>
+
+          {backends.length === 0 && !showAddForm && (
+            <div className="empty-state" style={{ padding: '24px' }}>
+              <p>No remote backends configured.</p>
+            </div>
+          )}
+
+          {backends.map(b => {
+            const stats = backendsStats[b.id] || {};
+            const test = testResults[b.id];
+            return (
+              <div key={b.id} className="backend-card" style={{ border: '1px solid var(--border)', borderRadius: '8px', padding: '16px', marginBottom: '12px', background: 'var(--card-bg, #1a1a2e)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <strong style={{ fontSize: '1.1em' }}>{b.name}</strong>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.85em' }}>{b.url}</span>
+                    <span style={{
+                      display: 'inline-block', padding: '2px 8px', borderRadius: '4px', fontSize: '0.75em',
+                      background: b.apiKeyConfigured ? 'var(--success-bg, #1a3a2a)' : 'var(--warning-bg, #3a2a1a)',
+                      color: b.apiKeyConfigured ? 'var(--success, #4ade80)' : 'var(--warning, #fbbf24)'
+                    }}>
+                      {b.apiKeyConfigured ? 'Key configured' : 'No API key'}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <label style={{ fontSize: '0.85em', cursor: 'pointer' }}>
+                      <input type="checkbox" checked={b.enabled} onChange={(e) => toggleBackend(b.id, e.target.checked)} />
+                      {' '}Enabled
+                    </label>
+                    <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={() => testBackend(b.id)}>
+                      {test?.testing ? 'Testing...' : 'Test'}
+                    </button>
+                    <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={() => setEditingId(editingId === b.id ? null : b.id)}>
+                      {editingId === b.id ? 'Close' : 'Edit'}
+                    </button>
+                    <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em', color: 'var(--error, #f87171)' }} onClick={() => deleteBackend(b.id, b.name)}>
+                      Delete
+                    </button>
+                  </div>
+                </div>
+
+                {/* Stats row */}
+                <div style={{ display: 'flex', gap: '24px', fontSize: '0.85em', color: 'var(--text-muted)', flexWrap: 'wrap' }}>
+                  <span>Priority: {b.priority}</span>
+                  <span>Shared Weight: {b.sharedResourceWeight}</span>
+                  <span>Queue: {b.queue?.active || 0}/{b.maxConcurrentRequests || 5}</span>
+                  <span>Requests: {stats.totalRequests || 0}</span>
+                  <span>Tok/s: {stats.avgTokPerSec ? stats.avgTokPerSec.toFixed(1) : '-'}</span>
+                  <span>Cost: ${stats.totalCostUsd ? stats.totalCostUsd.toFixed(4) : '0.00'}</span>
+                  <span>Errors: {stats.errorRequests || 0}</span>
+                  {b.costs?.inputTokenCostPer1M > 0 && (
+                    <span>Rate: ${b.costs.inputTokenCostPer1M}/M in, ${b.costs.outputTokenCostPer1M}/M out</span>
+                  )}
+                </div>
+
+                {/* Test result */}
+                {test && !test.testing && (
+                  <div style={{ marginTop: '8px', padding: '8px', borderRadius: '4px', fontSize: '0.85em', background: test.success ? 'var(--success-bg, #1a3a2a)' : 'var(--error-bg, #3a1a1a)', color: test.success ? 'var(--success, #4ade80)' : 'var(--error, #f87171)' }}>
+                    {test.message} {test.latencyMs && `(${test.latencyMs}ms)`}
+                  </div>
+                )}
+
+                {/* Model mappings */}
+                {b.modelMapping && Object.keys(b.modelMapping).length > 0 && (
+                  <div style={{ marginTop: '8px', fontSize: '0.85em' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>Model mapping: </span>
+                    {Object.entries(b.modelMapping).map(([k, v]) => (
+                      <span key={k} style={{ marginRight: '12px' }}>
+                        <code>{k}</code> {'→'} <code>{v}</code>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Edit form */}
+                {editingId === b.id && (
+                  <BackendEditForm backend={b} onSave={(updates) => {
+                    fetch(`${API_BASE}/backends/${b.id}`, {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(updates)
+                    }).then(() => { fetchBackends(); setEditingId(null); });
+                  }} onCancel={() => setEditingId(null)} />
+                )}
+              </div>
+            );
+          })}
+
+          {/* Add Backend */}
+          {showAddForm ? (
+            <div style={{ border: '1px solid var(--border)', borderRadius: '8px', padding: '16px', marginTop: '12px', background: 'var(--card-bg, #1a1a2e)' }}>
+              <h4 style={{ marginBottom: '12px' }}>Add New Backend</h4>
+              <BackendFormFields values={newBackend} onChange={setNewBackend} />
+              <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+                <button className="btn-primary" onClick={addBackend}>Add Backend</button>
+                <button className="btn-secondary" onClick={() => setShowAddForm(false)}>Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <button className="btn-secondary" onClick={() => setShowAddForm(true)} style={{ marginTop: '8px' }}>
+              + Add Backend
+            </button>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+// Shared form fields for backend add/edit
+function BackendFormFields({ values, onChange }) {
+  const update = (key, value) => onChange({ ...values, [key]: value });
+  const updateCost = (key, value) => onChange({ ...values, costs: { ...values.costs, [key]: value } });
+
+  // Model mapping editor
+  const mappingEntries = Object.entries(values.modelMapping || { '*': '' });
+  const addMapping = () => onChange({ ...values, modelMapping: { ...values.modelMapping, '': '' } });
+  const removeMapping = (key) => {
+    const m = { ...values.modelMapping };
+    delete m[key];
+    onChange({ ...values, modelMapping: m });
+  };
+  const updateMappingKey = (oldKey, newKey) => {
+    const m = {};
+    for (const [k, v] of Object.entries(values.modelMapping)) {
+      m[k === oldKey ? newKey : k] = v;
+    }
+    onChange({ ...values, modelMapping: m });
+  };
+  const updateMappingValue = (key, value) => {
+    onChange({ ...values, modelMapping: { ...values.modelMapping, [key]: value } });
+  };
+
+  return (
+    <div className="settings-grid">
+      <div className="setting-item">
+        <label>Name</label>
+        <input type="text" value={values.name} onChange={(e) => update('name', e.target.value)} placeholder="e.g. OpenRouter" />
+      </div>
+      <div className="setting-item">
+        <label>URL</label>
+        <input type="text" value={values.url} onChange={(e) => update('url', e.target.value)} placeholder="e.g. https://openrouter.ai/api/v1" />
+      </div>
+      <div className="setting-item">
+        <label>API Key Env Variable</label>
+        <p className="setting-hint">Name of the environment variable holding the API key (set in .env).</p>
+        <input type="text" value={values.apiKeyEnvVar} onChange={(e) => update('apiKeyEnvVar', e.target.value)} placeholder="e.g. BACKEND_OPENROUTER_API_KEY" />
+      </div>
+      <div className="setting-item">
+        <label>Priority (1-100, lower = preferred)</label>
+        <input type="number" value={values.priority} onChange={(e) => update('priority', parseInt(e.target.value))} min={1} max={100} />
+      </div>
+      <div className="setting-item">
+        <label>Shared Resource Weight (0-100)</label>
+        <p className="setting-hint">0 = dedicated resource, 100 = heavily shared with other users/tasks.</p>
+        <input type="range" value={values.sharedResourceWeight} onChange={(e) => update('sharedResourceWeight', parseInt(e.target.value))} min={0} max={100} />
+        <span style={{ fontSize: '0.85em', color: 'var(--text-muted)' }}>{values.sharedResourceWeight}</span>
+      </div>
+      <div className="setting-item">
+        <label>Max Concurrent Requests</label>
+        <input type="number" value={values.maxConcurrentRequests} onChange={(e) => update('maxConcurrentRequests', parseInt(e.target.value))} min={1} max={100} />
+      </div>
+      <div className="setting-item">
+        <label>Timeout (ms)</label>
+        <input type="number" value={values.timeoutMs} onChange={(e) => update('timeoutMs', parseInt(e.target.value))} min={5000} max={600000} step={1000} />
+      </div>
+
+      {/* Cost section */}
+      <div className="setting-item" style={{ gridColumn: '1 / -1' }}>
+        <label>Cost (per 1M tokens)</label>
+        <p className="setting-hint">Set to 0 for free/self-hosted backends.</p>
+        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+          <div>
+            <label style={{ fontSize: '0.85em' }}>Input</label>
+            <input type="number" value={values.costs?.inputTokenCostPer1M || 0} onChange={(e) => updateCost('inputTokenCostPer1M', parseFloat(e.target.value))} min={0} step={0.01} style={{ width: '100px' }} />
+          </div>
+          <div>
+            <label style={{ fontSize: '0.85em' }}>Output</label>
+            <input type="number" value={values.costs?.outputTokenCostPer1M || 0} onChange={(e) => updateCost('outputTokenCostPer1M', parseFloat(e.target.value))} min={0} step={0.01} style={{ width: '100px' }} />
+          </div>
+          <div>
+            <label style={{ fontSize: '0.85em' }}>Currency</label>
+            <input type="text" value={values.costs?.currency || 'USD'} onChange={(e) => updateCost('currency', e.target.value)} style={{ width: '60px' }} />
+          </div>
+        </div>
+      </div>
+
+      {/* Model mapping */}
+      <div className="setting-item" style={{ gridColumn: '1 / -1' }}>
+        <label>Model Mapping</label>
+        <p className="setting-hint">Map local model names to remote model IDs. Use * as a catch-all wildcard.</p>
+        {mappingEntries.map(([key, value], idx) => (
+          <div key={idx} style={{ display: 'flex', gap: '8px', marginBottom: '4px', alignItems: 'center' }}>
+            <input type="text" value={key} onChange={(e) => updateMappingKey(key, e.target.value)} placeholder="Local model (or *)" style={{ flex: 1 }} />
+            <span style={{ color: 'var(--text-muted)' }}>{'→'}</span>
+            <input type="text" value={value} onChange={(e) => updateMappingValue(key, e.target.value)} placeholder="Remote model ID" style={{ flex: 1 }} />
+            <button className="btn-secondary" style={{ padding: '4px 8px', fontSize: '0.85em' }} onClick={() => removeMapping(key)}>x</button>
+          </div>
+        ))}
+        <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em', marginTop: '4px' }} onClick={addMapping}>+ Add Mapping</button>
+      </div>
+    </div>
+  );
+}
+
+// Edit form for existing backend
+function BackendEditForm({ backend, onSave, onCancel }) {
+  const [values, setValues] = useState({
+    name: backend.name,
+    url: backend.url,
+    apiKeyEnvVar: backend.apiKeyEnvVar || '',
+    priority: backend.priority || 10,
+    sharedResourceWeight: backend.sharedResourceWeight || 0,
+    maxConcurrentRequests: backend.maxConcurrentRequests || 5,
+    timeoutMs: backend.timeoutMs || 120000,
+    costs: backend.costs || { inputTokenCostPer1M: 0, outputTokenCostPer1M: 0, currency: 'USD' },
+    modelMapping: backend.modelMapping || { '*': '' }
+  });
+
+  return (
+    <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--border)' }}>
+      <BackendFormFields values={values} onChange={setValues} />
+      <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+        <button className="btn-primary" onClick={() => onSave(values)}>Save Changes</button>
+        <button className="btn-secondary" onClick={onCancel}>Cancel</button>
+      </div>
     </div>
   );
 }
