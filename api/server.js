@@ -4144,6 +4144,9 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectReasoningEffort(req.body);
 
+  // Resolve backend routing (local vs remote)
+  const routing = resolveBackend(requestedModel, 'chat/completions');
+
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: routing.remote ? routing.backend.id : 'local' });
   // Ensure active request is cleaned up on any exit path
   res.on('finish', () => {
@@ -4151,9 +4154,6 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       endActiveRequest(activeReqId, { status: res.statusCode >= 400 ? 'error' : 'complete' });
     }
   });
-
-  // Resolve backend routing (local vs remote)
-  const routing = resolveBackend(requestedModel, 'chat/completions');
 
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
