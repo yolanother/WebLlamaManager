@@ -4375,9 +4375,17 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
     }
   }, [backends]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const updateRouting = (key, value) => {
+  const updateRouting = async (key, value) => {
     const updated = { ...backendsConfig, [key]: value };
     updateSetting('backends', updated);
+    // Auto-persist routing changes to the server
+    try {
+      await fetch(`${API_BASE}/backends/routing`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [key]: value })
+      });
+    } catch { /* ignore */ }
   };
 
   const addBackend = async () => {
@@ -4583,10 +4591,8 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
             </div>
           </div>
 
-          <div style={{ marginTop: '12px', marginBottom: '16px' }}>
-            <button className="btn-primary" onClick={saveRoutingPolicy} style={{ marginRight: '8px' }}>
-              Save Routing Policy
-            </button>
+          <div style={{ marginTop: '4px', marginBottom: '16px' }}>
+            <span style={{ fontSize: '0.8em', color: 'var(--text-muted)' }}>Routing settings save automatically.</span>
           </div>
 
           {/* Backend Directory */}

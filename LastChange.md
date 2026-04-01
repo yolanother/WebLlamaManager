@@ -1,8 +1,11 @@
-Fix routing variable declaration order causing crash
+Auto-save routing settings so enable toggle persists across restarts
 
-Move `const routing = resolveBackend(...)` before `startActiveRequest()`
-call in chat/completions handler. The previous order referenced `routing`
-before it was declared, causing "Cannot access 'routing' before
-initialization" ReferenceError on incoming requests.
+The enable checkbox and all routing policy controls now save to the
+server immediately on change via POST /api/backends/routing, instead
+of only updating local React state. Previously the enabled state was
+lost on server restart because it was never persisted to config.json.
+
+Removed the separate "Save Routing Policy" button since changes now
+auto-save.
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
