@@ -4297,6 +4297,8 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [testResults, setTestResults] = useState({});
+  const [localModels, setLocalModels] = useState([]);
+  const [remoteModels, setRemoteModels] = useState({}); // backendId -> string[]
   const [newBackend, setNewBackend] = useState({
     name: '', url: '', apiKeyEnvVar: '', priority: 10,
     modelMapping: { '*': '' },
@@ -4306,7 +4308,6 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
   });
 
   const backendsConfig = settings?.backends || {};
-  const directory = backendsConfig.directory || [];
 
   const fetchBackends = useCallback(async () => {
     try {
@@ -4324,10 +4325,37 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
     } catch { /* ignore */ }
   }, []);
 
+  const fetchLocalModels = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/models`);
+      const data = await res.json();
+      setLocalModels((data.serverModels || []).map(m => m.id || m.model || '').filter(Boolean));
+    } catch { /* ignore */ }
+  }, []);
+
+  const fetchRemoteModels = useCallback(async (backendId) => {
+    try {
+      const res = await fetch(`${API_BASE}/backends/${backendId}/models`);
+      const data = await res.json();
+      setRemoteModels(prev => ({ ...prev, [backendId]: data.models || [] }));
+      return data.models || [];
+    } catch { return []; }
+  }, []);
+
   useEffect(() => {
     fetchBackends();
     fetchStats();
-  }, [fetchBackends, fetchStats]);
+    fetchLocalModels();
+  }, [fetchBackends, fetchStats, fetchLocalModels]);
+
+  // Fetch remote models for each backend
+  useEffect(() => {
+    for (const b of backends) {
+      if (!remoteModels[b.id]) {
+        fetchRemoteModels(b.id);
+      }
+    }
+  }, [backends]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateRouting = (key, value) => {
     const updated = { ...backendsConfig, [key]: value };
@@ -4347,10 +4375,30 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
       });
       const data = await res.json();
       if (data.success) {
-        setMessage({ type: 'success', text: `Backend "${data.backend.name}" added` });
+        const backendId = data.backend.id;
+        setMessage({ type: 'info', text: `Backend "${data.backend.name}" added. Running connectivity test...` });
         setShowAddForm(false);
         setNewBackend({ name: '', url: '', apiKeyEnvVar: '', priority: 10, modelMapping: { '*': '' }, supportedEndpoints: ['chat/completions', 'completions', 'embeddings'], costs: { inputTokenCostPer1M: 0, outputTokenCostPer1M: 0, currency: 'USD' }, sharedResourceWeight: 0, maxConcurrentRequests: 5, timeoutMs: 120000 });
-        fetchBackends();
+        await fetchBackends();
+
+        // Auto-test after adding
+        setTestResults(prev => ({ ...prev, [backendId]: { testing: true } }));
+        try {
+          const testRes = await fetch(`${API_BASE}/backends/${backendId}/test`, { method: 'POST' });
+          const testData = await testRes.json();
+          setTestResults(prev => ({ ...prev, [backendId]: testData }));
+          await fetchBackends(); // Refresh to pick up tested state
+          if (testData.success) {
+            setMessage({ type: 'success', text: `Backend "${data.backend.name}" added and tested successfully (${testData.latencyMs}ms)` });
+            // Also fetch remote models now that we know the backend works
+            fetchRemoteModels(backendId);
+          } else {
+            setMessage({ type: 'error', text: `Backend added but test failed: ${testData.message}. Backend won't be used for offloading until it passes a test.` });
+          }
+        } catch (err) {
+          setTestResults(prev => ({ ...prev, [backendId]: { success: false, message: err.message } }));
+          setMessage({ type: 'error', text: `Backend added but test failed: ${err.message}` });
+        }
       } else {
         setMessage({ type: 'error', text: data.error });
       }
@@ -4390,6 +4438,10 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
       const res = await fetch(`${API_BASE}/backends/${id}/test`, { method: 'POST' });
       const data = await res.json();
       setTestResults(prev => ({ ...prev, [id]: data }));
+      fetchBackends(); // Refresh tested state
+      if (data.remoteModels?.length) {
+        setRemoteModels(prev => ({ ...prev, [id]: data.remoteModels }));
+      }
     } catch (err) {
       setTestResults(prev => ({ ...prev, [id]: { success: false, message: err.message } }));
     }
@@ -4416,17 +4468,6 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
     } catch (err) {
       setMessage({ type: 'error', text: `Failed to save routing: ${err.message}` });
     }
-  };
-
-  const updateBackendField = async (id, field, value) => {
-    try {
-      await fetch(`${API_BASE}/backends/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ [field]: value })
-      });
-      fetchBackends();
-    } catch { /* ignore */ }
   };
 
   return (
@@ -4542,19 +4583,35 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
           {backends.map(b => {
             const stats = backendsStats[b.id] || {};
             const test = testResults[b.id];
+            const testedBadge = b.tested
+              ? { bg: 'var(--success-bg, #1a3a2a)', color: 'var(--success, #4ade80)', text: 'Tested' }
+              : { bg: 'var(--error-bg, #3a1a1a)', color: 'var(--error, #f87171)', text: 'Untested' };
             return (
               <div key={b.id} className="backend-card" style={{ border: '1px solid var(--border)', borderRadius: '8px', padding: '16px', marginBottom: '12px', background: 'var(--card-bg, #1a1a2e)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
                     <strong style={{ fontSize: '1.1em' }}>{b.name}</strong>
                     <span style={{ color: 'var(--text-muted)', fontSize: '0.85em' }}>{b.url}</span>
                     <span style={{
                       display: 'inline-block', padding: '2px 8px', borderRadius: '4px', fontSize: '0.75em',
-                      background: b.apiKeyConfigured ? 'var(--success-bg, #1a3a2a)' : 'var(--warning-bg, #3a2a1a)',
-                      color: b.apiKeyConfigured ? 'var(--success, #4ade80)' : 'var(--warning, #fbbf24)'
+                      background: testedBadge.bg, color: testedBadge.color
                     }}>
-                      {b.apiKeyConfigured ? 'Key configured' : 'No API key'}
+                      {testedBadge.text}
                     </span>
+                    {b.apiKeyEnvVar && (
+                      <span style={{
+                        display: 'inline-block', padding: '2px 8px', borderRadius: '4px', fontSize: '0.75em',
+                        background: b.apiKeyConfigured ? 'var(--success-bg, #1a3a2a)' : 'var(--warning-bg, #3a2a1a)',
+                        color: b.apiKeyConfigured ? 'var(--success, #4ade80)' : 'var(--warning, #fbbf24)'
+                      }}>
+                        {b.apiKeyConfigured ? 'Key configured' : 'No API key'}
+                      </span>
+                    )}
+                    {!b.tested && (
+                      <span style={{ fontSize: '0.75em', color: 'var(--warning, #fbbf24)' }}>
+                        (must pass test before offloading)
+                      </span>
+                    )}
                   </div>
                   <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                     <label style={{ fontSize: '0.85em', cursor: 'pointer' }}>
@@ -4600,7 +4657,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
                     <span style={{ color: 'var(--text-muted)' }}>Model mapping: </span>
                     {Object.entries(b.modelMapping).map(([k, v]) => (
                       <span key={k} style={{ marginRight: '12px' }}>
-                        <code>{k}</code> {'→'} <code>{v}</code>
+                        <code>{k === '*' ? '* (all models)' : k}</code> {'→'} <code>{v || '(not set)'}</code>
                       </span>
                     ))}
                   </div>
@@ -4608,7 +4665,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
 
                 {/* Edit form */}
                 {editingId === b.id && (
-                  <BackendEditForm backend={b} onSave={(updates) => {
+                  <BackendEditForm backend={b} localModels={localModels} remoteModels={remoteModels[b.id] || []} onSave={(updates) => {
                     fetch(`${API_BASE}/backends/${b.id}`, {
                       method: 'PUT',
                       headers: { 'Content-Type': 'application/json' },
@@ -4624,9 +4681,9 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
           {showAddForm ? (
             <div style={{ border: '1px solid var(--border)', borderRadius: '8px', padding: '16px', marginTop: '12px', background: 'var(--card-bg, #1a1a2e)' }}>
               <h4 style={{ marginBottom: '12px' }}>Add New Backend</h4>
-              <BackendFormFields values={newBackend} onChange={setNewBackend} />
+              <BackendFormFields values={newBackend} onChange={setNewBackend} localModels={localModels} remoteModels={[]} />
               <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
-                <button className="btn-primary" onClick={addBackend}>Add Backend</button>
+                <button className="btn-primary" onClick={addBackend}>Add Backend & Test</button>
                 <button className="btn-secondary" onClick={() => setShowAddForm(false)}>Cancel</button>
               </div>
             </div>
@@ -4642,7 +4699,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
 }
 
 // Shared form fields for backend add/edit
-function BackendFormFields({ values, onChange }) {
+function BackendFormFields({ values, onChange, localModels = [], remoteModels = [] }) {
   const update = (key, value) => onChange({ ...values, [key]: value });
   const updateCost = (key, value) => onChange({ ...values, costs: { ...values.costs, [key]: value } });
 
@@ -4677,7 +4734,7 @@ function BackendFormFields({ values, onChange }) {
       </div>
       <div className="setting-item">
         <label>API Key Env Variable</label>
-        <p className="setting-hint">Name of the environment variable holding the API key (set in .env).</p>
+        <p className="setting-hint">Name of the environment variable holding the API key (set in .env). Leave blank for unauthenticated backends.</p>
         <input type="text" value={values.apiKeyEnvVar} onChange={(e) => update('apiKeyEnvVar', e.target.value)} placeholder="e.g. BACKEND_OPENROUTER_API_KEY" />
       </div>
       <div className="setting-item">
@@ -4719,15 +4776,49 @@ function BackendFormFields({ values, onChange }) {
         </div>
       </div>
 
-      {/* Model mapping */}
+      {/* Model mapping with dropdowns */}
       <div className="setting-item" style={{ gridColumn: '1 / -1' }}>
         <label>Model Mapping</label>
-        <p className="setting-hint">Map local model names to remote model IDs. Use * as a catch-all wildcard.</p>
+        <p className="setting-hint">Map local models to remote models. Use * (wildcard) to match all local models to a single remote model.</p>
         {mappingEntries.map(([key, value], idx) => (
-          <div key={idx} style={{ display: 'flex', gap: '8px', marginBottom: '4px', alignItems: 'center' }}>
-            <input type="text" value={key} onChange={(e) => updateMappingKey(key, e.target.value)} placeholder="Local model (or *)" style={{ flex: 1 }} />
-            <span style={{ color: 'var(--text-muted)' }}>{'→'}</span>
-            <input type="text" value={value} onChange={(e) => updateMappingValue(key, e.target.value)} placeholder="Remote model ID" style={{ flex: 1 }} />
+          <div key={idx} style={{ display: 'flex', gap: '8px', marginBottom: '6px', alignItems: 'center' }}>
+            {/* Local model selector */}
+            <div style={{ flex: 1 }}>
+              <select
+                value={key}
+                onChange={(e) => updateMappingKey(key, e.target.value)}
+                style={{ width: '100%' }}
+              >
+                <option value="*">* (all models)</option>
+                {localModels.map(m => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+                {key && key !== '*' && !localModels.includes(key) && (
+                  <option value={key}>{key} (custom)</option>
+                )}
+              </select>
+            </div>
+            <span style={{ color: 'var(--text-muted)', padding: '0 4px' }}>{'→'}</span>
+            {/* Remote model selector */}
+            <div style={{ flex: 1 }}>
+              {remoteModels.length > 0 ? (
+                <select
+                  value={value}
+                  onChange={(e) => updateMappingValue(key, e.target.value)}
+                  style={{ width: '100%' }}
+                >
+                  <option value="">-- Select remote model --</option>
+                  {remoteModels.map(m => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                  {value && !remoteModels.includes(value) && (
+                    <option value={value}>{value} (custom)</option>
+                  )}
+                </select>
+              ) : (
+                <input type="text" value={value} onChange={(e) => updateMappingValue(key, e.target.value)} placeholder="Remote model ID (test backend to load list)" style={{ width: '100%' }} />
+              )}
+            </div>
             <button className="btn-secondary" style={{ padding: '4px 8px', fontSize: '0.85em' }} onClick={() => removeMapping(key)}>x</button>
           </div>
         ))}
@@ -4738,7 +4829,7 @@ function BackendFormFields({ values, onChange }) {
 }
 
 // Edit form for existing backend
-function BackendEditForm({ backend, onSave, onCancel }) {
+function BackendEditForm({ backend, localModels, remoteModels, onSave, onCancel }) {
   const [values, setValues] = useState({
     name: backend.name,
     url: backend.url,
@@ -4753,7 +4844,7 @@ function BackendEditForm({ backend, onSave, onCancel }) {
 
   return (
     <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--border)' }}>
-      <BackendFormFields values={values} onChange={setValues} />
+      <BackendFormFields values={values} onChange={setValues} localModels={localModels} remoteModels={remoteModels} />
       <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
         <button className="btn-primary" onClick={() => onSave(values)}>Save Changes</button>
         <button className="btn-secondary" onClick={onCancel}>Cancel</button>

@@ -1,20 +1,22 @@
-Add remote backend load balancing for request offloading
+Add model selection dropdowns, test gating, and fix backend test
 
-When the local llama.cpp server queue fills up, requests can now be
-offloaded to remote OpenAI-compatible API endpoints. Backends are
-configurable with cost metrics (tok/s, $/1M tokens, shared resource
-weight) and four offload policies: overflow, threshold, percentage,
-and manual routing.
+- Model mapping now uses dropdowns populated from local and remote
+  model lists instead of free-text inputs. Local models come from
+  /api/models, remote models fetched via new GET /api/backends/:id/models
+  endpoint. Supports glob patterns (e.g. "qwen*") in addition to
+  exact match and * wildcard.
 
-Key features:
-- Backend directory with CRUD management via API and UI
-- Per-backend request queues with configurable concurrency
-- Cost tracking (time, money, shared resource contention)
-- Routing engine with priority-based backend selection
-- Test connectivity button for each backend
-- Dashboard shows live backend status when enabled
-- Request logs tagged with backend attribution
-- API keys stored in .env, never exposed in config/API responses
-- Fully backwards compatible (disabled by default)
+- Backend test now fetches the remote /models list first to find a
+  valid model name, then sends a test chat completion. Previously
+  used the catch-all mapping value which could be empty, causing
+  "model is required" errors on backends like Ollama.
+
+- Backends must pass a connectivity test before they can be used for
+  offloading. The "tested" flag is persisted in config.json and
+  checked by the routing engine. Untested backends show a warning
+  badge in the UI.
+
+- Adding a new backend now auto-triggers a connectivity test. The
+  button reads "Add Backend & Test" to make this clear.
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>

@@ -235,6 +235,22 @@ function initBackendQueues() {
   }
 }
 
+// Resolve a model name against a mapping (supports exact match, glob patterns, * catch-all)
+function resolveModelMapping(mapping, requestedModel) {
+  if (!mapping) return null;
+  // 1. Exact match
+  if (mapping[requestedModel]) return mapping[requestedModel];
+  // 2. Glob pattern match (e.g. "qwen*" matches "qwen-32b")
+  for (const [pattern, target] of Object.entries(mapping)) {
+    if (pattern === '*' || pattern === requestedModel) continue;
+    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+    if (regex.test(requestedModel)) return target;
+  }
+  // 3. Wildcard catch-all
+  if (mapping['*']) return mapping['*'];
+  return null;
+}
+
 // Resolve which backend should handle a request
 function resolveBackend(requestedModel, endpoint) {
   const backends = config.backends || {};
@@ -246,7 +262,7 @@ function resolveBackend(requestedModel, endpoint) {
   const slashIdx = requestedModel.indexOf('/');
   if (slashIdx > 0) {
     const prefix = requestedModel.substring(0, slashIdx);
-    const explicitBackend = backends.directory.find(b => b.id === prefix && b.enabled);
+    const explicitBackend = backends.directory.find(b => b.id === prefix && b.enabled && b.tested);
     if (explicitBackend) {
       const remoteModel = requestedModel.substring(slashIdx + 1);
       return buildRemoteRouting(explicitBackend, remoteModel, endpoint);
@@ -288,15 +304,15 @@ function resolveBackend(requestedModel, endpoint) {
     return { remote: false };
   }
 
-  // Pick best backend
+  // Pick best backend (must be enabled, tested, and have a model mapping)
   const endpointKey = endpoint.replace(/\//g, '/');
   const candidates = backends.directory.filter(b => {
     if (!b.enabled) return false;
+    if (!b.tested) return false; // Must pass a connectivity test before use
     if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
-    // Check model mapping
+    // Check model mapping (exact match, glob patterns, or * catch-all)
     if (!b.modelMapping) return false;
-    const hasMapping = b.modelMapping[requestedModel] || b.modelMapping['*'];
-    return !!hasMapping;
+    return !!resolveModelMapping(b.modelMapping, requestedModel);
   });
 
   if (candidates.length === 0) {
@@ -317,7 +333,7 @@ function resolveBackend(requestedModel, endpoint) {
   });
 
   const chosen = candidates[0];
-  const remoteModel = chosen.modelMapping[requestedModel] || chosen.modelMapping['*'];
+  const remoteModel = resolveModelMapping(chosen.modelMapping, requestedModel);
   return buildRemoteRouting(chosen, remoteModel, endpoint);
 }
 
@@ -1822,6 +1838,36 @@ app.delete('/api/backends/:id', (req, res) => {
 });
 
 // Test backend connectivity
+// Fetch available models from a remote backend
+app.get('/api/backends/:id/models', async (req, res) => {
+  const backend = config.backends?.directory?.find(b => b.id === req.params.id);
+  if (!backend) {
+    return res.status(404).json({ error: 'Backend not found' });
+  }
+
+  const apiKey = backend.apiKeyEnvVar ? process.env[backend.apiKeyEnvVar] : null;
+  const headers = {};
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  if (backend.extraHeaders) Object.assign(headers, backend.extraHeaders);
+  const baseUrl = backend.url.replace(/\/+$/, '');
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const response = await fetch(`${baseUrl}/models`, { headers, signal: controller.signal });
+    clearTimeout(timeout);
+    if (!response.ok) {
+      return res.json({ models: [], error: `Backend returned ${response.status}` });
+    }
+    const data = await response.json();
+    const models = (data.data || data.models || []).map(m => typeof m === 'string' ? m : m.id || m.name || '').filter(Boolean);
+    res.json({ models });
+  } catch (err) {
+    res.json({ models: [], error: err.message });
+  }
+});
+
+// Test backend connectivity — fetches models list first, then sends a test chat request
 app.post('/api/backends/:id/test', async (req, res) => {
   const backend = config.backends?.directory?.find(b => b.id === req.params.id);
   if (!backend) {
@@ -1834,10 +1880,49 @@ app.post('/api/backends/:id/test', async (req, res) => {
   if (backend.extraHeaders) Object.assign(headers, backend.extraHeaders);
 
   const baseUrl = backend.url.replace(/\/+$/, '');
-  const testModel = backend.modelMapping?.['*'] || Object.values(backend.modelMapping || {})[0] || 'test';
   const startTime = Date.now();
 
   try {
+    // Step 1: Fetch available models from the backend
+    const modelsController = new AbortController();
+    const modelsTimeout = setTimeout(() => modelsController.abort(), 10000);
+    let remoteModels = [];
+    try {
+      const modelsRes = await fetch(`${baseUrl}/models`, {
+        headers: { ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {}), ...(backend.extraHeaders || {}) },
+        signal: modelsController.signal
+      });
+      clearTimeout(modelsTimeout);
+      if (modelsRes.ok) {
+        const modelsData = await modelsRes.json();
+        remoteModels = (modelsData.data || modelsData.models || []).map(m => typeof m === 'string' ? m : m.id || m.name || '').filter(Boolean);
+      }
+    } catch {
+      clearTimeout(modelsTimeout);
+    }
+
+    // Step 2: Pick a test model — prefer configured mapping, fall back to first available remote model
+    let testModel = '';
+    const mappingValues = Object.values(backend.modelMapping || {}).filter(v => v && v !== '*');
+    if (mappingValues.length > 0) {
+      testModel = mappingValues[0];
+    } else if (remoteModels.length > 0) {
+      testModel = remoteModels[0];
+    }
+
+    if (!testModel) {
+      const duration = Date.now() - startTime;
+      return res.json({
+        success: false,
+        status: 0,
+        latencyMs: duration,
+        remoteModels,
+        error: 'No model available for testing. Configure a model mapping or ensure the backend has models loaded.',
+        message: 'No model available for testing'
+      });
+    }
+
+    // Step 3: Send a test chat completion
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
     const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -1859,24 +1944,52 @@ app.post('/api/backends/:id/test', async (req, res) => {
     if (response.ok) {
       let parsed;
       try { parsed = JSON.parse(body); } catch { parsed = null; }
+
+      // Mark backend as tested
+      const idx = config.backends.directory.findIndex(b => b.id === backend.id);
+      if (idx !== -1) {
+        config.backends.directory[idx].tested = true;
+        config.backends.directory[idx].lastTestTime = Date.now();
+        saveConfig(config);
+      }
+
       res.json({
         success: true,
         status: response.status,
         latencyMs: duration,
         model: parsed?.model || testModel,
-        message: `Connected successfully in ${duration}ms`
+        remoteModels,
+        message: `Connected successfully in ${duration}ms (model: ${parsed?.model || testModel})`
       });
     } else {
+      // Mark test as failed
+      const idx = config.backends.directory.findIndex(b => b.id === backend.id);
+      if (idx !== -1) {
+        config.backends.directory[idx].tested = false;
+        config.backends.directory[idx].lastTestTime = Date.now();
+        saveConfig(config);
+      }
+
       res.json({
         success: false,
         status: response.status,
         latencyMs: duration,
+        remoteModels,
         error: body.slice(0, 500),
         message: `Backend returned ${response.status}`
       });
     }
   } catch (err) {
     const duration = Date.now() - startTime;
+
+    // Mark test as failed
+    const idx = config.backends?.directory?.findIndex(b => b.id === backend.id);
+    if (idx !== undefined && idx !== -1) {
+      config.backends.directory[idx].tested = false;
+      config.backends.directory[idx].lastTestTime = Date.now();
+      saveConfig(config);
+    }
+
     res.json({
       success: false,
       status: 0,
