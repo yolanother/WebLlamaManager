@@ -1,22 +1,24 @@
-Add model selection dropdowns, test gating, and fix backend test
+Add offloaded request visibility to telemetry dashboard
 
-- Model mapping now uses dropdowns populated from local and remote
-  model lists instead of free-text inputs. Local models come from
-  /api/models, remote models fetched via new GET /api/backends/:id/models
-  endpoint. Supports glob patterns (e.g. "qwen*") in addition to
-  exact match and * wildcard.
+Forwarded requests to remote backends are now visible across all
+telemetry surfaces:
 
-- Backend test now fetches the remote /models list first to find a
-  valid model name, then sends a test chat completion. Previously
-  used the catch-all mapping value which could be empty, causing
-  "model is required" errors on backends like Ollama.
+- Active request panel shows a purple backend badge when processing
+  a request via a remote backend
+- Request log table has a new Backend column showing "local" or the
+  backend ID for each request
+- LLM log entries show backend badge (already done in prior commit)
+- Request Volume chart includes a purple "Offloaded" area stacked
+  with Success/Errors/Retries/Restarts
+- Request Health % chart shows Local vs Offloaded vs Retries vs
+  Errors breakdown
+- Analytics JSONL records now include rOf (offloaded count) and bc
+  (per-backend counts) per minute for historical analysis
 
-- Backends must pass a connectivity test before they can be used for
-  offloading. The "tested" flag is persisted in config.json and
-  checked by the routing engine. Untested backends show a warning
-  badge in the UI.
-
-- Adding a new backend now auto-triggers a connectivity test. The
-  button reads "Add Backend & Test" to make this clear.
+Server-side changes:
+- requestStatsAccum tracks offloaded count and per-backend counts
+- startActiveRequest accepts backend parameter
+- Request log middleware includes req._backend field
+- All 5 proxy endpoints set req._backend when routing remote
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>

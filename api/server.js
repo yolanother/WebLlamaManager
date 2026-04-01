@@ -107,7 +107,8 @@ app.use((req, res, next) => {
       error: errorMessage,
       retries: req._retryInfo?.retries || 0,
       retryErrors: req._retryInfo?.retryErrors || [],
-      restarted: req._retryInfo?.restarted || false
+      restarted: req._retryInfo?.restarted || false,
+      backend: req._backend || 'local'
     };
 
     // Track request stats for analytics
@@ -446,6 +447,9 @@ function updateBackendTokenStats(backendId, promptTokens, completionTokens, dura
     const cost = calculateBackendCost(backend, promptTokens, completionTokens);
     stats.totalCostUsd += cost;
   }
+  // Track in per-minute accumulator
+  requestStatsAccum.offloaded++;
+  requestStatsAccum.backendCounts[backendId] = (requestStatsAccum.backendCounts[backendId] || 0) + 1;
 }
 
 // Analytics data storage (circular buffers for time-series data)
@@ -558,7 +562,9 @@ const requestStatsAccum = {
   statusCodes: {},
   modelCounts: {},  // per-model request counts for this minute
   totalPromptTokens: 0,
-  totalCompletionTokens: 0
+  totalCompletionTokens: 0,
+  offloaded: 0,     // requests sent to remote backends this minute
+  backendCounts: {}  // per-backend request counts this minute
 };
 
 // Flush minute-level aggregate to persistent storage
@@ -603,7 +609,9 @@ function flushAnalyticsMinute() {
     tp: requestStatsAccum.totalPromptTokens,
     tcc: requestStatsAccum.totalCompletionTokens,
     mc: { ...requestStatsAccum.modelCounts },
-    // Per-backend stats for this minute
+    rOf: requestStatsAccum.offloaded,  // requests offloaded to remote backends
+    bc: { ...requestStatsAccum.backendCounts },  // per-backend request counts
+    // Per-backend cumulative stats snapshot
     be: Object.fromEntries([...backendStats.entries()].map(([id, s]) => [id, {
       rT: s.totalRequests, tPS: Math.round(s.avgTokPerSec * 10) / 10,
       pT: s.totalPromptTokens, cT: s.totalCompletionTokens,
@@ -637,6 +645,8 @@ function flushAnalyticsMinute() {
   requestStatsAccum.modelCounts = {};
   requestStatsAccum.totalPromptTokens = 0;
   requestStatsAccum.totalCompletionTokens = 0;
+  requestStatsAccum.offloaded = 0;
+  requestStatsAccum.backendCounts = {};
 }
 
 // Flush every 60 seconds
@@ -778,7 +788,7 @@ function broadcastActiveRequest(event, data) {
   }
 }
 
-function startActiveRequest({ model, endpoint, messages, prompt }) {
+function startActiveRequest({ model, endpoint, messages, prompt, backend }) {
   const id = ++activeRequestIdCounter;
   // Extract last user message for display
   let userMessage = '';
@@ -794,7 +804,7 @@ function startActiveRequest({ model, endpoint, messages, prompt }) {
   } else if (prompt) {
     userMessage = typeof prompt === 'string' ? prompt : String(prompt);
   }
-  const entry = { id, model, endpoint, userMessage, responseText: '', startTime: Date.now(), status: 'processing', tokens: 0 };
+  const entry = { id, model, endpoint, userMessage, responseText: '', startTime: Date.now(), status: 'processing', tokens: 0, backend: backend || 'local' };
   activeRequests.set(id, entry);
   broadcastActiveRequest('start', entry);
   return id;
@@ -4134,7 +4144,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectReasoningEffort(req.body);
 
-  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages });
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: routing.remote ? routing.backend.id : 'local' });
   // Ensure active request is cleaned up on any exit path
   res.on('finish', () => {
     if (activeRequests.has(activeReqId)) {
@@ -4147,6 +4157,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
+    req._backend = routing.backend.id;
     const remoteBody = { ...proxyBody, model: routing.targetModel };
     console.log(`[chat/completions] Routing to remote backend: ${routing.backend.name} (model: ${routing.targetModel})`);
     addLog('backends', `Routing chat/completions to ${routing.backend.name} (queue: local=${llamaQueue.pending} pending)`);
@@ -4501,6 +4512,7 @@ app.post('/api/v1/completions', async (req, res) => {
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'completions');
   if (routing.remote) {
+    req._backend = routing.backend.id;
     const remoteBody = { ...req.body, model: routing.targetModel };
     try {
       const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
@@ -4672,6 +4684,7 @@ app.post('/api/v1/embeddings', async (req, res) => {
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'embeddings');
   if (routing.remote) {
+    req._backend = routing.backend.id;
     const remoteBody = { ...req.body, model: routing.targetModel };
     try {
       const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
@@ -4759,6 +4772,7 @@ app.post('/api/v1/responses', async (req, res) => {
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'responses');
   if (routing.remote) {
+    req._backend = routing.backend.id;
     const remoteBody = { ...proxyBody, model: routing.targetModel };
     try {
       const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
@@ -4989,6 +5003,7 @@ app.post('/api/v1/messages', async (req, res) => {
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'messages');
   if (routing.remote) {
+    req._backend = routing.backend.id;
     const remoteBody = { ...proxyBody, model: routing.targetModel };
     try {
       const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {

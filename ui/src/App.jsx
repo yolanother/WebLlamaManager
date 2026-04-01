@@ -545,7 +545,8 @@ const CHART_COLORS = {
   contextUsed: '#a78bfa',
   contextTotal: '#4c1d95',
   queueActive: '#06b6d4',
-  queuePending: '#f59e0b'
+  queuePending: '#f59e0b',
+  offloaded: '#8b5cf6'
 };
 
 // Custom tooltip for charts
@@ -739,6 +740,11 @@ function ActiveRequestPanel({ request, isFullscreen }) {
         </div>
         <div className="active-request-info">
           <span className="active-request-model">{request.model}</span>
+          {request.backend && request.backend !== 'local' && (
+            <span style={{ display: 'inline-block', padding: '1px 6px', borderRadius: '3px', fontSize: '0.75em', background: '#2d1b69', color: '#a78bfa', marginRight: '6px' }}>
+              {request.backend}
+            </span>
+          )}
           <span className="active-request-prompt">{truncated || 'Processing...'}</span>
         </div>
         <div className="active-request-meta">
@@ -997,10 +1003,11 @@ function Dashboard({ stats, activeRequest }) {
   // Compute percentage breakdown for request health chart (0-100% stacked)
   const requestHealthPoints = historyPoints.map(p => {
     const total = (p.rOk || 0) + (p.rErr || 0) + (p.rRt || 0) + (p.rRs || 0);
-    if (total === 0) return { time: p.time, pctOk: 100, pctErr: 0, pctRt: 0, pctRs: 0 };
+    if (total === 0) return { time: p.time, pctOk: 100, pctErr: 0, pctRt: 0, pctRs: 0, pctOf: 0 };
     return {
       time: p.time,
-      pctOk: Math.round((p.rOk || 0) / total * 1000) / 10,
+      pctOk: Math.round(((p.rOk || 0) - (p.rOf || 0)) / total * 1000) / 10, // local success
+      pctOf: Math.round((p.rOf || 0) / total * 1000) / 10, // offloaded
       pctErr: Math.round((p.rErr || 0) / total * 1000) / 10,
       pctRt: Math.round((p.rRt || 0) / total * 1000) / 10,
       pctRs: Math.round((p.rRs || 0) / total * 1000) / 10
@@ -1017,12 +1024,13 @@ function Dashboard({ stats, activeRequest }) {
     const buckets = new Map();
     for (const p of points) {
       const key = Math.floor(p.ts / bucketMs) * bucketMs;
-      if (!buckets.has(key)) buckets.set(key, { ts: key, rOk: 0, rErr: 0, rRt: 0, rRs: 0 });
+      if (!buckets.has(key)) buckets.set(key, { ts: key, rOk: 0, rErr: 0, rRt: 0, rRs: 0, rOf: 0 });
       const b = buckets.get(key);
       b.rOk += p.rOk || 0;
       b.rErr += p.rErr || 0;
       b.rRt += p.rRt || 0;
       b.rRs += p.rRs || 0;
+      b.rOf += p.rOf || 0;
     }
     return [...buckets.values()]
       .sort((a, b) => a.ts - b.ts)
@@ -2105,6 +2113,7 @@ function Dashboard({ stats, activeRequest }) {
                     <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <Tooltip content={<HistoryTooltip range={historyRange} />} />
                     <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    <Area type="monotone" dataKey="rOf" name="Offloaded" stroke={CHART_COLORS.offloaded} fill={CHART_COLORS.offloaded} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
                     <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
                     <Area type="monotone" dataKey="rRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
                     <Area type="monotone" dataKey="rRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
@@ -2114,6 +2123,7 @@ function Dashboard({ stats, activeRequest }) {
             </div>
             <div className="chart-legend">
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestOk }}></span>Success</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.offloaded }}></span>Offloaded</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestErr }}></span>Errors</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRetry }}></span>Retries</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRestart }}></span>Restarts</div>
@@ -2131,7 +2141,8 @@ function Dashboard({ stats, activeRequest }) {
                     <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                     <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `${v}%`} />
                     <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
-                    <Area type="monotone" dataKey="pctOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctOk" name="Local" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctOf" name="Offloaded" stroke={CHART_COLORS.offloaded} fill={CHART_COLORS.offloaded} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
                     <Area type="monotone" dataKey="pctRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
                     <Area type="monotone" dataKey="pctRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
                     <Area type="monotone" dataKey="pctErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
@@ -2140,7 +2151,8 @@ function Dashboard({ stats, activeRequest }) {
               ) : <div className="chart-empty">No historical data yet</div>}
             </div>
             <div className="chart-legend">
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestOk }}></span>Success</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestOk }}></span>Local</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.offloaded }}></span>Offloaded</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRetry }}></span>Retries</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRestart }}></span>Restarts</div>
               <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestErr }}></span>Errors</div>
@@ -3487,6 +3499,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                     <th>Status</th>
                     <th>Duration</th>
                     <th>Model</th>
+                    <th>Backend</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -3521,6 +3534,11 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                           </td>
                           <td className="request-duration">{log.duration}ms</td>
                           <td className="request-model">{log.model || '-'}</td>
+                          <td className="request-backend">{log.backend && log.backend !== 'local' ? (
+                            <span style={{ display: 'inline-block', padding: '1px 6px', borderRadius: '3px', fontSize: '0.8em', background: '#2d1b69', color: '#a78bfa' }}>{log.backend}</span>
+                          ) : (
+                            <span style={{ color: 'var(--text-muted)', fontSize: '0.85em' }}>local</span>
+                          )}</td>
                         </tr>
                         {isExpanded && (
                           <tr className="request-error-row">
