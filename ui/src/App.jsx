@@ -302,9 +302,40 @@ function useWebSocket() {
   const [connected, setConnected] = useState(false);
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
+  const pollIntervalRef = useRef(null);
+  const wsFailCountRef = useRef(0);
+  const usingPollingRef = useRef(false);
   const MAX_LOGS = 500;
   const MAX_REQUEST_LOGS = 200;
   const MAX_LLM_LOGS = 50;
+  const WS_FAIL_THRESHOLD = 3; // Fall back to polling after this many WS failures
+
+  // HTTP polling fallback for when WebSocket is unavailable (e.g. reverse proxy without WS support)
+  const startPolling = useCallback(() => {
+    if (pollIntervalRef.current) return; // already polling
+    usingPollingRef.current = true;
+    console.log('[poll] Starting HTTP polling fallback (WebSocket unavailable)');
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/stats`);
+        if (res.ok) {
+          const data = await res.json();
+          setStats(data);
+          setConnected(true);
+        }
+      } catch { /* server unreachable */ }
+    };
+    poll(); // immediate first poll
+    pollIntervalRef.current = setInterval(poll, 2000);
+  }, []);
+
+  const stopPolling = useCallback(() => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    usingPollingRef.current = false;
+  }, []);
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -314,6 +345,8 @@ function useWebSocket() {
       wsRef.current = new WebSocket(wsUrl);
 
       wsRef.current.onopen = () => {
+        wsFailCountRef.current = 0;
+        stopPolling();
         setConnected(true);
         console.log('[ws] Connected');
       };
@@ -370,8 +403,14 @@ function useWebSocket() {
 
       wsRef.current.onclose = () => {
         setConnected(false);
-        console.log('[ws] Disconnected, reconnecting...');
-        reconnectTimeoutRef.current = setTimeout(connect, 2000);
+        wsFailCountRef.current++;
+        if (wsFailCountRef.current >= WS_FAIL_THRESHOLD && !usingPollingRef.current) {
+          console.log(`[ws] ${wsFailCountRef.current} consecutive failures, falling back to HTTP polling`);
+          startPolling();
+        } else if (!usingPollingRef.current) {
+          console.log('[ws] Disconnected, reconnecting...');
+          reconnectTimeoutRef.current = setTimeout(connect, 2000);
+        }
       };
 
       wsRef.current.onerror = (error) => {
@@ -379,17 +418,23 @@ function useWebSocket() {
       };
     } catch (e) {
       console.error('[ws] Connection failed:', e);
-      reconnectTimeoutRef.current = setTimeout(connect, 2000);
+      wsFailCountRef.current++;
+      if (wsFailCountRef.current >= WS_FAIL_THRESHOLD && !usingPollingRef.current) {
+        startPolling();
+      } else {
+        reconnectTimeoutRef.current = setTimeout(connect, 2000);
+      }
     }
-  }, []);
+  }, [startPolling, stopPolling]);
 
   useEffect(() => {
     connect();
     return () => {
       if (wsRef.current) wsRef.current.close();
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      stopPolling();
     };
-  }, [connect]);
+  }, [connect, stopPolling]);
 
   const clearLogs = useCallback(() => setLogs([]), []);
   const clearRequestLogs = useCallback(() => setRequestLogs([]), []);
