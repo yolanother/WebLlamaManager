@@ -7,7 +7,20 @@ import { dirname, join, basename } from 'path';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { cpus, totalmem, freemem, loadavg } from 'os';
+import { EventEmitter } from 'events';
 import pty from 'node-pty';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const { Agent: UndiciAgent } = require('undici');
+
+// Custom dispatcher with extended timeouts for slow/large models (e.g. 120B reasoning models)
+// Default undici headersTimeout is 300s which is too short for prompt processing on large models
+const llamaDispatcher = new UndiciAgent({
+  headersTimeout: 0,   // Disable headers timeout — large models can take minutes to start generating
+  bodyTimeout: 0,      // Disable body timeout — streaming can have long pauses between tokens
+  keepAliveTimeout: 60000,
+  keepAliveMaxTimeout: 600000
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -165,6 +178,8 @@ class RequestQueue {
     this.running = 0;
     this.queue = [];
     this.queuedCount = 0; // total requests that had to wait
+    this._nextId = 1;
+    this.activeItems = new Map(); // id -> { id, model, endpoint, startTime }
   }
 
   setConcurrency(n) {
@@ -172,38 +187,77 @@ class RequestQueue {
     this._drain();
   }
 
-  async acquire() {
+  async acquire(meta = {}) {
+    const id = this._nextId++;
+    const item = { id, ...meta, enqueuedAt: Date.now(), status: 'active' };
     if (this.running < this.concurrency) {
       this.running++;
-      return;
+      item.startedAt = Date.now();
+      this.activeItems.set(id, item);
+      return id;
     }
     this.queuedCount++;
-    return new Promise((resolve, reject) => this.queue.push({ resolve, reject }));
+    item.status = 'pending';
+    return new Promise((resolve, reject) => {
+      item._resolve = resolve;
+      item._reject = reject;
+      this.queue.push(item);
+    });
   }
 
   flush() {
     const count = this.queue.length;
     for (const entry of this.queue) {
-      entry.reject(new Error('Queue flushed'));
+      entry._reject(new Error('Queue flushed'));
     }
     this.queue = [];
     return count;
   }
 
-  release() {
+  cancel(id) {
+    const idx = this.queue.findIndex(e => e.id === id);
+    if (idx >= 0) {
+      const entry = this.queue.splice(idx, 1)[0];
+      entry._reject(new Error('Request cancelled'));
+      return true;
+    }
+    return false;
+  }
+
+  release(id) {
     this.running--;
+    if (id) this.activeItems.delete(id);
     this._drain();
   }
 
   _drain() {
     while (this.queue.length > 0 && this.running < this.concurrency) {
       this.running++;
-      this.queue.shift().resolve();
+      const item = this.queue.shift();
+      item.status = 'active';
+      item.startedAt = Date.now();
+      this.activeItems.set(item.id, item);
+      item._resolve(item.id);
     }
   }
 
   get pending() { return this.queue.length; }
   get active() { return this.running; }
+
+  // Get all items (active + pending) for the queue management UI
+  getItems() {
+    const active = [...this.activeItems.values()].map(i => ({
+      id: i.id, model: i.model || 'unknown', endpoint: i.endpoint || '',
+      enqueuedAt: i.enqueuedAt, startedAt: i.startedAt, status: 'active',
+      elapsed: Date.now() - (i.startedAt || i.enqueuedAt)
+    }));
+    const pending = this.queue.map(i => ({
+      id: i.id, model: i.model || 'unknown', endpoint: i.endpoint || '',
+      enqueuedAt: i.enqueuedAt, startedAt: null, status: 'pending',
+      elapsed: Date.now() - i.enqueuedAt
+    }));
+    return [...active, ...pending];
+  }
 }
 
 const llamaQueue = new RequestQueue(1); // default: 1 concurrent request
@@ -278,8 +332,9 @@ function resolveBackend(requestedModel, endpoint) {
     // Only offload via explicit prefix (handled above)
     return { remote: false };
   } else if (policy === 'overflow') {
-    // Offload when local queue is full
-    shouldOffload = llamaQueue.active >= llamaQueue.concurrency && llamaQueue.pending > 0;
+    // Offload when local queue is at capacity (active requests >= concurrency limit)
+    // This triggers offload for the current request that would otherwise have to wait
+    shouldOffload = llamaQueue.active >= llamaQueue.concurrency;
   } else if (policy === 'threshold') {
     const queueDepth = backends.offloadThresholdQueueDepth ?? 2;
     const waitMs = backends.offloadThresholdWaitMs ?? 5000;
@@ -299,6 +354,12 @@ function resolveBackend(requestedModel, endpoint) {
       offloadCounter = (offloadCounter + 1) % 100;
       shouldOffload = offloadCounter < pct;
     }
+  }
+
+  // For all policies: if a different model is currently loaded/active and we'd need a model switch,
+  // prefer offloading to avoid the expensive switch wait
+  if (!shouldOffload && llamaQueue.active > 0 && lastUsedModel && lastUsedModel !== requestedModel) {
+    shouldOffload = true;
   }
 
   if (!shouldOffload) {
@@ -593,6 +654,21 @@ function flushAnalyticsMinute() {
     tc: Math.round(avg(tempPoints, 'cpu') * 10) / 10,
     tps: Math.round(avg(tokenPoints, 'tokensPerSecond') * 10) / 10,
     tpsMax: Math.round(max(tokenPoints, 'tokensPerSecond') * 10) / 10,
+    // Per-model average tok/s (only from actual generation points, not zero-fill)
+    mtps: (() => {
+      const byModel = {};
+      for (const p of tokenPoints) {
+        if (!p.model || p.tokensPerSecond <= 0) continue;
+        if (!byModel[p.model]) byModel[p.model] = { sum: 0, count: 0 };
+        byModel[p.model].sum += p.tokensPerSecond;
+        byModel[p.model].count++;
+      }
+      const result = {};
+      for (const [m, v] of Object.entries(byModel)) {
+        result[m] = Math.round(v.sum / v.count * 10) / 10;
+      }
+      return result;
+    })(),
     qA: Math.round(avg(queuePoints, 'active') * 10) / 10,
     qP: Math.round(avg(queuePoints, 'pending') * 10) / 10,
     qMx: Math.round(max(queuePoints, 'active')),
@@ -775,9 +851,11 @@ function broadcastLlmLog(entry) {
   }
 }
 
-// Active request tracking — broadcast to dashboard via WebSocket
+// Active request tracking — broadcast to dashboard via WebSocket + SSE
 let activeRequests = new Map(); // id -> { id, model, endpoint, userMessage, responseText, startTime, status }
 let activeRequestIdCounter = 0;
+const activeRequestEvents = new EventEmitter();
+activeRequestEvents.setMaxListeners(100);
 
 function broadcastActiveRequest(event, data) {
   const message = JSON.stringify({ type: 'activeRequest', event, data });
@@ -804,10 +882,21 @@ function startActiveRequest({ model, endpoint, messages, prompt, backend }) {
   } else if (prompt) {
     userMessage = typeof prompt === 'string' ? prompt : String(prompt);
   }
-  const entry = { id, model, endpoint, userMessage, responseText: '', startTime: Date.now(), status: 'processing', tokens: 0, backend: backend || 'local' };
+  const abortController = new AbortController();
+  // Store full context for debugging (messages array or prompt)
+  const fullContext = messages && Array.isArray(messages) ? messages : (prompt ? [{ role: 'user', content: prompt }] : []);
+  const entry = { id, model, endpoint, userMessage, fullContext, responseText: '', startTime: Date.now(), status: 'processing', tokens: 0, backend: backend || 'local', abortController };
   activeRequests.set(id, entry);
-  broadcastActiveRequest('start', entry);
+  // Broadcast without non-serializable fields (abortController)
+  const { abortController: _ac, ...broadcastData } = entry;
+  broadcastActiveRequest('start', broadcastData);
   return id;
+}
+
+// Get the abort signal for an active request (used by proxy endpoints)
+function getActiveRequestSignal(id) {
+  const entry = activeRequests.get(id);
+  return entry?.abortController?.signal;
 }
 
 function updateActiveRequest(id, text) {
@@ -815,7 +904,9 @@ function updateActiveRequest(id, text) {
   if (!entry) return;
   entry.responseText += text;
   entry.tokens++;
-  // Throttle updates: broadcast every 5 tokens to avoid flooding
+  // Emit for SSE watchers on every token
+  activeRequestEvents.emit(`update:${id}`, { id, responseText: entry.responseText, tokens: entry.tokens, duration: Date.now() - entry.startTime });
+  // Throttle WebSocket broadcasts: every 5 tokens to avoid flooding
   if (entry.tokens % 5 === 0 || text.includes('\n')) {
     broadcastActiveRequest('update', { id, responseText: entry.responseText, tokens: entry.tokens, duration: Date.now() - entry.startTime });
   }
@@ -833,7 +924,10 @@ function endActiveRequest(id, { status = 'complete', tokens = 0, responseText } 
     lastUsedModel = entry.model;
     lastUsedModelTime = Date.now();
   }
-  broadcastActiveRequest('end', { id, status, tokens: entry.tokens, duration: entry.duration });
+  broadcastActiveRequest('end', { id, status, tokens: entry.tokens, duration: entry.duration, responseText: entry.responseText });
+  activeRequestEvents.emit(`end:${id}`, { id, status, tokens: entry.tokens, duration: entry.duration, responseText: entry.responseText });
+  activeRequestEvents.removeAllListeners(`update:${id}`);
+  activeRequestEvents.removeAllListeners(`end:${id}`);
   activeRequests.delete(id);
 }
 
@@ -848,7 +942,7 @@ function addAnalyticsPoint(category, data) {
 
 // Record token stats from a completion
 function recordTokenStats(stats) {
-  const { promptTokens, completionTokens, tokensPerSecond, model, duration } = stats;
+  const { promptTokens, completionTokens, tokensPerSecond, model, duration, backend } = stats;
 
   tokenStats.totalPromptTokens += promptTokens || 0;
   tokenStats.totalCompletionTokens += completionTokens || 0;
@@ -857,7 +951,8 @@ function recordTokenStats(stats) {
   // Also accumulate into per-minute request stats
   requestStatsAccum.totalPromptTokens += promptTokens || 0;
   requestStatsAccum.totalCompletionTokens += completionTokens || 0;
-  const modelKey = model || 'unknown';
+  // Prepend backend name for offloaded requests so telemetry shows where it ran
+  const modelKey = backend && backend !== 'local' ? `${backend}/${model || 'unknown'}` : (model || 'unknown');
   requestStatsAccum.modelCounts[modelKey] = (requestStatsAccum.modelCounts[modelKey] || 0) + 1;
 
   const requestRecord = {
@@ -865,7 +960,7 @@ function recordTokenStats(stats) {
     promptTokens: promptTokens || 0,
     completionTokens: completionTokens || 0,
     tokensPerSecond: tokensPerSecond || 0,
-    model: model || 'unknown',
+    model: modelKey,
     duration: duration || 0
   };
 
@@ -2184,6 +2279,160 @@ app.post('/api/queue/flush', (req, res) => {
   console.log(`[queue] ${msg}`);
   addLog('system', msg);
   res.json({ flushed });
+});
+
+// List all queue items (active + pending) with metadata
+app.get('/api/queue', (req, res) => {
+  const detail = req.query.detail === 'full';
+
+  // Resolve backend id -> name for display
+  const backendDir = config?.backends?.directory || [];
+  const backendNameMap = {};
+  for (const b of backendDir) backendNameMap[b.id] = b.name || b.id;
+
+  // Active requests from the activeRequests map (includes both local and remote)
+  const activeItems = [...activeRequests.values()].map(ar => {
+    const backendId = ar.backend || 'local';
+    const isOffloaded = backendId !== 'local';
+    const result = {
+      id: ar.id,
+      model: ar.model || 'unknown',
+      endpoint: ar.endpoint || '',
+      enqueuedAt: ar.startTime,
+      startedAt: ar.startTime,
+      status: 'active',
+      elapsed: Date.now() - ar.startTime,
+      userMessage: detail ? (ar.userMessage || '') : ((ar.userMessage || '').slice(0, 200)),
+      tokens: ar.tokens || 0,
+      activeRequestId: ar.id,
+      backend: backendId,
+      backendName: isOffloaded ? (backendNameMap[backendId] || backendId) : 'local',
+      offloaded: isOffloaded
+    };
+    if (detail) {
+      result.responseText = ar.responseText || '';
+      result.startTime = ar.startTime;
+      result.fullContext = ar.fullContext || [];
+    }
+    return result;
+  });
+
+  // Pending requests from the local queue (waiting for a slot)
+  const pendingItems = llamaQueue.queue.map(item => ({
+    id: item.id,
+    model: item.model || 'unknown',
+    endpoint: item.endpoint || '',
+    enqueuedAt: item.enqueuedAt,
+    startedAt: null,
+    status: 'pending',
+    elapsed: Date.now() - item.enqueuedAt,
+    userMessage: '',
+    tokens: 0,
+    activeRequestId: null,
+    backend: 'local',
+    backendName: 'local (queued)',
+    offloaded: false
+  }));
+
+  // Pending requests from remote backend queues
+  const remotePendingItems = [];
+  for (const [backendId, queue] of backendQueues) {
+    const name = backendNameMap[backendId] || backendId;
+    for (const item of queue.queue) {
+      remotePendingItems.push({
+        id: item.id,
+        model: item.model || 'unknown',
+        endpoint: item.endpoint || '',
+        enqueuedAt: item.enqueuedAt,
+        startedAt: null,
+        status: 'pending',
+        elapsed: Date.now() - item.enqueuedAt,
+        userMessage: '',
+        tokens: 0,
+        activeRequestId: null,
+        backend: backendId,
+        backendName: `${name} (queued)`,
+        offloaded: true
+      });
+    }
+  }
+
+  res.json({
+    items: [...activeItems, ...pendingItems, ...remotePendingItems],
+    concurrency: llamaQueue.concurrency,
+    totalQueued: llamaQueue.queuedCount
+  });
+});
+
+// Cancel a specific pending queue item
+app.delete('/api/queue/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'Invalid queue item ID' });
+  const cancelled = llamaQueue.cancel(id);
+  if (cancelled) {
+    const msg = `Queue item ${id} cancelled`;
+    console.log(`[queue] ${msg}`);
+    addLog('system', msg);
+    res.json({ cancelled: true, id });
+  } else {
+    res.status(404).json({ error: 'Queue item not found or already active (only pending items can be cancelled)' });
+  }
+});
+
+// Kill an active (processing) request by its activeRequest ID
+app.delete('/api/queue/active/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'Invalid request ID' });
+  const entry = activeRequests.get(id);
+  if (!entry) return res.status(404).json({ error: 'Active request not found' });
+  if (entry.abortController) {
+    entry.abortController.abort();
+    const msg = `Active request ${id} (model: ${entry.model}) killed`;
+    console.log(`[queue] ${msg}`);
+    addLog('system', msg);
+    endActiveRequest(id, { status: 'cancelled' });
+    res.json({ killed: true, id });
+  } else {
+    res.status(400).json({ error: 'Request cannot be aborted (no abort controller)' });
+  }
+});
+
+// SSE stream for watching an active request's live output
+app.get('/api/queue/watch/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'Invalid request ID' });
+
+  const entry = activeRequests.get(id);
+  if (!entry) return res.status(404).json({ error: 'Active request not found' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+
+  // Send initial state with full context
+  const { abortController: _ac, ...safeEntry } = entry;
+  res.write(`data: ${JSON.stringify({ event: 'init', ...safeEntry })}\n\n`);
+
+  // Stream updates
+  const onUpdate = (data) => {
+    res.write(`data: ${JSON.stringify({ event: 'update', ...data })}\n\n`);
+  };
+  const onEnd = (data) => {
+    res.write(`data: ${JSON.stringify({ event: 'end', ...data })}\n\n`);
+    cleanup();
+  };
+
+  activeRequestEvents.on(`update:${id}`, onUpdate);
+  activeRequestEvents.on(`end:${id}`, onEnd);
+
+  const cleanup = () => {
+    activeRequestEvents.off(`update:${id}`, onUpdate);
+    activeRequestEvents.off(`end:${id}`, onEnd);
+    res.end();
+  };
+
+  req.on('close', cleanup);
 });
 
 // Get model aliases
@@ -3691,7 +3940,22 @@ app.get('/api/analytics', (req, res) => {
       totalRequests: tokenStats.totalRequests,
       averageTokensPerSecond: tokenStats.recentRequests.length > 0
         ? tokenStats.recentRequests.reduce((sum, r) => sum + r.tokensPerSecond, 0) / tokenStats.recentRequests.length
-        : 0
+        : 0,
+      // Per-model average tok/s from recent requests
+      modelAvgTps: (() => {
+        const byModel = {};
+        for (const r of tokenStats.recentRequests) {
+          if (!r.model || r.tokensPerSecond <= 0) continue;
+          if (!byModel[r.model]) byModel[r.model] = { sum: 0, count: 0 };
+          byModel[r.model].sum += r.tokensPerSecond;
+          byModel[r.model].count++;
+        }
+        const result = {};
+        for (const [m, v] of Object.entries(byModel)) {
+          result[m] = Math.round(v.sum / v.count * 10) / 10;
+        }
+        return result;
+      })()
     }
   });
 });
@@ -3737,9 +4001,11 @@ app.get('/api/analytics/history', (req, res) => {
       const sum = (key) => items.reduce((s, p) => s + (p[key] || 0), 0);
       const maxVal = (key) => Math.max(...items.map(p => p[key] || 0));
 
-      // Merge status codes across bucket
+      // Merge status codes, model counts, and per-model tps across bucket
       const mergedSc = {};
       const mergedMc = {};
+      const mergedMtps = {};
+      const mtpsCounts = {};
       for (const item of items) {
         for (const [code, count] of Object.entries(item.sc || {})) {
           mergedSc[code] = (mergedSc[code] || 0) + count;
@@ -3747,6 +4013,13 @@ app.get('/api/analytics/history', (req, res) => {
         for (const [model, count] of Object.entries(item.mc || {})) {
           mergedMc[model] = (mergedMc[model] || 0) + count;
         }
+        for (const [model, tps] of Object.entries(item.mtps || {})) {
+          mergedMtps[model] = (mergedMtps[model] || 0) + tps;
+          mtpsCounts[model] = (mtpsCounts[model] || 0) + 1;
+        }
+      }
+      for (const model of Object.keys(mergedMtps)) {
+        mergedMtps[model] = Math.round(mergedMtps[model] / mtpsCounts[model] * 10) / 10;
       }
 
       points.push({
@@ -3773,6 +4046,7 @@ app.get('/api/analytics/history', (req, res) => {
         cxP: Math.round(avg('cxP') * 10) / 10,
         sc: mergedSc,
         mc: mergedMc,
+        mtps: mergedMtps,
         tp: sum('tp'),
         tcc: sum('tcc')
       });
@@ -3789,6 +4063,8 @@ app.get('/api/analytics/history', (req, res) => {
   const avgTps = tpsPoints.length > 0 ? tpsPoints.reduce((s, p) => s + p.tps, 0) / tpsPoints.length : 0;
   const allStatusCodes = {};
   const allModelCounts = {};
+  const allModelTps = {};
+  const modelTpsCounts = {};
   for (const p of points) {
     for (const [code, count] of Object.entries(p.sc || {})) {
       allStatusCodes[code] = (allStatusCodes[code] || 0) + count;
@@ -3796,6 +4072,14 @@ app.get('/api/analytics/history', (req, res) => {
     for (const [model, count] of Object.entries(p.mc || {})) {
       allModelCounts[model] = (allModelCounts[model] || 0) + count;
     }
+    for (const [model, tps] of Object.entries(p.mtps || {})) {
+      allModelTps[model] = (allModelTps[model] || 0) + tps;
+      modelTpsCounts[model] = (modelTpsCounts[model] || 0) + 1;
+    }
+  }
+  const modelAvgTps = {};
+  for (const model of Object.keys(allModelTps)) {
+    modelAvgTps[model] = Math.round(allModelTps[model] / modelTpsCounts[model] * 10) / 10;
   }
 
   res.json({
@@ -3807,7 +4091,8 @@ app.get('/api/analytics/history', (req, res) => {
       totalRestarts,
       avgTps: Math.round(avgTps * 10) / 10,
       statusCodes: allStatusCodes,
-      modelCounts: allModelCounts
+      modelCounts: allModelCounts,
+      modelAvgTps
     }
   });
 });
@@ -3947,7 +4232,7 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
 // Retry fetch with backoff for transient connection failures (e.g. model switching in router mode)
 // Also retries on proxy connection errors (500) with server health polling
 // Returns { response, retries, retryErrors } so callers can log retry info
-async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model } = {}) {
+async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model, signal } = {}) {
   // Wake from idle shutdown if needed
   if (idleShutdown && (!llamaProcess || llamaProcess.killed)) {
     const msg = 'Waking llama-server from idle shutdown for incoming request...';
@@ -3959,24 +4244,28 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
 
   // Acquire queue slot — blocks if at concurrency limit
   const queueStart = Date.now();
-  await llamaQueue.acquire();
+  const queueId = await llamaQueue.acquire({ model: model || label, endpoint: label });
   const queueWait = Date.now() - queueStart;
   if (queueWait > 100) {
     console.log(`[${label}] Queued for ${queueWait}ms (active: ${llamaQueue.active}, pending: ${llamaQueue.pending})`);
   }
   try {
-  return await _fetchWithRetryInner(url, options, { retries, baseDelay, label, model });
+  const result = await _fetchWithRetryInner(url, options, { retries, baseDelay, label, model, signal });
+  result.queueWait = queueWait;
+  return result;
   } finally {
-    llamaQueue.release();
+    llamaQueue.release(queueId);
   }
 }
 
-async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model } = {}) {
+async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model, signal } = {}) {
   const retryErrors = [];
   let hasRestarted = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const response = await fetch(url, options);
+      // Check if request was aborted before each attempt
+      if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
+      const response = await fetch(url, { ...options, dispatcher: llamaDispatcher, signal });
 
       // Check for proxy connection errors (server may be reloading after OOM)
       if (response.status === 500 && attempt < retries) {
@@ -4220,7 +4509,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             res.end();
             const duration = Date.now() - startTime;
             const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration });
+            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration, backend: backend.name });
             updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
             addLlmLog({
               endpoint: 'chat/completions', model, stream: true, status: 200, duration, promptTokens, completionTokens,
@@ -4248,7 +4537,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         const promptTokens = usage.prompt_tokens || 0;
         const completionTokens = usage.completion_tokens || 0;
         const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration });
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({
           endpoint: 'chat/completions', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens,
@@ -4280,13 +4569,15 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   function logLlm(entry) {
     addLlmLog({ ...entry, retries: retryInfo.retries, retryErrors: retryInfo.retryErrors, backend: 'local', requestBody: entry.requestBody || req.body });
   }
+  let totalQueueWait = 0;
   async function doFetch(body) {
     const result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
-    }, { label: 'chat/completions', model: body.model });
+    }, { label: 'chat/completions', model: body.model, signal: getActiveRequestSignal(activeReqId) });
     retryInfo = { retries: result.retries, retryErrors: result.retryErrors, restarted: result.restarted };
+    totalQueueWait += result.queueWait || 0;
     req._retryInfo = retryInfo;
     return result.response;
   }
@@ -4378,6 +4669,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       let promptTokens = 0;
       let model = req.body.model || 'unknown';
       let responseText = '';
+      let serverTimings = null;
 
       const processStream = async () => {
         try {
@@ -4407,6 +4699,9 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                     promptTokens = data.usage.prompt_tokens || promptTokens;
                     completionTokens = data.usage.completion_tokens || completionTokens;
                   }
+                  if (data.timings) {
+                    serverTimings = data.timings;
+                  }
                   if (data.model) {
                     model = data.model;
                   }
@@ -4419,18 +4714,27 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           res.end();
 
           // Record stats after stream completes
-          const duration = Date.now() - startTime;
-          const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+          // Prefer server-reported timings (accurate inference time) over wall-clock (includes queue wait)
+          const wallDuration = Date.now() - startTime;
+          const inferDuration = serverTimings
+            ? (serverTimings.prompt_ms || 0) + (serverTimings.predicted_ms || 0)
+            : wallDuration - totalQueueWait;
+          const tokensPerSecond = serverTimings?.predicted_per_second
+            || (inferDuration > 0 ? (completionTokens / (inferDuration / 1000)) : 0);
+          if (serverTimings) {
+            promptTokens = serverTimings.prompt_n || promptTokens;
+            completionTokens = serverTimings.predicted_n || completionTokens;
+          }
           recordTokenStats({
             promptTokens,
             completionTokens,
             tokensPerSecond,
             model,
-            duration
+            duration: inferDuration
           });
           logLlm({
             endpoint: 'chat/completions', model, stream: true,
-            status: 200, duration, promptTokens, completionTokens,
+            status: 200, duration: wallDuration, promptTokens, completionTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.messages || null, prompt: null,
             response: responseText, error: null
@@ -4456,19 +4760,24 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       // Non-streaming response
       const data = await response.json();
 
-      // Extract token stats from response
-      const duration = Date.now() - startTime;
+      // Extract token stats — prefer server-reported timings (excludes queue wait)
+      const wallDuration = Date.now() - startTime;
       const usage = data.usage || {};
-      const promptTokens = usage.prompt_tokens || 0;
-      const completionTokens = usage.completion_tokens || 0;
-      const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+      const timings = data.timings || {};
+      const promptTokens = timings.prompt_n || usage.prompt_tokens || 0;
+      const completionTokens = timings.predicted_n || usage.completion_tokens || 0;
+      const inferDuration = timings.predicted_ms
+        ? (timings.prompt_ms || 0) + timings.predicted_ms
+        : wallDuration - totalQueueWait;
+      const tokensPerSecond = timings.predicted_per_second
+        || (inferDuration > 0 ? (completionTokens / (inferDuration / 1000)) : 0);
 
       recordTokenStats({
         promptTokens,
         completionTokens,
         tokensPerSecond,
         model: data.model || req.body.model || 'unknown',
-        duration
+        duration: inferDuration
       });
 
       logLlm({
@@ -4537,7 +4846,7 @@ app.post('/api/v1/completions', async (req, res) => {
             res.end();
             const duration = Date.now() - startTime;
             const tokensPerSecond = duration > 0 ? tokens / (duration / 1000) : 0;
-            recordTokenStats({ promptTokens: 0, completionTokens: tokens, tokensPerSecond, model: requestedModel, duration });
+            recordTokenStats({ promptTokens: 0, completionTokens: tokens, tokensPerSecond, model: requestedModel, duration, backend: backend.name });
             updateBackendTokenStats(backend.id, 0, tokens, duration, backend);
             addLlmLog({ endpoint: 'completions', model: requestedModel, stream: true, status: 200, duration, promptTokens: 0, completionTokens: tokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: req.body.prompt || null, response: responseText, error: null, backend: backend.id, requestBody: req.body });
           } catch { res.end(); }
@@ -4550,7 +4859,7 @@ app.post('/api/v1/completions', async (req, res) => {
         const promptTokens = usage.prompt_tokens || 0;
         const completionTokens = usage.completion_tokens || 0;
         const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || requestedModel, duration });
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || requestedModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({ endpoint: 'completions', model: data.model || requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: req.body.prompt || null, response: data.choices?.[0]?.text || null, error: null, backend: backend.id, requestBody: req.body });
         res.json(data);
@@ -4563,7 +4872,7 @@ app.post('/api/v1/completions', async (req, res) => {
   }
 
   try {
-    const { response, retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
+    const { response, retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted, queueWait: completionsQueueWait } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body)
@@ -4601,6 +4910,7 @@ app.post('/api/v1/completions', async (req, res) => {
             const chunk = decoder.decode(value);
             res.write(chunk);
 
+            let completionsServerTimings = null;
             const lines = chunk.split('\n');
             for (const line of lines) {
               if (line.startsWith('data: ') && line !== 'data: [DONE]') {
@@ -4609,6 +4919,7 @@ app.post('/api/v1/completions', async (req, res) => {
                   if (data.choices?.[0]?.text) {
                     responseText += data.choices[0].text;
                   }
+                  if (data.timings) completionsServerTimings = data.timings;
                 } catch (e) { /* skip */ }
               }
             }
@@ -4616,18 +4927,22 @@ app.post('/api/v1/completions', async (req, res) => {
           }
           res.end();
 
-          const duration = Date.now() - startTime;
-          const tokensPerSecond = duration > 0 ? tokens / (duration / 1000) : 0;
+          const wallDuration = Date.now() - startTime;
+          const inferDuration = completionsServerTimings
+            ? (completionsServerTimings.prompt_ms || 0) + (completionsServerTimings.predicted_ms || 0)
+            : wallDuration - (completionsQueueWait || 0);
+          const tokensPerSecond = completionsServerTimings?.predicted_per_second
+            || (inferDuration > 0 ? (tokens / (inferDuration / 1000)) : 0);
           recordTokenStats({
             promptTokens: 0,
-            completionTokens: tokens,
+            completionTokens: completionsServerTimings?.predicted_n || tokens,
             tokensPerSecond,
             model: requestedModel,
-            duration
+            duration: inferDuration
           });
           addLlmLog({
             endpoint: 'completions', model: requestedModel, stream: true,
-            status: 200, duration, promptTokens: 0, completionTokens: tokens,
+            status: 200, duration: wallDuration, promptTokens: 0, completionTokens: tokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: null, prompt: req.body.prompt || null,
             response: responseText, error: null, ...retryFields
@@ -4640,18 +4955,23 @@ app.post('/api/v1/completions', async (req, res) => {
       processStream();
     } else {
       const data = await response.json();
-      const duration = Date.now() - startTime;
+      const wallDuration = Date.now() - startTime;
       const usage = data.usage || {};
-      const promptTokens = usage.prompt_tokens || 0;
-      const completionTokens = usage.completion_tokens || 0;
-      const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+      const timings = data.timings || {};
+      const promptTokens = timings.prompt_n || usage.prompt_tokens || 0;
+      const completionTokens = timings.predicted_n || usage.completion_tokens || 0;
+      const inferDuration = timings.predicted_ms
+        ? (timings.prompt_ms || 0) + timings.predicted_ms
+        : wallDuration - (completionsQueueWait || 0);
+      const tokensPerSecond = timings.predicted_per_second
+        || (inferDuration > 0 ? (completionTokens / (inferDuration / 1000)) : 0);
 
       recordTokenStats({
         promptTokens,
         completionTokens,
         tokensPerSecond,
         model: data.model || requestedModel,
-        duration
+        duration: inferDuration
       });
 
       addLlmLog({
@@ -4796,7 +5116,7 @@ app.post('/api/v1/responses', async (req, res) => {
             res.end();
             const duration = Date.now() - startTime;
             const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration });
+            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration, backend: backend.name });
             updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
             addLlmLog({ endpoint: 'responses', model, stream: true, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: null, response: responseText, error: null, backend: backend.id, requestBody: req.body });
           } catch (e) { res.end(); }
@@ -4809,7 +5129,7 @@ app.post('/api/v1/responses', async (req, res) => {
         const promptTokens = usage.input_tokens || usage.prompt_tokens || 0;
         const completionTokens = usage.output_tokens || usage.completion_tokens || 0;
         const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration });
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({ endpoint: 'responses', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: null, response: null, error: null, backend: backend.id, requestBody: req.body });
         data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
@@ -5027,7 +5347,7 @@ app.post('/api/v1/messages', async (req, res) => {
             res.end();
             const duration = Date.now() - startTime;
             const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration });
+            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration, backend: backend.name });
             updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
             addLlmLog({ endpoint: 'messages', model, stream: true, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: req.body.messages || null, prompt: null, response: responseText, error: null, backend: backend.id, requestBody: req.body });
           } catch (e) { res.end(); }
@@ -5040,7 +5360,7 @@ app.post('/api/v1/messages', async (req, res) => {
         const promptTokens = usage.input_tokens || 0;
         const completionTokens = usage.output_tokens || 0;
         const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration });
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({ endpoint: 'messages', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: req.body.messages || null, prompt: null, response: null, error: null, backend: backend.id, requestBody: req.body });
         data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };

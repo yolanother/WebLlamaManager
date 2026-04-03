@@ -299,6 +299,7 @@ function useWebSocket() {
   const [requestLogs, setRequestLogs] = useState([]);
   const [llmLogs, setLlmLogs] = useState([]);
   const [activeRequest, setActiveRequest] = useState(null);
+  const [activeRequestsMap, setActiveRequestsMap] = useState({});
   const [connected, setConnected] = useState(false);
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
@@ -383,8 +384,13 @@ function useWebSocket() {
             const { event, data } = message;
             if (event === 'start') {
               setActiveRequest(data);
+              setActiveRequestsMap(prev => ({ ...prev, [data.id]: data }));
             } else if (event === 'update') {
               setActiveRequest(prev => prev && prev.id === data.id ? { ...prev, ...data } : prev);
+              setActiveRequestsMap(prev => {
+                const existing = prev[data.id];
+                return { ...prev, [data.id]: existing ? { ...existing, ...data } : { id: data.id, status: 'processing', ...data } };
+              });
             } else if (event === 'end') {
               setActiveRequest(prev => {
                 if (prev && prev.id === data.id) {
@@ -393,6 +399,12 @@ function useWebSocket() {
                   return { ...prev, ...data };
                 }
                 return prev;
+              });
+              setActiveRequestsMap(prev => {
+                const next = { ...prev, [data.id]: { ...prev[data.id], ...data } };
+                // Remove ended requests after a brief delay
+                setTimeout(() => setActiveRequestsMap(cur => { const c = { ...cur }; delete c[data.id]; return c; }), 3000);
+                return next;
               });
             }
           }
@@ -440,7 +452,7 @@ function useWebSocket() {
   const clearRequestLogs = useCallback(() => setRequestLogs([]), []);
   const clearLlmLogs = useCallback(() => setLlmLogs([]), []);
 
-  return { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs, activeRequest };
+  return { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs, activeRequest, activeRequestsMap };
 }
 
 // Sidebar Navigation
@@ -491,6 +503,10 @@ function Sidebar({ stats }) {
         <NavLink to="/logs" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
           <span className="nav-icon">&#x1F4DC;</span>
           Logs
+        </NavLink>
+        <NavLink to="/queue" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+          <span className="nav-icon">&#x1F4CB;</span>
+          Queue
         </NavLink>
         <NavLink to="/processes" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
           <span className="nav-icon">&#x1F5A5;</span>
@@ -722,7 +738,10 @@ function MemoryChart({ data, primaryKey = 'vram', height = 140 }) {
   );
 }
 
-// Tokens/sec Chart Component
+// Model line colors for per-model charts
+const MODEL_SPEED_COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a78bfa', '#06b6d4', '#f97316', '#ec4899'];
+
+// Tokens/sec Chart Component — shows separate lines per model
 function TokensChart({ data, height = 140 }) {
   if (!data || data.length < 1) {
     return (
@@ -732,24 +751,73 @@ function TokensChart({ data, height = 140 }) {
     );
   }
 
+  // Find all unique models with actual generation (tokensPerSecond > 0)
+  const modelSet = new Set();
+  for (const d of data) {
+    if (d.model && d.tokensPerSecond > 0) modelSet.add(d.model);
+  }
+  const models = [...modelSet];
+
+  // If only zero-fill points (no models), show simple aggregate
+  if (models.length === 0) {
+    const maxTokens = Math.max(...data.map(d => d.tokensPerSecond || 0), 10);
+    return (
+      <div className="chart-container" style={{ height }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+            <defs>
+              <linearGradient id="gradTokens" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} />
+                <stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+            <XAxis dataKey="timestamp" hide />
+            <YAxis domain={[0, Math.ceil(maxTokens / 5) * 5]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+            <Tooltip content={<ChartTooltip unit=" tok/s" />} />
+            <Area type="monotone" dataKey="tokensPerSecond" name="Speed" stroke={CHART_COLORS.tokens} fill="url(#gradTokens)" strokeWidth={2} dot={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+    );
+  }
+
+  // Transform data: two keys per model — `m` for carry-forward (dotted), `m__real` for actual (solid)
+  const lastKnown = {};
+  const transformed = data.map(d => {
+    const point = { timestamp: d.timestamp };
+    if (d.model && d.tokensPerSecond > 0) {
+      lastKnown[d.model] = d.tokensPerSecond;
+    }
+    for (const m of models) {
+      const isReal = d.model === m && d.tokensPerSecond > 0;
+      point[m] = isReal ? d.tokensPerSecond : (lastKnown[m] || null);       // carry-forward (dotted)
+      point[m + '__real'] = isReal ? d.tokensPerSecond : null;               // real only (solid)
+    }
+    return point;
+  });
+
   const maxTokens = Math.max(...data.map(d => d.tokensPerSecond || 0), 10);
+  const shortName = (m) => m.length > 25 ? m.slice(0, 22) + '...' : m;
 
   return (
     <div className="chart-container" style={{ height }}>
       <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-          <defs>
-            <linearGradient id="gradTokens" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} />
-              <stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} />
-            </linearGradient>
-          </defs>
+        <LineChart data={transformed} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
           <XAxis dataKey="timestamp" hide />
           <YAxis domain={[0, Math.ceil(maxTokens / 5) * 5]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit=" tok/s" />} />
-          <Area type="monotone" dataKey="tokensPerSecond" name="Speed" stroke={CHART_COLORS.tokens} fill="url(#gradTokens)" strokeWidth={2} dot={false} />
-        </AreaChart>
+          {models.map((m, i) => {
+            const color = MODEL_SPEED_COLORS[i % MODEL_SPEED_COLORS.length];
+            return (
+              <React.Fragment key={m}>
+                <Line type="monotone" dataKey={m} name={shortName(m)} stroke={color} strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls={false} strokeOpacity={0.5} />
+                <Line type="monotone" dataKey={m + '__real'} name={null} stroke={color} strokeWidth={2} dot={false} connectNulls={true} legendType="none" tooltipType="none" />
+              </React.Fragment>
+            );
+          })}
+        </LineChart>
       </ResponsiveContainer>
     </div>
   );
@@ -1152,6 +1220,47 @@ function Dashboard({ stats, activeRequest }) {
     return { data, models: top5 };
   }, [historyData, historyRange]);
 
+  // Build per-model generation speed over time (uses mtps field from history points)
+  const modelSpeedOverTime = React.useMemo(() => {
+    const points = historyData?.points || [];
+    if (points.length === 0) return { data: [], models: [] };
+
+    // Collect all models that have speed data
+    const modelTotals = {};
+    for (const p of points) {
+      for (const [model, tps] of Object.entries(p.mtps || {})) {
+        modelTotals[model] = (modelTotals[model] || 0) + tps;
+      }
+    }
+
+    // Top models by cumulative speed (proxy for most active)
+    const topModels = Object.entries(modelTotals)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([m]) => m);
+
+    if (topModels.length === 0) return { data: [], models: [] };
+
+    // Build data with carry-forward (dotted) and real values (solid)
+    const lastKnown = {};
+    const data = points.map(p => {
+      const entry = { time: formatHistoryTime(p.ts, historyRange) };
+      if (p.mtps) {
+        for (const [m, tps] of Object.entries(p.mtps)) {
+          if (topModels.includes(m)) lastKnown[m] = tps;
+        }
+      }
+      for (const m of topModels) {
+        const real = p.mtps?.[m] || null;
+        entry[m] = real || lastKnown[m] || null;        // carry-forward (dotted)
+        entry[m + '__real'] = real;                       // real only (solid)
+      }
+      return entry;
+    });
+
+    return { data, models: topModels };
+  }, [historyData, historyRange]);
+
   // Build crash-by-model bar chart data
   const crashByModelData = crashData?.summary?.byModel
     ? Object.entries(crashData.summary.byModel)
@@ -1363,20 +1472,28 @@ function Dashboard({ stats, activeRequest }) {
               </div>
             </div>
             <div className="chart-card">
-              <h4>Generation Speed</h4>
+              <h4>Generation Speed by Model</h4>
               <div className="chart-container" style={{ height: 200 }}>
-                {historyPoints.length > 0 ? (
+                {modelSpeedOverTime.data.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <defs><linearGradient id="gradFsTps" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} /></linearGradient></defs>
+                    <LineChart data={modelSpeedOverTime.data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                       <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                       <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
-                      <Area type="monotone" dataKey="tps" name="Avg tok/s" stroke={CHART_COLORS.tokens} fill="url(#gradFsTps)" strokeWidth={2} dot={false} animationDuration={500} />
-                    </AreaChart>
+                      {modelSpeedOverTime.models.map((m, i) => {
+                        const color = MODEL_SPEED_COLORS[i % MODEL_SPEED_COLORS.length];
+                        const label = m.length > 30 ? m.slice(0, 27) + '...' : m;
+                        return (
+                          <React.Fragment key={m}>
+                            <Line type="monotone" dataKey={m} name={label} stroke={color} strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls={false} strokeOpacity={0.5} animationDuration={500} />
+                            <Line type="monotone" dataKey={m + '__real'} name={null} stroke={color} strokeWidth={2} dot={false} connectNulls={true} legendType="none" tooltipType="none" animationDuration={500} />
+                          </React.Fragment>
+                        );
+                      })}
+                    </LineChart>
                   </ResponsiveContainer>
-                ) : <div className="chart-empty">No historical data yet</div>}
+                ) : <div className="chart-empty">No per-model speed data yet</div>}
               </div>
             </div>
             <div className="chart-card">
@@ -1497,20 +1614,25 @@ function Dashboard({ stats, activeRequest }) {
               </div>
             </div>
             <div className="chart-card">
-              <h4>Generation Speed</h4>
+              <h4>Generation Speed by Model</h4>
               <div className="chart-container" style={{ height: 200 }}>
-                {historyPoints.length > 0 ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <defs><linearGradient id="gradFsTps3" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} /></linearGradient></defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
-                      <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
-                      <Area type="monotone" dataKey="tps" name="Avg tok/s" stroke={CHART_COLORS.tokens} fill="url(#gradFsTps3)" strokeWidth={2} dot={false} animationDuration={500} />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                ) : <div className="chart-empty">No historical data yet</div>}
+                {(() => {
+                  const modelTps = historyData?.summary?.modelAvgTps || {};
+                  const data = Object.entries(modelTps)
+                    .map(([model, tps]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, tps, fullModel: model }))
+                    .sort((a, b) => b.tps - a.tps);
+                  return data.length > 0 ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={data} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
+                        <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                        <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} />
+                        <YAxis dataKey="model" type="category" tick={{ fill: '#ccc', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
+                        <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
+                        <Bar dataKey="tps" name="Avg tok/s" fill={CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : <div className="chart-empty">No per-model speed data in this time range</div>;
+                })()}
               </div>
             </div>
           </div>
@@ -2024,25 +2146,21 @@ function Dashboard({ stats, activeRequest }) {
 
           {/* Generation Speed History */}
           <div className="chart-card-wide">
-            <h4>Generation Speed <span className="chart-value">avg tok/s</span></h4>
+            <h4>Generation Speed by Model <span className="chart-value">tok/s per model</span></h4>
             <div className="chart-container-wide">
-              {historyPoints.length > 0 ? (
+              {modelSpeedOverTime.data.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                    <defs>
-                      <linearGradient id="gradHistTokens" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} />
-                        <stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
+                  <LineChart data={modelSpeedOverTime.data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                     <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                     <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
-                    <Area type="monotone" dataKey="tps" name="Avg tok/s" stroke={CHART_COLORS.tokens} fill="url(#gradHistTokens)" strokeWidth={2} dot={false} animationDuration={500} />
-                  </AreaChart>
+                    {modelSpeedOverTime.models.map((m, i) => (
+                      <Line key={m} type="monotone" dataKey={m} name={m.length > 30 ? m.slice(0, 27) + '...' : m} stroke={MODEL_SPEED_COLORS[i % MODEL_SPEED_COLORS.length]} strokeWidth={2} dot={false} connectNulls={false} animationDuration={500} />
+                    ))}
+                  </LineChart>
                 </ResponsiveContainer>
-              ) : <div className="chart-empty">No historical data yet</div>}
+              ) : <div className="chart-empty">No per-model speed data yet</div>}
             </div>
           </div>
 
@@ -2291,6 +2409,43 @@ function Dashboard({ stats, activeRequest }) {
                   {model.length > 30 ? model.slice(0, 27) + '...' : model}
                 </div>
               ))}
+            </div>
+          </div>
+
+          {/* Generation Speed by Model */}
+          <div className="chart-card-wide">
+            <h4>Generation Speed by Model <span className="chart-value">avg tok/s</span></h4>
+            <div className="chart-container-wide">
+              {(() => {
+                const modelTps = historyData?.summary?.modelAvgTps || {};
+                const data = Object.entries(modelTps)
+                  .map(([model, tps]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, tps, fullModel: model }))
+                  .sort((a, b) => b.tps - a.tps);
+                return data.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={data} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                      <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} />
+                      <YAxis dataKey="model" type="category" tick={{ fill: '#ccc', fontSize: 11 }} width={180} tickLine={false} axisLine={false} />
+                      <Tooltip content={({ active, payload }) => {
+                        if (!active || !payload?.length) return null;
+                        const d = payload[0].payload;
+                        return (
+                          <div className="chart-tooltip">
+                            <div className="chart-tooltip-time">{d.fullModel}</div>
+                            <div className="chart-tooltip-row">
+                              <span className="chart-tooltip-dot" style={{ background: CHART_COLORS.tokens }} />
+                              <span className="chart-tooltip-label">Avg Speed:</span>
+                              <span className="chart-tooltip-value">{d.tps} tok/s</span>
+                            </div>
+                          </div>
+                        );
+                      }} />
+                      <Bar dataKey="tps" name="Avg tok/s" fill={CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : <div className="chart-empty">No per-model speed data in this time range</div>;
+              })()}
             </div>
           </div>
 
@@ -7132,9 +7287,366 @@ function ChatPage({ stats }) {
   );
 }
 
+// Queue Management Page
+function QueuePage({ stats, activeRequestsMap }) {
+  const [queueData, setQueueData] = useState({ items: [], concurrency: 1, totalQueued: 0 });
+  const [cancelling, setCancelling] = useState(new Set());
+  const [expandedId, setExpandedId] = useState(null);
+  const [expandedSysMsgs, setExpandedSysMsgs] = useState(new Set());
+  const [watchData, setWatchData] = useState(null); // SSE live data for expanded request
+  const responseRef = useRef(null);
+  const eventSourceRef = useRef(null);
+
+  // Auto-scroll expanded response
+  useEffect(() => {
+    if (expandedId && responseRef.current) {
+      responseRef.current.scrollTop = responseRef.current.scrollHeight;
+    }
+  });
+
+  // SSE connection for watching expanded active request
+  useEffect(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    setWatchData(null);
+
+    if (!expandedId) return;
+
+    // expandedId IS the activeRequestId (queue API uses ar.id for both)
+    const arId = expandedId;
+
+    const es = new EventSource(`${API_BASE}/queue/watch/${arId}`);
+    eventSourceRef.current = es;
+
+    es.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data.event === 'init') {
+          setWatchData(data);
+        } else if (data.event === 'update') {
+          setWatchData(prev => prev ? { ...prev, ...data, status: 'processing' } : { ...data, status: 'processing' });
+        } else if (data.event === 'end') {
+          setWatchData(prev => prev ? { ...prev, ...data } : data);
+          es.close();
+        }
+      } catch { /* skip parse errors */ }
+    };
+
+    es.onerror = () => {
+      es.close();
+    };
+
+    return () => es.close();
+  // Only reconnect when the expanded row changes, not on every poll
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expandedId]);
+
+  const fetchQueue = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/queue`);
+      const data = await res.json();
+      setQueueData(data);
+    } catch (err) {
+      console.error('Failed to fetch queue:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchQueue();
+    const interval = setInterval(fetchQueue, 1000);
+    return () => clearInterval(interval);
+  }, [fetchQueue]);
+
+  const cancelItem = async (id) => {
+    setCancelling(prev => new Set(prev).add(id));
+    try {
+      const res = await fetch(`${API_BASE}/queue/${id}`, { method: 'DELETE' });
+      if (res.ok) fetchQueue();
+      else console.error('Cancel failed:', (await res.json()).error);
+    } catch (err) { console.error('Failed to cancel:', err); }
+    setCancelling(prev => { const s = new Set(prev); s.delete(id); return s; });
+  };
+
+  const killActive = async (activeRequestId) => {
+    setCancelling(prev => new Set(prev).add(`active-${activeRequestId}`));
+    try {
+      const res = await fetch(`${API_BASE}/queue/active/${activeRequestId}`, { method: 'DELETE' });
+      if (res.ok) fetchQueue();
+      else console.error('Kill failed:', (await res.json()).error);
+    } catch (err) { console.error('Failed to kill:', err); }
+    setCancelling(prev => { const s = new Set(prev); s.delete(`active-${activeRequestId}`); return s; });
+  };
+
+  const flushAll = async () => {
+    try { await fetch(`${API_BASE}/queue/flush`, { method: 'POST' }); fetchQueue(); }
+    catch (err) { console.error('Failed to flush:', err); }
+  };
+
+  const activeItems = queueData.items.filter(i => i.status === 'active');
+  const pendingItems = queueData.items.filter(i => i.status === 'pending');
+
+  const formatElapsed = (ms) => {
+    if (ms < 1000) return `${ms}ms`;
+    const s = ms / 1000;
+    if (s < 60) return `${s.toFixed(1)}s`;
+    const m = Math.floor(s / 60);
+    return `${m}m ${Math.floor(s % 60)}s`;
+  };
+
+  // Merge data: SSE watchData (best) > WS map > polling
+  const getLiveData = (item) => {
+    const isWatched = item.id === expandedId && watchData;
+    const ws = item.activeRequestId ? activeRequestsMap?.[item.activeRequestId] : null;
+    const live = isWatched ? watchData : ws;
+    return {
+      ...item,
+      userMessage: live?.userMessage || item.userMessage,
+      fullContext: live?.fullContext || item.fullContext || [],
+      responseText: live?.responseText || item.responseText || '',
+      tokens: live?.tokens || item.tokens || 0,
+      status: live?.status || item.status,
+      backend: live?.backend || item.backend || 'local',
+      startTime: live?.startTime || item.startTime
+    };
+  };
+
+  // Format a message for display (handles string and array content)
+  const formatMessageContent = (content) => {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content.map(c => {
+        if (c.type === 'text') return c.text;
+        if (c.type === 'image_url') return '[image]';
+        return JSON.stringify(c);
+      }).join('\n');
+    }
+    return JSON.stringify(content);
+  };
+
+  const renderExpandedRow = (item) => {
+    const live = getLiveData(item);
+    const isProcessing = live.status === 'processing' || item.status === 'active';
+    const elapsed = live.startTime ? Date.now() - live.startTime : item.elapsed;
+    const tokens = live.tokens || 0;
+    const tps = tokens > 0 && elapsed > 1000 ? (tokens / (elapsed / 1000)).toFixed(1) : '0.0';
+    const context = live.fullContext || [];
+
+    return (
+      <div className="queue-expanded">
+        <div className="queue-expanded-stats">
+          <span className="queue-expanded-stat">
+            <span className="queue-expanded-stat-label">Output Tokens:</span> {tokens}
+          </span>
+          <span className="queue-expanded-stat">
+            <span className="queue-expanded-stat-label">Speed:</span> {tps} tok/s
+            {isProcessing && tokens > 0 && <span className="streaming-indicator"> live</span>}
+          </span>
+          <span className="queue-expanded-stat">
+            <span className="queue-expanded-stat-label">Elapsed:</span> {formatElapsed(elapsed)}
+          </span>
+          <span className="queue-expanded-stat">
+            <span className="queue-expanded-stat-label">Backend:</span> {live.backend}
+          </span>
+          <span className="queue-expanded-stat">
+            <span className="queue-expanded-stat-label">Model:</span> {item.model}
+          </span>
+          <span className="queue-expanded-stat">
+            <span className="queue-expanded-stat-label">Context Messages:</span> {context.length}
+          </span>
+        </div>
+
+        {/* Full conversation context as chat bubbles */}
+        <div className="queue-expanded-section">
+          <div className="queue-expanded-label">Conversation Context ({context.length} messages)</div>
+          <div className="queue-chat-thread">
+            {context.length > 0 ? context.map((msg, i) => {
+              const role = msg.role || 'unknown';
+              const content = formatMessageContent(msg.content || msg.thinking || '');
+              const isSystem = role === 'system';
+              const sysKey = `${item.id}-${i}`;
+              const isSysExpanded = expandedSysMsgs.has(sysKey);
+              const isLong = content.length > 200;
+
+              return (
+                <div key={i} className={`chat-bubble chat-bubble-${role}`}>
+                  <div className="chat-bubble-header">
+                    <span className={`chat-bubble-role chat-role-${role}`}>{role}</span>
+                    {msg.name && <span className="chat-bubble-name">{msg.name}</span>}
+                  </div>
+                  {isSystem && isLong && !isSysExpanded ? (
+                    <div className="chat-bubble-body">
+                      <div className="chat-bubble-text">{content.slice(0, 150)}...</div>
+                      <button className="chat-bubble-expand" onClick={() => setExpandedSysMsgs(prev => { const s = new Set(prev); s.add(sysKey); return s; })}>
+                        Show full ({(content.length / 1000).toFixed(1)}k chars)
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="chat-bubble-body">
+                      <div className="chat-bubble-text">{parseMessageWithCodeBlocks(content || '(empty)')}</div>
+                      {isSystem && isLong && (
+                        <button className="chat-bubble-expand" onClick={() => setExpandedSysMsgs(prev => { const s = new Set(prev); s.delete(sysKey); return s; })}>
+                          Collapse
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            }) : <div className="queue-context-empty">(no context captured)</div>}
+          </div>
+        </div>
+
+        {/* Live response */}
+        <div className="queue-expanded-section">
+          <div className="queue-expanded-label">
+            Response
+            {isProcessing && tokens > 0 && <span className="streaming-indicator"> streaming...</span>}
+            {isProcessing && tokens === 0 && <span className="streaming-indicator"> waiting...</span>}
+          </div>
+          <div className="queue-expanded-content queue-expanded-response" ref={expandedId === item.id ? responseRef : null}>
+            {live.responseText ? parseMessageWithCodeBlocks(live.responseText) : (isProcessing ? 'Waiting for first token...' : 'No response')}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="page queue-page">
+      <div className="page-header">
+        <h2>Queue Management</h2>
+        <div className="header-actions">
+          <span className="queue-summary">
+            Concurrency: {queueData.concurrency} | Total queued: {queueData.totalQueued}
+          </span>
+          {pendingItems.length > 0 && (
+            <button className="btn-warning" onClick={flushAll}>
+              Flush All Pending ({pendingItems.length})
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="queue-stats-row">
+        <StatCard label="Active" value={activeItems.length} status={activeItems.length > 0 ? 'success' : ''} icon="&#x26A1;" />
+        <StatCard label="Pending" value={pendingItems.length} status={pendingItems.length > 0 ? 'warning' : ''} icon="&#x23F3;" />
+        <StatCard label="Concurrency" value={queueData.concurrency} icon="&#x1F504;" />
+        <StatCard label="Total Queued" value={queueData.totalQueued} icon="&#x1F4CA;" />
+      </div>
+
+      {activeItems.length > 0 && (
+        <div className="queue-section">
+          <h3>Active Requests</h3>
+          <div className="queue-table">
+            <div className="queue-table-header">
+              <span className="queue-col-id">ID</span>
+              <span className="queue-col-model">Model</span>
+              <span className="queue-col-endpoint">Endpoint</span>
+              <span className="queue-col-message">Message</span>
+              <span className="queue-col-tokens">Tokens</span>
+              <span className="queue-col-elapsed">Elapsed</span>
+              <span className="queue-col-actions">Actions</span>
+            </div>
+            {activeItems.map(item => {
+              const live = getLiveData(item);
+              const isExpanded = expandedId === item.id;
+              return (
+                <React.Fragment key={item.id}>
+                  <div
+                    className={`queue-table-row active clickable ${isExpanded ? 'expanded' : ''} ${item.offloaded ? 'offloaded' : ''}`}
+                    onClick={() => setExpandedId(isExpanded ? null : item.id)}
+                  >
+                    <span className="queue-col-id">
+                      <span className={`queue-expand-arrow ${isExpanded ? 'open' : ''}`}>&#x25B6;</span>
+                      {item.id}
+                    </span>
+                    <span className="queue-col-model" title={item.model}>
+                      <span className="queue-model-name">{item.model.length > 25 ? item.model.slice(0, 22) + '...' : item.model}</span>
+                      {item.offloaded && <span className="queue-backend-tag">{item.backendName}</span>}
+                      {!item.offloaded && item.backend === 'local' && <span className="queue-backend-tag local">local</span>}
+                    </span>
+                    <span className="queue-col-endpoint">{item.endpoint}</span>
+                    <span className="queue-col-message" title={live.userMessage}>{live.userMessage ? (live.userMessage.length > 60 ? live.userMessage.slice(0, 57) + '...' : live.userMessage) : '-'}</span>
+                    <span className="queue-col-tokens">{live.tokens || '-'}</span>
+                    <span className={`queue-col-elapsed ${item.elapsed > 120000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
+                    <span className="queue-col-actions" onClick={e => e.stopPropagation()}>
+                      {item.activeRequestId ? (
+                        <button
+                          className="btn-danger-sm"
+                          onClick={() => killActive(item.activeRequestId)}
+                          disabled={cancelling.has(`active-${item.activeRequestId}`)}
+                          title="Kill this request"
+                        >
+                          {cancelling.has(`active-${item.activeRequestId}`) ? '...' : 'Kill'}
+                        </button>
+                      ) : (
+                        <span className="queue-status-badge active-badge">Processing</span>
+                      )}
+                    </span>
+                  </div>
+                  {isExpanded && renderExpandedRow(item)}
+                </React.Fragment>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {pendingItems.length > 0 && (
+        <div className="queue-section">
+          <h3>Pending Requests</h3>
+          <div className="queue-table">
+            <div className="queue-table-header">
+              <span className="queue-col-id">ID</span>
+              <span className="queue-col-model">Model</span>
+              <span className="queue-col-endpoint">Endpoint</span>
+              <span className="queue-col-message">Message</span>
+              <span className="queue-col-tokens">Tokens</span>
+              <span className="queue-col-elapsed">Waiting</span>
+              <span className="queue-col-actions">Actions</span>
+            </div>
+            {pendingItems.map(item => (
+              <div key={item.id} className={`queue-table-row pending ${item.offloaded ? 'offloaded' : ''}`}>
+                <span className="queue-col-id">{item.id}</span>
+                <span className="queue-col-model" title={item.model}>
+                  <span className="queue-model-name">{item.model.length > 25 ? item.model.slice(0, 22) + '...' : item.model}</span>
+                  {item.backendName && <span className="queue-backend-tag">{item.backendName}</span>}
+                </span>
+                <span className="queue-col-endpoint">{item.endpoint}</span>
+                <span className="queue-col-message" title={item.userMessage}>{item.userMessage ? (item.userMessage.length > 60 ? item.userMessage.slice(0, 57) + '...' : item.userMessage) : '-'}</span>
+                <span className="queue-col-tokens">-</span>
+                <span className={`queue-col-elapsed ${item.elapsed > 60000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
+                <span className="queue-col-actions">
+                  <button
+                    className="btn-danger-sm"
+                    onClick={() => cancelItem(item.id)}
+                    disabled={cancelling.has(item.id)}
+                    title="Cancel this request"
+                  >
+                    {cancelling.has(item.id) ? '...' : 'Cancel'}
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {queueData.items.length === 0 && (
+        <div className="queue-empty">
+          <span className="queue-empty-icon">&#x2705;</span>
+          <p>Queue is empty — no active or pending requests</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Main App
 function App() {
-  const { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs, activeRequest } = useWebSocket();
+  const { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs, activeRequest, activeRequestsMap } = useWebSocket();
 
   return (
     <BrowserRouter>
@@ -7154,6 +7666,7 @@ function App() {
             <Route path="/models" element={<ModelsPage stats={stats} />} />
             <Route path="/download" element={<DownloadPage stats={stats} />} />
             <Route path="/logs" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
+            <Route path="/queue" element={<QueuePage stats={stats} activeRequestsMap={activeRequestsMap} />} />
             <Route path="/processes" element={<ProcessesPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/docs" element={<DocsPage />} />
