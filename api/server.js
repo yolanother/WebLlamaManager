@@ -306,8 +306,47 @@ function resolveModelMapping(mapping, requestedModel) {
   return null;
 }
 
+// Estimate input token count from request body (rough: ~4 chars per token)
+function estimateInputTokens(body) {
+  let chars = 0;
+  if (body?.messages && Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      const content = msg.content;
+      if (typeof content === 'string') chars += content.length;
+      else if (Array.isArray(content)) {
+        for (const c of content) {
+          if (c.type === 'text') chars += (c.text || '').length;
+        }
+      }
+    }
+  } else if (body?.prompt) {
+    chars = typeof body.prompt === 'string' ? body.prompt.length : JSON.stringify(body.prompt).length;
+  }
+  return Math.ceil(chars / 4);
+}
+
+// Estimate how long a request will take locally based on recent performance
+function estimateLocalProcessingMs(inputTokens) {
+  // Get recent local prompt processing speed
+  const recentLocal = tokenStats.recentRequests.filter(r => r.promptTokens > 10 && r.duration > 100);
+  if (recentLocal.length < 3) return 0; // not enough data to estimate
+
+  // Average prompt tokens per second from recent requests
+  const promptSpeeds = recentLocal.slice(-10).map(r => r.promptTokens / (r.duration / 1000));
+  const avgPromptTps = promptSpeeds.reduce((a, b) => a + b, 0) / promptSpeeds.length;
+  if (avgPromptTps <= 0) return 0;
+
+  // Estimated prompt processing time + queue wait
+  const promptMs = (inputTokens / avgPromptTps) * 1000;
+  const queueWaitMs = llamaQueue.pending > 0
+    ? llamaQueue.pending * (recentLocal.slice(-5).reduce((s, r) => s + r.duration, 0) / Math.min(5, recentLocal.length))
+    : 0;
+
+  return promptMs + queueWaitMs;
+}
+
 // Resolve which backend should handle a request
-function resolveBackend(requestedModel, endpoint) {
+function resolveBackend(requestedModel, endpoint, body) {
   const backends = config.backends || {};
   if (!backends.enabled || !backends.directory?.length) {
     return { remote: false };
@@ -360,6 +399,20 @@ function resolveBackend(requestedModel, endpoint) {
   // prefer offloading to avoid the expensive switch wait
   if (!shouldOffload && llamaQueue.active > 0 && lastUsedModel && lastUsedModel !== requestedModel) {
     shouldOffload = true;
+  }
+
+  // Estimate-based offload: if input is large and local processing would be slow,
+  // offload to a remote backend even if the queue isn't full
+  if (!shouldOffload && body && llamaQueue.active > 0) {
+    const inputTokens = estimateInputTokens(body);
+    const offloadThresholdMs = backends.offloadEstimateThresholdMs ?? 10000;
+    if (inputTokens > 500) { // only estimate for non-trivial inputs
+      const estimatedMs = estimateLocalProcessingMs(inputTokens);
+      if (estimatedMs > offloadThresholdMs) {
+        shouldOffload = true;
+        console.log(`[routing] Offloading: ~${inputTokens} input tokens, estimated ${Math.round(estimatedMs)}ms local processing > ${offloadThresholdMs}ms threshold`);
+      }
+    }
   }
 
   if (!shouldOffload) {
@@ -4434,7 +4487,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   const proxyBody = injectReasoningEffort(req.body);
 
   // Resolve backend routing (local vs remote)
-  const routing = resolveBackend(requestedModel, 'chat/completions');
+  const routing = resolveBackend(requestedModel, 'chat/completions', req.body);
 
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: routing.remote ? routing.backend.id : 'local' });
   // Ensure active request is cleaned up on any exit path
@@ -4819,7 +4872,7 @@ app.post('/api/v1/completions', async (req, res) => {
   const isStreaming = req.body.stream === true;
 
   // Route to remote backend if applicable
-  const routing = resolveBackend(requestedModel, 'completions');
+  const routing = resolveBackend(requestedModel, 'completions', req.body);
   if (routing.remote) {
     req._backend = routing.backend.id;
     const remoteBody = { ...req.body, model: routing.targetModel };
@@ -5002,7 +5055,7 @@ app.post('/api/v1/embeddings', async (req, res) => {
   const requestedModel = req.body.model || 'default';
 
   // Route to remote backend if applicable
-  const routing = resolveBackend(requestedModel, 'embeddings');
+  const routing = resolveBackend(requestedModel, 'embeddings', req.body);
   if (routing.remote) {
     req._backend = routing.backend.id;
     const remoteBody = { ...req.body, model: routing.targetModel };
@@ -5090,7 +5143,7 @@ app.post('/api/v1/responses', async (req, res) => {
   const proxyBody = injectReasoningEffort(req.body);
 
   // Route to remote backend if applicable
-  const routing = resolveBackend(requestedModel, 'responses');
+  const routing = resolveBackend(requestedModel, 'responses', req.body);
   if (routing.remote) {
     req._backend = routing.backend.id;
     const remoteBody = { ...proxyBody, model: routing.targetModel };
@@ -5321,7 +5374,7 @@ app.post('/api/v1/messages', async (req, res) => {
   const proxyBody = injectReasoningEffort(req.body);
 
   // Route to remote backend if applicable
-  const routing = resolveBackend(requestedModel, 'messages');
+  const routing = resolveBackend(requestedModel, 'messages', req.body);
   if (routing.remote) {
     req._backend = routing.backend.id;
     const remoteBody = { ...proxyBody, model: routing.targetModel };
