@@ -4782,7 +4782,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 
       logLlm({
         endpoint: 'chat/completions', model: data.model || req.body.model || 'unknown',
-        stream: false, status: 200, duration, promptTokens, completionTokens,
+        stream: false, status: 200, duration: wallDuration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
         response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || null, error: null
@@ -4790,7 +4790,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 
       // Add our tracking info to response
       data._llama_manager = {
-        duration,
+        duration: wallDuration,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         backend: 'local'
       };
@@ -4976,7 +4976,7 @@ app.post('/api/v1/completions', async (req, res) => {
 
       addLlmLog({
         endpoint: 'completions', model: data.model || requestedModel,
-        stream: false, status: 200, duration, promptTokens, completionTokens,
+        stream: false, status: 200, duration: wallDuration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: null, prompt: req.body.prompt || null,
         response: data.choices?.[0]?.text || null, error: null, ...retryFields

@@ -60,7 +60,7 @@ CMD="$CMD --jinja"
 CMD="$CMD --host 0.0.0.0"
 CMD="$CMD --port $PORT"
 [ -n "$NO_WARMUP" ] && CMD="$CMD --no-warmup"
-[ -n "$FLASH_ATTN" ] && CMD="$CMD --flash-attn"
+[ -n "$FLASH_ATTN" ] && CMD="$CMD --flash-attn on"
 
 echo "Command: $CMD"
 exec $CMD
