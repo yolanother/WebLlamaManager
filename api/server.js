@@ -4497,7 +4497,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                     const data = JSON.parse(line.slice(6));
                     const delta = data.choices?.[0]?.delta;
                     if (delta) {
-                      const text = delta.content || delta.reasoning_content || '';
+                      const text = delta.content || delta.reasoning_content || delta.reasoning || '';
                       if (text) { completionTokens++; responseText += text; updateActiveRequest(activeReqId, text); }
                     }
                     if (data.usage) { promptTokens = data.usage.prompt_tokens || promptTokens; completionTokens = data.usage.completion_tokens || completionTokens; }
@@ -4543,7 +4543,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           endpoint: 'chat/completions', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens,
           tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
           messages: req.body.messages || null, prompt: null,
-          response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || null, error: null,
+          response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || data.choices?.[0]?.message?.reasoning || null, error: null,
           backend: backend.id, requestBody: req.body
         });
         data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
@@ -4688,7 +4688,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                   const data = JSON.parse(line.slice(6));
                   const delta = data.choices?.[0]?.delta;
                   if (delta) {
-                    const text = delta.content || delta.reasoning_content || '';
+                    const text = delta.content || delta.reasoning_content || delta.reasoning || '';
                     if (text) {
                       completionTokens++;
                       responseText += text;
@@ -4785,7 +4785,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         stream: false, status: 200, duration: wallDuration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
-        response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || null, error: null
+        response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || data.choices?.[0]?.message?.reasoning || null, error: null
       });
 
       // Add our tracking info to response
