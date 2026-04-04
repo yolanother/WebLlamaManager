@@ -424,6 +424,7 @@ function resolveBackend(requestedModel, endpoint, body) {
   const candidates = backends.directory.filter(b => {
     if (!b.enabled) return false;
     if (!b.tested) return false; // Must pass a connectivity test before use
+    if (isBackendCircuitOpen(b.id)) return false; // Skip backends with tripped circuit breaker
     if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
     // Check model mapping (exact match, glob patterns, or * catch-all)
     if (!b.modelMapping) return false;
@@ -473,10 +474,44 @@ function buildRemoteRouting(backend, remoteModel, endpoint) {
 }
 
 // Fetch from a remote backend with retry and per-backend queue
+// Circuit breaker state per backend
+const backendCircuitBreakers = new Map(); // backend.id -> { failures, lastFailure, trippedAt }
+const CIRCUIT_BREAKER_THRESHOLD = 3;     // consecutive failures to trip
+const CIRCUIT_BREAKER_RESET_MS = 60000;  // try again after 60s
+
+function isBackendCircuitOpen(backendId) {
+  const cb = backendCircuitBreakers.get(backendId);
+  if (!cb || !cb.trippedAt) return false;
+  // Allow retry after reset period (half-open)
+  if (Date.now() - cb.trippedAt > CIRCUIT_BREAKER_RESET_MS) return false;
+  return true;
+}
+
+function recordBackendSuccess(backendId) {
+  backendCircuitBreakers.set(backendId, { failures: 0, lastFailure: 0, trippedAt: null });
+}
+
+function recordBackendFailure(backendId, backendName) {
+  const cb = backendCircuitBreakers.get(backendId) || { failures: 0, lastFailure: 0, trippedAt: null };
+  cb.failures++;
+  cb.lastFailure = Date.now();
+  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD && !cb.trippedAt) {
+    cb.trippedAt = Date.now();
+    console.log(`[circuit-breaker] Backend ${backendName} tripped after ${cb.failures} consecutive failures — pausing for ${CIRCUIT_BREAKER_RESET_MS / 1000}s`);
+    addLog('backends', `Circuit breaker tripped for ${backendName} — ${cb.failures} consecutive failures, pausing ${CIRCUIT_BREAKER_RESET_MS / 1000}s`);
+  }
+  backendCircuitBreakers.set(backendId, cb);
+}
+
 async function fetchRemoteBackend(backend, url, options, { label = 'remote', model } = {}) {
   const queue = backendQueues.get(backend.id);
   if (!queue) {
     throw new Error(`No queue for backend ${backend.id}`);
+  }
+
+  // Check circuit breaker before queuing
+  if (isBackendCircuitOpen(backend.id)) {
+    throw new Error(`Backend ${backend.name} circuit breaker is open (consecutive failures)`);
   }
 
   const queueStart = Date.now();
@@ -507,8 +542,10 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
           stats.lastUsed = Date.now();
           if (response.ok) {
             stats.successRequests++;
+            recordBackendSuccess(backend.id);
           } else {
             stats.errorRequests++;
+            recordBackendFailure(backend.id, backend.name);
           }
           stats.totalDurationMs += duration;
           stats.recentLatencies.push(duration);
@@ -532,6 +569,7 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
       stats.errorRequests++;
       stats.lastUsed = Date.now();
     }
+    recordBackendFailure(backend.id, backend.name);
     throw lastError;
   } finally {
     queue.release();
@@ -1253,14 +1291,19 @@ async function getSystemStats() {
       ])
     ),
     backends: config.backends?.enabled ? Object.fromEntries(
-      [...backendStats.entries()].map(([id, s]) => [id, {
-        active: backendQueues.get(id)?.active || 0,
-        pending: backendQueues.get(id)?.pending || 0,
-        tokPerSec: Math.round(s.avgTokPerSec * 10) / 10,
-        totalCost: Math.round(s.totalCostUsd * 10000) / 10000,
-        totalRequests: s.totalRequests,
-        errors: s.errorRequests
-      }])
+      [...backendStats.entries()].map(([id, s]) => {
+        const cb = backendCircuitBreakers.get(id);
+        return [id, {
+          active: backendQueues.get(id)?.active || 0,
+          pending: backendQueues.get(id)?.pending || 0,
+          tokPerSec: Math.round(s.avgTokPerSec * 10) / 10,
+          totalCost: Math.round(s.totalCostUsd * 10000) / 10000,
+          totalRequests: s.totalRequests,
+          errors: s.errorRequests,
+          circuitOpen: isBackendCircuitOpen(id),
+          consecutiveFailures: cb?.failures || 0
+        }];
+      })
     ) : null
   };
 }
