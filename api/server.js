@@ -3540,31 +3540,30 @@ function findPresetForModel(modelName) {
 // + acquireLocalSlot path serializes new requests during the window.
 let modeSwitchPromise = null;
 async function ensureModelServed(modelName) {
-  // Loop because two requests with different targets can stack up: A triggers
-  // a swap to gemma-spec; B arrives during that swap wanting Qwen. After A's
-  // swap finishes, B must re-check and trigger another swap to router.
+  // Only auto-swap TO an autoActivate preset. We never auto-swap AWAY from a
+  // manually-activated preset, even for non-matching model requests — the
+  // user explicitly chose that preset and yanking it would unload their
+  // model. Mismatched requests reach llama-server with whatever model is
+  // currently loaded; that's the user's responsibility once they pick a
+  // single-model preset.
   while (true) {
     const targetPreset = findPresetForModel(modelName);
-    const targetMode = targetPreset ? 'single' : 'router';
+    if (!targetPreset) return; // No autoActivate match — keep current mode.
+    if (currentMode === 'single' && currentPreset === targetPreset) return; // Already there.
 
-    // Already at target — no swap needed.
-    if (currentMode === targetMode && currentPreset === targetPreset) return;
-
-    // A swap is in flight — wait for it then re-evaluate (the swap might
-    // not be heading to the mode we need).
+    // A swap is in flight — wait for it then re-evaluate.
     if (modeSwitchPromise) {
       try { await modeSwitchPromise; } catch { /* re-check anyway */ }
       continue;
     }
 
     const fromDesc = currentMode === 'single' ? `preset=${currentPreset}` : 'router';
-    const toDesc = targetMode === 'single' ? `preset=${targetPreset}` : 'router';
-    console.log(`[mode-switch] Auto-switching ${fromDesc} -> ${toDesc} for model ${modelName}`);
-    addLog('system', `Auto-switching llama-server mode: ${fromDesc} -> ${toDesc} (triggered by request for ${modelName})`);
+    console.log(`[mode-switch] Auto-switching ${fromDesc} -> preset=${targetPreset} for model ${modelName}`);
+    addLog('system', `Auto-switching llama-server mode: ${fromDesc} -> preset=${targetPreset} (triggered by request for ${modelName})`);
 
     modeSwitchPromise = (async () => {
       try {
-        currentMode = targetMode;
+        currentMode = 'single';
         currentPreset = targetPreset;
         await restartLlamaServer();
       } finally {
