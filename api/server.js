@@ -8,6 +8,7 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { cpus, totalmem, freemem, loadavg } from 'os';
 import { EventEmitter } from 'events';
+import { createHash } from 'crypto';
 import pty from 'node-pty';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -267,6 +268,127 @@ const llamaQueue = new RequestQueue(1); // default: 1 concurrent request
 // `localStallMs` in config.json overrides the default; 0 disables the watchdog.
 const DEFAULT_LOCAL_STALL_MS = 60_000;
 const STALL_WATCHDOG_INTERVAL = 5_000;
+
+// === Prefix cache router (Phase 1: sticky-slot routing) ============================
+//
+// llama.cpp's per-slot KV cache automatically matches a request's prompt prefix
+// against whatever the slot last processed and re-uses the matching tokens —
+// only the diff at the tail is re-prompt-processed. When two requests for the
+// same conversation land on different slots, that benefit is lost.
+//
+// We exploit this by hashing the conversation prefix (everything except the
+// last user turn) and remembering which slot last served that prefix for a
+// given model. Subsequent requests for the same prefix are pinned to that
+// slot via the `id_slot` field on the chat completion body — llama.cpp then
+// auto-matches the cached prefix and only processes the new tail. Up to
+// n_parallel distinct conversations cache hot at once.
+//
+// Key shape: `${model}|${sha1(prefixJson).slice(0,16)}`
+// Value:     { slotId, lastUsedAt, hits, misses }
+const conversationSlotMap = new Map();
+const CONVERSATION_MAP_MAX = 256; // LRU cap; bigger than n_parallel since we evict naturally
+
+// Compute a stable hash of the prefix (all messages except the trailing user
+// turn). Returns null if there's no useful prefix to hash on (e.g. the request
+// is just a single user message — nothing to cache).
+function conversationPrefixKey(model, messages) {
+  if (!Array.isArray(messages) || messages.length < 2) return null;
+  // Slice off the trailing run of user messages so we hash on the durable prefix.
+  let cutoff = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') cutoff = i;
+    else break;
+  }
+  if (cutoff <= 0) return null;
+  const prefix = messages.slice(0, cutoff);
+  try {
+    // crypto is already imported up top; use sha1 for speed (not security)
+    const h = createHash('sha1').update(JSON.stringify(prefix)).digest('hex').slice(0, 16);
+    return `${model}|${h}`;
+  } catch { return null; }
+}
+
+// Slot count for the loaded llama-server (cached). Discovered by hitting /slots.
+// Default 4 (matches the n_parallel we observed) until we can probe.
+let llamaSlotCount = 4;
+let _slotCountProbed = false;
+let _slotRoundRobin = 0;
+async function probeSlotCount(model) {
+  if (_slotCountProbed) return;
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return;
+    const data = await r.json();
+    if (Array.isArray(data) && data.length > 0) {
+      llamaSlotCount = data.length;
+      _slotCountProbed = true;
+      console.log(`[prefix-cache] Detected ${llamaSlotCount} llama.cpp slots for ${model}`);
+    }
+  } catch { /* ignore */ }
+}
+
+// Pick or assign a slot for a conversation. Returns { slotId, hit, key } or
+// null if not applicable. We assign slots via round-robin for misses; on a
+// hit we return the same slot the prefix was last seen on so llama.cpp's
+// per-slot auto-prefix-match kicks in.
+function lookupOrAssignSlot(model, messages) {
+  const key = conversationPrefixKey(model, messages);
+  if (!key) return null;
+  const existing = conversationSlotMap.get(key);
+  if (existing) {
+    existing.lastUsedAt = Date.now();
+    existing.hits = (existing.hits || 0) + 1;
+    // Move-to-front for LRU
+    conversationSlotMap.delete(key);
+    conversationSlotMap.set(key, existing);
+    return { slotId: existing.slotId, hit: true, key };
+  }
+  // New prefix: assign next slot in round-robin so we spread distinct
+  // conversations across slots and minimize evictions.
+  const slotId = _slotRoundRobin % llamaSlotCount;
+  _slotRoundRobin = (_slotRoundRobin + 1) >>> 0;
+  conversationSlotMap.set(key, { slotId, lastUsedAt: Date.now(), hits: 0, misses: 1 });
+  if (conversationSlotMap.size > CONVERSATION_MAP_MAX) {
+    const oldestKey = conversationSlotMap.keys().next().value;
+    conversationSlotMap.delete(oldestKey);
+  }
+  return { slotId, hit: false, key };
+}
+
+// === Pre-tokenization queue =========================================================
+// Tokenizing happens on CPU; while a request waits in the local queue for the
+// GPU to be free, we can spend that CPU time tokenizing its prompt. Results
+// are stashed on the activeRequest entry and (when present) sent to llama.cpp
+// as a pre-tokenized `prompt` array so its own tokenizer pass is skipped.
+//
+// Tokenization is best-effort: if it fails (model not loaded, timeout, etc.)
+// we silently fall through to letting llama.cpp tokenize as normal.
+async function preTokenize(model, messages, signal) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  // Flatten messages to a single string for tokenize — llama.cpp's /tokenize
+  // doesn't know the chat template, so this gives an approximate count + the
+  // raw text token IDs we can use for cache key chunking later.
+  let text = '';
+  for (const m of messages) {
+    const role = m.role || '';
+    const c = m.content;
+    text += `\n${role}: `;
+    if (typeof c === 'string') text += c;
+    else if (Array.isArray(c)) text += c.map(p => p.type === 'text' ? p.text : '').join('');
+  }
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/tokenize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text, model, add_special: false }),
+      signal: signal || AbortSignal.timeout(15000)
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (Array.isArray(data?.tokens)) return data.tokens;
+    return null;
+  } catch { return null; }
+}
 
 // Remote backend load balancing
 const backendQueues = new Map();  // backend.id -> RequestQueue
@@ -1583,6 +1705,21 @@ async function getSystemStats() {
       lastKillStallMs: watchdogStats.lastKillStallMs,
       stallMs: config?.localStallMs ?? DEFAULT_LOCAL_STALL_MS
     },
+    prefixCache: (() => {
+      let hits = 0, misses = 0;
+      for (const v of conversationSlotMap.values()) {
+        hits += v.hits || 0;
+        misses += v.misses || 0;
+      }
+      return {
+        entries: conversationSlotMap.size,
+        slots: llamaSlotCount,
+        slotsDetected: _slotCountProbed,
+        hits,
+        misses,
+        hitRate: hits + misses > 0 ? Math.round((hits / (hits + misses)) * 1000) / 10 : null
+      };
+    })(),
     activeModel: activeRequests.size > 0 ? [...activeRequests.values()][0]?.model : null,
     lastUsedModel,
     lastUsedModelTime,
@@ -4976,7 +5113,43 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // Resolve backend routing (local vs remote)
   const routing = resolveBackend(requestedModel, 'chat/completions', req.body);
 
+  // Prefix-cache routing (local only): pin same-conversation requests to the
+  // same llama.cpp slot so its per-slot KV cache auto-matches the prefix and
+  // we only re-prompt-process the trailing user turn. id_slot is a hint —
+  // llama.cpp may pick differently if our slot is busy.
+  let slotAssignment = null;
+  if (!routing.remote && Array.isArray(req.body.messages)) {
+    slotAssignment = lookupOrAssignSlot(requestedModel, req.body.messages);
+    if (slotAssignment && slotAssignment.slotId != null) {
+      proxyBody.id_slot = slotAssignment.slotId;
+      proxyBody.cache_prompt = true; // explicit; llama.cpp default is also true
+      if (slotAssignment.hit) {
+        console.log(`[prefix-cache] HIT model=${requestedModel} slot=${slotAssignment.slotId} key=${slotAssignment.key}`);
+      }
+    }
+    // Probe slot count in the background on first request per model
+    if (!_slotCountProbed) probeSlotCount(requestedModel).catch(() => {});
+  }
+
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: routing.remote ? routing.backend.id : 'local' });
+
+  // Fire pre-tokenization in the background while we wait on the queue.
+  // The result lands on the activeRequest entry so anyone curious can see
+  // the real token count even before llama-cpp processes it. We don't
+  // currently inject the pre-tokenized prompt — llama.cpp's chat-template
+  // path needs the messages array, not raw tokens. But the result is still
+  // useful for size estimation, prefix-cache hashing, and future work.
+  if (!routing.remote && Array.isArray(req.body.messages)) {
+    preTokenize(requestedModel, req.body.messages, getActiveRequestSignal(activeReqId))
+      .then(tokens => {
+        const ar = activeRequests.get(activeReqId);
+        if (ar && tokens) {
+          ar.preTokenized = tokens.length;
+          ar.preTokenizedAt = Date.now();
+        }
+      })
+      .catch(() => {});
+  }
   // Ensure active request is cleaned up on any exit path
   res.on('finish', () => {
     if (activeRequests.has(activeReqId)) {
