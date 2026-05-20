@@ -6688,7 +6688,10 @@ const STALL_HARD_CAP_MULTIPLIER = 6; // e.g. 10min soft → 60min hard cap
 // Remote backends use a tighter threshold: a wedged Ollama/etc. that accepts
 // the request but never streams data has no GPU work to "extend" — we should
 // give up fairly quickly and let the caller fail/retry/route elsewhere.
-const REMOTE_STALL_MS = 60_000;
+// Remote stall threshold. 120s rather than 60s gives a slow-but-not-stuck
+// Ollama backend a fair chance to deliver the first token under load. Truly
+// wedged remotes still get torn down — just after a longer grace window.
+const REMOTE_STALL_MS = 120_000;
 
 setInterval(async () => {
   const stallMs = config?.localStallMs ?? DEFAULT_LOCAL_STALL_MS;
