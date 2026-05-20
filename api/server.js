@@ -2043,9 +2043,25 @@ async function getGpuStats() {
           // If GTT is larger than VRAM, prefer showing GTT as it represents usable memory
           const isAPU = gttStats.total > vramTotal;
 
+          // Strix Halo + ROCm 7 quirk: rocm-smi's "GPU use (%)" reads 0 even
+          // during active inference (kernel sysfs gpu_busy_percent has the same
+          // issue on this hardware). Derive a usable proxy from sclk: at idle
+          // the engine clock sits ~600 MHz; under compute it ramps to ~2900 MHz.
+          // If we see a real rocm-smi number, prefer that (other GPUs work fine).
+          const reportedUsage = parseFloat(card['GPU use (%)'] || card.gpu_use || 0);
+          let usage = reportedUsage;
+          if (reportedUsage === 0 && isAPU && coreClock > 0) {
+            // Map sclk 600 -> 0%, 2900 -> 100%.
+            const SCLK_IDLE = 600;
+            const SCLK_MAX = 2900;
+            usage = Math.max(0, Math.min(100,
+              Math.round(((coreClock - SCLK_IDLE) / (SCLK_MAX - SCLK_IDLE)) * 100)
+            ));
+          }
           resolve({
             temperature: parseFloat(card['Temperature (Sensor edge) (C)'] || card.temperature || 0),
-            usage: parseFloat(card['GPU use (%)'] || card.gpu_use || 0),
+            usage,
+            usageRaw: reportedUsage,
             power,
             coreClock,
             memClock,
