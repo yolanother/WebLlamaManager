@@ -5316,6 +5316,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
               messages: req.body.messages || null, prompt: null, response: responseText || null, error: `Stream error: ${e.message}`,
               backend: backend.id, requestBody: req.body
             });
+            // Stream-abort counts as a backend failure for circuit-breaker
+            // purposes. Without this, watchdog kills on hung Ollama OpenAI
+            // compat endpoints wouldn't trip the breaker and we'd keep
+            // routing to a wedged backend.
+            recordBackendFailure(backend.id, backend.name);
             endActiveRequest(activeReqId, { status: 'error' });
             res.end();
           }
