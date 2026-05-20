@@ -4471,6 +4471,20 @@ function SettingsPage() {
               onChange={(e) => updateSetting('maxConcurrentRequests', parseInt(e.target.value))}
             />
           </div>
+          <div className="setting-item">
+            <label htmlFor="localStallMs">Stall Watchdog (seconds)</label>
+            <p className="setting-hint">
+              Abort a local request if no token is received for this long. The timer resets on every token, so long generations are safe — only a truly wedged upstream gets killed. Set to 0 to disable.
+            </p>
+            <input
+              type="number"
+              id="localStallMs"
+              min="0"
+              max="3600"
+              value={Math.round((settings?.localStallMs ?? 60000) / 1000)}
+              onChange={(e) => updateSetting('localStallMs', parseInt(e.target.value) * 1000)}
+            />
+          </div>
         </div>
       </section>
 
@@ -7607,29 +7621,40 @@ function QueuePage({ stats, activeRequestsMap }) {
               <span className="queue-col-elapsed">Waiting</span>
               <span className="queue-col-actions">Actions</span>
             </div>
-            {pendingItems.map(item => (
-              <div key={item.id} className={`queue-table-row pending ${item.offloaded ? 'offloaded' : ''}`}>
-                <span className="queue-col-id">{item.id}</span>
-                <span className="queue-col-model" title={item.model}>
-                  <span className="queue-model-name">{item.model.length > 25 ? item.model.slice(0, 22) + '...' : item.model}</span>
-                  {item.backendName && <span className="queue-backend-tag">{item.backendName}</span>}
-                </span>
-                <span className="queue-col-endpoint">{item.endpoint}</span>
-                <span className="queue-col-message" title={item.userMessage}>{item.userMessage ? (item.userMessage.length > 60 ? item.userMessage.slice(0, 57) + '...' : item.userMessage) : '-'}</span>
-                <span className="queue-col-tokens">-</span>
-                <span className={`queue-col-elapsed ${item.elapsed > 60000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
-                <span className="queue-col-actions">
-                  <button
-                    className="btn-danger-sm"
-                    onClick={() => cancelItem(item.id)}
-                    disabled={cancelling.has(item.id)}
-                    title="Cancel this request"
-                  >
-                    {cancelling.has(item.id) ? '...' : 'Cancel'}
-                  </button>
-                </span>
-              </div>
-            ))}
+            {pendingItems.map(item => {
+              // Items with an activeRequestId (chat/completions queued behind a slot)
+              // need to be killed via the active-request abort path. Queue-only items
+              // (completions/responses/messages) use the pending-cancel endpoint with
+              // the numeric portion of the prefixed id.
+              const hasActive = item.activeRequestId != null;
+              const cancelKey = hasActive ? `active-${item.activeRequestId}` : item.id;
+              const onCancel = hasActive
+                ? () => killActive(item.activeRequestId)
+                : () => cancelItem(item.queueItemId ?? parseInt(String(item.id).replace(/^q/, ''), 10));
+              return (
+                <div key={item.id} className={`queue-table-row pending ${item.offloaded ? 'offloaded' : ''}`}>
+                  <span className="queue-col-id">{item.id}</span>
+                  <span className="queue-col-model" title={item.model}>
+                    <span className="queue-model-name">{item.model.length > 25 ? item.model.slice(0, 22) + '...' : item.model}</span>
+                    {item.backendName && <span className="queue-backend-tag">{item.backendName}</span>}
+                  </span>
+                  <span className="queue-col-endpoint">{item.endpoint}</span>
+                  <span className="queue-col-message" title={item.userMessage}>{item.userMessage ? (item.userMessage.length > 60 ? item.userMessage.slice(0, 57) + '...' : item.userMessage) : '-'}</span>
+                  <span className="queue-col-tokens">-</span>
+                  <span className={`queue-col-elapsed ${item.elapsed > 60000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
+                  <span className="queue-col-actions">
+                    <button
+                      className="btn-danger-sm"
+                      onClick={onCancel}
+                      disabled={cancelling.has(cancelKey)}
+                      title={hasActive ? 'Abort this queued request' : 'Cancel this pending request'}
+                    >
+                      {cancelling.has(cancelKey) ? '...' : 'Cancel'}
+                    </button>
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
