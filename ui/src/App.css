@@ -2798,6 +2798,37 @@ input::placeholder {
   animation: blink 1s infinite;
 }
 
+.query-message.waiting .message-content {
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.query-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.query-thinking-dot {
+  font-size: 1.5em;
+  line-height: 0.5;
+  animation: query-thinking-bounce 1.4s infinite ease-in-out both;
+}
+
+.query-thinking-dot:nth-child(1) { animation-delay: -0.32s; }
+.query-thinking-dot:nth-child(2) { animation-delay: -0.16s; }
+.query-thinking-dot:nth-child(3) { animation-delay: 0s; }
+
+.query-thinking-label {
+  margin-left: 8px;
+  font-size: 0.92em;
+}
+
+@keyframes query-thinking-bounce {
+  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+  40%           { opacity: 1.0; transform: translateY(-3px); }
+}
+
 /* Message stats tooltip */
 .message-stats-tooltip {
   position: fixed;

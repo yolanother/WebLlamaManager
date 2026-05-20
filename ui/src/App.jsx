@@ -6047,6 +6047,15 @@ function QueryPanel({ stats }) {
   const [streamingMessage, setStreamingMessage] = useState('');
   const [hoveredMessage, setHoveredMessage] = useState(null);
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
+  // queueStatus tracks the request's position while waiting on the server's
+  // local queue. The server emits `: queued position=N/T waited=Xs` as SSE
+  // comments while blocked on acquireLocalSlot. Cleared once tokens arrive.
+  // { position: number, total: number, waitedSec: number } | null
+  const [queueStatus, setQueueStatus] = useState(null);
+  // waitingForFirstToken: true between submit and first content chunk. Shows
+  // a "Thinking..." indicator so the user knows the request is in flight even
+  // before bytes start arriving.
+  const [waitingForFirstToken, setWaitingForFirstToken] = useState(false);
   const [copiedId, setCopiedId] = useState(null);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
@@ -6153,6 +6162,8 @@ function QueryPanel({ stats }) {
     setPrompt('');
     setIsLoading(true);
     setStreamingMessage('');
+    setWaitingForFirstToken(true);
+    setQueueStatus(null);
 
     // Generate title from first message
     const title = isFirstMessage
@@ -6192,6 +6203,20 @@ function QueryPanel({ stats }) {
         const lines = chunk.split('\n');
 
         for (const line of lines) {
+          // SSE comment lines (": ...") carry server-side queue status
+          // while we're blocked waiting on the local queue. Parse them
+          // so the UI can show position + waited time.
+          if (line.startsWith(': ')) {
+            const m = line.match(/queued position=(\d+|\?)\/(\d+) waited=(\d+)s/);
+            if (m) {
+              setQueueStatus({
+                position: m[1] === '?' ? null : parseInt(m[1], 10),
+                total: parseInt(m[2], 10),
+                waitedSec: parseInt(m[3], 10)
+              });
+            }
+            continue;
+          }
           if (line.startsWith('data: ')) {
             const data = line.slice(6);
             if (data === '[DONE]') continue;
@@ -6200,6 +6225,10 @@ function QueryPanel({ stats }) {
               const parsed = JSON.parse(data);
               const content = parsed.choices?.[0]?.delta?.content || '';
               if (content) {
+                if (waitingForFirstToken) {
+                  setWaitingForFirstToken(false);
+                  setQueueStatus(null);
+                }
                 fullContent += content;
                 tokenCount++;
                 setStreamingMessage(fullContent);
@@ -6241,6 +6270,8 @@ function QueryPanel({ stats }) {
       const finalMessages = [...newMessages, assistantMessage];
       setMessages(finalMessages);
       setStreamingMessage('');
+      setWaitingForFirstToken(false);
+      setQueueStatus(null);
 
       // Save to shared history so ChatPage can see it
       const convTitle = title || (messages.length === 0 ? prompt.trim().slice(0, 50) : 'Quick Chat');
@@ -6253,6 +6284,8 @@ function QueryPanel({ stats }) {
         content: `Error: ${err.message}`,
         stats: null
       }]);
+      setWaitingForFirstToken(false);
+      setQueueStatus(null);
     }
 
     setIsLoading(false);
@@ -6348,6 +6381,27 @@ function QueryPanel({ stats }) {
                 <span className="message-role">AI{selectedModel ? ` - ${formatModelName({ id: selectedModel })}` : ''}</span>
               </div>
               <div className="message-content">{parseMessageWithCodeBlocks(streamingMessage)}</div>
+            </div>
+          )}
+          {waitingForFirstToken && !streamingMessage && (
+            <div className="query-message assistant waiting">
+              <div className="message-header">
+                <span className="message-role">AI{selectedModel ? ` - ${formatModelName({ id: selectedModel })}` : ''}</span>
+              </div>
+              <div className="message-content">
+                <span className="query-thinking">
+                  <span className="query-thinking-dot">·</span>
+                  <span className="query-thinking-dot">·</span>
+                  <span className="query-thinking-dot">·</span>
+                  <span className="query-thinking-label">
+                    {queueStatus
+                      ? (queueStatus.position
+                          ? `Queued: position ${queueStatus.position}/${queueStatus.total} — waited ${queueStatus.waitedSec}s`
+                          : `Waiting in queue (${queueStatus.total} ahead) — ${queueStatus.waitedSec}s`)
+                      : 'Thinking…'}
+                  </span>
+                </span>
+              </div>
             </div>
           )}
           <div ref={messagesEndRef} />
