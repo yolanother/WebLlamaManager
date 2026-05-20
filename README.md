@@ -289,6 +289,22 @@ Enable lingering: `sudo loginctl enable-linger $USER`
 - Try reducing `modelsMax` in config.json
 - Try a smaller quantization (Q4 instead of Q5/Q6)
 
+### Tok/s < 1 even on small models / GPU never ramps up
+
+llama.cpp logs `ggml_cuda_init: failed to initialize ROCm: no ROCm-capable
+device is detected`, every tensor buffer ends up on CPU, and
+`cat /sys/class/drm/card*/device/gpu_busy_percent` stays at `0`.
+
+On **AMD Strix Halo / Ryzen AI MAX** systems this is almost always the
+`amdxdna` NPU driver claiming `/dev/kfd` ahead of `amdgpu`. Fix:
+
+```bash
+./scripts/fix-strix-halo-npu-conflict.sh
+```
+
+See [`docs/GOTCHAS.md`](docs/GOTCHAS.md) for full background, other
+hardware quirks we've hit, and how to report a new one.
+
 ## OpenCode Setup
 
 Llama Manager works with [OpenCode](https://opencode.ai) as an OpenAI-compatible provider.

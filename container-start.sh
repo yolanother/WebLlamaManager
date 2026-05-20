@@ -17,6 +17,16 @@ set -euo pipefail
 # AMD GPU settings
 export HSA_OVERRIDE_GFX_VERSION=11.5.1
 export ROCM_LLVM_PRE_VEGA=1
+
+# Strix Halo / unified-memory GPU: tell the HIP backend it can place buffers
+# in GTT (system RAM) instead of the tiny BIOS-reserved VRAM partition.
+# Without these flags, llama.cpp tries to fit the whole model in VRAM (~1GB
+# on Strix Halo by default) and silently falls back to CPU for any model
+# that doesn't fit. Both flag names are set because the canonical name has
+# changed between llama.cpp releases.
+export GGML_HIP_UMA=1
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+
 export IP_ADDRESS=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk 'NR==1 {print $2}' | cut -d'/' -f1)
 
 # Set llama.cpp cache directory to MODELS_DIR so HF downloads go there
