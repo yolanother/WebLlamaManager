@@ -3514,6 +3514,68 @@ async function stopLlamaServer() {
 // Restart llama server in its current mode (router or preset)
 // Used by fetchWithRetry when the server appears to have crashed
 let restartInProgress = false;
+// Find the preset that should serve the given model name, if any.
+// Only considers presets with autoActivate=true so manual presets (like
+// the qwen3-coder-next preset) don't auto-trigger on every related request.
+// Match by autoActivateModels array, or fall back to the model-dir name
+// derived from preset.modelPath.
+function findPresetForModel(modelName) {
+  if (!modelName || !config.presets) return null;
+  for (const [id, p] of Object.entries(config.presets)) {
+    if (!p.autoActivate) continue;
+    if (Array.isArray(p.autoActivateModels) && p.autoActivateModels.includes(modelName)) {
+      return id;
+    }
+    if (p.modelPath) {
+      const dirName = p.modelPath.split('/').slice(-2, -1)[0];
+      if (dirName === modelName) return id;
+    }
+  }
+  return null;
+}
+
+// Auto-switch between router mode and preset (single-model) mode based on
+// the incoming request's model. Concurrent callers share the same swap
+// promise so we don't kick off multiple restarts; the existing llamaQueue
+// + acquireLocalSlot path serializes new requests during the window.
+let modeSwitchPromise = null;
+async function ensureModelServed(modelName) {
+  // Loop because two requests with different targets can stack up: A triggers
+  // a swap to gemma-spec; B arrives during that swap wanting Qwen. After A's
+  // swap finishes, B must re-check and trigger another swap to router.
+  while (true) {
+    const targetPreset = findPresetForModel(modelName);
+    const targetMode = targetPreset ? 'single' : 'router';
+
+    // Already at target — no swap needed.
+    if (currentMode === targetMode && currentPreset === targetPreset) return;
+
+    // A swap is in flight — wait for it then re-evaluate (the swap might
+    // not be heading to the mode we need).
+    if (modeSwitchPromise) {
+      try { await modeSwitchPromise; } catch { /* re-check anyway */ }
+      continue;
+    }
+
+    const fromDesc = currentMode === 'single' ? `preset=${currentPreset}` : 'router';
+    const toDesc = targetMode === 'single' ? `preset=${targetPreset}` : 'router';
+    console.log(`[mode-switch] Auto-switching ${fromDesc} -> ${toDesc} for model ${modelName}`);
+    addLog('system', `Auto-switching llama-server mode: ${fromDesc} -> ${toDesc} (triggered by request for ${modelName})`);
+
+    modeSwitchPromise = (async () => {
+      try {
+        currentMode = targetMode;
+        currentPreset = targetPreset;
+        await restartLlamaServer();
+      } finally {
+        modeSwitchPromise = null;
+      }
+    })();
+    await modeSwitchPromise;
+    return;
+  }
+}
+
 async function restartLlamaServer() {
   if (restartInProgress) {
     console.log('[restart] Restart already in progress, waiting for it to complete...');
@@ -5656,6 +5718,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   };
 
   try {
+    // Auto-swap llama-server mode/preset if the requested model isn't served
+    // by the currently-loaded mode. We hold the local queue slot here (only
+    // one request runs at a time), so swapping won't kill anyone else's
+    // in-flight inference. Pending requests stay queued during the swap.
+    await ensureModelServed(requestedModel);
     let response = await doFetch(proxyBody);
     let activeBody = proxyBody;
 
@@ -6055,6 +6122,7 @@ app.post('/api/v1/completions', async (req, res) => {
   }
 
   try {
+    await ensureModelServed(requestedModel);
     const { response, retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -6343,6 +6411,7 @@ app.post('/api/v1/responses', async (req, res) => {
     return;
   }
   try {
+    await ensureModelServed(requestedModel);
     let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -6584,6 +6653,7 @@ app.post('/api/v1/messages', async (req, res) => {
     return;
   }
   try {
+    await ensureModelServed(requestedModel);
     let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
