@@ -926,6 +926,16 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
         // to tear down a stalled body stream after headers arrive. We remove
         // it in the response-consumer (the proxy handler) via a `.finally`.
 
+        // If the external signal aborted DURING our fetch but before headers
+        // arrived (race), don't count as a backend failure — the caller gave
+        // up. This happens when the client disconnects mid-fetch.
+        if (externalSignal?.aborted) {
+          if (externalAbortHandler) {
+            try { externalSignal.removeEventListener('abort', externalAbortHandler); } catch {}
+          }
+          throw new Error('External signal aborted (client cancelled)');
+        }
+
         const duration = Date.now() - startTime;
         if (stats) {
           stats.totalRequests++;
@@ -949,6 +959,12 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
           try { externalSignal.removeEventListener('abort', externalAbortHandler); } catch {}
         }
         lastError = err;
+        // Caller-side abort (client disconnect, watchdog-from-client side):
+        // not a backend failure. Don't retry, don't count toward the
+        // consecutive-failures counter that would trip the circuit breaker.
+        if (externalSignal?.aborted) {
+          throw err;
+        }
         // If the breaker tripped while we were retrying, stop early — no
         // point hammering a backend we just decided to back off from.
         if (isBackendCircuitOpen(backend.id)) {
@@ -5227,9 +5243,14 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // an activeRequests entry forever, and our /api/queue piles up ghost
   // pending rows that don't correspond to real llamaQueue items. Also
   // abort the request signal so any in-flight upstream fetch tears down.
+  // cancelReason is captured in handler closure scope so stream catches
+  // can tell "client disconnected" (NOT a backend failure) from "backend
+  // error" (counts toward circuit breaker).
+  let cancelReason = null;
   const cleanupActive = (reason) => {
     if (!activeRequests.has(activeReqId)) return;
     const entry = activeRequests.get(activeReqId);
+    cancelReason = reason;
     try { entry?.abortController?.abort(); } catch { /* ignore */ }
     endActiveRequest(activeReqId, { status: reason });
   };
@@ -5333,10 +5354,12 @@ app.post('/api/v1/chat/completions', async (req, res) => {
               backend: backend.id, requestBody: req.body
             });
             // Stream-abort counts as a backend failure for circuit-breaker
-            // purposes. Without this, watchdog kills on hung Ollama OpenAI
-            // compat endpoints wouldn't trip the breaker and we'd keep
-            // routing to a wedged backend.
-            recordBackendFailure(backend.id, backend.name);
+            // purposes — UNLESS the cancel came from our own client (close
+            // event). Client disconnects are not backend faults; counting
+            // them would falsely trip the circuit breaker.
+            if (cancelReason !== 'client_disconnect') {
+              recordBackendFailure(backend.id, backend.name);
+            }
             endActiveRequest(activeReqId, { status: 'error' });
             res.end();
           }
