@@ -2924,6 +2924,63 @@ app.get('/health', async (req, res) => {
   });
 });
 
+// Local GPU health check — surfaces the Strix Halo /dev/kfd EINVAL state
+// so the dashboard can alarm on it and operators can correlate sub-1
+// tok/s requests with a broken local accelerator. Returns:
+//   { healthy: boolean, kfd: 'ok'|'einval'|'unavailable', detail: string,
+//     gpuBusyPercent: number|null, gpuVramUsedBytes: number|null }
+app.get('/api/health/gpu', async (req, res) => {
+  let kfd = 'unavailable';
+  let detail = '';
+  try {
+    const { promisify } = await import('util');
+    const fs = await import('fs');
+    const openAsync = promisify(fs.open);
+    const closeAsync = promisify(fs.close);
+    const fd = await openAsync('/dev/kfd', 'r+');
+    await closeAsync(fd);
+    kfd = 'ok';
+  } catch (e) {
+    if (e && (e.code === 'EINVAL' || e.errno === -22)) {
+      kfd = 'einval';
+      detail = '/dev/kfd open returned EINVAL — KFD state wedged. ' +
+               'If you blacklisted amdxdna recently, REBOOT is required ' +
+               'for the iGPU to come back. See docs/GOTCHAS.md.';
+    } else if (e && e.code === 'ENOENT') {
+      kfd = 'unavailable';
+      detail = '/dev/kfd not present (no AMD compute GPU on this host?)';
+    } else {
+      detail = `open /dev/kfd: ${e && (e.code || e.message)}`;
+    }
+  }
+
+  let gpuBusyPercent = null;
+  let gpuVramUsedBytes = null;
+  try {
+    const fs = await import('fs/promises');
+    const dirs = (await fs.readdir('/sys/class/drm'))
+      .filter(d => /^card\d+$/.test(d))
+      .map(d => `/sys/class/drm/${d}/device`);
+    for (const dir of dirs) {
+      try {
+        const vendor = (await fs.readFile(`${dir}/vendor`, 'utf8')).trim();
+        if (vendor !== '0x1002') continue; // only AMD
+        const busy = (await fs.readFile(`${dir}/gpu_busy_percent`, 'utf8')).trim();
+        const used = (await fs.readFile(`${dir}/mem_info_vram_used`, 'utf8')).trim();
+        gpuBusyPercent = parseInt(busy, 10);
+        gpuVramUsedBytes = parseInt(used, 10);
+        break;
+      } catch { /* keep looking */ }
+    }
+  } catch { /* fall through, leave nulls */ }
+
+  const healthy = kfd === 'ok';
+  res.status(healthy ? 200 : 503).json({
+    healthy, kfd, detail,
+    gpuBusyPercent, gpuVramUsedBytes
+  });
+});
+
 // Proxy llama.cpp backend /health — returns raw llama-server health status
 app.get('/api/v1/health', async (req, res) => {
   try {

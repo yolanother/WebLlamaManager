@@ -193,6 +193,56 @@ fix and the NPU blacklist applied, a 27B Q4 model should produce
 
 ---
 
+## Working around local GPU outages while you wait for a reboot
+
+When local GPU is broken (KFD wedged, ROCm down, etc.) the manager
+automatically routes requests with a matching `modelMapping` to a
+remote backend — see `config.json.backends.directory`. The
+[`_llama_manager.compute`](#response-metadata) field tells callers
+which path ran their request.
+
+**To check status from a script or curl:**
+
+```bash
+curl -sS http://127.0.0.1:5250/api/health/gpu | jq
+```
+
+Returns:
+
+```json
+{
+  "healthy": false,
+  "kfd": "einval",
+  "detail": "/dev/kfd open returned EINVAL — KFD state wedged. ...",
+  "gpuBusyPercent": 0,
+  "gpuVramUsedBytes": 163188736
+}
+```
+
+When `kfd != "ok"`, the local accelerator is down and any local-only
+model will fall back to CPU. Either reboot, or add a `modelMapping`
+to a healthy remote backend for the affected model.
+
+### Response metadata
+
+Every `/api/v1/chat/completions`, `/api/v1/messages`, and `/api/v1/responses`
+reply carries an `_llama_manager` block so the caller can detect
+slow-path runs without polling another endpoint:
+
+```json
+"_llama_manager": {
+  "duration": 3843,
+  "tokensPerSecond": 47.0,
+  "backend": "dahaka-ollama-mngx88pk",
+  "compute": "remote",      // local-gpu | local-cpu | local-unknown | remote
+  "slow": false,            // true when tokensPerSecond < 1
+  "warning": "Sub-1 tok/s …" // present only when slow=true
+}
+```
+
+Callers should treat `slow: true` as an alarm signal — the request
+almost certainly ran on CPU. Dashboards can surface it directly.
+
 ## Reporting a new gotcha
 
 When you hit something painful:
