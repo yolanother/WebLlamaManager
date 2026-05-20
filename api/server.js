@@ -3534,44 +3534,68 @@ function findPresetForModel(modelName) {
   return null;
 }
 
+// Does the given preset serve the given model name? Used to detect when
+// we're in single-mode for the wrong model. Match by autoActivateModels
+// array (if set) or by model-dir name derived from modelPath.
+function presetServesModel(preset, modelName) {
+  if (!preset || !modelName) return false;
+  if (Array.isArray(preset.autoActivateModels) && preset.autoActivateModels.includes(modelName)) return true;
+  if (Array.isArray(preset.servesModels) && preset.servesModels.includes(modelName)) return true;
+  if (preset.modelPath) {
+    const dirName = preset.modelPath.split('/').slice(-2, -1)[0];
+    if (dirName === modelName) return true;
+  }
+  return false;
+}
+
 // Auto-switch between router mode and preset (single-model) mode based on
 // the incoming request's model. Concurrent callers share the same swap
 // promise so we don't kick off multiple restarts; the existing llamaQueue
 // + acquireLocalSlot path serializes new requests during the window.
 let modeSwitchPromise = null;
 async function ensureModelServed(modelName) {
-  // Only auto-swap TO an autoActivate preset. We never auto-swap AWAY from a
-  // manually-activated preset, even for non-matching model requests — the
-  // user explicitly chose that preset and yanking it would unload their
-  // model. Mismatched requests reach llama-server with whatever model is
-  // currently loaded; that's the user's responsibility once they pick a
-  // single-model preset.
+  // Two correctness rules:
+  //   (1) If the model has an autoActivate preset and we're not in it -> swap to it.
+  //   (2) If we're in a single-mode preset that doesn't serve this model -> swap
+  //       BACK to router. Router can dynamically load any model, so it's the
+  //       only safe fallback. Without this we'd silently serve the request
+  //       with whatever model the preset has loaded — wrong-model output.
   while (true) {
     const targetPreset = findPresetForModel(modelName);
-    if (!targetPreset) return; // No autoActivate match — keep current mode.
-    if (currentMode === 'single' && currentPreset === targetPreset) return; // Already there.
 
-    // A swap is in flight — wait for it then re-evaluate.
-    if (modeSwitchPromise) {
-      try { await modeSwitchPromise; } catch { /* re-check anyway */ }
-      continue;
+    // Rule 1: target preset matches; swap to it if not already there.
+    if (targetPreset && !(currentMode === 'single' && currentPreset === targetPreset)) {
+      if (modeSwitchPromise) { try { await modeSwitchPromise; } catch {} continue; }
+      const fromDesc = currentMode === 'single' ? `preset=${currentPreset}` : 'router';
+      console.log(`[mode-switch] ${fromDesc} -> preset=${targetPreset} for model ${modelName}`);
+      addLog('system', `Auto-switching llama-server mode: ${fromDesc} -> preset=${targetPreset} (triggered by request for ${modelName})`);
+      modeSwitchPromise = (async () => {
+        try { currentMode = 'single'; currentPreset = targetPreset; await restartLlamaServer(); }
+        finally { modeSwitchPromise = null; }
+      })();
+      await modeSwitchPromise;
+      return;
     }
 
-    const fromDesc = currentMode === 'single' ? `preset=${currentPreset}` : 'router';
-    console.log(`[mode-switch] Auto-switching ${fromDesc} -> preset=${targetPreset} for model ${modelName}`);
-    addLog('system', `Auto-switching llama-server mode: ${fromDesc} -> preset=${targetPreset} (triggered by request for ${modelName})`);
-
-    modeSwitchPromise = (async () => {
-      try {
-        currentMode = 'single';
-        currentPreset = targetPreset;
-        await restartLlamaServer();
-      } finally {
-        modeSwitchPromise = null;
+    // Rule 2: we're in a single-mode preset that doesn't serve this model.
+    // Swap to router so the right model gets loaded. The manually-activated
+    // preset has to give way — otherwise we'd serve wrong-model output.
+    if (currentMode === 'single' && currentPreset && !targetPreset) {
+      const preset = config.presets?.[currentPreset];
+      if (preset && !presetServesModel(preset, modelName)) {
+        if (modeSwitchPromise) { try { await modeSwitchPromise; } catch {} continue; }
+        console.log(`[mode-switch] preset=${currentPreset} cannot serve ${modelName}, swapping to router`);
+        addLog('system', `Auto-switching llama-server mode: preset=${currentPreset} -> router (preset cannot serve ${modelName})`);
+        modeSwitchPromise = (async () => {
+          try { currentMode = 'router'; currentPreset = null; await restartLlamaServer(); }
+          finally { modeSwitchPromise = null; }
+        })();
+        await modeSwitchPromise;
+        return;
       }
-    })();
-    await modeSwitchPromise;
-    return;
+    }
+
+    return; // already at correct mode (or router, which can serve anything)
   }
 }
 
