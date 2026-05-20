@@ -5329,6 +5329,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -5337,11 +5338,23 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         let model = routing.targetModel;
         let responseText = '';
 
+        // Same keepalive-during-silence trick as the local path. Remote
+        // backends (especially Ollama under load) can take 30-90s for first
+        // token; without periodic comment lines, clients with 60-90s read
+        // timeouts abort and we log 502 'This operation was aborted'.
+        let lastChunkAt = Date.now();
+        const keepaliveTicker = setInterval(() => {
+          if (Date.now() - lastChunkAt > 20_000 && !res.writableEnded) {
+            try { res.write(`: processing waited=${Math.round((Date.now() - startTime) / 1000)}s backend=${backend.id}\n\n`); } catch {}
+          }
+        }, 10_000);
+
         const processStream = async () => {
           try {
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
+              lastChunkAt = Date.now();
               const chunk = decoder.decode(value);
               // Normalize model field in remote streaming chunks to match requested model
               const lines = chunk.split('\n');
@@ -5375,6 +5388,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
               }
               res.write(needsRewrite ? rewrittenLines.join('\n') : chunk);
             }
+            clearInterval(keepaliveTicker);
             res.end();
             const duration = Date.now() - startTime;
             const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
@@ -5388,6 +5402,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             });
             endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
           } catch (e) {
+            clearInterval(keepaliveTicker);
             const duration = Date.now() - startTime;
             addLlmLog({
               endpoint: 'chat/completions', model, stream: true, status: 500, duration, promptTokens, completionTokens, tokensPerSecond: 0,
