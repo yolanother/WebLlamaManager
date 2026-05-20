@@ -31,6 +31,19 @@ const PROJECT_ROOT = dirname(__dirname);
 import dotenv from 'dotenv';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
+// Safety net: log unhandled rejections instead of crashing the process. Node's
+// default behavior on unhandledRejection (since Node 16) is to terminate. We'd
+// rather log and keep serving — a stray promise rejection from one request
+// shouldn't take down every other in-flight request. The underlying handler
+// fixes (try/catch around acquireLocalSlot, etc.) should prevent these, but
+// this is a backstop for ones we miss.
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+
 const app = express();
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
@@ -5433,15 +5446,34 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   let bodyCommitted = false;
   // Acquire local queue slot for the lifetime of this response. Released automatically
   // via res.on('close'/'finish') even if the handler errors out partway.
-  const { queueWait: initialQueueWait } = await acquireLocalSlot(req, res, {
-    model: requestedModel, endpoint: 'chat/completions', activeReqId,
-    onWait: isStreaming ? ({ position, pending, waitedMs }) => {
-      flushSseHeaders();
-      const pos = position != null ? position + 1 : '?';
-      // SSE comment line — keeps the connection warm; clients ignore it.
-      res.write(`: queued position=${pos}/${pending} waited=${Math.round(waitedMs / 1000)}s\n\n`);
-    } : null
-  });
+  // Wrapped in try/catch because the queue can reject pending acquires (flush,
+  // cancel, client disconnect) — without this catch the rejection propagates up
+  // as an unhandled promise rejection and crashes the Node process.
+  let initialQueueWait = 0;
+  try {
+    const slot = await acquireLocalSlot(req, res, {
+      model: requestedModel, endpoint: 'chat/completions', activeReqId,
+      onWait: isStreaming ? ({ position, pending, waitedMs }) => {
+        flushSseHeaders();
+        const pos = position != null ? position + 1 : '?';
+        res.write(`: queued position=${pos}/${pending} waited=${Math.round(waitedMs / 1000)}s\n\n`);
+      } : null
+    });
+    initialQueueWait = slot.queueWait;
+  } catch (err) {
+    // Acquire was rejected (flush / cancel / etc.). Clean up and bail.
+    if (activeRequests.has(activeReqId)) {
+      endActiveRequest(activeReqId, { status: 'cancelled' });
+    }
+    if (!res.headersSent) {
+      res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
+    } else if (!res.writableEnded) {
+      // SSE keepalive already flushed headers — emit error event then close.
+      try { res.write(`event: error\ndata: ${JSON.stringify({ status: 503, error: err.message })}\n\n`); } catch {}
+      try { res.end(); } catch {}
+    }
+    return;
+  }
   let totalQueueWait = initialQueueWait;
   async function doFetch(body) {
     const result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
@@ -5831,9 +5863,17 @@ app.post('/api/v1/completions', async (req, res) => {
   }
 
   // Hold a local queue slot for the lifetime of the response (released on res close/finish)
-  const { queueWait: completionsQueueWait } = await acquireLocalSlot(req, res, {
-    model: requestedModel, endpoint: 'completions', activeReqId: null
-  });
+  let completionsQueueWait = 0;
+  try {
+    const slot = await acquireLocalSlot(req, res, {
+      model: requestedModel, endpoint: 'completions', activeReqId: null
+    });
+    completionsQueueWait = slot.queueWait;
+  } catch (err) {
+    if (!res.headersSent) return res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
+    if (!res.writableEnded) res.end();
+    return;
+  }
 
   try {
     const { response, retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
@@ -6114,9 +6154,15 @@ app.post('/api/v1/responses', async (req, res) => {
   let allRetryErrors = [];
   let anyRestarted = false;
   // Hold a local queue slot for the lifetime of the response (released on res close/finish)
-  await acquireLocalSlot(req, res, {
-    model: requestedModel, endpoint: 'responses', activeReqId: null
-  });
+  try {
+    await acquireLocalSlot(req, res, {
+      model: requestedModel, endpoint: 'responses', activeReqId: null
+    });
+  } catch (err) {
+    if (!res.headersSent) return res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
+    if (!res.writableEnded) res.end();
+    return;
+  }
   try {
     let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
       method: 'POST',
@@ -6349,9 +6395,15 @@ app.post('/api/v1/messages', async (req, res) => {
   let allRetryErrors = [];
   let anyRestarted = false;
   // Hold a local queue slot for the lifetime of the response (released on res close/finish)
-  await acquireLocalSlot(req, res, {
-    model: requestedModel, endpoint: 'messages', activeReqId: null
-  });
+  try {
+    await acquireLocalSlot(req, res, {
+      model: requestedModel, endpoint: 'messages', activeReqId: null
+    });
+  } catch (err) {
+    if (!res.headersSent) return res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
+    if (!res.writableEnded) res.end();
+    return;
+  }
   try {
     let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
       method: 'POST',
