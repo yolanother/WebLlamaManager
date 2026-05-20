@@ -7022,8 +7022,22 @@ setInterval(async () => {
       const totalElapsed = now - entry.startTime;
       const hardCapHit = totalElapsed >= hardCapMs;
       if (!hardCapHit) {
-        const upstreamBusy = await isUpstreamProcessing(entry.model);
-        if (upstreamBusy) {
+        // Check llama-cpp slot state. is_processing=true on its own can be
+        // a zombie slot — we've seen cases where llama-server shows slots
+        // is_processing but n_decoded stays at 0 and the worker is at 0% CPU.
+        // Real "upstream is making progress" means n_decoded ADVANCED since
+        // we last looked, not just is_processing=true. Track it per entry.
+        const slots = await fetchSlots(entry.model);
+        const procSlots = Array.isArray(slots) ? slots.filter(s => s.is_processing) : [];
+        const totalDecoded = procSlots.reduce((s, x) => {
+          const nt = x.next_token?.[0] || {};
+          return s + (nt.n_decoded || 0);
+        }, 0);
+        const upstreamBusy = procSlots.length > 0;
+        const lastDecoded = entry._lastUpstreamDecoded ?? -1;
+        const advanced = totalDecoded > lastDecoded;
+        entry._lastUpstreamDecoded = totalDecoded;
+        if (upstreamBusy && advanced) {
           entry.lastActivityAt = now;
           if (!entry._extendedByWatchdog) {
             entry._extendedByWatchdog = true;
