@@ -1,26 +1,36 @@
-Queue UX: surface invisible slot holders, show position, SSE keepalive
+Slot-aware watchdog + don't break catch path with SSE keepalive
 
-Three related queue-visibility fixes:
+Two compounding bugs:
 
-1. Surface "invisible" local slot holders. completions / responses /
-   messages handlers hold the local llamaQueue slot but don't call
-   startActiveRequest, so they didn't appear anywhere in the UI's
-   Active Requests list. That made pending chat requests look
-   mysteriously stuck — the slot was held but nothing visible was
-   running. /api/queue now emits a synthetic active row for any
-   llamaQueue.activeItems entry that lacks a matching activeRequest,
-   labeled "local (<endpoint>)".
+1. Stuck-slot cascade in llama-cpp. When the JS-side stall watchdog
+   aborted a fetch mid-prompt-processing, llama-cpp didn't notice
+   the TCP close (it only polls during token emission) and kept
+   processing in the background. The next request got its own
+   llama-cpp slot. Repeated kills produced N stuck slots competing
+   for the GPU, each running at 1/N speed. That's the "4 minutes to
+   first token" pathology.
 
-2. Queue position. Each pending item now includes queuePosition
-   (1-based) and queueLength so the UI can render a "#3 of 17" chip.
-   Pending items are sorted by position for FIFO display order.
+   Watchdog now two-tier:
+   - Soft (stallMs): if no token in stallMs, check llama-cpp /slots
+     for the model. If any slot is_processing, the upstream IS still
+     working — extend lastActivityAt and re-check next pass. Logs
+     once on extension so the operator can see it happen.
+   - Hard (stallMs × 6): unconditional kill if we hit the cap.
+     Catches truly wedged llama-cpp (no slot activity at all).
 
-3. SSE keepalive while queued. acquireLocalSlot() accepts an onWait
-   callback fired every 5s while blocked on acquire. The
-   chat/completions handler uses it (when stream=true) to flush SSE
-   headers up front and emit `:` comment lines, keeping reverse
-   proxies from 504ing during long queue waits. Comments are
-   ignored by SSE clients (including OpenAI-compatible ones) so this
-   is invisible to consumers except for the kept-open socket.
+2. SSE keepalive broke the chat/completions catch path. Flushing
+   SSE headers early for keepalive made res.headersSent === true,
+   which the catch block used as "real body already committed" and
+   returned early — skipping endActiveRequest. The leaked
+   activeRequests entry then got re-triggered by the event-driven
+   backfill scanner on every subsequent completion, spamming
+   "[backfill] Request X stalled" forever.
+
+   Replaced res.headersSent checks with a bodyCommitted flag that
+   only flips when the real upstream body starts streaming, and a
+   sseKeepaliveActive flag for the "headers flushed for keepalive
+   only" state. The catch block now always finalizes the
+   activeRequest. New sendErrorIfPossible() helper handles the
+   keepalive-active error path by emitting an SSE error event.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>

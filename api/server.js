@@ -5123,16 +5123,26 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // connection alive past any reverse-proxy read timeout. Comments are ignored
   // by SSE clients (including OpenAI-compatible ones) so this is invisible to
   // the consumer except for the kept-open socket.
-  let sseHeadersFlushed = false;
+  //
+  // CAUTION: flushing headers makes res.headersSent === true, which several
+  // downstream branches use as a "real body already committed" sentinel. We use
+  // `sseKeepaliveActive` to distinguish these two states so the streaming/catch
+  // paths can still finalize the response properly after keepalive started.
+  let sseKeepaliveActive = false;
   const flushSseHeaders = () => {
-    if (sseHeadersFlushed || res.headersSent) return;
-    sseHeadersFlushed = true;
+    if (sseKeepaliveActive || res.headersSent) return;
+    sseKeepaliveActive = true;
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
     res.flushHeaders();
   };
+  // bodyCommitted goes true the moment we start writing the actual upstream
+  // response body (or sent json for non-streaming). Replaces res.headersSent
+  // as the "already committed" check now that headers may be flushed early
+  // for keepalive.
+  let bodyCommitted = false;
   // Acquire local queue slot for the lifetime of this response. Released automatically
   // via res.on('close'/'finish') even if the handler errors out partway.
   const { queueWait: initialQueueWait } = await acquireLocalSlot(req, res, {
@@ -5162,12 +5172,30 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     requestedModel, endpoint: 'chat/completions', proxyBody, isStreaming, startTime, activeReqId
   });
 
+  // Helper: send a JSON error response if we haven't started the real body yet.
+  // Distinguishes "keepalive headers flushed" from "real response started" so
+  // SSE keepalive doesn't accidentally short-circuit error reporting. When
+  // keepalive is active, we send the error as an SSE event instead of HTTP json.
+  const sendErrorIfPossible = (status, errText) => {
+    if (bodyCommitted) return;
+    bodyCommitted = true;
+    if (sseKeepaliveActive) {
+      // Headers already sent as SSE; emit the error as an SSE data event then close.
+      res.write(`event: error\ndata: ${JSON.stringify({ status, error: errText })}\n\n`);
+      res.end();
+    } else if (!res.headersSent) {
+      res.status(status).send(errText);
+    } else {
+      res.end();
+    }
+  };
+
   try {
     let response = await doFetch(proxyBody);
     let activeBody = proxyBody;
 
     // If backfill won while we were fetching, bail out
-    if (res.headersSent) {
+    if (bodyCommitted) {
       if (backfillTimer) clearTimeout(backfillTimer);
       return;
     }
@@ -5198,7 +5226,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                 promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
                 messages: req.body.messages || null, prompt: null, response: null, error: retryError
               });
-              if (!res.headersSent) return res.status(response.status).send(retryError);
+              sendErrorIfPossible(response.status, retryError);
               return;
             }
           }
@@ -5212,7 +5240,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
             messages: req.body.messages || null, prompt: null, response: null, error: errorText
           });
-          if (!res.headersSent) return res.status(response.status).send(errorText);
+          sendErrorIfPossible(response.status, errorText);
           return;
         }
       } else if (isTemplateSanitizable(errorText) && proxyBody.messages) {
@@ -5230,7 +5258,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
           messages: req.body.messages || null, prompt: null, response: null, error: errorText
         });
-        if (!res.headersSent) return res.status(response.status).send(errorText);
+        sendErrorIfPossible(response.status, errorText);
         return;
       }
     }
@@ -5245,18 +5273,22 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
         messages: req.body.messages || null, prompt: null, response: null, error
       });
-      if (!res.headersSent) return res.status(response.status).send(error);
+      sendErrorIfPossible(response.status, error);
       return;
     }
 
-    // Final headersSent check before committing to response
-    if (res.headersSent) return;
+    // Final commit check before streaming the real body
+    if (bodyCommitted) return;
+    bodyCommitted = true;
 
     if (isStreaming) {
-      // Stream the response and track tokens
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+      // Stream the response and track tokens. If keepalive already flushed SSE
+      // headers, skip the setHeader calls (they'd throw on already-sent headers).
+      if (!sseKeepaliveActive) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+      }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -5418,9 +5450,12 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     }
   } catch (error) {
     if (backfillTimer) clearTimeout(backfillTimer);
-    // If backfill already won and served the response, don't send an error
-    if (res.headersSent) return;
-    endActiveRequest(activeReqId, { status: 'error' });
+    // Always finalize the activeRequest so it doesn't leak in the backfill
+    // scan loop forever. (Pre-fix: an SSE-keepalive-active request that
+    // errored would skip endActiveRequest because res.headersSent was true.)
+    if (activeRequests.has(activeReqId)) {
+      endActiveRequest(activeReqId, { status: 'error' });
+    }
     if (error.retryErrors) retryInfo = { retries: error.retries, retryErrors: error.retryErrors };
     logLlm({
       endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
@@ -5429,7 +5464,21 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       messages: req.body.messages || null, prompt: null,
       response: null, error: error.message
     });
-    res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
+    // If body already committed (real streaming started, or backfill won), just close.
+    // Otherwise send the 502 (handling SSE-keepalive-active path via sendErrorIfPossible).
+    if (bodyCommitted) {
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    if (sseKeepaliveActive) {
+      bodyCommitted = true;
+      res.write(`event: error\ndata: ${JSON.stringify({ status: 502, error: error.message })}\n\n`);
+      res.end();
+    } else if (!res.headersSent) {
+      res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
+    } else {
+      res.end();
+    }
   }
 });
 
@@ -6295,14 +6344,34 @@ function isLlamaServerHeaviestProcess() {
   }
 }
 
+// Check llama-cpp's slots for the given model. Returns true if any slot is
+// currently processing — meaning the upstream is genuinely working, just
+// slowly. The watchdog uses this to avoid the cascade where killing a
+// long-prompt-processing handler frees the JS slot, the next request starts
+// a NEW upstream slot (llama-cpp doesn't notice TCP close during prompt
+// processing), and we end up with N stuck slots competing for the GPU.
+async function isUpstreamProcessing(model) {
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return false;
+    const slots = await r.json();
+    return Array.isArray(slots) && slots.some(s => s.is_processing);
+  } catch { return false; }
+}
+
 // Stall watchdog: scans active local requests every STALL_WATCHDOG_INTERVAL ms.
-// If a request has gone longer than config.localStallMs without receiving a token
-// (lastActivityAt not refreshed), abort it so its queue slot frees and the next
-// request can run. This catches upstream wedges (model switch crash, OOM stall,
-// hung slot) that would otherwise pin concurrency = 1 indefinitely.
-setInterval(() => {
+// Two-tier:
+//  1. Soft tier (stallMs): if entry has gone stallMs without tokens AND
+//     llama-cpp shows no active processing for the model, kill it.
+//     If llama-cpp IS processing, extend lastActivityAt — prompt processing
+//     for a long context can legitimately take many minutes.
+//  2. Hard tier (stallMs * STALL_HARD_CAP_MULTIPLIER): kill regardless of
+//     upstream state. Catches truly wedged llama-cpp (no progress at all).
+const STALL_HARD_CAP_MULTIPLIER = 6; // e.g. 10min soft → 60min hard cap
+setInterval(async () => {
   const stallMs = config?.localStallMs ?? DEFAULT_LOCAL_STALL_MS;
   if (!Number.isFinite(stallMs) || stallMs <= 0) return; // disabled
+  const hardCapMs = stallMs * STALL_HARD_CAP_MULTIPLIER;
   const now = Date.now();
   // Only candidates that hold a real queue slot are eligible. Queued-behind
   // requests are idle by design, not wedged.
@@ -6316,8 +6385,28 @@ setInterval(() => {
     if (!slotHolders.has(id)) continue;
     const idle = now - (entry.lastActivityAt || entry.startTime);
     if (idle < stallMs) continue;
+    const totalElapsed = now - entry.startTime;
+    // Hard cap reached → kill unconditionally
+    const hardCapHit = totalElapsed >= hardCapMs;
+    // Soft tier: check upstream. If still processing, extend the deadline.
+    if (!hardCapHit) {
+      const upstreamBusy = await isUpstreamProcessing(entry.model);
+      if (upstreamBusy) {
+        // Upstream is genuinely working. Bump lastActivityAt so we re-check
+        // in another stallMs window rather than spamming this check.
+        entry.lastActivityAt = now;
+        if (!entry._extendedByWatchdog) {
+          entry._extendedByWatchdog = true;
+          const extendMsg = `Stall watchdog: extending request ${id} (model: ${entry.model}) — upstream is still processing (idle ${Math.round(idle / 1000)}s, hardcap ${Math.round(hardCapMs / 1000)}s)`;
+          console.log(`[watchdog] ${extendMsg}`);
+          addLog('system', extendMsg);
+        }
+        continue;
+      }
+    }
     entry._watchdogKilled = true;
-    const msg = `Stall watchdog: aborting local request ${id} (model: ${entry.model}, ${entry.tokens} tokens, idle ${Math.round(idle / 1000)}s ≥ ${Math.round(stallMs / 1000)}s)`;
+    const reason = hardCapHit ? `hardcap ${Math.round(hardCapMs / 1000)}s` : `idle ${Math.round(idle / 1000)}s ≥ ${Math.round(stallMs / 1000)}s`;
+    const msg = `Stall watchdog: aborting local request ${id} (model: ${entry.model}, ${entry.tokens} tokens, ${reason})`;
     console.warn(`[watchdog] ${msg}`);
     addLog('system', msg);
     requestStatsAccum.watchdogKills++;
