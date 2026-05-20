@@ -7636,9 +7636,15 @@ function QueuePage({ stats, activeRequestsMap }) {
               const onCancel = hasActive
                 ? () => killActive(item.activeRequestId)
                 : () => cancelItem(item.queueItemId ?? parseInt(String(item.id).replace(/^q/, ''), 10));
+              const posLabel = item.queuePosition != null
+                ? `#${item.queuePosition}${item.queueLength ? ` of ${item.queueLength}` : ''}`
+                : null;
               return (
                 <div key={item.id} className={`queue-table-row pending ${item.offloaded ? 'offloaded' : ''}`}>
-                  <span className="queue-col-id">{item.id}</span>
+                  <span className="queue-col-id">
+                    {item.id}
+                    {posLabel && <div className="queue-position-tag" title={`Position in local queue: ${posLabel}`}>{posLabel}</div>}
+                  </span>
                   <span className="queue-col-model" title={item.model}>
                     <span className="queue-model-name">{item.model.length > 25 ? item.model.slice(0, 22) + '...' : item.model}</span>
                     {item.backendName && <span className="queue-backend-tag">{item.backendName}</span>}

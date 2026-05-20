@@ -3095,6 +3095,18 @@ input::placeholder {
   background: rgba(255, 255, 255, 0.05);
 }
 
+.queue-position-tag {
+  font-size: 10px;
+  font-family: -apple-system, sans-serif;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.10);
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-top: 4px;
+  width: fit-content;
+  white-space: nowrap;
+}
+
 .queue-col-endpoint {
   font-family: monospace;
   font-size: 12px;

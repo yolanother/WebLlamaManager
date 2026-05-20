@@ -1,32 +1,26 @@
-Wire preferLocal=false to always-prefer-remote for offloadable requests
+Queue UX: surface invisible slot holders, show position, SSE keepalive
 
-When a pile of mixed offloadable + non-offloadable requests came in,
-the `overflow` policy would let whoever arrived first claim the local
-slot. If an offloadable request (one with a remote mapping) got there
-first, non-offloadable requests (those with no remote alternative)
-stacked behind it on the local queue — even though the offloadable
-request could have gone to a remote backend.
+Three related queue-visibility fixes:
 
-`preferLocal` already existed in config + UI but was never consulted
-in routing. Now:
+1. Surface "invisible" local slot holders. completions / responses /
+   messages handlers hold the local llamaQueue slot but don't call
+   startActiveRequest, so they didn't appear anywhere in the UI's
+   Active Requests list. That made pending chat requests look
+   mysteriously stuck — the slot was held but nothing visible was
+   running. /api/queue now emits a synthetic active row for any
+   llamaQueue.activeItems entry that lacks a matching activeRequest,
+   labeled "local (<endpoint>)".
 
-- When `preferLocal: false`, offloadable requests go remote whenever
-  any remote backend has capacity, regardless of local idle/busy
-  state. The local slot is reserved for non-offloadable models.
+2. Queue position. Each pending item now includes queuePosition
+   (1-based) and queueLength so the UI can render a "#3 of 17" chip.
+   Pending items are sorted by position for FIFO display order.
 
-- Pre-policy check: if a viable remote candidate exists (mapping
-  present, circuit closed, queue has capacity), set `shouldOffload`
-  before the overflow/threshold/percentage policy evaluation runs.
-
-- Falls back to local automatically if no remote is viable (mapping
-  missing, all remote queues full, circuits open) — non-offloadable
-  models keep their guaranteed local path.
-
-- UI label and hint updated to reflect actual behavior (was a dead
-  checkbox before).
-
-Verified: with three concurrent Qwen3-8B (offloadable to Dahaka +
-Borethrax) and gemma-4-31B (no remote mapping), Qwen requests land
-on Dahaka/Borethrax while gemma takes the local slot.
+3. SSE keepalive while queued. acquireLocalSlot() accepts an onWait
+   callback fired every 5s while blocked on acquire. The
+   chat/completions handler uses it (when stream=true) to flush SSE
+   headers up front and emit `:` comment lines, keeping reverse
+   proxies from 504ing during long queue waits. Comments are
+   ignored by SSE clients (including OpenAI-compatible ones) so this
+   is invisible to consumers except for the kept-open socket.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>

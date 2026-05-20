@@ -2739,10 +2739,51 @@ app.get('/api/queue', (req, res) => {
     else pendingFromActive.push(result);
   }
 
+  // Surface "invisible" local slot holders: llamaQueue items that hold the slot
+  // but don't have a matching entry in activeRequests. These are completions /
+  // responses / messages handlers which don't call startActiveRequest, so without
+  // this they'd hold the slot silently and pending requests would look mysteriously
+  // stuck. Show them as active rows with a synthetic id so the user can see what's
+  // actually running on the local backend.
+  const trackedActiveReqIds = new Set([...activeRequests.keys()]);
+  for (const item of llamaQueue.activeItems.values()) {
+    if (item.activeReqId != null && trackedActiveReqIds.has(item.activeReqId)) continue;
+    const start = item.startedAt || item.enqueuedAt;
+    activeItems.push({
+      id: `slot${item.id}`,
+      queueItemId: item.id,
+      model: item.model || 'unknown',
+      endpoint: item.endpoint || '',
+      enqueuedAt: start,
+      startedAt: start,
+      status: 'active',
+      elapsed: Date.now() - start,
+      userMessage: '',
+      tokens: 0,
+      activeRequestId: null,
+      backend: 'local',
+      backendName: `local (${item.endpoint || 'untracked'})`,
+      offloaded: false
+    });
+  }
+
   // Pending requests from the local queue (waiting for a slot). Skip any whose
   // activeReqId is already represented via pendingFromActive (chat/completions
   // path); keep only those that lack an activeRequest entry (e.g. completions,
   // responses, messages handlers that don't call startActiveRequest).
+  // Build a position lookup so each pending row can display "you are #N in line".
+  const positionByActiveReqId = new Map();
+  const positionByQueueItemId = new Map();
+  llamaQueue.queue.forEach((item, idx) => {
+    if (item.activeReqId != null) positionByActiveReqId.set(item.activeReqId, idx);
+    positionByQueueItemId.set(item.id, idx);
+  });
+  // Annotate pendingFromActive with their queue position (1-based for display).
+  for (const p of pendingFromActive) {
+    const idx = positionByActiveReqId.get(p.activeRequestId);
+    if (idx != null) p.queuePosition = idx + 1;
+    p.queueLength = llamaQueue.queue.length;
+  }
   const seenActiveReqIds = new Set(pendingFromActive.map(p => p.activeRequestId));
   const pendingItems = [
     ...pendingFromActive,
@@ -2764,9 +2805,13 @@ app.get('/api/queue', (req, res) => {
         activeRequestId: null,
         backend: 'local',
         backendName: 'local (queued)',
-        offloaded: false
+        offloaded: false,
+        queuePosition: (positionByQueueItemId.get(item.id) ?? 0) + 1,
+        queueLength: llamaQueue.queue.length
       }))
   ];
+  // Sort pending items by queue position so the display order matches FIFO order.
+  pendingItems.sort((a, b) => (a.queuePosition ?? 1e9) - (b.queuePosition ?? 1e9));
 
   // Pending requests from remote backend queues
   const remotePendingItems = [];
@@ -4668,9 +4713,34 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
 // actually serializes GPU work. Returns { release, queueWait }. Safe to call once per
 // proxy handler invocation; subsequent fetchWithRetry calls within the same handler
 // share the held slot.
-async function acquireLocalSlot(req, res, { model, endpoint, activeReqId }) {
+async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait } = {}) {
   const queueStart = Date.now();
-  const slotId = await llamaQueue.acquire({ model: model || endpoint, endpoint, activeReqId });
+
+  // Fire onWait every 5s while we're blocked on acquire(). Callers use this to
+  // ship SSE keepalive comments so reverse proxies don't 504 on long queue waits.
+  // The first tick happens after the first interval — short waits never trigger it.
+  let waitTimer = null;
+  if (typeof onWait === 'function') {
+    const tick = () => {
+      try {
+        const position = llamaQueue.queue.findIndex(i => i.activeReqId === activeReqId);
+        onWait({
+          position: position >= 0 ? position : null,   // 0-based; null once acquired
+          pending: llamaQueue.pending,
+          active: llamaQueue.active,
+          waitedMs: Date.now() - queueStart
+        });
+      } catch { /* keepalive must never throw */ }
+    };
+    waitTimer = setInterval(tick, 5000);
+  }
+
+  let slotId;
+  try {
+    slotId = await llamaQueue.acquire({ model: model || endpoint, endpoint, activeReqId });
+  } finally {
+    if (waitTimer) clearInterval(waitTimer);
+  }
   const queueWait = Date.now() - queueStart;
   if (queueWait > 100) {
     console.log(`[${endpoint}] Queued for ${queueWait}ms (active: ${llamaQueue.active}, pending: ${llamaQueue.pending})`);
@@ -5048,10 +5118,31 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   function logLlm(entry) {
     addLlmLog({ ...entry, retries: retryInfo.retries, retryErrors: retryInfo.retryErrors, backend: 'local', requestBody: entry.requestBody || req.body });
   }
+  // If this is a streaming request, flush SSE headers up front. That way we can
+  // emit `:` comment lines while we're blocked on the local queue, keeping the
+  // connection alive past any reverse-proxy read timeout. Comments are ignored
+  // by SSE clients (including OpenAI-compatible ones) so this is invisible to
+  // the consumer except for the kept-open socket.
+  let sseHeadersFlushed = false;
+  const flushSseHeaders = () => {
+    if (sseHeadersFlushed || res.headersSent) return;
+    sseHeadersFlushed = true;
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+    res.flushHeaders();
+  };
   // Acquire local queue slot for the lifetime of this response. Released automatically
   // via res.on('close'/'finish') even if the handler errors out partway.
   const { queueWait: initialQueueWait } = await acquireLocalSlot(req, res, {
-    model: requestedModel, endpoint: 'chat/completions', activeReqId
+    model: requestedModel, endpoint: 'chat/completions', activeReqId,
+    onWait: isStreaming ? ({ position, pending, waitedMs }) => {
+      flushSseHeaders();
+      const pos = position != null ? position + 1 : '?';
+      // SSE comment line — keeps the connection warm; clients ignore it.
+      res.write(`: queued position=${pos}/${pending} waited=${Math.round(waitedMs / 1000)}s\n\n`);
+    } : null
   });
   let totalQueueWait = initialQueueWait;
   async function doFetch(body) {
