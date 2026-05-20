@@ -669,6 +669,43 @@ function TemperatureChart({ data, height = 140 }) {
   );
 }
 
+// GPU/CPU compute-usage chart. Mirrors TemperatureChart but plots
+// utilization % so users can see when the iGPU is actually loaded
+// (and how that correlates with CPU spikes during prompt processing).
+function UsageChart({ data, height = 140 }) {
+  if (!data || data.length < 2) {
+    return (
+      <div className="chart-container" style={{ height }}>
+        <div className="chart-empty">Collecting data...</div>
+      </div>
+    );
+  }
+  return (
+    <div className="chart-container" style={{ height }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+          <defs>
+            <linearGradient id="gradGpuUse" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={CHART_COLORS.temperature} stopOpacity={0.3} />
+              <stop offset="95%" stopColor={CHART_COLORS.temperature} stopOpacity={0} />
+            </linearGradient>
+            <linearGradient id="gradCpuUse" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={CHART_COLORS.temperatureCpu} stopOpacity={0.2} />
+              <stop offset="95%" stopColor={CHART_COLORS.temperatureCpu} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+          <XAxis dataKey="timestamp" hide />
+          <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <Tooltip content={<ChartTooltip unit="%" />} />
+          <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpuUse)" strokeWidth={2} dot={false} />
+          <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpuUse)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 // Power Chart Component
 function PowerChart({ data, height = 140 }) {
   if (!data || data.length < 2) {
@@ -1379,6 +1416,10 @@ function Dashboard({ stats, activeRequest }) {
               <TemperatureChart data={analytics?.temperature || []} height={200} />
             </div>
             <div className="chart-card">
+              <h4>GPU / CPU Usage <span className="chart-value">GPU: {stats?.gpu?.usage?.toFixed(0) || 0}%{stats?.cpu?.usage != null ? ` / CPU: ${stats.cpu.usage.toFixed(0)}%` : ''}</span></h4>
+              <UsageChart data={analytics?.usage || []} height={200} />
+            </div>
+            <div className="chart-card">
               <h4>Power <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span></h4>
               <PowerChart data={analytics?.power || []} height={200} />
             </div>
@@ -1906,6 +1947,28 @@ function Dashboard({ stats, activeRequest }) {
               </span>
             </h4>
             <TemperatureChart data={analytics?.temperature || []} />
+            <div className="chart-legend">
+              <div className="chart-legend-item">
+                <span className="chart-legend-dot gpu"></span>
+                GPU
+              </div>
+              <div className="chart-legend-item">
+                <span className="chart-legend-dot cpu"></span>
+                CPU
+              </div>
+            </div>
+          </div>
+
+          {/* GPU/CPU Usage Chart */}
+          <div className="chart-card">
+            <h4>
+              GPU / CPU Usage
+              <span className="chart-value">
+                GPU: {stats?.gpu?.usage?.toFixed(0) || 0}%
+                {stats?.cpu?.usage != null && ` / CPU: ${stats.cpu.usage.toFixed(0)}%`}
+              </span>
+            </h4>
+            <UsageChart data={analytics?.usage || []} />
             <div className="chart-legend">
               <div className="chart-legend-item">
                 <span className="chart-legend-dot gpu"></span>

@@ -1092,7 +1092,8 @@ const analyticsData = {
   memory: [],        // { timestamp, vram, gtt, system }
   tokens: [],        // { timestamp, promptTokens, completionTokens, tokensPerSecond, model }
   context: [],       // { timestamp, usedContext, totalContext, usage }
-  queue: []          // { timestamp, active, pending, concurrency }
+  queue: [],         // { timestamp, active, pending, concurrency }
+  usage: []          // { timestamp, gpu, cpu }  -- compute utilization %
 };
 
 // Persistent analytics storage (minute-level aggregates in JSONL file)
@@ -2044,18 +2045,20 @@ async function getGpuStats() {
           const isAPU = gttStats.total > vramTotal;
 
           // Strix Halo + ROCm 7 quirk: rocm-smi's "GPU use (%)" reads 0 even
-          // during active inference (kernel sysfs gpu_busy_percent has the same
-          // issue on this hardware). Derive a usable proxy from sclk: at idle
-          // the engine clock sits ~600 MHz; under compute it ramps to ~2900 MHz.
-          // If we see a real rocm-smi number, prefer that (other GPUs work fine).
+          // during active inference. The kernel's gpu_busy_percent and sclk
+          // (which sticks at 600 MHz reported value) are equally broken on
+          // this iGPU. Power is the only signal that actually moves: idle
+          // sits around 25-35W, active compute pushes 100-130W. Derive a
+          // usage proxy from package power. If we see a real rocm-smi GPU%
+          // number, prefer that (other GPUs report this correctly).
           const reportedUsage = parseFloat(card['GPU use (%)'] || card.gpu_use || 0);
           let usage = reportedUsage;
-          if (reportedUsage === 0 && isAPU && coreClock > 0) {
-            // Map sclk 600 -> 0%, 2900 -> 100%.
-            const SCLK_IDLE = 600;
-            const SCLK_MAX = 2900;
+          if (reportedUsage === 0 && isAPU && power > 0) {
+            // Map power 35W -> 0%, 130W -> 100%.
+            const POWER_IDLE = 35;
+            const POWER_MAX = 130;
             usage = Math.max(0, Math.min(100,
-              Math.round(((coreClock - SCLK_IDLE) / (SCLK_MAX - SCLK_IDLE)) * 100)
+              Math.round(((power - POWER_IDLE) / (POWER_MAX - POWER_IDLE)) * 100)
             ));
           }
           resolve({
@@ -2172,6 +2175,10 @@ async function broadcastStats() {
         vram: stats.gpu.vram?.usage || 0,
         gtt: stats.gpu.gtt?.usage || 0,
         system: stats.memory?.usage || 0
+      });
+      addAnalyticsPoint('usage', {
+        gpu: stats.gpu.usage || 0,
+        cpu: stats.cpu?.usage || 0
       });
     } else if (stats.cpu?.temperature) {
       addAnalyticsPoint('temperature', {
@@ -4859,6 +4866,7 @@ app.get('/api/analytics', (req, res) => {
     tokens: analyticsData.tokens.filter(p => p.timestamp > cutoff),
     context: analyticsData.context.filter(p => p.timestamp > cutoff),
     queue: analyticsData.queue.filter(p => p.timestamp > cutoff),
+    usage: analyticsData.usage.filter(p => p.timestamp > cutoff),
     tokenStats: {
       totalPromptTokens: tokenStats.totalPromptTokens,
       totalCompletionTokens: tokenStats.totalCompletionTokens,
