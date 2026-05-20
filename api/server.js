@@ -5422,7 +5422,23 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         };
         processStream();
       } else {
-        const data = await response.json();
+        // Non-streaming. Same heartbeat-whitespace trick as the local path
+        // so opencode-style clients (60-90s TCP read timeout, stream:false)
+        // don't abort during the remote backend's first-token wait.
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.flushHeaders();
+        const heartbeatTicker = setInterval(() => {
+          if (!res.writableEnded) {
+            try { res.write('\n'); } catch {}
+          }
+        }, 20_000);
+        let data;
+        try {
+          data = await response.json();
+        } finally {
+          clearInterval(heartbeatTicker);
+        }
         const duration = Date.now() - startTime;
         const usage = data.usage || {};
         const promptTokens = usage.prompt_tokens || 0;
@@ -5441,7 +5457,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         if (data.model) data.model = requestedModel;
         data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
         endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
-        res.json(data);
+        // Headers already flushed; write JSON body and end manually.
+        if (!res.writableEnded) { res.write(JSON.stringify(data)); res.end(); }
       }
     } catch (error) {
       endActiveRequest(activeReqId, { status: 'error' });
@@ -5452,7 +5469,14 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         messages: req.body.messages || null, prompt: null, response: null, error: error.message,
         backend: routing.backend.id, requestBody: req.body
       });
-      res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+      // Headers may already be flushed from the non-streaming heartbeat —
+      // in that case write the error as a JSON object after the whitespace.
+      if (!res.headersSent) {
+        res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+      } else if (!res.writableEnded) {
+        res.write(JSON.stringify({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message }));
+        res.end();
+      }
     }
     return;
   }
@@ -5780,8 +5804,31 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 
       processStream();
     } else {
-      // Non-streaming response
-      const data = await response.json();
+      // Non-streaming response. Clients (opencode etc.) typically have a
+      // 60-90s TCP read timeout while waiting for the full JSON body. If
+      // llama-cpp's prompt processing takes longer than that, the client
+      // aborts before we ever get the response.
+      //
+      // Trick: HTTP allows whitespace before the JSON body. We commit
+      // chunked transfer encoding + Content-Type:application/json + start
+      // writing `\n` heartbeat bytes every 20s of silence. The client's
+      // socket sees activity (TCP read timeout resets) but JSON.parse
+      // happily skips the leading whitespace. Once we have the real
+      // response we write it and end.
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Transfer-Encoding', 'chunked');
+      res.flushHeaders();
+      const heartbeatTicker = setInterval(() => {
+        if (!res.writableEnded) {
+          try { res.write('\n'); } catch {}
+        }
+      }, 20_000);
+      let data;
+      try {
+        data = await response.json();
+      } finally {
+        clearInterval(heartbeatTicker);
+      }
 
       // Extract token stats — prefer server-reported timings (excludes queue wait)
       const wallDuration = Date.now() - startTime;
@@ -5825,7 +5872,13 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       };
 
       endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
-      if (!res.headersSent) res.json(data);
+      // Headers were already flushed for the heartbeat; write the JSON body
+      // and end manually instead of res.json() (which would try to set
+      // Content-Type a second time).
+      if (!res.writableEnded) {
+        res.write(JSON.stringify(data));
+        res.end();
+      }
     }
   } catch (error) {
     if (backfillTimer) clearTimeout(backfillTimer);
@@ -5855,7 +5908,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       res.end();
     } else if (!res.headersSent) {
       res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
-    } else {
+    } else if (!res.writableEnded) {
+      // Non-streaming heartbeat already flushed headers but no body yet.
+      // Write the error as a JSON object — the leading heartbeat newlines
+      // are valid whitespace before a JSON value.
+      res.write(JSON.stringify({ error: 'Failed to reach llama server', details: error.message }));
       res.end();
     }
   }
