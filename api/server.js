@@ -376,28 +376,57 @@ function resolveBackend(requestedModel, endpoint, body) {
   if (policy === 'manual') {
     // Only offload via explicit prefix (handled above)
     return { remote: false };
-  } else if (policy === 'overflow') {
-    // Offload when local queue is at capacity (active requests >= concurrency limit)
-    // This triggers offload for the current request that would otherwise have to wait
-    shouldOffload = llamaQueue.active >= llamaQueue.concurrency;
-  } else if (policy === 'threshold') {
-    const queueDepth = backends.offloadThresholdQueueDepth ?? 2;
-    const waitMs = backends.offloadThresholdWaitMs ?? 5000;
-    shouldOffload = llamaQueue.pending >= queueDepth;
-    // Estimate wait based on average recent request duration
-    if (!shouldOffload && waitMs > 0) {
-      const recentDurations = tokenStats.recentRequests.slice(-10).map(r => r.duration || 0);
-      if (recentDurations.length > 0) {
-        const avgDuration = recentDurations.reduce((a, b) => a + b, 0) / recentDurations.length;
-        const estimatedWait = llamaQueue.pending * avgDuration;
-        shouldOffload = estimatedWait > waitMs;
-      }
+  }
+
+  // preferLocal=false means "spread offloadable work to remote whenever possible".
+  // Don't tie up the local slot with requests that have a viable remote backend —
+  // reserve local for non-offloadable models (those with no remote mapping). When
+  // a request is offloadable AND a remote has capacity, we offload even if local
+  // is idle. Falls back to local automatically if no remote candidate is viable
+  // (mapping missing, circuit open, queue full, etc.).
+  const preferLocal = backends.preferLocal !== false;
+  if (!preferLocal) {
+    const endpointKey = endpoint.replace(/\//g, '/');
+    const hasViableRemote = backends.directory.some(b => {
+      if (!b.enabled || !b.tested) return false;
+      if (isBackendCircuitOpen(b.id)) return false;
+      if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
+      if (!b.modelMapping) return false;
+      if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
+      const queue = backendQueues.get(b.id);
+      if (queue && queue.active >= queue.concurrency) return false;
+      return true;
+    });
+    if (hasViableRemote) {
+      shouldOffload = true;
+      console.log(`[routing] Prefer-remote: "${requestedModel}" has a viable remote backend (preferLocal=false), keeping local slot free for non-offloadable work`);
     }
-  } else if (policy === 'percentage') {
-    const pct = backends.offloadPercentage || 0;
-    if (pct > 0) {
-      offloadCounter = (offloadCounter + 1) % 100;
-      shouldOffload = offloadCounter < pct;
+  }
+
+  if (!shouldOffload) {
+    if (policy === 'overflow') {
+      // Offload when local queue is at capacity (active requests >= concurrency limit).
+      // This triggers offload for the current request that would otherwise have to wait.
+      shouldOffload = llamaQueue.active >= llamaQueue.concurrency;
+    } else if (policy === 'threshold') {
+      const queueDepth = backends.offloadThresholdQueueDepth ?? 2;
+      const waitMs = backends.offloadThresholdWaitMs ?? 5000;
+      shouldOffload = llamaQueue.pending >= queueDepth;
+      // Estimate wait based on average recent request duration
+      if (!shouldOffload && waitMs > 0) {
+        const recentDurations = tokenStats.recentRequests.slice(-10).map(r => r.duration || 0);
+        if (recentDurations.length > 0) {
+          const avgDuration = recentDurations.reduce((a, b) => a + b, 0) / recentDurations.length;
+          const estimatedWait = llamaQueue.pending * avgDuration;
+          shouldOffload = estimatedWait > waitMs;
+        }
+      }
+    } else if (policy === 'percentage') {
+      const pct = backends.offloadPercentage || 0;
+      if (pct > 0) {
+        offloadCounter = (offloadCounter + 1) % 100;
+        shouldOffload = offloadCounter < pct;
+      }
     }
   }
 

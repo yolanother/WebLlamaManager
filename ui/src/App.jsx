@@ -4800,8 +4800,13 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
                   checked={backendsConfig.preferLocal !== false}
                   onChange={(e) => updateRouting('preferLocal', e.target.checked)}
                 />
-                {' '}Prefer Local (always try local first)
+                {' '}Prefer Local
               </label>
+              <p className="setting-hint">
+                When enabled (default), requests run locally until the queue is full, then overflow to remote per the offload policy above.
+                When disabled, offloadable requests (those with a remote mapping) always go remote whenever a remote backend has capacity —
+                reserving the local slot for non-offloadable models. Useful when local is the slow node and remote backends should handle the bulk of work.
+              </p>
             </div>
           </div>
 

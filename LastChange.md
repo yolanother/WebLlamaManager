@@ -1,36 +1,32 @@
-Hold local queue slot through full body stream + stall watchdog
+Wire preferLocal=false to always-prefer-remote for offloadable requests
 
-Concurrency = 1 was only serializing connection setup — fetchWithRetry
-released the llamaQueue slot as soon as response headers arrived, so
-multiple requests could be in the streaming phase against llama-cpp
-simultaneously. Active Requests piled up and a single wedged upstream
-(no timeout on fetch or reader.read) could hold one slot forever while
-new requests stacked behind it.
+When a pile of mixed offloadable + non-offloadable requests came in,
+the `overflow` policy would let whoever arrived first claim the local
+slot. If an offloadable request (one with a remote mapping) got there
+first, non-offloadable requests (those with no remote alternative)
+stacked behind it on the local queue — even though the offloadable
+request could have gone to a remote backend.
 
-Now:
+`preferLocal` already existed in config + UI but was never consulted
+in routing. Now:
 
-- acquireLocalSlot(req, res) holds the slot for the entire response
-  lifecycle via res.on('close'|'finish'). One local request at a time
-  actually means one. Applied to chat/completions, completions,
-  responses, and messages handlers.
+- When `preferLocal: false`, offloadable requests go remote whenever
+  any remote backend has capacity, regardless of local idle/busy
+  state. The local slot is reserved for non-offloadable models.
 
-- Stall watchdog scans local slot-holders every 5s and aborts any
-  entry whose lastActivityAt is stale beyond config.localStallMs
-  (default 60s). The timer resets on every token (updateActiveRequest)
-  and on slot acquisition, so long generations are safe and only a
-  genuinely wedged upstream gets killed. Counter exposed in
-  /api/stats.watchdog and the per-minute aggregate.
+- Pre-policy check: if a viable remote candidate exists (mapping
+  present, circuit closed, queue has capacity), set `shouldOffload`
+  before the overflow/threshold/percentage policy evaluation runs.
 
-- /api/queue cross-references llamaQueue.activeItems via activeReqId.
-  Chat requests waiting on acquire() now correctly show as pending
-  with backendName "local (queued)" instead of falsely as active.
+- Falls back to local automatically if no remote is viable (mapping
+  missing, all remote queues full, circuits open) — non-offloadable
+  models keep their guaranteed local path.
 
-- Routing improvements: track activeLocalModel separately from
-  lastUsedModel so model-switch offload triggers even while a heavy
-  model is still loading; skip backends whose queues are at capacity
-  (backpressure); sort candidates by exponential-moving-average tok/s
-  within each priority tier.
+- UI label and hint updated to reflect actual behavior (was a dead
+  checkbox before).
 
-- Settings UI exposes localStallMs as a seconds input (0 = disabled).
+Verified: with three concurrent Qwen3-8B (offloadable to Dahaka +
+Borethrax) and gemma-4-31B (no remote mapping), Qwen requests land
+on Dahaka/Borethrax while gemma takes the local slot.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
