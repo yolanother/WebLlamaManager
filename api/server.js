@@ -4963,8 +4963,16 @@ async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait
   // socket error, abort. This guarantees the slot frees even if a downstream handler
   // forgets to call release() explicitly.
   if (res) {
+    // Race fix: if the client disconnected WHILE we were waiting on
+    // acquire(), the 'close' event already fired before we got here — our
+    // listeners would never trigger and the slot would leak. Check
+    // destroyed/writableEnded synchronously after attaching listeners and
+    // release immediately if we're already past the point of no return.
     res.on('close', release);
     res.on('finish', release);
+    if (res.destroyed || res.writableEnded) {
+      release();
+    }
   }
   return { slotId, release, queueWait };
 }
@@ -6702,6 +6710,32 @@ setInterval(async () => {
   const slotHolders = new Set();
   for (const item of llamaQueue.activeItems.values()) {
     if (item.activeReqId != null) slotHolders.add(item.activeReqId);
+  }
+  // Leaked-slot detector: any llamaQueue.activeItems entry whose
+  // activeReqId points at an activeRequest that no longer exists is a leak
+  // (handler died without firing release()). Force-release it. Threshold is
+  // intentionally generous to avoid killing in-progress prompt-processing for
+  // non-chat endpoints (completions/responses/messages don't register
+  // activeRequests so they always look "leaked").
+  for (const item of llamaQueue.activeItems.values()) {
+    const heldFor = now - (item.startedAt || item.enqueuedAt);
+    if (heldFor < stallMs) continue;
+    const tracked = item.activeReqId != null && activeRequests.has(item.activeReqId);
+    if (tracked) continue;
+    // For chat/completions slot holders, activeReqId IS set — so if the entry
+    // is missing now, it leaked. For other endpoints, activeReqId is null and
+    // we can't tell tracked vs untracked. Use hardCap for the latter.
+    const isChatLeak = item.activeReqId != null;
+    if (!isChatLeak && heldFor < hardCapMs) continue;
+    const msg = `Stall watchdog: force-releasing leaked llamaQueue slot ${item.id} (model=${item.model}, endpoint=${item.endpoint}, held ${Math.round(heldFor / 1000)}s, activeReqId=${item.activeReqId})`;
+    console.warn(`[watchdog] ${msg}`);
+    addLog('system', msg);
+    requestStatsAccum.watchdogKills++;
+    watchdogStats.totalKills++;
+    watchdogStats.lastKillAt = now;
+    watchdogStats.lastKillModel = item.model;
+    watchdogStats.lastKillStallMs = heldFor;
+    llamaQueue.release(item.id);
   }
   for (const [id, entry] of activeRequests) {
     if (entry._watchdogKilled) continue;
