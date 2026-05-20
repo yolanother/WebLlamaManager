@@ -5511,6 +5511,40 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // as the "already committed" check now that headers may be flushed early
   // for keepalive.
   let bodyCommitted = false;
+  // For non-streaming requests, we need to keep the client's TCP socket alive
+  // while llama-cpp builds the full JSON response (which can take 60-120s for
+  // big prompts). HTTP/JSON trick: commit Content-Type: application/json with
+  // Transfer-Encoding: chunked up front, then write `\n` heartbeat bytes
+  // periodically. The client's socket sees activity (read timeout resets) and
+  // JSON.parse happily skips leading whitespace when we eventually write the
+  // real body. This MUST start before doFetch since for non-streaming the
+  // entire wait is inside the fetch (llama-cpp doesn't send headers until the
+  // full response is composed).
+  let nonStreamingHeartbeatTicker = null;
+  if (!isStreaming) {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+    res.flushHeaders();
+    // Disable Nagle's algorithm so the 1-byte heartbeat goes on the wire
+    // immediately instead of waiting up to 200ms for more bytes.
+    try { req.socket?.setNoDelay?.(true); } catch {}
+    nonStreamingHeartbeatTicker = setInterval(() => {
+      if (!res.writableEnded) {
+        try { res.write('\n'); } catch {}
+      }
+    }, 20_000);
+    // Auto-clear on any response end path (success, error, client disconnect)
+    // so we don't leak intervals if a downstream branch forgets.
+    const clearHeartbeat = () => {
+      if (nonStreamingHeartbeatTicker) {
+        clearInterval(nonStreamingHeartbeatTicker);
+        nonStreamingHeartbeatTicker = null;
+      }
+    };
+    res.on('close', clearHeartbeat);
+    res.on('finish', clearHeartbeat);
+  }
   // Acquire local queue slot for the lifetime of this response. Released automatically
   // via res.on('close'/'finish') even if the handler errors out partway.
   // Wrapped in try/catch because the queue can reject pending acquires (flush,
@@ -5570,6 +5604,15 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       // Headers already sent as SSE; emit the error as an SSE data event then close.
       res.write(`event: error\ndata: ${JSON.stringify({ status, error: errText })}\n\n`);
       res.end();
+    } else if (nonStreamingHeartbeatTicker || (res.headersSent && !isStreaming)) {
+      // Non-streaming heartbeat already flushed headers and may have written
+      // whitespace bytes. Write the error as a JSON object — the leading
+      // whitespace is valid before a JSON value, so the client's JSON.parse
+      // still works.
+      if (!res.writableEnded) {
+        res.write(JSON.stringify({ error: errText, status }));
+        res.end();
+      }
     } else if (!res.headersSent) {
       res.status(status).send(errText);
     } else {
@@ -5804,31 +5847,12 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 
       processStream();
     } else {
-      // Non-streaming response. Clients (opencode etc.) typically have a
-      // 60-90s TCP read timeout while waiting for the full JSON body. If
-      // llama-cpp's prompt processing takes longer than that, the client
-      // aborts before we ever get the response.
-      //
-      // Trick: HTTP allows whitespace before the JSON body. We commit
-      // chunked transfer encoding + Content-Type:application/json + start
-      // writing `\n` heartbeat bytes every 20s of silence. The client's
-      // socket sees activity (TCP read timeout resets) but JSON.parse
-      // happily skips the leading whitespace. Once we have the real
-      // response we write it and end.
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Transfer-Encoding', 'chunked');
-      res.flushHeaders();
-      const heartbeatTicker = setInterval(() => {
-        if (!res.writableEnded) {
-          try { res.write('\n'); } catch {}
-        }
-      }, 20_000);
-      let data;
-      try {
-        data = await response.json();
-      } finally {
-        clearInterval(heartbeatTicker);
-      }
+      // Non-streaming response. Heartbeat ticker was started at the top of
+      // the handler (before doFetch) so it's been keeping the client socket
+      // alive throughout this whole flow. We just read the body and clear it.
+      const data = await response.json();
+      clearInterval(nonStreamingHeartbeatTicker);
+      nonStreamingHeartbeatTicker = null;
 
       // Extract token stats — prefer server-reported timings (excludes queue wait)
       const wallDuration = Date.now() - startTime;
@@ -5882,6 +5906,10 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     }
   } catch (error) {
     if (backfillTimer) clearTimeout(backfillTimer);
+    if (nonStreamingHeartbeatTicker) {
+      clearInterval(nonStreamingHeartbeatTicker);
+      nonStreamingHeartbeatTicker = null;
+    }
     // Always finalize the activeRequest so it doesn't leak in the backfill
     // scan loop forever. (Pre-fix: an SSE-keepalive-active request that
     // errored would skip endActiveRequest because res.headersSent was true.)
