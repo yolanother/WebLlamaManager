@@ -840,7 +840,10 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
         });
 
         if (data.model) data.model = requestedModel;
-        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: chosen.id, backfill: true };
+        data._llama_manager = enrichLlamaManagerMeta(
+          { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: chosen.id, backfill: true },
+          { completionTokens: bfCompletionTokens }
+        );
         endActiveRequest(activeReqId, { status: 'complete', tokens: bfCompletionTokens, responseText: data.choices?.[0]?.message?.content || '' });
         res.json(data);
       }
@@ -874,6 +877,56 @@ function isBackendCircuitOpen(backendId) {
 
 function recordBackendSuccess(backendId) {
   backendCircuitBreakers.set(backendId, { failures: 0, lastFailure: 0, trippedAt: null });
+}
+
+// ---------------------------------------------------------------------------
+// LLM-response metadata enrichment.
+//
+// Callers want to see whether a request actually ran on GPU and to be warned
+// when throughput drops into "this almost certainly fell back to CPU"
+// territory. We compute three derived fields from the base
+// `_llama_manager` envelope:
+//
+//   compute  — "local-gpu" | "local-cpu" | "remote"
+//   warning  — string when tok/s implies CPU fallback (else undefined)
+//   slow     — boolean, true when tokensPerSecond < SLOW_TPS_THRESHOLD
+//
+// "local-cpu" detection is heuristic: a local backend that produced more
+// than a handful of tokens but at <5 tok/s is overwhelmingly likely to be
+// running on CPU. The threshold (`LOCAL_CPU_TPS_CEILING`) is conservative —
+// any real GPU run on Strix Halo / consumer NVIDIA easily clears 10 tok/s
+// for the kinds of models we run, so 5 is a safe floor.
+// ---------------------------------------------------------------------------
+
+const SLOW_TPS_THRESHOLD = 1;           // tok/s under which we flag the caller
+const LOCAL_CPU_TPS_CEILING = 5;        // local backend running below this = CPU
+const MIN_TOKENS_FOR_TPS_TRUST = 8;     // smaller samples are too noisy to classify
+
+function enrichLlamaManagerMeta(meta, opts = {}) {
+  if (!meta || typeof meta !== 'object') return meta;
+  const tps = Number(meta.tokensPerSecond) || 0;
+  const completionTokens = Number(opts.completionTokens) || 0;
+  const isLocal = meta.backend === 'local' || meta.backend === undefined;
+
+  let compute;
+  if (!isLocal) {
+    compute = 'remote';
+  } else if (completionTokens >= MIN_TOKENS_FOR_TPS_TRUST && tps > 0 && tps < LOCAL_CPU_TPS_CEILING) {
+    compute = 'local-cpu';
+  } else if (completionTokens >= MIN_TOKENS_FOR_TPS_TRUST && tps >= LOCAL_CPU_TPS_CEILING) {
+    compute = 'local-gpu';
+  } else {
+    compute = isLocal ? 'local-unknown' : 'remote';
+  }
+  meta.compute = compute;
+
+  if (tps > 0 && tps < SLOW_TPS_THRESHOLD && completionTokens >= MIN_TOKENS_FOR_TPS_TRUST) {
+    meta.slow = true;
+    meta.warning = `Sub-${SLOW_TPS_THRESHOLD} tok/s (${tps.toFixed(2)}) — request almost certainly ran on CPU. See dashboard for GPU health.`;
+  } else {
+    meta.slow = false;
+  }
+  return meta;
 }
 
 function recordBackendFailure(backendId, backendName) {
@@ -5565,7 +5618,10 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         });
         // Normalize model field to match what was requested
         if (data.model) data.model = requestedModel;
-        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        data._llama_manager = enrichLlamaManagerMeta(
+          { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id },
+          { completionTokens }
+        );
         endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
         // Headers already flushed; write JSON body and end manually.
         if (!res.writableEnded) { res.write(JSON.stringify(data)); res.end(); }
@@ -6015,12 +6071,15 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         data.model = requestedModel;
       }
 
-      // Add our tracking info to response
-      data._llama_manager = {
-        duration: wallDuration,
-        tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
-        backend: 'local'
-      };
+      // Add our tracking info to response (with compute/warning derivation)
+      data._llama_manager = enrichLlamaManagerMeta(
+        {
+          duration: wallDuration,
+          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+          backend: 'local'
+        },
+        { completionTokens }
+      );
 
       endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
       // Headers were already flushed for the heartbeat; write the JSON body
@@ -6412,7 +6471,10 @@ app.post('/api/v1/responses', async (req, res) => {
         recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({ endpoint: 'responses', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: null, response: null, error: null, backend: backend.id, requestBody: req.body });
-        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        data._llama_manager = enrichLlamaManagerMeta(
+          { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id },
+          { completionTokens }
+        );
         res.json(data);
       }
     } catch (error) {
@@ -6580,10 +6642,14 @@ app.post('/api/v1/responses', async (req, res) => {
         prompt: null, response: respText, error: null, ...retryFields()
       });
 
-      data._llama_manager = {
-        duration,
-        tokensPerSecond: Math.round(tokensPerSecond * 10) / 10
-      };
+      data._llama_manager = enrichLlamaManagerMeta(
+        {
+          duration,
+          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+          backend: 'local'
+        },
+        { completionTokens }
+      );
 
       res.json(data);
     }
@@ -6654,7 +6720,10 @@ app.post('/api/v1/messages', async (req, res) => {
         recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({ endpoint: 'messages', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: req.body.messages || null, prompt: null, response: null, error: null, backend: backend.id, requestBody: req.body });
-        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        data._llama_manager = enrichLlamaManagerMeta(
+          { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id },
+          { completionTokens }
+        );
         res.json(data);
       }
     } catch (error) {
@@ -6814,10 +6883,14 @@ app.post('/api/v1/messages', async (req, res) => {
         response: data.content?.[0]?.text || null, error: null, ...retryFields()
       });
 
-      data._llama_manager = {
-        duration,
-        tokensPerSecond: Math.round(tokensPerSecond * 10) / 10
-      };
+      data._llama_manager = enrichLlamaManagerMeta(
+        {
+          duration,
+          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+          backend: 'local'
+        },
+        { completionTokens: outputTokens }
+      );
 
       res.json(data);
     }
