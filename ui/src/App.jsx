@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, NavLink, useLocation, useParams, useNavigate } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart,
   BarChart, Bar
@@ -3275,7 +3275,16 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
   const [showFiltersPanel, setShowFiltersPanel] = useState(false);
   const [logFilters, setLogFilters] = useState({ defaultFilters: [], customFilters: [] });
   const [newFilterPattern, setNewFilterPattern] = useState('');
-  const [activeTab, setActiveTab] = useState('server');
+  // Drive the active tab off the URL so /logs/llm, /logs/requests, /logs/server
+  // each survive page navigation + refresh. Falls back to 'server' if no segment.
+  const { tab: urlTab } = useParams();
+  const navigate = useNavigate();
+  const VALID_TABS = ['server', 'requests', 'llm'];
+  const activeTab = VALID_TABS.includes(urlTab) ? urlTab : 'server';
+  const setActiveTab = (next) => {
+    if (!VALID_TABS.includes(next)) next = 'server';
+    navigate(next === 'server' ? '/logs' : `/logs/${next}`, { replace: false });
+  };
   const logsEndRef = useRef(null);
   const logsContainerRef = useRef(null);
 
@@ -7795,6 +7804,7 @@ function App() {
             <Route path="/models" element={<ModelsPage stats={stats} />} />
             <Route path="/download" element={<DownloadPage stats={stats} />} />
             <Route path="/logs" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
+            <Route path="/logs/:tab" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
             <Route path="/queue" element={<QueuePage stats={stats} activeRequestsMap={activeRequestsMap} />} />
             <Route path="/processes" element={<ProcessesPage />} />
             <Route path="/settings" element={<SettingsPage />} />
