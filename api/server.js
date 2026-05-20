@@ -5275,6 +5275,8 @@ function injectReasoningEffort(body) {
 const MODEL_SAMPLING_DEFAULTS = [
   // Gemma 4 (Unsloth): temp=1.0, top_p=0.95, top_k=64
   { pattern: /gemma-?4/i, params: { temperature: 1.0, top_p: 0.95, top_k: 64 } },
+  // Qwen3.6 (Unsloth, thinking mode general): temp=1.0, top_p=0.95, top_k=20, min_p=0.0
+  { pattern: /qwen3\.?6/i, params: { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0 } },
 ];
 function injectModelSamplingDefaults(body) {
   const model = body.model || '';
