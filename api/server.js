@@ -875,7 +875,7 @@ function recordBackendFailure(backendId, backendName) {
   backendCircuitBreakers.set(backendId, cb);
 }
 
-async function fetchRemoteBackend(backend, url, options, { label = 'remote', model } = {}) {
+async function fetchRemoteBackend(backend, url, options, { label = 'remote', model, externalSignal } = {}) {
   const queue = backendQueues.get(backend.id);
   if (!queue) {
     throw new Error(`No queue for backend ${backend.id}`);
@@ -906,10 +906,25 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
       // "This operation was aborted" without actually contacting the backend.
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || 120000);
+      // Compose with the caller's externalSignal (e.g. activeRequest's
+      // abortController) so the watchdog or a user-initiated kill can also
+      // tear down a hung remote fetch — including after headers arrive but
+      // the body stream stops sending data.
+      let externalAbortHandler = null;
+      if (externalSignal) {
+        if (externalSignal.aborted) controller.abort();
+        else {
+          externalAbortHandler = () => controller.abort();
+          externalSignal.addEventListener('abort', externalAbortHandler, { once: true });
+        }
+      }
       const fetchOptions = { ...options, signal: controller.signal };
       try {
         const response = await fetch(url, fetchOptions);
         clearTimeout(timeout);
+        // Keep externalAbortHandler active — caller's signal may still need
+        // to tear down a stalled body stream after headers arrive. We remove
+        // it in the response-consumer (the proxy handler) via a `.finally`.
 
         const duration = Date.now() - startTime;
         if (stats) {
@@ -930,6 +945,9 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
         return { response, retries: attempt, backend };
       } catch (err) {
         clearTimeout(timeout);
+        if (externalAbortHandler && externalSignal) {
+          try { externalSignal.removeEventListener('abort', externalAbortHandler); } catch {}
+        }
         lastError = err;
         // If the breaker tripped while we were retrying, stop early — no
         // point hammering a backend we just decided to back off from.
@@ -5214,7 +5232,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         method: 'POST',
         headers: { ...routing.headers },
         body: JSON.stringify(remoteBody)
-      }, { label: 'chat/completions', model: routing.targetModel });
+      }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId) });
 
       if (!response.ok) {
         const error = await response.text();
@@ -6662,55 +6680,72 @@ setInterval(async () => {
 //  2. Hard tier (stallMs * STALL_HARD_CAP_MULTIPLIER): kill regardless of
 //     upstream state. Catches truly wedged llama-cpp (no progress at all).
 const STALL_HARD_CAP_MULTIPLIER = 6; // e.g. 10min soft → 60min hard cap
+// Remote backends use a tighter threshold: a wedged Ollama/etc. that accepts
+// the request but never streams data has no GPU work to "extend" — we should
+// give up fairly quickly and let the caller fail/retry/route elsewhere.
+const REMOTE_STALL_MS = 60_000;
+
 setInterval(async () => {
   const stallMs = config?.localStallMs ?? DEFAULT_LOCAL_STALL_MS;
   if (!Number.isFinite(stallMs) || stallMs <= 0) return; // disabled
   const hardCapMs = stallMs * STALL_HARD_CAP_MULTIPLIER;
   const now = Date.now();
-  // Only candidates that hold a real queue slot are eligible. Queued-behind
-  // requests are idle by design, not wedged.
+  // Local: only candidates that hold a real queue slot are eligible.
   const slotHolders = new Set();
   for (const item of llamaQueue.activeItems.values()) {
     if (item.activeReqId != null) slotHolders.add(item.activeReqId);
   }
   for (const [id, entry] of activeRequests) {
-    if (entry.backend !== 'local') continue;
     if (entry._watchdogKilled) continue;
-    if (!slotHolders.has(id)) continue;
     const idle = now - (entry.lastActivityAt || entry.startTime);
-    if (idle < stallMs) continue;
-    const totalElapsed = now - entry.startTime;
-    // Hard cap reached → kill unconditionally
-    const hardCapHit = totalElapsed >= hardCapMs;
-    // Soft tier: check upstream. If still processing, extend the deadline.
-    if (!hardCapHit) {
-      const upstreamBusy = await isUpstreamProcessing(entry.model);
-      if (upstreamBusy) {
-        // Upstream is genuinely working. Bump lastActivityAt so we re-check
-        // in another stallMs window rather than spamming this check.
-        entry.lastActivityAt = now;
-        if (!entry._extendedByWatchdog) {
-          entry._extendedByWatchdog = true;
-          const extendMsg = `Stall watchdog: extending request ${id} (model: ${entry.model}) — upstream is still processing (idle ${Math.round(idle / 1000)}s, hardcap ${Math.round(hardCapMs / 1000)}s)`;
-          console.log(`[watchdog] ${extendMsg}`);
-          addLog('system', extendMsg);
+    if (entry.backend === 'local') {
+      if (!slotHolders.has(id)) continue;
+      if (idle < stallMs) continue;
+      const totalElapsed = now - entry.startTime;
+      const hardCapHit = totalElapsed >= hardCapMs;
+      if (!hardCapHit) {
+        const upstreamBusy = await isUpstreamProcessing(entry.model);
+        if (upstreamBusy) {
+          entry.lastActivityAt = now;
+          if (!entry._extendedByWatchdog) {
+            entry._extendedByWatchdog = true;
+            const extendMsg = `Stall watchdog: extending request ${id} (model: ${entry.model}) — upstream is still processing (idle ${Math.round(idle / 1000)}s, hardcap ${Math.round(hardCapMs / 1000)}s)`;
+            console.log(`[watchdog] ${extendMsg}`);
+            addLog('system', extendMsg);
+          }
+          continue;
         }
-        continue;
       }
+      entry._watchdogKilled = true;
+      const reason = hardCapHit ? `hardcap ${Math.round(hardCapMs / 1000)}s` : `idle ${Math.round(idle / 1000)}s ≥ ${Math.round(stallMs / 1000)}s`;
+      const msg = `Stall watchdog: aborting local request ${id} (model: ${entry.model}, ${entry.tokens} tokens, ${reason})`;
+      console.warn(`[watchdog] ${msg}`);
+      addLog('system', msg);
+      requestStatsAccum.watchdogKills++;
+      watchdogStats.totalKills++;
+      watchdogStats.lastKillAt = now;
+      watchdogStats.lastKillModel = entry.model;
+      watchdogStats.lastKillStallMs = idle;
+      try { entry.abortController?.abort(); } catch { /* ignore */ }
+    } else {
+      // Remote backend stall. Tighter threshold (60s default) — there's no
+      // way to "verify upstream is processing" via /slots, and a wedged remote
+      // (Dahaka's OpenAI compat layer hanging is the canonical case) just
+      // ties up the request indefinitely. Abort propagates via the
+      // activeRequest signal that we now pass to fetchRemoteBackend, which
+      // tears down the fetch + body stream.
+      if (idle < REMOTE_STALL_MS) continue;
+      entry._watchdogKilled = true;
+      const msg = `Stall watchdog: aborting remote request ${id} (backend: ${entry.backend}, model: ${entry.model}, ${entry.tokens} tokens, idle ${Math.round(idle / 1000)}s ≥ ${Math.round(REMOTE_STALL_MS / 1000)}s)`;
+      console.warn(`[watchdog] ${msg}`);
+      addLog('system', msg);
+      requestStatsAccum.watchdogKills++;
+      watchdogStats.totalKills++;
+      watchdogStats.lastKillAt = now;
+      watchdogStats.lastKillModel = entry.model;
+      watchdogStats.lastKillStallMs = idle;
+      try { entry.abortController?.abort(); } catch { /* ignore */ }
     }
-    entry._watchdogKilled = true;
-    const reason = hardCapHit ? `hardcap ${Math.round(hardCapMs / 1000)}s` : `idle ${Math.round(idle / 1000)}s ≥ ${Math.round(stallMs / 1000)}s`;
-    const msg = `Stall watchdog: aborting local request ${id} (model: ${entry.model}, ${entry.tokens} tokens, ${reason})`;
-    console.warn(`[watchdog] ${msg}`);
-    addLog('system', msg);
-    requestStatsAccum.watchdogKills++;
-    watchdogStats.totalKills++;
-    watchdogStats.lastKillAt = now;
-    watchdogStats.lastKillModel = entry.model;
-    watchdogStats.lastKillStallMs = idle;
-    try { entry.abortController?.abort(); } catch { /* ignore */ }
-    // Don't call endActiveRequest here — the proxy handler will catch the abort
-    // and end the response normally, which triggers cleanup and slot release.
   }
 }, STALL_WATCHDOG_INTERVAL);
 
