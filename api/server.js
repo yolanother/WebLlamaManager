@@ -5221,12 +5221,20 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       })
       .catch(() => {});
   }
-  // Ensure active request is cleaned up on any exit path
-  res.on('finish', () => {
-    if (activeRequests.has(activeReqId)) {
-      endActiveRequest(activeReqId, { status: res.statusCode >= 400 ? 'error' : 'complete' });
-    }
-  });
+  // Ensure active request is cleaned up on any exit path. 'finish' fires
+  // when res.end() is called cleanly. 'close' fires on client disconnect /
+  // socket destroy — without this, a client that dies mid-request leaks
+  // an activeRequests entry forever, and our /api/queue piles up ghost
+  // pending rows that don't correspond to real llamaQueue items. Also
+  // abort the request signal so any in-flight upstream fetch tears down.
+  const cleanupActive = (reason) => {
+    if (!activeRequests.has(activeReqId)) return;
+    const entry = activeRequests.get(activeReqId);
+    try { entry?.abortController?.abort(); } catch { /* ignore */ }
+    endActiveRequest(activeReqId, { status: reason });
+  };
+  res.on('finish', () => cleanupActive(res.statusCode >= 400 ? 'error' : 'complete'));
+  res.on('close', () => cleanupActive('client_disconnect'));
 
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
