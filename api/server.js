@@ -5206,6 +5206,29 @@ function injectReasoningEffort(body) {
   return body;
 }
 
+// Apply model-specific sampling-parameter recommendations when the client
+// didn't supply explicit values. Lets us match Unsloth / model-card guidance
+// without forcing every caller to know the right knobs.
+// Pattern-keyed; each rule is matched on the requested model name (glob).
+const MODEL_SAMPLING_DEFAULTS = [
+  // Gemma 4 (Unsloth): temp=1.0, top_p=0.95, top_k=64
+  { pattern: /gemma-?4/i, params: { temperature: 1.0, top_p: 0.95, top_k: 64 } },
+];
+function injectModelSamplingDefaults(body) {
+  const model = body.model || '';
+  for (const rule of MODEL_SAMPLING_DEFAULTS) {
+    if (!rule.pattern.test(model)) continue;
+    const out = { ...body };
+    for (const [key, val] of Object.entries(rule.params)) {
+      // Only set when the caller didn't already specify (undefined === unspecified).
+      // We don't override an explicit 0 / null — only when the field is missing.
+      if (out[key] === undefined) out[key] = val;
+    }
+    return out;
+  }
+  return body;
+}
+
 // OpenAI-compatible chat completions (streaming and non-streaming)
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
@@ -5227,7 +5250,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   }
 
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
-  const proxyBody = injectReasoningEffort(req.body);
+  const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
   // Resolve backend routing (local vs remote)
   const routing = resolveBackend(requestedModel, 'chat/completions', req.body);
@@ -6251,7 +6274,7 @@ app.post('/api/v1/responses', async (req, res) => {
   console.log(`[responses] Request for model: ${requestedModel}`);
 
   // Inject reasoning_effort if configured
-  const proxyBody = injectReasoningEffort(req.body);
+  const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'responses', req.body);
@@ -6492,7 +6515,7 @@ app.post('/api/v1/messages', async (req, res) => {
   console.log(`[messages] Request for model: ${requestedModel}`);
 
   // Inject reasoning_effort if configured
-  const proxyBody = injectReasoningEffort(req.body);
+  const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'messages', req.body);
