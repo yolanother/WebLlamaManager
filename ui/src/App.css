@@ -1588,6 +1588,16 @@ input::placeholder {
   font-size: 13px;
 }
 
+.logs-filter-select {
+  padding: 8px 10px;
+  font-size: 13px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color, #2a2f3a);
+  border-radius: 4px;
+  max-width: 200px;
+}
+
 .auto-scroll-toggle {
   display: flex;
   align-items: center;

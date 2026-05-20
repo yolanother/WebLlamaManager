@@ -3275,6 +3275,9 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
   const [showFiltersPanel, setShowFiltersPanel] = useState(false);
   const [logFilters, setLogFilters] = useState({ defaultFilters: [], customFilters: [] });
   const [newFilterPattern, setNewFilterPattern] = useState('');
+  // LLM tab structured filters (model + backend dropdowns). Empty = no filter.
+  const [llmModelFilter, setLlmModelFilter] = useState('');
+  const [llmBackendFilter, setLlmBackendFilter] = useState('');
   // Drive the active tab off the URL so /logs/llm, /logs/requests, /logs/server
   // each survive page navigation + refresh. Falls back to 'server' if no segment.
   const { tab: urlTab } = useParams();
@@ -3434,16 +3437,40 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
     }, 10000);
   };
 
-  const filteredLlmLogs = filter
-    ? allLlmLogs.filter(log =>
-        (log.model || '').toLowerCase().includes(filter.toLowerCase()) ||
-        (log.response || '').toLowerCase().includes(filter.toLowerCase()) ||
-        (log.messages || []).some(m =>
-          (typeof m.content === 'string' ? m.content : '').toLowerCase().includes(filter.toLowerCase())
-        ) ||
-        (log.prompt || '').toLowerCase().includes(filter.toLowerCase())
-      )
-    : allLlmLogs;
+  // Build unique value lists for the model/backend dropdowns from the current
+  // log set. Re-derived whenever the underlying logs change.
+  const llmModelOptions = React.useMemo(() => {
+    const set = new Set();
+    for (const l of allLlmLogs) if (l.model) set.add(l.model);
+    return [...set].sort();
+  }, [allLlmLogs]);
+  const llmBackendOptions = React.useMemo(() => {
+    const set = new Set();
+    for (const l of allLlmLogs) set.add(l.backend || 'local');
+    return [...set].sort();
+  }, [allLlmLogs]);
+
+  const filteredLlmLogs = React.useMemo(() => {
+    return allLlmLogs.filter(log => {
+      // Model dropdown filter (exact match on dropdown value)
+      if (llmModelFilter && log.model !== llmModelFilter) return false;
+      // Backend dropdown filter
+      if (llmBackendFilter && (log.backend || 'local') !== llmBackendFilter) return false;
+      // Free-text filter searches model, response, messages, prompt
+      if (filter) {
+        const q = filter.toLowerCase();
+        const hit =
+          (log.model || '').toLowerCase().includes(q) ||
+          (log.response || '').toLowerCase().includes(q) ||
+          (log.messages || []).some(m =>
+            (typeof m.content === 'string' ? m.content : '').toLowerCase().includes(q)
+          ) ||
+          (log.prompt || '').toLowerCase().includes(q);
+        if (!hit) return false;
+      }
+      return true;
+    });
+  }, [allLlmLogs, filter, llmModelFilter, llmBackendFilter]);
 
   const fetchFilters = async () => {
     try {
@@ -3586,9 +3613,42 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
               Clear
             </button>
           ) : (
-            <button className="btn-secondary" onClick={handleClearLlmLogs}>
-              Clear
-            </button>
+            <>
+              <select
+                className="logs-filter-select"
+                value={llmModelFilter}
+                onChange={(e) => setLlmModelFilter(e.target.value)}
+                title="Filter by model"
+              >
+                <option value="">All models</option>
+                {llmModelOptions.map(m => (
+                  <option key={m} value={m}>{m.length > 32 ? m.slice(0, 30) + '…' : m}</option>
+                ))}
+              </select>
+              <select
+                className="logs-filter-select"
+                value={llmBackendFilter}
+                onChange={(e) => setLlmBackendFilter(e.target.value)}
+                title="Filter by backend / host"
+              >
+                <option value="">All backends</option>
+                {llmBackendOptions.map(b => (
+                  <option key={b} value={b}>{b}</option>
+                ))}
+              </select>
+              {(llmModelFilter || llmBackendFilter) && (
+                <button
+                  className="btn-secondary"
+                  onClick={() => { setLlmModelFilter(''); setLlmBackendFilter(''); }}
+                  title="Clear model/backend filters"
+                >
+                  Clear filters
+                </button>
+              )}
+              <button className="btn-secondary" onClick={handleClearLlmLogs}>
+                Clear
+              </button>
+            </>
           )}
           <label className="auto-scroll-toggle">
             <input
