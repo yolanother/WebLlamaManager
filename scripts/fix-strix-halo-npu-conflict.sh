@@ -118,6 +118,28 @@ say
 # Phase 4: verify ROCm can now see the GPU
 # ----------------------------------------------------------------------
 say "=== Phase 4: verify ROCm sees the GPU ==="
+# Probe /dev/kfd from the HOST first — that's the authoritative check.
+# If KFD is wedged from amdxdna ever co-loading earlier in this boot,
+# the open() returns EINVAL on host AND in the container, and no
+# amount of amdxdna unloading will fix it. Reboot is the only cure.
+KFD_PROBE=$(python3 -c "
+import os
+try:
+    fd = os.open('/dev/kfd', os.O_RDWR); os.close(fd); print('ok')
+except OSError as e:
+    print(f'errno={e.errno}')
+" 2>&1)
+say "host /dev/kfd open: $KFD_PROBE"
+if [ "$KFD_PROBE" != "ok" ]; then
+  say "  ✗ /dev/kfd is wedged at the host level."
+  say "  This happens after amdxdna co-loaded with amdgpu earlier this boot."
+  say "  The blacklist is correct, but only a REBOOT (or full amdgpu reload)"
+  say "  will reset the KFD state."
+  say
+  say "  Recommended: sudo reboot   (the blacklist file keeps amdxdna out next boot)"
+  say "  Or: ./scripts/fix-gpu-passthrough.sh   (kills the display — TTY only)"
+  exit 5
+fi
 if command -v distrobox >/dev/null && distrobox list 2>/dev/null | grep -q " $CONTAINER "; then
   say "rocminfo from container (AFTER):"
   if distrobox enter "$CONTAINER" -- rocminfo 2>&1 \

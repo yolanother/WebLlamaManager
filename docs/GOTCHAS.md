@@ -51,24 +51,43 @@ not help.
 
 **Fix**
 
-Persistently blacklist `amdxdna`, then unload it:
+Persistently blacklist `amdxdna`, then **reboot** — not just `modprobe -r`:
 
 ```bash
 echo "blacklist amdxdna" | sudo tee /etc/modprobe.d/blacklist-amdxdna.conf
-sudo modprobe -r amdxdna
-systemctl --user restart llama-manager
+sudo reboot   # mandatory if amdxdna ever co-loaded with amdgpu
 ```
 
-Or run the wrapper which logs every step, verifies via `rocminfo`,
-and restarts the manager service:
+The wrapper script does the blacklist + unload + service restart and
+checks for you:
 
 ```bash
 ./scripts/fix-strix-halo-npu-conflict.sh
 ```
 
-If `modprobe -r amdxdna` fails with "Module is in use" the kernel has
-the module wedged — reboot once, the blacklist file keeps it from
-loading again.
+> ⚠️ **You almost certainly still need a reboot the first time.**
+> Unloading `amdxdna` does NOT unwind the broken KFD state in
+> `amdgpu`. As long as the host shows
+> `python3 -c "import os; os.open('/dev/kfd', os.O_RDWR)"` → `errno=22`
+> the only cures are:
+>
+> 1. **Reboot** (recommended — the blacklist file keeps `amdxdna`
+>    out, so a clean `amdgpu` initializes alone).
+> 2. Full `amdgpu` reload via [`fix-gpu-passthrough.sh`](../scripts/fix-gpu-passthrough.sh)
+>    — risky, will kill any running display/X/Wayland session and any
+>    GPU-using process. Only attempt from a TTY with the desktop
+>    stopped.
+>
+> If `modprobe -r amdxdna` fails with "Module is in use", that means
+> something is still holding /dev/accel open — reboot is the only fix.
+
+After the reboot:
+
+```bash
+lsmod | grep amdxdna                              # should be empty
+python3 -c "import os; os.open('/dev/kfd', os.O_RDWR)"  # should succeed
+podman exec llama-rocm-7rc-rocwmma rocminfo | grep -E 'Marketing Name|gfx'
+```
 
 **Verify**
 
