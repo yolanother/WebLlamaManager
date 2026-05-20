@@ -5638,6 +5638,19 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         res.setHeader('Connection', 'keep-alive');
       }
 
+      // SSE keepalive during prompt processing. Llama-cpp doesn't emit any
+      // bytes between accepting the request and producing the first token —
+      // that gap can be 30-90s for a fresh large prompt on a slow backend.
+      // Many HTTP clients have a 60-90s read timeout and abort during that
+      // silence. Send a `: processing` comment every 20s to keep the socket
+      // warm. Reset on every real chunk so we only emit during silent gaps.
+      let lastChunkAt = Date.now();
+      const keepaliveTicker = setInterval(() => {
+        if (Date.now() - lastChunkAt > 20_000 && !res.writableEnded) {
+          try { res.write(`: processing waited=${Math.round((Date.now() - startTime) / 1000)}s\n\n`); } catch {}
+        }
+      }, 10_000);
+
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let completionTokens = 0;
@@ -5651,6 +5664,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            lastChunkAt = Date.now();
 
             const chunk = decoder.decode(value);
 
@@ -5703,6 +5717,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             }
             res.write(outputChunk);
           }
+          clearInterval(keepaliveTicker);
           res.end();
 
           // Record stats after stream completes
@@ -5733,6 +5748,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           });
           endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
         } catch (e) {
+          clearInterval(keepaliveTicker);
           console.error('[proxy] Stream error:', e);
           const duration = Date.now() - startTime;
           logLlm({
