@@ -6586,10 +6586,11 @@ async function isUpstreamProcessing(model) {
 }
 
 // Fetch full slot details for proof-of-life UI updates. Returns the raw slot
-// array (or null on error). Cheap — single GET per model per probe tick.
+// array (or null on error). Short timeout (1.5s) so a busy llama-cpp doesn't
+// gum up the probe cadence — we'd rather skip a tick than block forever.
 async function fetchSlots(model) {
   try {
-    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(1500) });
     if (!r.ok) return null;
     return await r.json();
   } catch { return null; }
