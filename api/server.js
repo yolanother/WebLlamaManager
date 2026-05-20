@@ -775,13 +775,16 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
   const startTime = Date.now();
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || 120000);
-    const fetchOptions = { ...options, signal: controller.signal };
-
     let lastError;
     const maxRetries = 3;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      // Create a FRESH controller + timeout per attempt. The old code reused
+      // one controller across retries, so once it aborted (first timeout or
+      // first cancellation), every subsequent retry immediately threw
+      // "This operation was aborted" without actually contacting the backend.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || 120000);
+      const fetchOptions = { ...options, signal: controller.signal };
       try {
         const response = await fetch(url, fetchOptions);
         clearTimeout(timeout);
@@ -806,6 +809,11 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
       } catch (err) {
         clearTimeout(timeout);
         lastError = err;
+        // If the breaker tripped while we were retrying, stop early — no
+        // point hammering a backend we just decided to back off from.
+        if (isBackendCircuitOpen(backend.id)) {
+          break;
+        }
         if (attempt < maxRetries) {
           const delay = 1000 * Math.pow(2, attempt);
           console.log(`[${label}][${backend.name}] Retry ${attempt + 1}/${maxRetries}: ${err.message}`);
