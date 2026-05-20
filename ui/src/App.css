@@ -3124,6 +3124,43 @@ input::placeholder {
   background: rgba(148, 163, 184, 0.10);
 }
 
+.queue-probe-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-family: -apple-system, sans-serif;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
+.queue-probe-prompt-processing {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.15);
+  animation: queue-probe-pulse 1.6s ease-in-out infinite;
+}
+
+.queue-probe-decoding {
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.15);
+}
+
+.queue-probe-idle {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.10);
+}
+
+@keyframes queue-probe-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.queue-elapsed-sub {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
 .queue-col-endpoint {
   font-family: monospace;
   font-size: 12px;

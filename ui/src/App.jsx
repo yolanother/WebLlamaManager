@@ -7600,8 +7600,25 @@ function QueuePage({ stats, activeRequestsMap }) {
                           tok:…
                         </span>
                       )}
+                      {item.upstreamProbe && (
+                        <span
+                          className={`queue-probe-tag queue-probe-${item.upstreamProbe.phase || 'idle'}`}
+                          title={`llama.cpp slot ${item.upstreamProbe.slotId ?? '?'}: ${item.upstreamProbe.phase}; last probe ${Math.round((Date.now() - (item.upstreamProbe.probedAt || 0)) / 1000)}s ago`}
+                        >
+                          {item.upstreamProbe.phase === 'prompt-processing' ? '🔄 prompt' :
+                           item.upstreamProbe.phase === 'decoding' ? `▶ ${item.upstreamProbe.nDecoded} tok` :
+                           '○ idle'}
+                        </span>
+                      )}
                     </span>
-                    <span className={`queue-col-elapsed ${item.elapsed > 120000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
+                    <span className={`queue-col-elapsed ${(item.activeElapsed ?? item.elapsed) > 120000 ? 'elapsed-warning' : ''}`}>
+                      <div>{formatElapsed(item.activeElapsed ?? item.elapsed)}</div>
+                      {item.activeElapsed != null && item.totalElapsed != null && item.totalElapsed !== item.activeElapsed && (
+                        <div className="queue-elapsed-sub" title="Total time since request entered the proxy (includes queue wait)">
+                          (total {formatElapsed(item.totalElapsed)})
+                        </div>
+                      )}
+                    </span>
                     <span className="queue-col-actions" onClick={e => e.stopPropagation()}>
                       {item.activeRequestId ? (
                         <button

@@ -1369,7 +1369,13 @@ function startActiveRequest({ model, endpoint, messages, prompt, backend }) {
   const now = Date.now();
   // lastActivityAt is updated on every token (updateActiveRequest); the stall watchdog
   // aborts entries where (now - lastActivityAt) exceeds config.localStallMs.
-  const entry = { id, model, endpoint, userMessage, fullContext, responseText: '', startTime: now, lastActivityAt: now, status: 'processing', tokens: 0, backend: backend || 'local', abortController };
+  // slotAcquiredAt is set when the local queue slot is granted (in acquireLocalSlot);
+  // null while waiting in the queue. UI shows "active" elapsed = now - slotAcquiredAt
+  // vs "total" elapsed = now - startTime, so the operator can tell queue-wait from
+  // actual upstream work.
+  // upstreamProbe captures the latest llama.cpp /slots state for this request —
+  // proof-of-life during long prompt processing (no tokens yet but slot busy).
+  const entry = { id, model, endpoint, userMessage, fullContext, responseText: '', startTime: now, lastActivityAt: now, slotAcquiredAt: null, upstreamProbe: null, status: 'processing', tokens: 0, backend: backend || 'local', abortController };
   activeRequests.set(id, entry);
   // Track which model is actively being processed on the local backend
   // This is used by the offload logic to detect model-switch conflicts while a model is still loading
@@ -2887,6 +2893,25 @@ app.get('/api/queue', (req, res) => {
       result.preTokenizedAt = ar.preTokenizedAt;
     } else {
       result.preTokenized = null;
+    }
+    // Two timing fields: total = since proxy entered the handler (includes
+    // queue wait); active = since the local queue slot was acquired (true
+    // time in llama.cpp's hands). For remote-routed requests, both are equal.
+    result.totalElapsed = result.elapsed;
+    if (ar.slotAcquiredAt) {
+      result.activeElapsed = Date.now() - ar.slotAcquiredAt;
+    } else if (isOffloaded) {
+      // Remote routing has no separate "slot acquire" step on our side; the
+      // total elapsed is also the active elapsed.
+      result.activeElapsed = result.elapsed;
+    } else {
+      result.activeElapsed = null;
+    }
+    // Proof-of-life: latest upstream slot probe (only present for local
+    // chat/completions while in flight). Tells the UI whether llama.cpp is
+    // currently prompt-processing or decoding.
+    if (ar.upstreamProbe) {
+      result.upstreamProbe = ar.upstreamProbe;
     }
     if (holdsSlot) activeItems.push(result);
     else pendingFromActive.push(result);
@@ -4900,9 +4925,15 @@ async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait
   }
   // Reset the stall watchdog clock now that the request is actually about to hit
   // the upstream — queue-wait time shouldn't count toward the no-token timeout.
+  // Also stamp slotAcquiredAt so the UI can show "active elapsed" separate from
+  // "total elapsed" (which includes queue wait).
   if (activeReqId != null) {
     const ar = activeRequests.get(activeReqId);
-    if (ar) ar.lastActivityAt = Date.now();
+    if (ar) {
+      const now = Date.now();
+      ar.lastActivityAt = now;
+      ar.slotAcquiredAt = now;
+    }
   }
   let released = false;
   const release = () => {
@@ -5140,6 +5171,12 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   }
 
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: routing.remote ? routing.backend.id : 'local' });
+  // Record which llama.cpp slot we asked for, so the upstream probe can find
+  // the right row instead of guessing.
+  if (slotAssignment && slotAssignment.slotId != null) {
+    const ar = activeRequests.get(activeReqId);
+    if (ar) ar.idSlot = slotAssignment.slotId;
+  }
 
   // Fire pre-tokenization in the background while we wait on the queue.
   // The result lands on the activeRequest entry so anyone curious can see
@@ -6547,6 +6584,73 @@ async function isUpstreamProcessing(model) {
     return Array.isArray(slots) && slots.some(s => s.is_processing);
   } catch { return false; }
 }
+
+// Fetch full slot details for proof-of-life UI updates. Returns the raw slot
+// array (or null on error). Cheap — single GET per model per probe tick.
+async function fetchSlots(model) {
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+// Periodic proof-of-life probe. For each active local request, query
+// llama.cpp /slots once per model and stamp upstreamProbe so the UI can
+// distinguish "alive, processing prompt" from "wedged". Runs every 3s; cheap
+// because we batch by model (one HTTP call per model regardless of how many
+// active requests share it).
+const UPSTREAM_PROBE_INTERVAL_MS = 3000;
+setInterval(async () => {
+  // Collect distinct models that have at least one active local slot holder
+  const slotHolders = new Set();
+  for (const item of llamaQueue.activeItems.values()) {
+    if (item.activeReqId != null) slotHolders.add(item.activeReqId);
+  }
+  const modelsToProbe = new Set();
+  for (const [id, entry] of activeRequests) {
+    if (entry.backend !== 'local') continue;
+    if (!slotHolders.has(id)) continue;
+    if (entry.model) modelsToProbe.add(entry.model);
+  }
+  if (modelsToProbe.size === 0) return;
+
+  // Probe each model in parallel (typically just 1)
+  const probedAt = Date.now();
+  const slotsByModel = new Map();
+  await Promise.all([...modelsToProbe].map(async (model) => {
+    const slots = await fetchSlots(model);
+    if (slots) slotsByModel.set(model, slots);
+  }));
+
+  // Attach probe to each active entry
+  for (const [id, entry] of activeRequests) {
+    if (entry.backend !== 'local') continue;
+    if (!slotHolders.has(id)) continue;
+    const slots = slotsByModel.get(entry.model);
+    if (!slots) continue;
+    // Try to find the specific slot this request is on. If we injected
+    // id_slot for prefix cache, we know it. Otherwise grab the first
+    // processing slot for the model (best effort).
+    let mySlot = null;
+    if (entry.idSlot != null) {
+      mySlot = slots.find(s => s.id === entry.idSlot);
+    }
+    if (!mySlot) {
+      mySlot = slots.find(s => s.is_processing) || null;
+    }
+    const isProcessing = !!mySlot?.is_processing;
+    const nDecoded = mySlot?.next_token?.[0]?.n_decoded ?? 0;
+    const phase = !isProcessing ? 'idle' : (nDecoded > 0 ? 'decoding' : 'prompt-processing');
+    entry.upstreamProbe = {
+      probedAt,
+      slotId: mySlot?.id ?? null,
+      isProcessing,
+      nDecoded,
+      phase
+    };
+  }
+}, UPSTREAM_PROBE_INTERVAL_MS);
 
 // Stall watchdog: scans active local requests every STALL_WATCHDOG_INTERVAL ms.
 // Two-tier:
