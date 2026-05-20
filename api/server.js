@@ -1271,10 +1271,20 @@ let logBuffer = [];
 let lastLogEntry = null;
 let lastLogCount = 0;
 
-// Default log patterns to filter out (noisy polling endpoints)
+// Default log patterns to filter out. These are llama.cpp's per-slot/per-request
+// access-log lines that our own probe/watchdog/proxy hits on a tight cadence —
+// they swamp the Server logs tab and aren't actionable. LLM completion details
+// go on the dedicated LLM Logs tab; this just keeps the server tab signal-only.
 const DEFAULT_LOG_FILTERS = [
+  // Llama.cpp HTTP access log noise from our own polling
   'GET /health.*200',
   'GET /models.*200',
+  'srv  log_server_r: (request|done request): GET /slots',
+  'srv  log_server_r: (request|done request): GET /props',
+  'srv  log_server_r: (request|done request): GET /models',
+  'srv  log_server_r: (request|done request): GET /health',
+  // Internal proxy chatter — every chat completion logs this twice
+  'srv  proxy_reques: proxying request',
 ];
 
 function shouldFilterLog(line, customFilters = []) {
