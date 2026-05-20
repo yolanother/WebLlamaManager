@@ -5277,32 +5277,26 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   }
   // Ensure active request is cleaned up on any exit path. 'finish' fires
   // when res.end() is called cleanly. 'close' fires on client disconnect /
-  // socket destroy.
-  //
-  // Importantly: on client_disconnect we DO NOT abort the upstream
-  // AbortController. Llama.cpp doesn't notice TCP close during prompt
-  // processing anyway (it polls only when emitting tokens) so aborting just
-  // wastes 60-120s of in-flight work AND causes its own cascade — the next
-  // request creates a new slot while the abandoned one keeps grinding. By
-  // letting the upstream finish naturally, the KV cache stays warm for the
-  // next request with a similar prefix. Watchdog kills and explicit manual
-  // kills still abort directly (via the watchdog setInterval / kill endpoint).
+  // socket destroy. Both abort the upstream — leaving abandoned work running
+  // saturates llama-cpp's parallel slots and any new request piles in
+  // behind it. Tradeoff: 0 token work IS thrown away, but llama-cpp does
+  // eventually free the slot via socket-close detection and a new request
+  // gets the freed slot quickly. Net: faster response for fresh requests
+  // when clients disconnect mid-stream.
   //
   // cancelReason is captured in handler closure scope so stream catches
   // can tell "client disconnected" (NOT a backend failure) from "backend
   // error" (counts toward circuit breaker).
   let cancelReason = null;
-  const cleanupActive = (reason, { abortUpstream = false } = {}) => {
+  const cleanupActive = (reason) => {
     if (!activeRequests.has(activeReqId)) return;
     const entry = activeRequests.get(activeReqId);
     cancelReason = reason;
-    if (abortUpstream) {
-      try { entry?.abortController?.abort(); } catch { /* ignore */ }
-    }
+    try { entry?.abortController?.abort(); } catch { /* ignore */ }
     endActiveRequest(activeReqId, { status: reason });
   };
   res.on('finish', () => cleanupActive(res.statusCode >= 400 ? 'error' : 'complete'));
-  res.on('close', () => cleanupActive('client_disconnect', { abortUpstream: false }));
+  res.on('close', () => cleanupActive('client_disconnect'));
 
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
