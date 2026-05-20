@@ -5562,15 +5562,27 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     });
     initialQueueWait = slot.queueWait;
   } catch (err) {
-    // Acquire was rejected (flush / cancel / etc.). Clean up and bail.
+    // Acquire was rejected (flush / cancel / reroute / client disconnect).
+    // If the reroute scanner cancelled us because a remote backend opened up,
+    // signal that to the client via 503 + Retry-After: 0 so it retries
+    // immediately — and the retry's resolveBackend will land on remote.
+    const entry = activeRequests.get(activeReqId);
+    const wasReroute = !!entry?._rerouteHint;
     if (activeRequests.has(activeReqId)) {
       endActiveRequest(activeReqId, { status: 'cancelled' });
     }
+    const reason = wasReroute
+      ? `Rerouted: a remote backend now has capacity for ${requestedModel}. Retry.`
+      : `Request cancelled while queued (${err.message})`;
     if (!res.headersSent) {
-      res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
+      if (wasReroute) res.setHeader('Retry-After', '0');
+      res.status(503).json({ error: reason });
     } else if (!res.writableEnded) {
-      // SSE keepalive already flushed headers — emit error event then close.
-      try { res.write(`event: error\ndata: ${JSON.stringify({ status: 503, error: err.message })}\n\n`); } catch {}
+      if (sseKeepaliveActive) {
+        try { res.write(`event: error\ndata: ${JSON.stringify({ status: 503, error: reason })}\n\n`); } catch {}
+      } else if (nonStreamingHeartbeatTicker || !isStreaming) {
+        try { res.write(JSON.stringify({ error: reason, status: 503 })); } catch {}
+      }
       try { res.end(); } catch {}
     }
     return;
@@ -6910,6 +6922,43 @@ setInterval(async () => {
     };
   }
 }, UPSTREAM_PROBE_INTERVAL_MS);
+
+// Reroute scanner: scans pending items in the local llamaQueue every few
+// seconds and identifies any whose model is offloadable to a remote backend
+// that now has capacity. Cancels those queue positions (the chat handler's
+// acquireLocalSlot catch sees this, marks the response with Retry-After:0,
+// and the client's retry hits resolveBackend fresh and lands on the remote
+// backend). This prevents the scenario where 8B Qwens block a gemma in the
+// local queue when Borethrax has just freed up.
+const REROUTE_SCAN_INTERVAL_MS = 3000;
+setInterval(() => {
+  if (llamaQueue.queue.length === 0) return;
+  const backends = config?.backends || {};
+  if (!backends.enabled || !backends.directory?.length) return;
+  // Pull these once per pass so the inner loop is cheap.
+  const dir = backends.directory;
+  for (const item of llamaQueue.queue) {
+    if (item.activeReqId == null) continue;
+    const entry = activeRequests.get(item.activeReqId);
+    if (!entry || entry._rerouteHint) continue;
+    const model = entry.model;
+    if (!model) continue;
+    // Find a remote backend that maps this model AND has capacity AND circuit
+    // is closed. If found, mark the entry and cancel the queue position.
+    const viable = dir.find(b => {
+      if (!b.enabled || !b.tested) return false;
+      if (isBackendCircuitOpen(b.id)) return false;
+      if (!b.modelMapping) return false;
+      if (!resolveModelMapping(b.modelMapping, model)) return false;
+      const q = backendQueues.get(b.id);
+      return !q || q.active < q.concurrency;
+    });
+    if (!viable) continue;
+    entry._rerouteHint = { backendId: viable.id, backendName: viable.name };
+    console.log(`[reroute] Cancelling local queue position for activeReqId=${item.activeReqId} (model=${model}) — ${viable.name} has capacity`);
+    llamaQueue.cancel(item.id);
+  }
+}, REROUTE_SCAN_INTERVAL_MS);
 
 // Stall watchdog: scans active local requests every STALL_WATCHDOG_INTERVAL ms.
 // Two-tier:
