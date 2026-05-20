@@ -5044,8 +5044,15 @@ async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 100
   let hasRestarted = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      // Check if request was aborted before each attempt
-      if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
+      // Check if request was aborted before each attempt — if so, bail out
+      // immediately. Continuing to retry with an already-aborted signal just
+      // burns the backoff schedule (1+2+4+8+16s = 31s) on guaranteed-fail
+      // attempts before giving up. Catch handles below treats abort as terminal.
+      if (signal?.aborted) {
+        const err = new DOMException('Request aborted (signal pre-check)', 'AbortError');
+        err.name = 'AbortError';
+        throw err;
+      }
       const response = await fetch(url, { ...options, dispatcher: llamaDispatcher, signal });
 
       // Check for proxy connection errors (server may be reloading after OOM)
@@ -5082,6 +5089,14 @@ async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 100
     } catch (err) {
       retryErrors.push(err.message);
       requestStatsAccum.retries++;
+      // Abort is terminal — don't retry. The caller (or upstream client) gave
+      // up; further retries on the same signal would instant-fail and waste
+      // backoff seconds. Same fix as fetchRemoteBackend's retry loop.
+      if (err.name === 'AbortError' || signal?.aborted) {
+        err.retries = attempt;
+        err.retryErrors = retryErrors;
+        throw err;
+      }
       // Node's fetch wraps errors: err.code may be undefined, real code is in err.cause.code
       const realCode = err.code || err.cause?.code || '';
       const isConnectionError = realCode === 'ECONNREFUSED' || realCode === 'ECONNRESET' ||
@@ -5262,23 +5277,32 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   }
   // Ensure active request is cleaned up on any exit path. 'finish' fires
   // when res.end() is called cleanly. 'close' fires on client disconnect /
-  // socket destroy — without this, a client that dies mid-request leaks
-  // an activeRequests entry forever, and our /api/queue piles up ghost
-  // pending rows that don't correspond to real llamaQueue items. Also
-  // abort the request signal so any in-flight upstream fetch tears down.
+  // socket destroy.
+  //
+  // Importantly: on client_disconnect we DO NOT abort the upstream
+  // AbortController. Llama.cpp doesn't notice TCP close during prompt
+  // processing anyway (it polls only when emitting tokens) so aborting just
+  // wastes 60-120s of in-flight work AND causes its own cascade — the next
+  // request creates a new slot while the abandoned one keeps grinding. By
+  // letting the upstream finish naturally, the KV cache stays warm for the
+  // next request with a similar prefix. Watchdog kills and explicit manual
+  // kills still abort directly (via the watchdog setInterval / kill endpoint).
+  //
   // cancelReason is captured in handler closure scope so stream catches
   // can tell "client disconnected" (NOT a backend failure) from "backend
   // error" (counts toward circuit breaker).
   let cancelReason = null;
-  const cleanupActive = (reason) => {
+  const cleanupActive = (reason, { abortUpstream = false } = {}) => {
     if (!activeRequests.has(activeReqId)) return;
     const entry = activeRequests.get(activeReqId);
     cancelReason = reason;
-    try { entry?.abortController?.abort(); } catch { /* ignore */ }
+    if (abortUpstream) {
+      try { entry?.abortController?.abort(); } catch { /* ignore */ }
+    }
     endActiveRequest(activeReqId, { status: reason });
   };
   res.on('finish', () => cleanupActive(res.statusCode >= 400 ? 'error' : 'complete'));
-  res.on('close', () => cleanupActive('client_disconnect'));
+  res.on('close', () => cleanupActive('client_disconnect', { abortUpstream: false }));
 
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
