@@ -7588,7 +7588,19 @@ function QueuePage({ stats, activeRequestsMap }) {
                     </span>
                     <span className="queue-col-endpoint">{item.endpoint}</span>
                     <span className="queue-col-message" title={live.userMessage}>{live.userMessage ? (live.userMessage.length > 60 ? live.userMessage.slice(0, 57) + '...' : live.userMessage) : '-'}</span>
-                    <span className="queue-col-tokens">{live.tokens || '-'}</span>
+                    <span className="queue-col-tokens">
+                      {live.tokens || '-'}
+                      {item.preTokenized != null && (
+                        <span className="queue-pretok-tag" title="Pre-tokenized (computed in parallel while queued)">
+                          tok:{item.preTokenized}
+                        </span>
+                      )}
+                      {item.preTokenized == null && item.backend === 'local' && (
+                        <span className="queue-pretok-tag queue-pretok-pending" title="Pre-tokenization pending">
+                          tok:…
+                        </span>
+                      )}
+                    </span>
                     <span className={`queue-col-elapsed ${item.elapsed > 120000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
                     <span className="queue-col-actions" onClick={e => e.stopPropagation()}>
                       {item.activeRequestId ? (
@@ -7651,7 +7663,17 @@ function QueuePage({ stats, activeRequestsMap }) {
                   </span>
                   <span className="queue-col-endpoint">{item.endpoint}</span>
                   <span className="queue-col-message" title={item.userMessage}>{item.userMessage ? (item.userMessage.length > 60 ? item.userMessage.slice(0, 57) + '...' : item.userMessage) : '-'}</span>
-                  <span className="queue-col-tokens">-</span>
+                  <span className="queue-col-tokens">
+                    {item.preTokenized != null ? (
+                      <span className="queue-pretok-tag" title="Pre-tokenized while queued (CPU work parallel to GPU)">
+                        tok:{item.preTokenized}
+                      </span>
+                    ) : item.backend === 'local' ? (
+                      <span className="queue-pretok-tag queue-pretok-pending" title="Pre-tokenization in progress">
+                        tok:…
+                      </span>
+                    ) : '-'}
+                  </span>
                   <span className={`queue-col-elapsed ${item.elapsed > 60000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
                   <span className="queue-col-actions">
                     <button

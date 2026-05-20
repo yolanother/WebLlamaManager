@@ -3107,6 +3107,23 @@ input::placeholder {
   white-space: nowrap;
 }
 
+.queue-pretok-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-family: -apple-system, sans-serif;
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.10);
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
+.queue-pretok-tag.queue-pretok-pending {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.10);
+}
+
 .queue-col-endpoint {
   font-family: monospace;
   font-size: 12px;

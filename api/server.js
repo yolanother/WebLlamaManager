@@ -2880,6 +2880,14 @@ app.get('/api/queue', (req, res) => {
       result.startTime = ar.startTime;
       result.fullContext = ar.fullContext || [];
     }
+    // Pre-tokenization visibility: show how many tokens we computed in the
+    // background while the request was queued/processing.
+    if (ar.preTokenized != null) {
+      result.preTokenized = ar.preTokenized;
+      result.preTokenizedAt = ar.preTokenizedAt;
+    } else {
+      result.preTokenized = null;
+    }
     if (holdsSlot) activeItems.push(result);
     else pendingFromActive.push(result);
   }
