@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, NavLink, useLocation, useParams, useNavigate } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart,
-  BarChart, Bar
+  BarChart, Bar, Cell
 } from 'recharts';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
@@ -663,6 +663,102 @@ function TemperatureChart({ data, height = 140 }) {
           <Tooltip content={<ChartTooltip unit="°C" />} />
           <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpu)" strokeWidth={2} dot={false} />
           <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpu)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// Horizontal bar chart ranking models by recent average tok/s, fastest
+// at the top. Data source: analytics.tokenStats.modelAvgTps (backend/model
+// -> avg t/s over recent requests). Empty until we have generation data.
+function ModelTpsRankChart({ modelAvgTps, height = 200 }) {
+  const data = React.useMemo(() => {
+    if (!modelAvgTps) return [];
+    return Object.entries(modelAvgTps)
+      .map(([model, tps]) => ({
+        // Trim backend prefix in the display, but keep the full id so duplicate
+        // model names from different backends don't collide.
+        model,
+        label: model.length > 40 ? model.slice(0, 37) + '…' : model,
+        tps: Math.round(tps * 10) / 10
+      }))
+      .filter(d => d.tps > 0)
+      .sort((a, b) => b.tps - a.tps);
+  }, [modelAvgTps]);
+
+  if (data.length === 0) {
+    return (
+      <div className="chart-container" style={{ height }}>
+        <div className="chart-empty">No per-model speed data yet — send a chat request</div>
+      </div>
+    );
+  }
+
+  // Color by rank using the existing palette
+  const palette = ['#10b981', '#3b82f6', '#a855f7', '#f59e0b', '#ef4444', '#06b6d4', '#ec4899', '#84cc16'];
+
+  return (
+    <div className="chart-container" style={{ height }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart
+          data={data}
+          layout="vertical"
+          margin={{ top: 5, right: 40, left: 5, bottom: 5 }}
+        >
+          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" horizontal={false} />
+          <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <YAxis
+            type="category"
+            dataKey="label"
+            tick={{ fill: '#bbb', fontSize: 11 }}
+            tickLine={false}
+            axisLine={false}
+            width={240}
+          />
+          <Tooltip content={<ChartTooltip unit=" tok/s" />} />
+          <Bar dataKey="tps" name="tok/s" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: '#ccc', fontSize: 11, formatter: (v) => v.toFixed(1) }}>
+            {data.map((entry, i) => (
+              <Cell key={entry.model} fill={palette[i % palette.length]} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// GPU/CPU compute-usage chart. Mirrors TemperatureChart but plots
+// utilization % so users can see when the iGPU is actually loaded
+// (and how that correlates with CPU spikes during prompt processing).
+function UsageChart({ data, height = 140 }) {
+  if (!data || data.length < 2) {
+    return (
+      <div className="chart-container" style={{ height }}>
+        <div className="chart-empty">Collecting data...</div>
+      </div>
+    );
+  }
+  return (
+    <div className="chart-container" style={{ height }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+          <defs>
+            <linearGradient id="gradGpuUse" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={CHART_COLORS.temperature} stopOpacity={0.3} />
+              <stop offset="95%" stopColor={CHART_COLORS.temperature} stopOpacity={0} />
+            </linearGradient>
+            <linearGradient id="gradCpuUse" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={CHART_COLORS.temperatureCpu} stopOpacity={0.2} />
+              <stop offset="95%" stopColor={CHART_COLORS.temperatureCpu} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+          <XAxis dataKey="timestamp" hide />
+          <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <Tooltip content={<ChartTooltip unit="%" />} />
+          <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpuUse)" strokeWidth={2} dot={false} />
+          <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpuUse)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
         </AreaChart>
       </ResponsiveContainer>
     </div>
@@ -1379,6 +1475,10 @@ function Dashboard({ stats, activeRequest }) {
               <TemperatureChart data={analytics?.temperature || []} height={200} />
             </div>
             <div className="chart-card">
+              <h4>GPU / CPU Usage <span className="chart-value">GPU: {stats?.gpu?.usage?.toFixed(0) || 0}%{stats?.cpu?.usage != null ? ` / CPU: ${stats.cpu.usage.toFixed(0)}%` : ''}</span></h4>
+              <UsageChart data={analytics?.usage || []} height={200} />
+            </div>
+            <div className="chart-card">
               <h4>Power <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span></h4>
               <PowerChart data={analytics?.power || []} height={200} />
             </div>
@@ -1918,6 +2018,28 @@ function Dashboard({ stats, activeRequest }) {
             </div>
           </div>
 
+          {/* GPU/CPU Usage Chart */}
+          <div className="chart-card">
+            <h4>
+              GPU / CPU Usage
+              <span className="chart-value">
+                GPU: {stats?.gpu?.usage?.toFixed(0) || 0}%
+                {stats?.cpu?.usage != null && ` / CPU: ${stats.cpu.usage.toFixed(0)}%`}
+              </span>
+            </h4>
+            <UsageChart data={analytics?.usage || []} />
+            <div className="chart-legend">
+              <div className="chart-legend-item">
+                <span className="chart-legend-dot gpu"></span>
+                GPU
+              </div>
+              <div className="chart-legend-item">
+                <span className="chart-legend-dot cpu"></span>
+                CPU
+              </div>
+            </div>
+          </div>
+
           {/* Power Chart */}
           <div className="chart-card">
             <h4>
@@ -1977,6 +2099,15 @@ function Dashboard({ stats, activeRequest }) {
                 <div className="token-stat-label">Completion Tokens</div>
               </div>
             </div>
+          </div>
+
+          {/* Per-Model tok/s ranking */}
+          <div className="chart-card">
+            <h4>
+              Model Speed Ranking
+              <span className="chart-value">avg tok/s (recent)</span>
+            </h4>
+            <ModelTpsRankChart modelAvgTps={analytics?.tokenStats?.modelAvgTps} height={Math.max(200, Object.keys(analytics?.tokenStats?.modelAvgTps || {}).length * 32 + 40)} />
           </div>
 
           {/* Context Usage Chart */}
@@ -3275,7 +3406,19 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
   const [showFiltersPanel, setShowFiltersPanel] = useState(false);
   const [logFilters, setLogFilters] = useState({ defaultFilters: [], customFilters: [] });
   const [newFilterPattern, setNewFilterPattern] = useState('');
-  const [activeTab, setActiveTab] = useState('server');
+  // LLM tab structured filters (model + backend dropdowns). Empty = no filter.
+  const [llmModelFilter, setLlmModelFilter] = useState('');
+  const [llmBackendFilter, setLlmBackendFilter] = useState('');
+  // Drive the active tab off the URL so /logs/llm, /logs/requests, /logs/server
+  // each survive page navigation + refresh. Falls back to 'server' if no segment.
+  const { tab: urlTab } = useParams();
+  const navigate = useNavigate();
+  const VALID_TABS = ['server', 'requests', 'llm'];
+  const activeTab = VALID_TABS.includes(urlTab) ? urlTab : 'server';
+  const setActiveTab = (next) => {
+    if (!VALID_TABS.includes(next)) next = 'server';
+    navigate(next === 'server' ? '/logs' : `/logs/${next}`, { replace: false });
+  };
   const logsEndRef = useRef(null);
   const logsContainerRef = useRef(null);
 
@@ -3425,16 +3568,40 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
     }, 10000);
   };
 
-  const filteredLlmLogs = filter
-    ? allLlmLogs.filter(log =>
-        (log.model || '').toLowerCase().includes(filter.toLowerCase()) ||
-        (log.response || '').toLowerCase().includes(filter.toLowerCase()) ||
-        (log.messages || []).some(m =>
-          (typeof m.content === 'string' ? m.content : '').toLowerCase().includes(filter.toLowerCase())
-        ) ||
-        (log.prompt || '').toLowerCase().includes(filter.toLowerCase())
-      )
-    : allLlmLogs;
+  // Build unique value lists for the model/backend dropdowns from the current
+  // log set. Re-derived whenever the underlying logs change.
+  const llmModelOptions = React.useMemo(() => {
+    const set = new Set();
+    for (const l of allLlmLogs) if (l.model) set.add(l.model);
+    return [...set].sort();
+  }, [allLlmLogs]);
+  const llmBackendOptions = React.useMemo(() => {
+    const set = new Set();
+    for (const l of allLlmLogs) set.add(l.backend || 'local');
+    return [...set].sort();
+  }, [allLlmLogs]);
+
+  const filteredLlmLogs = React.useMemo(() => {
+    return allLlmLogs.filter(log => {
+      // Model dropdown filter (exact match on dropdown value)
+      if (llmModelFilter && log.model !== llmModelFilter) return false;
+      // Backend dropdown filter
+      if (llmBackendFilter && (log.backend || 'local') !== llmBackendFilter) return false;
+      // Free-text filter searches model, response, messages, prompt
+      if (filter) {
+        const q = filter.toLowerCase();
+        const hit =
+          (log.model || '').toLowerCase().includes(q) ||
+          (log.response || '').toLowerCase().includes(q) ||
+          (log.messages || []).some(m =>
+            (typeof m.content === 'string' ? m.content : '').toLowerCase().includes(q)
+          ) ||
+          (log.prompt || '').toLowerCase().includes(q);
+        if (!hit) return false;
+      }
+      return true;
+    });
+  }, [allLlmLogs, filter, llmModelFilter, llmBackendFilter]);
 
   const fetchFilters = async () => {
     try {
@@ -3577,9 +3744,42 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
               Clear
             </button>
           ) : (
-            <button className="btn-secondary" onClick={handleClearLlmLogs}>
-              Clear
-            </button>
+            <>
+              <select
+                className="logs-filter-select"
+                value={llmModelFilter}
+                onChange={(e) => setLlmModelFilter(e.target.value)}
+                title="Filter by model"
+              >
+                <option value="">All models</option>
+                {llmModelOptions.map(m => (
+                  <option key={m} value={m}>{m.length > 32 ? m.slice(0, 30) + '…' : m}</option>
+                ))}
+              </select>
+              <select
+                className="logs-filter-select"
+                value={llmBackendFilter}
+                onChange={(e) => setLlmBackendFilter(e.target.value)}
+                title="Filter by backend / host"
+              >
+                <option value="">All backends</option>
+                {llmBackendOptions.map(b => (
+                  <option key={b} value={b}>{b}</option>
+                ))}
+              </select>
+              {(llmModelFilter || llmBackendFilter) && (
+                <button
+                  className="btn-secondary"
+                  onClick={() => { setLlmModelFilter(''); setLlmBackendFilter(''); }}
+                  title="Clear model/backend filters"
+                >
+                  Clear filters
+                </button>
+              )}
+              <button className="btn-secondary" onClick={handleClearLlmLogs}>
+                Clear
+              </button>
+            </>
           )}
           <label className="auto-scroll-toggle">
             <input
@@ -4471,6 +4671,20 @@ function SettingsPage() {
               onChange={(e) => updateSetting('maxConcurrentRequests', parseInt(e.target.value))}
             />
           </div>
+          <div className="setting-item">
+            <label htmlFor="localStallMs">Stall Watchdog (seconds)</label>
+            <p className="setting-hint">
+              Abort a local request if no token is received for this long. The timer resets on every token, so long generations are safe — only a truly wedged upstream gets killed. Set to 0 to disable.
+            </p>
+            <input
+              type="number"
+              id="localStallMs"
+              min="0"
+              max="3600"
+              value={Math.round((settings?.localStallMs ?? 60000) / 1000)}
+              onChange={(e) => updateSetting('localStallMs', parseInt(e.target.value) * 1000)}
+            />
+          </div>
         </div>
       </section>
 
@@ -4786,8 +5000,13 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
                   checked={backendsConfig.preferLocal !== false}
                   onChange={(e) => updateRouting('preferLocal', e.target.checked)}
                 />
-                {' '}Prefer Local (always try local first)
+                {' '}Prefer Local
               </label>
+              <p className="setting-hint">
+                When enabled (default), requests run locally until the queue is full, then overflow to remote per the offload policy above.
+                When disabled, offloadable requests (those with a remote mapping) always go remote whenever a remote backend has capacity —
+                reserving the local slot for non-offloadable models. Useful when local is the slow node and remote backends should handle the bulk of work.
+              </p>
             </div>
           </div>
 
@@ -6028,6 +6247,15 @@ function QueryPanel({ stats }) {
   const [streamingMessage, setStreamingMessage] = useState('');
   const [hoveredMessage, setHoveredMessage] = useState(null);
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
+  // queueStatus tracks the request's position while waiting on the server's
+  // local queue. The server emits `: queued position=N/T waited=Xs` as SSE
+  // comments while blocked on acquireLocalSlot. Cleared once tokens arrive.
+  // { position: number, total: number, waitedSec: number } | null
+  const [queueStatus, setQueueStatus] = useState(null);
+  // waitingForFirstToken: true between submit and first content chunk. Shows
+  // a "Thinking..." indicator so the user knows the request is in flight even
+  // before bytes start arriving.
+  const [waitingForFirstToken, setWaitingForFirstToken] = useState(false);
   const [copiedId, setCopiedId] = useState(null);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
@@ -6134,6 +6362,8 @@ function QueryPanel({ stats }) {
     setPrompt('');
     setIsLoading(true);
     setStreamingMessage('');
+    setWaitingForFirstToken(true);
+    setQueueStatus(null);
 
     // Generate title from first message
     const title = isFirstMessage
@@ -6173,6 +6403,20 @@ function QueryPanel({ stats }) {
         const lines = chunk.split('\n');
 
         for (const line of lines) {
+          // SSE comment lines (": ...") carry server-side queue status
+          // while we're blocked waiting on the local queue. Parse them
+          // so the UI can show position + waited time.
+          if (line.startsWith(': ')) {
+            const m = line.match(/queued position=(\d+|\?)\/(\d+) waited=(\d+)s/);
+            if (m) {
+              setQueueStatus({
+                position: m[1] === '?' ? null : parseInt(m[1], 10),
+                total: parseInt(m[2], 10),
+                waitedSec: parseInt(m[3], 10)
+              });
+            }
+            continue;
+          }
           if (line.startsWith('data: ')) {
             const data = line.slice(6);
             if (data === '[DONE]') continue;
@@ -6181,6 +6425,10 @@ function QueryPanel({ stats }) {
               const parsed = JSON.parse(data);
               const content = parsed.choices?.[0]?.delta?.content || '';
               if (content) {
+                if (waitingForFirstToken) {
+                  setWaitingForFirstToken(false);
+                  setQueueStatus(null);
+                }
                 fullContent += content;
                 tokenCount++;
                 setStreamingMessage(fullContent);
@@ -6222,6 +6470,8 @@ function QueryPanel({ stats }) {
       const finalMessages = [...newMessages, assistantMessage];
       setMessages(finalMessages);
       setStreamingMessage('');
+      setWaitingForFirstToken(false);
+      setQueueStatus(null);
 
       // Save to shared history so ChatPage can see it
       const convTitle = title || (messages.length === 0 ? prompt.trim().slice(0, 50) : 'Quick Chat');
@@ -6234,6 +6484,8 @@ function QueryPanel({ stats }) {
         content: `Error: ${err.message}`,
         stats: null
       }]);
+      setWaitingForFirstToken(false);
+      setQueueStatus(null);
     }
 
     setIsLoading(false);
@@ -6329,6 +6581,27 @@ function QueryPanel({ stats }) {
                 <span className="message-role">AI{selectedModel ? ` - ${formatModelName({ id: selectedModel })}` : ''}</span>
               </div>
               <div className="message-content">{parseMessageWithCodeBlocks(streamingMessage)}</div>
+            </div>
+          )}
+          {waitingForFirstToken && !streamingMessage && (
+            <div className="query-message assistant waiting">
+              <div className="message-header">
+                <span className="message-role">AI{selectedModel ? ` - ${formatModelName({ id: selectedModel })}` : ''}</span>
+              </div>
+              <div className="message-content">
+                <span className="query-thinking">
+                  <span className="query-thinking-dot">·</span>
+                  <span className="query-thinking-dot">·</span>
+                  <span className="query-thinking-dot">·</span>
+                  <span className="query-thinking-label">
+                    {queueStatus
+                      ? (queueStatus.position
+                          ? `Queued: position ${queueStatus.position}/${queueStatus.total} — waited ${queueStatus.waitedSec}s`
+                          : `Waiting in queue (${queueStatus.total} ahead) — ${queueStatus.waitedSec}s`)
+                      : 'Thinking…'}
+                  </span>
+                </span>
+              </div>
             </div>
           )}
           <div ref={messagesEndRef} />
@@ -7569,8 +7842,37 @@ function QueuePage({ stats, activeRequestsMap }) {
                     </span>
                     <span className="queue-col-endpoint">{item.endpoint}</span>
                     <span className="queue-col-message" title={live.userMessage}>{live.userMessage ? (live.userMessage.length > 60 ? live.userMessage.slice(0, 57) + '...' : live.userMessage) : '-'}</span>
-                    <span className="queue-col-tokens">{live.tokens || '-'}</span>
-                    <span className={`queue-col-elapsed ${item.elapsed > 120000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
+                    <span className="queue-col-tokens">
+                      {live.tokens || '-'}
+                      {item.preTokenized != null && (
+                        <span className="queue-pretok-tag" title="Pre-tokenized (computed in parallel while queued)">
+                          tok:{item.preTokenized}
+                        </span>
+                      )}
+                      {item.preTokenized == null && item.backend === 'local' && (
+                        <span className="queue-pretok-tag queue-pretok-pending" title="Pre-tokenization pending">
+                          tok:…
+                        </span>
+                      )}
+                      {item.upstreamProbe && (
+                        <span
+                          className={`queue-probe-tag queue-probe-${item.upstreamProbe.phase || 'idle'}`}
+                          title={`llama.cpp slot ${item.upstreamProbe.slotId ?? '?'}: ${item.upstreamProbe.phase}; last probe ${Math.round((Date.now() - (item.upstreamProbe.probedAt || 0)) / 1000)}s ago`}
+                        >
+                          {item.upstreamProbe.phase === 'prompt-processing' ? '🔄 prompt' :
+                           item.upstreamProbe.phase === 'decoding' ? `▶ ${item.upstreamProbe.nDecoded} tok` :
+                           '○ idle'}
+                        </span>
+                      )}
+                    </span>
+                    <span className={`queue-col-elapsed ${(item.activeElapsed ?? item.elapsed) > 120000 ? 'elapsed-warning' : ''}`}>
+                      <div>{formatElapsed(item.activeElapsed ?? item.elapsed)}</div>
+                      {item.activeElapsed != null && item.totalElapsed != null && item.totalElapsed !== item.activeElapsed && (
+                        <div className="queue-elapsed-sub" title="Total time since request entered the proxy (includes queue wait)">
+                          (total {formatElapsed(item.totalElapsed)})
+                        </div>
+                      )}
+                    </span>
                     <span className="queue-col-actions" onClick={e => e.stopPropagation()}>
                       {item.activeRequestId ? (
                         <button
@@ -7607,29 +7909,56 @@ function QueuePage({ stats, activeRequestsMap }) {
               <span className="queue-col-elapsed">Waiting</span>
               <span className="queue-col-actions">Actions</span>
             </div>
-            {pendingItems.map(item => (
-              <div key={item.id} className={`queue-table-row pending ${item.offloaded ? 'offloaded' : ''}`}>
-                <span className="queue-col-id">{item.id}</span>
-                <span className="queue-col-model" title={item.model}>
-                  <span className="queue-model-name">{item.model.length > 25 ? item.model.slice(0, 22) + '...' : item.model}</span>
-                  {item.backendName && <span className="queue-backend-tag">{item.backendName}</span>}
-                </span>
-                <span className="queue-col-endpoint">{item.endpoint}</span>
-                <span className="queue-col-message" title={item.userMessage}>{item.userMessage ? (item.userMessage.length > 60 ? item.userMessage.slice(0, 57) + '...' : item.userMessage) : '-'}</span>
-                <span className="queue-col-tokens">-</span>
-                <span className={`queue-col-elapsed ${item.elapsed > 60000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
-                <span className="queue-col-actions">
-                  <button
-                    className="btn-danger-sm"
-                    onClick={() => cancelItem(item.id)}
-                    disabled={cancelling.has(item.id)}
-                    title="Cancel this request"
-                  >
-                    {cancelling.has(item.id) ? '...' : 'Cancel'}
-                  </button>
-                </span>
-              </div>
-            ))}
+            {pendingItems.map(item => {
+              // Items with an activeRequestId (chat/completions queued behind a slot)
+              // need to be killed via the active-request abort path. Queue-only items
+              // (completions/responses/messages) use the pending-cancel endpoint with
+              // the numeric portion of the prefixed id.
+              const hasActive = item.activeRequestId != null;
+              const cancelKey = hasActive ? `active-${item.activeRequestId}` : item.id;
+              const onCancel = hasActive
+                ? () => killActive(item.activeRequestId)
+                : () => cancelItem(item.queueItemId ?? parseInt(String(item.id).replace(/^q/, ''), 10));
+              const posLabel = item.queuePosition != null
+                ? `#${item.queuePosition}${item.queueLength ? ` of ${item.queueLength}` : ''}`
+                : null;
+              return (
+                <div key={item.id} className={`queue-table-row pending ${item.offloaded ? 'offloaded' : ''}`}>
+                  <span className="queue-col-id">
+                    {item.id}
+                    {posLabel && <div className="queue-position-tag" title={`Position in local queue: ${posLabel}`}>{posLabel}</div>}
+                  </span>
+                  <span className="queue-col-model" title={item.model}>
+                    <span className="queue-model-name">{item.model.length > 25 ? item.model.slice(0, 22) + '...' : item.model}</span>
+                    {item.backendName && <span className="queue-backend-tag">{item.backendName}</span>}
+                  </span>
+                  <span className="queue-col-endpoint">{item.endpoint}</span>
+                  <span className="queue-col-message" title={item.userMessage}>{item.userMessage ? (item.userMessage.length > 60 ? item.userMessage.slice(0, 57) + '...' : item.userMessage) : '-'}</span>
+                  <span className="queue-col-tokens">
+                    {item.preTokenized != null ? (
+                      <span className="queue-pretok-tag" title="Pre-tokenized while queued (CPU work parallel to GPU)">
+                        tok:{item.preTokenized}
+                      </span>
+                    ) : item.backend === 'local' ? (
+                      <span className="queue-pretok-tag queue-pretok-pending" title="Pre-tokenization in progress">
+                        tok:…
+                      </span>
+                    ) : '-'}
+                  </span>
+                  <span className={`queue-col-elapsed ${item.elapsed > 60000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
+                  <span className="queue-col-actions">
+                    <button
+                      className="btn-danger-sm"
+                      onClick={onCancel}
+                      disabled={cancelling.has(cancelKey)}
+                      title={hasActive ? 'Abort this queued request' : 'Cancel this pending request'}
+                    >
+                      {cancelling.has(cancelKey) ? '...' : 'Cancel'}
+                    </button>
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -7666,6 +7995,7 @@ function App() {
             <Route path="/models" element={<ModelsPage stats={stats} />} />
             <Route path="/download" element={<DownloadPage stats={stats} />} />
             <Route path="/logs" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
+            <Route path="/logs/:tab" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
             <Route path="/queue" element={<QueuePage stats={stats} activeRequestsMap={activeRequestsMap} />} />
             <Route path="/processes" element={<ProcessesPage />} />
             <Route path="/settings" element={<SettingsPage />} />

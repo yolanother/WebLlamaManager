@@ -8,6 +8,7 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { cpus, totalmem, freemem, loadavg } from 'os';
 import { EventEmitter } from 'events';
+import { createHash } from 'crypto';
 import pty from 'node-pty';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -29,6 +30,19 @@ const PROJECT_ROOT = dirname(__dirname);
 // Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
 import dotenv from 'dotenv';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
+
+// Safety net: log unhandled rejections instead of crashing the process. Node's
+// default behavior on unhandledRejection (since Node 16) is to terminate. We'd
+// rather log and keep serving — a stray promise rejection from one request
+// shouldn't take down every other in-flight request. The underlying handler
+// fixes (try/catch around acquireLocalSlot, etc.) should prevent these, but
+// this is a backstop for ones we miss.
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
 
 const app = express();
 const httpServer = createServer(app);
@@ -169,6 +183,7 @@ let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
 let lastUsedModel = null;   // most recently used model name
 let lastUsedModelTime = 0;  // timestamp of last use
+let activeLocalModel = null; // model currently being processed/loaded on local backend
 let idleShutdown = false;   // true when server was stopped due to idle timeout
 
 // Request concurrency limiter for llama.cpp upstream requests
@@ -261,6 +276,132 @@ class RequestQueue {
 }
 
 const llamaQueue = new RequestQueue(1); // default: 1 concurrent request
+
+// Stall watchdog defaults: if a local request gets no token for this long, abort it.
+// `localStallMs` in config.json overrides the default; 0 disables the watchdog.
+const DEFAULT_LOCAL_STALL_MS = 60_000;
+const STALL_WATCHDOG_INTERVAL = 5_000;
+
+// === Prefix cache router (Phase 1: sticky-slot routing) ============================
+//
+// llama.cpp's per-slot KV cache automatically matches a request's prompt prefix
+// against whatever the slot last processed and re-uses the matching tokens —
+// only the diff at the tail is re-prompt-processed. When two requests for the
+// same conversation land on different slots, that benefit is lost.
+//
+// We exploit this by hashing the conversation prefix (everything except the
+// last user turn) and remembering which slot last served that prefix for a
+// given model. Subsequent requests for the same prefix are pinned to that
+// slot via the `id_slot` field on the chat completion body — llama.cpp then
+// auto-matches the cached prefix and only processes the new tail. Up to
+// n_parallel distinct conversations cache hot at once.
+//
+// Key shape: `${model}|${sha1(prefixJson).slice(0,16)}`
+// Value:     { slotId, lastUsedAt, hits, misses }
+const conversationSlotMap = new Map();
+const CONVERSATION_MAP_MAX = 256; // LRU cap; bigger than n_parallel since we evict naturally
+
+// Compute a stable hash of the prefix (all messages except the trailing user
+// turn). Returns null if there's no useful prefix to hash on (e.g. the request
+// is just a single user message — nothing to cache).
+function conversationPrefixKey(model, messages) {
+  if (!Array.isArray(messages) || messages.length < 2) return null;
+  // Slice off the trailing run of user messages so we hash on the durable prefix.
+  let cutoff = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') cutoff = i;
+    else break;
+  }
+  if (cutoff <= 0) return null;
+  const prefix = messages.slice(0, cutoff);
+  try {
+    // crypto is already imported up top; use sha1 for speed (not security)
+    const h = createHash('sha1').update(JSON.stringify(prefix)).digest('hex').slice(0, 16);
+    return `${model}|${h}`;
+  } catch { return null; }
+}
+
+// Slot count for the loaded llama-server (cached). Discovered by hitting /slots.
+// Default 4 (matches the n_parallel we observed) until we can probe.
+let llamaSlotCount = 4;
+let _slotCountProbed = false;
+let _slotRoundRobin = 0;
+async function probeSlotCount(model) {
+  if (_slotCountProbed) return;
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return;
+    const data = await r.json();
+    if (Array.isArray(data) && data.length > 0) {
+      llamaSlotCount = data.length;
+      _slotCountProbed = true;
+      console.log(`[prefix-cache] Detected ${llamaSlotCount} llama.cpp slots for ${model}`);
+    }
+  } catch { /* ignore */ }
+}
+
+// Pick or assign a slot for a conversation. Returns { slotId, hit, key } or
+// null if not applicable. We assign slots via round-robin for misses; on a
+// hit we return the same slot the prefix was last seen on so llama.cpp's
+// per-slot auto-prefix-match kicks in.
+function lookupOrAssignSlot(model, messages) {
+  const key = conversationPrefixKey(model, messages);
+  if (!key) return null;
+  const existing = conversationSlotMap.get(key);
+  if (existing) {
+    existing.lastUsedAt = Date.now();
+    existing.hits = (existing.hits || 0) + 1;
+    // Move-to-front for LRU
+    conversationSlotMap.delete(key);
+    conversationSlotMap.set(key, existing);
+    return { slotId: existing.slotId, hit: true, key };
+  }
+  // New prefix: assign next slot in round-robin so we spread distinct
+  // conversations across slots and minimize evictions.
+  const slotId = _slotRoundRobin % llamaSlotCount;
+  _slotRoundRobin = (_slotRoundRobin + 1) >>> 0;
+  conversationSlotMap.set(key, { slotId, lastUsedAt: Date.now(), hits: 0, misses: 1 });
+  if (conversationSlotMap.size > CONVERSATION_MAP_MAX) {
+    const oldestKey = conversationSlotMap.keys().next().value;
+    conversationSlotMap.delete(oldestKey);
+  }
+  return { slotId, hit: false, key };
+}
+
+// === Pre-tokenization queue =========================================================
+// Tokenizing happens on CPU; while a request waits in the local queue for the
+// GPU to be free, we can spend that CPU time tokenizing its prompt. Results
+// are stashed on the activeRequest entry and (when present) sent to llama.cpp
+// as a pre-tokenized `prompt` array so its own tokenizer pass is skipped.
+//
+// Tokenization is best-effort: if it fails (model not loaded, timeout, etc.)
+// we silently fall through to letting llama.cpp tokenize as normal.
+async function preTokenize(model, messages, signal) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  // Flatten messages to a single string for tokenize — llama.cpp's /tokenize
+  // doesn't know the chat template, so this gives an approximate count + the
+  // raw text token IDs we can use for cache key chunking later.
+  let text = '';
+  for (const m of messages) {
+    const role = m.role || '';
+    const c = m.content;
+    text += `\n${role}: `;
+    if (typeof c === 'string') text += c;
+    else if (Array.isArray(c)) text += c.map(p => p.type === 'text' ? p.text : '').join('');
+  }
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/tokenize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text, model, add_special: false }),
+      signal: signal || AbortSignal.timeout(15000)
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (Array.isArray(data?.tokens)) return data.tokens;
+    return null;
+  } catch { return null; }
+}
 
 // Remote backend load balancing
 const backendQueues = new Map();  // backend.id -> RequestQueue
@@ -370,35 +511,70 @@ function resolveBackend(requestedModel, endpoint, body) {
   if (policy === 'manual') {
     // Only offload via explicit prefix (handled above)
     return { remote: false };
-  } else if (policy === 'overflow') {
-    // Offload when local queue is at capacity (active requests >= concurrency limit)
-    // This triggers offload for the current request that would otherwise have to wait
-    shouldOffload = llamaQueue.active >= llamaQueue.concurrency;
-  } else if (policy === 'threshold') {
-    const queueDepth = backends.offloadThresholdQueueDepth ?? 2;
-    const waitMs = backends.offloadThresholdWaitMs ?? 5000;
-    shouldOffload = llamaQueue.pending >= queueDepth;
-    // Estimate wait based on average recent request duration
-    if (!shouldOffload && waitMs > 0) {
-      const recentDurations = tokenStats.recentRequests.slice(-10).map(r => r.duration || 0);
-      if (recentDurations.length > 0) {
-        const avgDuration = recentDurations.reduce((a, b) => a + b, 0) / recentDurations.length;
-        const estimatedWait = llamaQueue.pending * avgDuration;
-        shouldOffload = estimatedWait > waitMs;
-      }
-    }
-  } else if (policy === 'percentage') {
-    const pct = backends.offloadPercentage || 0;
-    if (pct > 0) {
-      offloadCounter = (offloadCounter + 1) % 100;
-      shouldOffload = offloadCounter < pct;
+  }
+
+  // preferLocal=false means "spread offloadable work to remote whenever possible".
+  // Don't tie up the local slot with requests that have a viable remote backend —
+  // reserve local for non-offloadable models (those with no remote mapping). When
+  // a request is offloadable AND a remote has capacity, we offload even if local
+  // is idle. Falls back to local automatically if no remote candidate is viable
+  // (mapping missing, circuit open, queue full, etc.).
+  const preferLocal = backends.preferLocal !== false;
+  if (!preferLocal) {
+    const endpointKey = endpoint.replace(/\//g, '/');
+    const hasViableRemote = backends.directory.some(b => {
+      if (!b.enabled || !b.tested) return false;
+      if (isBackendCircuitOpen(b.id)) return false;
+      if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
+      if (!b.modelMapping) return false;
+      if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
+      const queue = backendQueues.get(b.id);
+      if (queue && queue.active >= queue.concurrency) return false;
+      return true;
+    });
+    if (hasViableRemote) {
+      shouldOffload = true;
+      console.log(`[routing] Prefer-remote: "${requestedModel}" has a viable remote backend (preferLocal=false), keeping local slot free for non-offloadable work`);
     }
   }
 
-  // For all policies: if a different model is currently loaded/active and we'd need a model switch,
-  // prefer offloading to avoid the expensive switch wait
-  if (!shouldOffload && llamaQueue.active > 0 && lastUsedModel && lastUsedModel !== requestedModel) {
-    shouldOffload = true;
+  if (!shouldOffload) {
+    if (policy === 'overflow') {
+      // Offload when local queue is at capacity (active requests >= concurrency limit).
+      // This triggers offload for the current request that would otherwise have to wait.
+      shouldOffload = llamaQueue.active >= llamaQueue.concurrency;
+    } else if (policy === 'threshold') {
+      const queueDepth = backends.offloadThresholdQueueDepth ?? 2;
+      const waitMs = backends.offloadThresholdWaitMs ?? 5000;
+      shouldOffload = llamaQueue.pending >= queueDepth;
+      // Estimate wait based on average recent request duration
+      if (!shouldOffload && waitMs > 0) {
+        const recentDurations = tokenStats.recentRequests.slice(-10).map(r => r.duration || 0);
+        if (recentDurations.length > 0) {
+          const avgDuration = recentDurations.reduce((a, b) => a + b, 0) / recentDurations.length;
+          const estimatedWait = llamaQueue.pending * avgDuration;
+          shouldOffload = estimatedWait > waitMs;
+        }
+      }
+    } else if (policy === 'percentage') {
+      const pct = backends.offloadPercentage || 0;
+      if (pct > 0) {
+        offloadCounter = (offloadCounter + 1) % 100;
+        shouldOffload = offloadCounter < pct;
+      }
+    }
+  }
+
+  // For all policies: if a different model is currently being processed or was last used,
+  // prefer offloading to avoid the expensive model-switch wait.
+  // Uses activeLocalModel (what's in-flight right now) over lastUsedModel (last completed),
+  // so we detect conflicts even while a heavy model is still loading.
+  if (!shouldOffload && llamaQueue.active > 0) {
+    const effectiveModel = activeLocalModel || lastUsedModel;
+    if (effectiveModel && effectiveModel !== requestedModel) {
+      shouldOffload = true;
+      console.log(`[routing] Model-switch offload: local is processing "${effectiveModel}", request wants "${requestedModel}"`);
+    }
   }
 
   // Estimate-based offload: if input is large and local processing would be slow,
@@ -419,7 +595,7 @@ function resolveBackend(requestedModel, endpoint, body) {
     return { remote: false };
   }
 
-  // Pick best backend (must be enabled, tested, and have a model mapping)
+  // Pick best backend (must be enabled, tested, have capacity, and have a model mapping)
   const endpointKey = endpoint.replace(/\//g, '/');
   const candidates = backends.directory.filter(b => {
     if (!b.enabled) return false;
@@ -428,18 +604,34 @@ function resolveBackend(requestedModel, endpoint, body) {
     if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
     // Check model mapping (exact match, glob patterns, or * catch-all)
     if (!b.modelMapping) return false;
-    return !!resolveModelMapping(b.modelMapping, requestedModel);
+    if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
+    // Backpressure: skip backends whose queue is at capacity so we don't pile
+    // work onto an overloaded endpoint. If ALL backends are full, we fall through
+    // to local processing rather than making things worse.
+    const queue = backendQueues.get(b.id);
+    if (queue && queue.active >= queue.concurrency) {
+      console.log(`[routing] Skipping backend ${b.name}: queue full (${queue.active}/${queue.concurrency} active, ${queue.pending} pending)`);
+      return false;
+    }
+    return true;
   });
 
   if (candidates.length === 0) {
     return { remote: false };
   }
 
-  // Sort by priority, then sharedResourceWeight, then lowest active count
+  // Sort by: priority (lower = better), then token speed (higher = better),
+  // then sharedResourceWeight (lower = better), then lowest active queue count.
+  // Token speed uses the exponential moving average from completed requests,
+  // so faster backends are preferred over slower ones at the same priority level.
   candidates.sort((a, b) => {
     const pa = a.priority ?? 50;
     const pb = b.priority ?? 50;
     if (pa !== pb) return pa - pb;
+    // Prefer faster backends (higher avgTokPerSec is better, so sort descending)
+    const tpsA = backendStats.get(a.id)?.avgTokPerSec || 0;
+    const tpsB = backendStats.get(b.id)?.avgTokPerSec || 0;
+    if (tpsA !== tpsB) return tpsB - tpsA;
     const wa = a.sharedResourceWeight ?? 0;
     const wb = b.sharedResourceWeight ?? 0;
     if (wa !== wb) return wa - wb;
@@ -449,6 +641,9 @@ function resolveBackend(requestedModel, endpoint, body) {
   });
 
   const chosen = candidates[0];
+  const chosenQueue = backendQueues.get(chosen.id);
+  const chosenStats = backendStats.get(chosen.id);
+  console.log(`[routing] Selected backend: ${chosen.name} (${chosenQueue?.active || 0}/${chosenQueue?.concurrency || '?'} active, ${Math.round(chosenStats?.avgTokPerSec || 0)} tok/s, priority=${chosen.priority ?? 50})`);
   const remoteModel = resolveModelMapping(chosen.modelMapping, requestedModel);
   return buildRemoteRouting(chosen, remoteModel, endpoint);
 }
@@ -473,6 +668,199 @@ function buildRemoteRouting(backend, remoteModel, endpoint) {
   };
 }
 
+// Find the fastest available remote backend with capacity for a given model and endpoint.
+// Returns the best candidate backend config object, or null if none available.
+function findFastestAvailableBackend(requestedModel, endpoint) {
+  const backends = config.backends || {};
+  if (!backends.enabled || !backends.directory?.length) return null;
+
+  const endpointKey = endpoint.replace(/\//g, '/');
+  const candidates = backends.directory.filter(b => {
+    if (!b.enabled || !b.tested) return false;
+    if (isBackendCircuitOpen(b.id)) return false;
+    if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
+    if (!b.modelMapping) return false;
+    if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
+    const queue = backendQueues.get(b.id);
+    if (queue && queue.active >= queue.concurrency) return false;
+    return true;
+  });
+
+  if (candidates.length === 0) return null;
+
+  // Sort by token speed (fastest first)
+  candidates.sort((a, b) => {
+    const tpsA = backendStats.get(a.id)?.avgTokPerSec || 0;
+    const tpsB = backendStats.get(b.id)?.avgTokPerSec || 0;
+    return tpsB - tpsA;
+  });
+
+  return candidates[0];
+}
+
+// Backfill race: when a request stalls with no output, race it against the fastest
+// available remote backend. Whichever produces a response first wins; the loser is aborted.
+// Called from the local handler path. Also triggered event-driven when other requests complete.
+function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isStreaming, startTime, activeReqId }) {
+  const backends = config.backends || {};
+  if (!backends.enabled || !backends.directory?.length) return null;
+
+  const stallMs = backends.backfillStallMs ?? 15000;
+  const entry = activeRequests.get(activeReqId);
+  if (!entry) return null;
+
+  const doBackfill = async () => {
+    if (res.headersSent) return;
+    if (entry._backfillStarted) return;
+    if (entry.tokens > 0) return;
+    entry._backfillStarted = true;
+
+    const chosen = findFastestAvailableBackend(requestedModel, endpoint);
+    if (!chosen) {
+      entry._backfillStarted = false; // allow retry when another request completes
+      return;
+    }
+
+    const remoteModel = resolveModelMapping(chosen.modelMapping, requestedModel);
+    const routing = buildRemoteRouting(chosen, remoteModel, endpoint);
+    const remoteBody = { ...proxyBody, model: remoteModel };
+    const elapsed = Date.now() - startTime;
+
+    console.log(`[backfill] Request ${activeReqId} stalled ${elapsed}ms with 0 tokens, racing on ${chosen.name} (${Math.round(backendStats.get(chosen.id)?.avgTokPerSec || 0)} tok/s)`);
+    addLog('backends', `Backfill: racing stalled ${requestedModel} request on ${chosen.name} after ${Math.round(elapsed / 1000)}s`);
+
+    try {
+      const { response, backend } = await fetchRemoteBackend(chosen, routing.targetUrl, {
+        method: 'POST',
+        headers: { ...routing.headers },
+        body: JSON.stringify(remoteBody)
+      }, { label: 'backfill', model: remoteModel });
+
+      // Primary might have won while we were fetching
+      if (res.headersSent) {
+        console.log(`[backfill] Primary won while backfill was fetching from ${chosen.name}`);
+        try { if (response.body) { const r = response.body.getReader(); while (!(await r.read()).done); } } catch {}
+        return;
+      }
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.log(`[backfill] ${chosen.name} returned ${response.status}, letting primary continue`);
+        entry._backfillStarted = false;
+        return;
+      }
+
+      // === BACKFILL WINS ===
+      console.log(`[backfill] Won! Serving ${requestedModel} from ${chosen.name}, aborting primary after ${Date.now() - startTime}ms`);
+      addLog('backends', `Backfill won: ${chosen.name} beat ${entry.backend} for ${requestedModel} after ${Math.round((Date.now() - startTime) / 1000)}s`);
+
+      // Abort the primary request so its handler bails out
+      if (entry.abortController) entry.abortController.abort();
+      entry.backend = chosen.id;
+
+      if (isStreaming) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let completionTokens = 0, promptTokens = 0, responseText = '';
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value);
+
+            // Normalize model field in streaming chunks
+            const lines = chunk.split('\n');
+            const rewrittenLines = [];
+            let needsRewrite = false;
+            for (const line of lines) {
+              if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  const delta = data.choices?.[0]?.delta;
+                  if (delta) {
+                    const text = delta.content || delta.reasoning_content || delta.reasoning || '';
+                    if (text) { completionTokens++; responseText += text; updateActiveRequest(activeReqId, text); }
+                  }
+                  if (data.usage) { promptTokens = data.usage.prompt_tokens || promptTokens; completionTokens = data.usage.completion_tokens || completionTokens; }
+                  if (data.model && data.model !== requestedModel) {
+                    data.model = requestedModel;
+                    needsRewrite = true;
+                  }
+                  rewrittenLines.push(needsRewrite ? 'data: ' + JSON.stringify(data) : line);
+                } catch {
+                  rewrittenLines.push(line);
+                }
+              } else {
+                rewrittenLines.push(line);
+              }
+            }
+            res.write(needsRewrite ? rewrittenLines.join('\n') : chunk);
+          }
+          res.end();
+
+          const duration = Date.now() - startTime;
+          const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
+          recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: chosen.name });
+          updateBackendTokenStats(chosen.id, promptTokens, completionTokens, duration, chosen);
+          addLlmLog({
+            endpoint, model: requestedModel, stream: true, status: 200, duration, promptTokens, completionTokens,
+            tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+            messages: req.body.messages || null, prompt: null, response: responseText, error: null,
+            backend: chosen.id, requestBody: req.body, backfill: true
+          });
+          endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
+        } catch (e) {
+          console.error(`[backfill] Stream error from ${chosen.name}:`, e.message);
+          if (!res.writableEnded) res.end();
+          endActiveRequest(activeReqId, { status: 'error' });
+        }
+      } else {
+        // Non-streaming backfill response
+        const data = await response.json();
+        const duration = Date.now() - startTime;
+        const usage = data.usage || {};
+        const bfPromptTokens = usage.prompt_tokens || 0;
+        const bfCompletionTokens = usage.completion_tokens || 0;
+        const tokensPerSecond = duration > 0 ? (bfCompletionTokens / (duration / 1000)) : 0;
+
+        recordTokenStats({ promptTokens: bfPromptTokens, completionTokens: bfCompletionTokens, tokensPerSecond, model: requestedModel, duration, backend: chosen.name });
+        updateBackendTokenStats(chosen.id, bfPromptTokens, bfCompletionTokens, duration, chosen);
+        addLlmLog({
+          endpoint, model: requestedModel, stream: false, status: 200, duration,
+          promptTokens: bfPromptTokens, completionTokens: bfCompletionTokens,
+          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+          messages: req.body.messages || null, prompt: null,
+          response: data.choices?.[0]?.message?.content || null, error: null,
+          backend: chosen.id, requestBody: req.body, backfill: true
+        });
+
+        if (data.model) data.model = requestedModel;
+        data._llama_manager = enrichLlamaManagerMeta(
+          { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: chosen.id, backfill: true },
+          { completionTokens: bfCompletionTokens }
+        );
+        endActiveRequest(activeReqId, { status: 'complete', tokens: bfCompletionTokens, responseText: data.choices?.[0]?.message?.content || '' });
+        res.json(data);
+      }
+    } catch (err) {
+      console.log(`[backfill] Failed on ${chosen.name}: ${err.message}`);
+      entry._backfillStarted = false;
+    }
+  };
+
+  // Store callback for event-driven trigger (when other requests complete)
+  entry._triggerBackfill = doBackfill;
+
+  // Timer-based trigger
+  const timer = setTimeout(doBackfill, stallMs);
+  return timer;
+}
+
 // Fetch from a remote backend with retry and per-backend queue
 // Circuit breaker state per backend
 const backendCircuitBreakers = new Map(); // backend.id -> { failures, lastFailure, trippedAt }
@@ -491,6 +879,56 @@ function recordBackendSuccess(backendId) {
   backendCircuitBreakers.set(backendId, { failures: 0, lastFailure: 0, trippedAt: null });
 }
 
+// ---------------------------------------------------------------------------
+// LLM-response metadata enrichment.
+//
+// Callers want to see whether a request actually ran on GPU and to be warned
+// when throughput drops into "this almost certainly fell back to CPU"
+// territory. We compute three derived fields from the base
+// `_llama_manager` envelope:
+//
+//   compute  — "local-gpu" | "local-cpu" | "remote"
+//   warning  — string when tok/s implies CPU fallback (else undefined)
+//   slow     — boolean, true when tokensPerSecond < SLOW_TPS_THRESHOLD
+//
+// "local-cpu" detection is heuristic: a local backend that produced more
+// than a handful of tokens but at <5 tok/s is overwhelmingly likely to be
+// running on CPU. The threshold (`LOCAL_CPU_TPS_CEILING`) is conservative —
+// any real GPU run on Strix Halo / consumer NVIDIA easily clears 10 tok/s
+// for the kinds of models we run, so 5 is a safe floor.
+// ---------------------------------------------------------------------------
+
+const SLOW_TPS_THRESHOLD = 1;           // tok/s under which we flag the caller
+const LOCAL_CPU_TPS_CEILING = 5;        // local backend running below this = CPU
+const MIN_TOKENS_FOR_TPS_TRUST = 8;     // smaller samples are too noisy to classify
+
+function enrichLlamaManagerMeta(meta, opts = {}) {
+  if (!meta || typeof meta !== 'object') return meta;
+  const tps = Number(meta.tokensPerSecond) || 0;
+  const completionTokens = Number(opts.completionTokens) || 0;
+  const isLocal = meta.backend === 'local' || meta.backend === undefined;
+
+  let compute;
+  if (!isLocal) {
+    compute = 'remote';
+  } else if (completionTokens >= MIN_TOKENS_FOR_TPS_TRUST && tps > 0 && tps < LOCAL_CPU_TPS_CEILING) {
+    compute = 'local-cpu';
+  } else if (completionTokens >= MIN_TOKENS_FOR_TPS_TRUST && tps >= LOCAL_CPU_TPS_CEILING) {
+    compute = 'local-gpu';
+  } else {
+    compute = isLocal ? 'local-unknown' : 'remote';
+  }
+  meta.compute = compute;
+
+  if (tps > 0 && tps < SLOW_TPS_THRESHOLD && completionTokens >= MIN_TOKENS_FOR_TPS_TRUST) {
+    meta.slow = true;
+    meta.warning = `Sub-${SLOW_TPS_THRESHOLD} tok/s (${tps.toFixed(2)}) — request almost certainly ran on CPU. See dashboard for GPU health.`;
+  } else {
+    meta.slow = false;
+  }
+  return meta;
+}
+
 function recordBackendFailure(backendId, backendName) {
   const cb = backendCircuitBreakers.get(backendId) || { failures: 0, lastFailure: 0, trippedAt: null };
   cb.failures++;
@@ -503,7 +941,7 @@ function recordBackendFailure(backendId, backendName) {
   backendCircuitBreakers.set(backendId, cb);
 }
 
-async function fetchRemoteBackend(backend, url, options, { label = 'remote', model } = {}) {
+async function fetchRemoteBackend(backend, url, options, { label = 'remote', model, externalSignal } = {}) {
   const queue = backendQueues.get(backend.id);
   if (!queue) {
     throw new Error(`No queue for backend ${backend.id}`);
@@ -525,16 +963,44 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
   const startTime = Date.now();
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || 120000);
-    const fetchOptions = { ...options, signal: controller.signal };
-
     let lastError;
     const maxRetries = 3;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      // Create a FRESH controller + timeout per attempt. The old code reused
+      // one controller across retries, so once it aborted (first timeout or
+      // first cancellation), every subsequent retry immediately threw
+      // "This operation was aborted" without actually contacting the backend.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || 120000);
+      // Compose with the caller's externalSignal (e.g. activeRequest's
+      // abortController) so the watchdog or a user-initiated kill can also
+      // tear down a hung remote fetch — including after headers arrive but
+      // the body stream stops sending data.
+      let externalAbortHandler = null;
+      if (externalSignal) {
+        if (externalSignal.aborted) controller.abort();
+        else {
+          externalAbortHandler = () => controller.abort();
+          externalSignal.addEventListener('abort', externalAbortHandler, { once: true });
+        }
+      }
+      const fetchOptions = { ...options, signal: controller.signal };
       try {
         const response = await fetch(url, fetchOptions);
         clearTimeout(timeout);
+        // Keep externalAbortHandler active — caller's signal may still need
+        // to tear down a stalled body stream after headers arrive. We remove
+        // it in the response-consumer (the proxy handler) via a `.finally`.
+
+        // If the external signal aborted DURING our fetch but before headers
+        // arrived (race), don't count as a backend failure — the caller gave
+        // up. This happens when the client disconnects mid-fetch.
+        if (externalSignal?.aborted) {
+          if (externalAbortHandler) {
+            try { externalSignal.removeEventListener('abort', externalAbortHandler); } catch {}
+          }
+          throw new Error('External signal aborted (client cancelled)');
+        }
 
         const duration = Date.now() - startTime;
         if (stats) {
@@ -555,7 +1021,21 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
         return { response, retries: attempt, backend };
       } catch (err) {
         clearTimeout(timeout);
+        if (externalAbortHandler && externalSignal) {
+          try { externalSignal.removeEventListener('abort', externalAbortHandler); } catch {}
+        }
         lastError = err;
+        // Caller-side abort (client disconnect, watchdog-from-client side):
+        // not a backend failure. Don't retry, don't count toward the
+        // consecutive-failures counter that would trip the circuit breaker.
+        if (externalSignal?.aborted) {
+          throw err;
+        }
+        // If the breaker tripped while we were retrying, stop early — no
+        // point hammering a backend we just decided to back off from.
+        if (isBackendCircuitOpen(backend.id)) {
+          break;
+        }
         if (attempt < maxRetries) {
           const delay = 1000 * Math.pow(2, attempt);
           console.log(`[${label}][${backend.name}] Retry ${attempt + 1}/${maxRetries}: ${err.message}`);
@@ -612,7 +1092,8 @@ const analyticsData = {
   memory: [],        // { timestamp, vram, gtt, system }
   tokens: [],        // { timestamp, promptTokens, completionTokens, tokensPerSecond, model }
   context: [],       // { timestamp, usedContext, totalContext, usage }
-  queue: []          // { timestamp, active, pending, concurrency }
+  queue: [],         // { timestamp, active, pending, concurrency }
+  usage: []          // { timestamp, gpu, cpu }  -- compute utilization %
 };
 
 // Persistent analytics storage (minute-level aggregates in JSONL file)
@@ -716,7 +1197,16 @@ const requestStatsAccum = {
   totalPromptTokens: 0,
   totalCompletionTokens: 0,
   offloaded: 0,     // requests sent to remote backends this minute
-  backendCounts: {}  // per-backend request counts this minute
+  backendCounts: {}, // per-backend request counts this minute
+  watchdogKills: 0   // local requests killed by the stall watchdog this minute
+};
+
+// Cumulative watchdog stats (since process start) — surfaced via /api/stats
+const watchdogStats = {
+  totalKills: 0,
+  lastKillAt: null,
+  lastKillModel: null,
+  lastKillStallMs: null
 };
 
 // Flush minute-level aggregate to persistent storage
@@ -814,6 +1304,7 @@ function flushAnalyticsMinute() {
   requestStatsAccum.totalCompletionTokens = 0;
   requestStatsAccum.offloaded = 0;
   requestStatsAccum.backendCounts = {};
+  requestStatsAccum.watchdogKills = 0;
 }
 
 // Flush every 60 seconds
@@ -834,10 +1325,20 @@ let logBuffer = [];
 let lastLogEntry = null;
 let lastLogCount = 0;
 
-// Default log patterns to filter out (noisy polling endpoints)
+// Default log patterns to filter out. These are llama.cpp's per-slot/per-request
+// access-log lines that our own probe/watchdog/proxy hits on a tight cadence —
+// they swamp the Server logs tab and aren't actionable. LLM completion details
+// go on the dedicated LLM Logs tab; this just keeps the server tab signal-only.
 const DEFAULT_LOG_FILTERS = [
+  // Llama.cpp HTTP access log noise from our own polling
   'GET /health.*200',
   'GET /models.*200',
+  'srv  log_server_r: (request|done request): GET /slots',
+  'srv  log_server_r: (request|done request): GET /props',
+  'srv  log_server_r: (request|done request): GET /models',
+  'srv  log_server_r: (request|done request): GET /health',
+  // Internal proxy chatter — every chat completion logs this twice
+  'srv  proxy_reques: proxying request',
 ];
 
 function shouldFilterLog(line, customFilters = []) {
@@ -976,8 +1477,22 @@ function startActiveRequest({ model, endpoint, messages, prompt, backend }) {
   const abortController = new AbortController();
   // Store full context for debugging (messages array or prompt)
   const fullContext = messages && Array.isArray(messages) ? messages : (prompt ? [{ role: 'user', content: prompt }] : []);
-  const entry = { id, model, endpoint, userMessage, fullContext, responseText: '', startTime: Date.now(), status: 'processing', tokens: 0, backend: backend || 'local', abortController };
+  const now = Date.now();
+  // lastActivityAt is updated on every token (updateActiveRequest); the stall watchdog
+  // aborts entries where (now - lastActivityAt) exceeds config.localStallMs.
+  // slotAcquiredAt is set when the local queue slot is granted (in acquireLocalSlot);
+  // null while waiting in the queue. UI shows "active" elapsed = now - slotAcquiredAt
+  // vs "total" elapsed = now - startTime, so the operator can tell queue-wait from
+  // actual upstream work.
+  // upstreamProbe captures the latest llama.cpp /slots state for this request —
+  // proof-of-life during long prompt processing (no tokens yet but slot busy).
+  const entry = { id, model, endpoint, userMessage, fullContext, responseText: '', startTime: now, lastActivityAt: now, slotAcquiredAt: null, upstreamProbe: null, status: 'processing', tokens: 0, backend: backend || 'local', abortController };
   activeRequests.set(id, entry);
+  // Track which model is actively being processed on the local backend
+  // This is used by the offload logic to detect model-switch conflicts while a model is still loading
+  if ((backend || 'local') === 'local') {
+    activeLocalModel = model;
+  }
   // Broadcast without non-serializable fields (abortController)
   const { abortController: _ac, ...broadcastData } = entry;
   broadcastActiveRequest('start', broadcastData);
@@ -995,6 +1510,8 @@ function updateActiveRequest(id, text) {
   if (!entry) return;
   entry.responseText += text;
   entry.tokens++;
+  // Reset stall watchdog clock on each token — the request is making progress.
+  entry.lastActivityAt = Date.now();
   // Emit for SSE watchers on every token
   activeRequestEvents.emit(`update:${id}`, { id, responseText: entry.responseText, tokens: entry.tokens, duration: Date.now() - entry.startTime });
   // Throttle WebSocket broadcasts: every 5 tokens to avoid flooding
@@ -1020,6 +1537,27 @@ function endActiveRequest(id, { status = 'complete', tokens = 0, responseText } 
   activeRequestEvents.removeAllListeners(`update:${id}`);
   activeRequestEvents.removeAllListeners(`end:${id}`);
   activeRequests.delete(id);
+  // Update activeLocalModel: find the most recent local request still in-flight, or clear it
+  if (entry.backend === 'local') {
+    const remainingLocal = [...activeRequests.values()].filter(r => r.backend === 'local');
+    activeLocalModel = remainingLocal.length > 0 ? remainingLocal[remainingLocal.length - 1].model : null;
+  }
+
+  // Event-driven backfill trigger: when a request completes, check if any other
+  // requests are stalled and could benefit from backfill racing on a faster backend.
+  // This catches cases where the timer hasn't fired yet but we know a backend is free.
+  const backfillStallMs = config?.backends?.backfillStallMs ?? 15000;
+  const now = Date.now();
+  for (const [otherId, otherEntry] of activeRequests) {
+    if (otherEntry.tokens > 0) continue; // already producing output
+    if (otherEntry._backfillStarted) continue; // already racing
+    if (now - otherEntry.startTime < backfillStallMs) continue; // not stalled long enough
+    if (otherEntry._triggerBackfill) {
+      console.log(`[backfill] Request ${otherId} stalled, triggered by completion of request ${id}`);
+      otherEntry._triggerBackfill();
+      break; // one at a time to avoid overwhelming backends
+    }
+  }
 }
 
 // Add analytics data point
@@ -1277,6 +1815,28 @@ async function getSystemStats() {
       concurrency: llamaQueue.concurrency,
       totalQueued: llamaQueue.queuedCount
     },
+    watchdog: {
+      totalKills: watchdogStats.totalKills,
+      lastKillAt: watchdogStats.lastKillAt,
+      lastKillModel: watchdogStats.lastKillModel,
+      lastKillStallMs: watchdogStats.lastKillStallMs,
+      stallMs: config?.localStallMs ?? DEFAULT_LOCAL_STALL_MS
+    },
+    prefixCache: (() => {
+      let hits = 0, misses = 0;
+      for (const v of conversationSlotMap.values()) {
+        hits += v.hits || 0;
+        misses += v.misses || 0;
+      }
+      return {
+        entries: conversationSlotMap.size,
+        slots: llamaSlotCount,
+        slotsDetected: _slotCountProbed,
+        hits,
+        misses,
+        hitRate: hits + misses > 0 ? Math.round((hits / (hits + misses)) * 1000) / 10 : null
+      };
+    })(),
     activeModel: activeRequests.size > 0 ? [...activeRequests.values()][0]?.model : null,
     lastUsedModel,
     lastUsedModelTime,
@@ -1484,9 +2044,27 @@ async function getGpuStats() {
           // If GTT is larger than VRAM, prefer showing GTT as it represents usable memory
           const isAPU = gttStats.total > vramTotal;
 
+          // Strix Halo + ROCm 7 quirk: rocm-smi's "GPU use (%)" reads 0 even
+          // during active inference. The kernel's gpu_busy_percent and sclk
+          // (which sticks at 600 MHz reported value) are equally broken on
+          // this iGPU. Power is the only signal that actually moves: idle
+          // sits around 25-35W, active compute pushes 100-130W. Derive a
+          // usage proxy from package power. If we see a real rocm-smi GPU%
+          // number, prefer that (other GPUs report this correctly).
+          const reportedUsage = parseFloat(card['GPU use (%)'] || card.gpu_use || 0);
+          let usage = reportedUsage;
+          if (reportedUsage === 0 && isAPU && power > 0) {
+            // Map power 35W -> 0%, 130W -> 100%.
+            const POWER_IDLE = 35;
+            const POWER_MAX = 130;
+            usage = Math.max(0, Math.min(100,
+              Math.round(((power - POWER_IDLE) / (POWER_MAX - POWER_IDLE)) * 100)
+            ));
+          }
           resolve({
             temperature: parseFloat(card['Temperature (Sensor edge) (C)'] || card.temperature || 0),
-            usage: parseFloat(card['GPU use (%)'] || card.gpu_use || 0),
+            usage,
+            usageRaw: reportedUsage,
             power,
             coreClock,
             memClock,
@@ -1597,6 +2175,10 @@ async function broadcastStats() {
         vram: stats.gpu.vram?.usage || 0,
         gtt: stats.gpu.gtt?.usage || 0,
         system: stats.memory?.usage || 0
+      });
+      addAnalyticsPoint('usage', {
+        gpu: stats.gpu.usage || 0,
+        cpu: stats.cpu?.usage || 0
       });
     } else if (stats.cpu?.temperature) {
       addAnalyticsPoint('temperature', {
@@ -1795,6 +2377,7 @@ app.get('/api/settings', (req, res) => {
       gpuLayers: config.gpuLayers || 99,
       requestLogging: config.requestLogging || false,
       maxConcurrentRequests: config.maxConcurrentRequests || 1,
+      localStallMs: config.localStallMs ?? DEFAULT_LOCAL_STALL_MS,
       defaultReasoningEffort: config.defaultReasoningEffort || null,
       modelReasoningEffort: config.modelReasoningEffort || {},
       fullscreenInterval: config.fullscreenInterval || 30000,
@@ -1821,7 +2404,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, defaultReasoningEffort, modelReasoningEffort, fullscreenInterval } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, fullscreenInterval } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -1875,6 +2458,15 @@ app.post('/api/settings', (req, res) => {
     } else {
       return res.status(400).json({ error: 'Max concurrent requests must be between 1 and 32' });
     }
+  }
+
+  if (localStallMs !== undefined) {
+    // 0 (or any non-positive number) disables the watchdog. Allow up to 1 hour as a safety upper bound.
+    const ms = parseInt(localStallMs);
+    if (!Number.isFinite(ms) || ms < 0 || ms > 3_600_000) {
+      return res.status(400).json({ error: 'localStallMs must be between 0 (disabled) and 3600000 (1 hour)' });
+    }
+    config.localStallMs = ms;
   }
 
   if (defaultReasoningEffort !== undefined) {
@@ -2355,6 +2947,63 @@ app.get('/health', async (req, res) => {
   });
 });
 
+// Local GPU health check — surfaces the Strix Halo /dev/kfd EINVAL state
+// so the dashboard can alarm on it and operators can correlate sub-1
+// tok/s requests with a broken local accelerator. Returns:
+//   { healthy: boolean, kfd: 'ok'|'einval'|'unavailable', detail: string,
+//     gpuBusyPercent: number|null, gpuVramUsedBytes: number|null }
+app.get('/api/health/gpu', async (req, res) => {
+  let kfd = 'unavailable';
+  let detail = '';
+  try {
+    const { promisify } = await import('util');
+    const fs = await import('fs');
+    const openAsync = promisify(fs.open);
+    const closeAsync = promisify(fs.close);
+    const fd = await openAsync('/dev/kfd', 'r+');
+    await closeAsync(fd);
+    kfd = 'ok';
+  } catch (e) {
+    if (e && (e.code === 'EINVAL' || e.errno === -22)) {
+      kfd = 'einval';
+      detail = '/dev/kfd open returned EINVAL — KFD state wedged. ' +
+               'If you blacklisted amdxdna recently, REBOOT is required ' +
+               'for the iGPU to come back. See docs/GOTCHAS.md.';
+    } else if (e && e.code === 'ENOENT') {
+      kfd = 'unavailable';
+      detail = '/dev/kfd not present (no AMD compute GPU on this host?)';
+    } else {
+      detail = `open /dev/kfd: ${e && (e.code || e.message)}`;
+    }
+  }
+
+  let gpuBusyPercent = null;
+  let gpuVramUsedBytes = null;
+  try {
+    const fs = await import('fs/promises');
+    const dirs = (await fs.readdir('/sys/class/drm'))
+      .filter(d => /^card\d+$/.test(d))
+      .map(d => `/sys/class/drm/${d}/device`);
+    for (const dir of dirs) {
+      try {
+        const vendor = (await fs.readFile(`${dir}/vendor`, 'utf8')).trim();
+        if (vendor !== '0x1002') continue; // only AMD
+        const busy = (await fs.readFile(`${dir}/gpu_busy_percent`, 'utf8')).trim();
+        const used = (await fs.readFile(`${dir}/mem_info_vram_used`, 'utf8')).trim();
+        gpuBusyPercent = parseInt(busy, 10);
+        gpuVramUsedBytes = parseInt(used, 10);
+        break;
+      } catch { /* keep looking */ }
+    }
+  } catch { /* fall through, leave nulls */ }
+
+  const healthy = kfd === 'ok';
+  res.status(healthy ? 200 : 503).json({
+    healthy, kfd, detail,
+    gpuBusyPercent, gpuVramUsedBytes
+  });
+});
+
 // Proxy llama.cpp backend /health — returns raw llama-server health status
 app.get('/api/v1/health', async (req, res) => {
   try {
@@ -2386,23 +3035,40 @@ app.get('/api/queue', (req, res) => {
   const backendNameMap = {};
   for (const b of backendDir) backendNameMap[b.id] = b.name || b.id;
 
-  // Active requests from the activeRequests map (includes both local and remote)
-  const activeItems = [...activeRequests.values()].map(ar => {
+  // Build a set of activeRequest IDs that currently hold a local llamaQueue slot
+  // (i.e. actually streaming from llama-cpp). Anything else marked as backend=local
+  // is sitting in the JS queue waiting on acquire() — display it as pending so the
+  // UI doesn't claim 7 requests are simultaneously hitting the GPU when only 1 is.
+  const localSlotHolders = new Set();
+  for (const item of llamaQueue.activeItems.values()) {
+    if (item.activeReqId != null) localSlotHolders.add(item.activeReqId);
+  }
+
+  // Items from the activeRequests map (covers both local and remote). For local
+  // requests we split into actively-streaming (holds a slot) vs queued (doesn't).
+  const activeItems = [];
+  const pendingFromActive = [];
+  for (const ar of activeRequests.values()) {
     const backendId = ar.backend || 'local';
     const isOffloaded = backendId !== 'local';
+    const holdsSlot = isOffloaded || localSlotHolders.has(ar.id);
+    const status = holdsSlot ? 'active' : 'pending';
+    const backendName = isOffloaded
+      ? (backendNameMap[backendId] || backendId)
+      : (holdsSlot ? 'local' : 'local (queued)');
     const result = {
       id: ar.id,
       model: ar.model || 'unknown',
       endpoint: ar.endpoint || '',
       enqueuedAt: ar.startTime,
-      startedAt: ar.startTime,
-      status: 'active',
+      startedAt: holdsSlot ? ar.startTime : null,
+      status,
       elapsed: Date.now() - ar.startTime,
       userMessage: detail ? (ar.userMessage || '') : ((ar.userMessage || '').slice(0, 200)),
       tokens: ar.tokens || 0,
       activeRequestId: ar.id,
       backend: backendId,
-      backendName: isOffloaded ? (backendNameMap[backendId] || backendId) : 'local',
+      backendName,
       offloaded: isOffloaded
     };
     if (detail) {
@@ -2410,25 +3076,110 @@ app.get('/api/queue', (req, res) => {
       result.startTime = ar.startTime;
       result.fullContext = ar.fullContext || [];
     }
-    return result;
-  });
+    // Pre-tokenization visibility: show how many tokens we computed in the
+    // background while the request was queued/processing.
+    if (ar.preTokenized != null) {
+      result.preTokenized = ar.preTokenized;
+      result.preTokenizedAt = ar.preTokenizedAt;
+    } else {
+      result.preTokenized = null;
+    }
+    // Two timing fields: total = since proxy entered the handler (includes
+    // queue wait); active = since the local queue slot was acquired (true
+    // time in llama.cpp's hands). For remote-routed requests, both are equal.
+    result.totalElapsed = result.elapsed;
+    if (ar.slotAcquiredAt) {
+      result.activeElapsed = Date.now() - ar.slotAcquiredAt;
+    } else if (isOffloaded) {
+      // Remote routing has no separate "slot acquire" step on our side; the
+      // total elapsed is also the active elapsed.
+      result.activeElapsed = result.elapsed;
+    } else {
+      result.activeElapsed = null;
+    }
+    // Proof-of-life: latest upstream slot probe (only present for local
+    // chat/completions while in flight). Tells the UI whether llama.cpp is
+    // currently prompt-processing or decoding.
+    if (ar.upstreamProbe) {
+      result.upstreamProbe = ar.upstreamProbe;
+    }
+    if (holdsSlot) activeItems.push(result);
+    else pendingFromActive.push(result);
+  }
 
-  // Pending requests from the local queue (waiting for a slot)
-  const pendingItems = llamaQueue.queue.map(item => ({
-    id: item.id,
-    model: item.model || 'unknown',
-    endpoint: item.endpoint || '',
-    enqueuedAt: item.enqueuedAt,
-    startedAt: null,
-    status: 'pending',
-    elapsed: Date.now() - item.enqueuedAt,
-    userMessage: '',
-    tokens: 0,
-    activeRequestId: null,
-    backend: 'local',
-    backendName: 'local (queued)',
-    offloaded: false
-  }));
+  // Surface "invisible" local slot holders: llamaQueue items that hold the slot
+  // but don't have a matching entry in activeRequests. These are completions /
+  // responses / messages handlers which don't call startActiveRequest, so without
+  // this they'd hold the slot silently and pending requests would look mysteriously
+  // stuck. Show them as active rows with a synthetic id so the user can see what's
+  // actually running on the local backend.
+  const trackedActiveReqIds = new Set([...activeRequests.keys()]);
+  for (const item of llamaQueue.activeItems.values()) {
+    if (item.activeReqId != null && trackedActiveReqIds.has(item.activeReqId)) continue;
+    const start = item.startedAt || item.enqueuedAt;
+    activeItems.push({
+      id: `slot${item.id}`,
+      queueItemId: item.id,
+      model: item.model || 'unknown',
+      endpoint: item.endpoint || '',
+      enqueuedAt: start,
+      startedAt: start,
+      status: 'active',
+      elapsed: Date.now() - start,
+      userMessage: '',
+      tokens: 0,
+      activeRequestId: null,
+      backend: 'local',
+      backendName: `local (${item.endpoint || 'untracked'})`,
+      offloaded: false
+    });
+  }
+
+  // Pending requests from the local queue (waiting for a slot). Skip any whose
+  // activeReqId is already represented via pendingFromActive (chat/completions
+  // path); keep only those that lack an activeRequest entry (e.g. completions,
+  // responses, messages handlers that don't call startActiveRequest).
+  // Build a position lookup so each pending row can display "you are #N in line".
+  const positionByActiveReqId = new Map();
+  const positionByQueueItemId = new Map();
+  llamaQueue.queue.forEach((item, idx) => {
+    if (item.activeReqId != null) positionByActiveReqId.set(item.activeReqId, idx);
+    positionByQueueItemId.set(item.id, idx);
+  });
+  // Annotate pendingFromActive with their queue position (1-based for display).
+  for (const p of pendingFromActive) {
+    const idx = positionByActiveReqId.get(p.activeRequestId);
+    if (idx != null) p.queuePosition = idx + 1;
+    p.queueLength = llamaQueue.queue.length;
+  }
+  const seenActiveReqIds = new Set(pendingFromActive.map(p => p.activeRequestId));
+  const pendingItems = [
+    ...pendingFromActive,
+    ...llamaQueue.queue
+      .filter(item => item.activeReqId == null || !seenActiveReqIds.has(item.activeReqId))
+      .map(item => ({
+        // Prefix the id so it can't collide with an activeRequest id; the cancel
+        // endpoint parses the numeric portion off (see DELETE /api/queue/:id below).
+        id: `q${item.id}`,
+        queueItemId: item.id,
+        model: item.model || 'unknown',
+        endpoint: item.endpoint || '',
+        enqueuedAt: item.enqueuedAt,
+        startedAt: null,
+        status: 'pending',
+        elapsed: Date.now() - item.enqueuedAt,
+        userMessage: '',
+        tokens: 0,
+        activeRequestId: null,
+        backend: 'local',
+        backendName: 'local (queued)',
+        offloaded: false,
+        queuePosition: (positionByQueueItemId.get(item.id) ?? 0) + 1,
+        queueLength: llamaQueue.queue.length
+      }))
+  ];
+  // Sort pending items by queue position so the display order matches FIFO order.
+  pendingItems.sort((a, b) => (a.queuePosition ?? 1e9) - (b.queuePosition ?? 1e9));
 
   // Pending requests from remote backend queues
   const remotePendingItems = [];
@@ -2896,6 +3647,91 @@ async function stopLlamaServer() {
 // Restart llama server in its current mode (router or preset)
 // Used by fetchWithRetry when the server appears to have crashed
 let restartInProgress = false;
+// Find the preset that should serve the given model name, if any.
+// Only considers presets with autoActivate=true so manual presets (like
+// the qwen3-coder-next preset) don't auto-trigger on every related request.
+// Match by autoActivateModels array, or fall back to the model-dir name
+// derived from preset.modelPath.
+function findPresetForModel(modelName) {
+  if (!modelName || !config.presets) return null;
+  for (const [id, p] of Object.entries(config.presets)) {
+    if (!p.autoActivate) continue;
+    if (Array.isArray(p.autoActivateModels) && p.autoActivateModels.includes(modelName)) {
+      return id;
+    }
+    if (p.modelPath) {
+      const dirName = p.modelPath.split('/').slice(-2, -1)[0];
+      if (dirName === modelName) return id;
+    }
+  }
+  return null;
+}
+
+// Does the given preset serve the given model name? Used to detect when
+// we're in single-mode for the wrong model. Match by autoActivateModels
+// array (if set) or by model-dir name derived from modelPath.
+function presetServesModel(preset, modelName) {
+  if (!preset || !modelName) return false;
+  if (Array.isArray(preset.autoActivateModels) && preset.autoActivateModels.includes(modelName)) return true;
+  if (Array.isArray(preset.servesModels) && preset.servesModels.includes(modelName)) return true;
+  if (preset.modelPath) {
+    const dirName = preset.modelPath.split('/').slice(-2, -1)[0];
+    if (dirName === modelName) return true;
+  }
+  return false;
+}
+
+// Auto-switch between router mode and preset (single-model) mode based on
+// the incoming request's model. Concurrent callers share the same swap
+// promise so we don't kick off multiple restarts; the existing llamaQueue
+// + acquireLocalSlot path serializes new requests during the window.
+let modeSwitchPromise = null;
+async function ensureModelServed(modelName) {
+  // Two correctness rules:
+  //   (1) If the model has an autoActivate preset and we're not in it -> swap to it.
+  //   (2) If we're in a single-mode preset that doesn't serve this model -> swap
+  //       BACK to router. Router can dynamically load any model, so it's the
+  //       only safe fallback. Without this we'd silently serve the request
+  //       with whatever model the preset has loaded — wrong-model output.
+  while (true) {
+    const targetPreset = findPresetForModel(modelName);
+
+    // Rule 1: target preset matches; swap to it if not already there.
+    if (targetPreset && !(currentMode === 'single' && currentPreset === targetPreset)) {
+      if (modeSwitchPromise) { try { await modeSwitchPromise; } catch {} continue; }
+      const fromDesc = currentMode === 'single' ? `preset=${currentPreset}` : 'router';
+      console.log(`[mode-switch] ${fromDesc} -> preset=${targetPreset} for model ${modelName}`);
+      addLog('system', `Auto-switching llama-server mode: ${fromDesc} -> preset=${targetPreset} (triggered by request for ${modelName})`);
+      modeSwitchPromise = (async () => {
+        try { currentMode = 'single'; currentPreset = targetPreset; await restartLlamaServer(); }
+        finally { modeSwitchPromise = null; }
+      })();
+      await modeSwitchPromise;
+      return;
+    }
+
+    // Rule 2: we're in a single-mode preset that doesn't serve this model.
+    // Swap to router so the right model gets loaded. The manually-activated
+    // preset has to give way — otherwise we'd serve wrong-model output.
+    if (currentMode === 'single' && currentPreset && !targetPreset) {
+      const preset = config.presets?.[currentPreset];
+      if (preset && !presetServesModel(preset, modelName)) {
+        if (modeSwitchPromise) { try { await modeSwitchPromise; } catch {} continue; }
+        console.log(`[mode-switch] preset=${currentPreset} cannot serve ${modelName}, swapping to router`);
+        addLog('system', `Auto-switching llama-server mode: preset=${currentPreset} -> router (preset cannot serve ${modelName})`);
+        modeSwitchPromise = (async () => {
+          try { currentMode = 'router'; currentPreset = null; await restartLlamaServer(); }
+          finally { modeSwitchPromise = null; }
+        })();
+        await modeSwitchPromise;
+        return;
+      }
+    }
+
+    return; // already at correct mode (or router, which can serve anything)
+  }
+}
+
 async function restartLlamaServer() {
   if (restartInProgress) {
     console.log('[restart] Restart already in progress, waiting for it to complete...');
@@ -4030,6 +4866,7 @@ app.get('/api/analytics', (req, res) => {
     tokens: analyticsData.tokens.filter(p => p.timestamp > cutoff),
     context: analyticsData.context.filter(p => p.timestamp > cutoff),
     queue: analyticsData.queue.filter(p => p.timestamp > cutoff),
+    usage: analyticsData.usage.filter(p => p.timestamp > cutoff),
     tokenStats: {
       totalPromptTokens: tokenStats.totalPromptTokens,
       totalCompletionTokens: tokenStats.totalCompletionTokens,
@@ -4325,9 +5162,86 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
   return false;
 }
 
+// Acquire a llamaQueue slot tied to the response lifecycle. The slot is held until
+// the HTTP response closes or finishes — covering the full body stream so concurrency=1
+// actually serializes GPU work. Returns { release, queueWait }. Safe to call once per
+// proxy handler invocation; subsequent fetchWithRetry calls within the same handler
+// share the held slot.
+async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait } = {}) {
+  const queueStart = Date.now();
+
+  // Fire onWait every 5s while we're blocked on acquire(). Callers use this to
+  // ship SSE keepalive comments so reverse proxies don't 504 on long queue waits.
+  // The first tick happens after the first interval — short waits never trigger it.
+  let waitTimer = null;
+  if (typeof onWait === 'function') {
+    const tick = () => {
+      try {
+        const position = llamaQueue.queue.findIndex(i => i.activeReqId === activeReqId);
+        onWait({
+          position: position >= 0 ? position : null,   // 0-based; null once acquired
+          pending: llamaQueue.pending,
+          active: llamaQueue.active,
+          waitedMs: Date.now() - queueStart
+        });
+      } catch { /* keepalive must never throw */ }
+    };
+    waitTimer = setInterval(tick, 5000);
+  }
+
+  let slotId;
+  try {
+    slotId = await llamaQueue.acquire({ model: model || endpoint, endpoint, activeReqId });
+  } finally {
+    if (waitTimer) clearInterval(waitTimer);
+  }
+  const queueWait = Date.now() - queueStart;
+  if (queueWait > 100) {
+    console.log(`[${endpoint}] Queued for ${queueWait}ms (active: ${llamaQueue.active}, pending: ${llamaQueue.pending})`);
+  }
+  // Reset the stall watchdog clock now that the request is actually about to hit
+  // the upstream — queue-wait time shouldn't count toward the no-token timeout.
+  // Also stamp slotAcquiredAt so the UI can show "active elapsed" separate from
+  // "total elapsed" (which includes queue wait).
+  if (activeReqId != null) {
+    const ar = activeRequests.get(activeReqId);
+    if (ar) {
+      const now = Date.now();
+      ar.lastActivityAt = now;
+      ar.slotAcquiredAt = now;
+    }
+  }
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    llamaQueue.release(slotId);
+  };
+  // Release when the HTTP response ends for any reason: clean finish, client disconnect,
+  // socket error, abort. This guarantees the slot frees even if a downstream handler
+  // forgets to call release() explicitly.
+  if (res) {
+    // Race fix: if the client disconnected WHILE we were waiting on
+    // acquire(), the 'close' event already fired before we got here — our
+    // listeners would never trigger and the slot would leak. Check
+    // destroyed/writableEnded synchronously after attaching listeners and
+    // release immediately if we're already past the point of no return.
+    res.on('close', release);
+    res.on('finish', release);
+    if (res.destroyed || res.writableEnded) {
+      release();
+    }
+  }
+  return { slotId, release, queueWait };
+}
+
 // Retry fetch with backoff for transient connection failures (e.g. model switching in router mode)
 // Also retries on proxy connection errors (500) with server health polling
 // Returns { response, retries, retryErrors } so callers can log retry info
+//
+// NOTE: This no longer manages the llamaQueue slot. Callers in proxy handlers must
+// acquire a slot via acquireLocalSlot() before calling fetchWithRetry on the local
+// upstream. This ensures the slot is held through the streamed body, not just headers.
 async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model, signal } = {}) {
   // Wake from idle shutdown if needed
   if (idleShutdown && (!llamaProcess || llamaProcess.killed)) {
@@ -4338,20 +5252,10 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
     await restartLlamaServer();
   }
 
-  // Acquire queue slot — blocks if at concurrency limit
-  const queueStart = Date.now();
-  const queueId = await llamaQueue.acquire({ model: model || label, endpoint: label });
-  const queueWait = Date.now() - queueStart;
-  if (queueWait > 100) {
-    console.log(`[${label}] Queued for ${queueWait}ms (active: ${llamaQueue.active}, pending: ${llamaQueue.pending})`);
-  }
-  try {
   const result = await _fetchWithRetryInner(url, options, { retries, baseDelay, label, model, signal });
-  result.queueWait = queueWait;
+  // queueWait is filled in by acquireLocalSlot when applicable; default to 0 here
+  result.queueWait = result.queueWait || 0;
   return result;
-  } finally {
-    llamaQueue.release(queueId);
-  }
 }
 
 async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 1000, label = 'proxy', model, signal } = {}) {
@@ -4359,8 +5263,15 @@ async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 100
   let hasRestarted = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      // Check if request was aborted before each attempt
-      if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
+      // Check if request was aborted before each attempt — if so, bail out
+      // immediately. Continuing to retry with an already-aborted signal just
+      // burns the backoff schedule (1+2+4+8+16s = 31s) on guaranteed-fail
+      // attempts before giving up. Catch handles below treats abort as terminal.
+      if (signal?.aborted) {
+        const err = new DOMException('Request aborted (signal pre-check)', 'AbortError');
+        err.name = 'AbortError';
+        throw err;
+      }
       const response = await fetch(url, { ...options, dispatcher: llamaDispatcher, signal });
 
       // Check for proxy connection errors (server may be reloading after OOM)
@@ -4397,6 +5308,14 @@ async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 100
     } catch (err) {
       retryErrors.push(err.message);
       requestStatsAccum.retries++;
+      // Abort is terminal — don't retry. The caller (or upstream client) gave
+      // up; further retries on the same signal would instant-fail and waste
+      // backoff seconds. Same fix as fetchRemoteBackend's retry loop.
+      if (err.name === 'AbortError' || signal?.aborted) {
+        err.retries = attempt;
+        err.retryErrors = retryErrors;
+        throw err;
+      }
       // Node's fetch wraps errors: err.code may be undefined, real code is in err.cause.code
       const realCode = err.code || err.cause?.code || '';
       const isConnectionError = realCode === 'ECONNREFUSED' || realCode === 'ECONNRESET' ||
@@ -4506,6 +5425,31 @@ function injectReasoningEffort(body) {
   return body;
 }
 
+// Apply model-specific sampling-parameter recommendations when the client
+// didn't supply explicit values. Lets us match Unsloth / model-card guidance
+// without forcing every caller to know the right knobs.
+// Pattern-keyed; each rule is matched on the requested model name (glob).
+const MODEL_SAMPLING_DEFAULTS = [
+  // Gemma 4 (Unsloth): temp=1.0, top_p=0.95, top_k=64
+  { pattern: /gemma-?4/i, params: { temperature: 1.0, top_p: 0.95, top_k: 64 } },
+  // Qwen3.6 (Unsloth, thinking mode general): temp=1.0, top_p=0.95, top_k=20, min_p=0.0
+  { pattern: /qwen3\.?6/i, params: { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0 } },
+];
+function injectModelSamplingDefaults(body) {
+  const model = body.model || '';
+  for (const rule of MODEL_SAMPLING_DEFAULTS) {
+    if (!rule.pattern.test(model)) continue;
+    const out = { ...body };
+    for (const [key, val] of Object.entries(rule.params)) {
+      // Only set when the caller didn't already specify (undefined === unspecified).
+      // We don't override an explicit 0 / null — only when the field is missing.
+      if (out[key] === undefined) out[key] = val;
+    }
+    return out;
+  }
+  return body;
+}
+
 // OpenAI-compatible chat completions (streaming and non-streaming)
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
@@ -4527,18 +5471,76 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   }
 
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
-  const proxyBody = injectReasoningEffort(req.body);
+  const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
   // Resolve backend routing (local vs remote)
   const routing = resolveBackend(requestedModel, 'chat/completions', req.body);
 
-  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: routing.remote ? routing.backend.id : 'local' });
-  // Ensure active request is cleaned up on any exit path
-  res.on('finish', () => {
-    if (activeRequests.has(activeReqId)) {
-      endActiveRequest(activeReqId, { status: res.statusCode >= 400 ? 'error' : 'complete' });
+  // Prefix-cache routing (local only): pin same-conversation requests to the
+  // same llama.cpp slot so its per-slot KV cache auto-matches the prefix and
+  // we only re-prompt-process the trailing user turn. id_slot is a hint —
+  // llama.cpp may pick differently if our slot is busy.
+  let slotAssignment = null;
+  if (!routing.remote && Array.isArray(req.body.messages)) {
+    slotAssignment = lookupOrAssignSlot(requestedModel, req.body.messages);
+    if (slotAssignment && slotAssignment.slotId != null) {
+      proxyBody.id_slot = slotAssignment.slotId;
+      proxyBody.cache_prompt = true; // explicit; llama.cpp default is also true
+      if (slotAssignment.hit) {
+        console.log(`[prefix-cache] HIT model=${requestedModel} slot=${slotAssignment.slotId} key=${slotAssignment.key}`);
+      }
     }
-  });
+    // Probe slot count in the background on first request per model
+    if (!_slotCountProbed) probeSlotCount(requestedModel).catch(() => {});
+  }
+
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: routing.remote ? routing.backend.id : 'local' });
+  // Record which llama.cpp slot we asked for, so the upstream probe can find
+  // the right row instead of guessing.
+  if (slotAssignment && slotAssignment.slotId != null) {
+    const ar = activeRequests.get(activeReqId);
+    if (ar) ar.idSlot = slotAssignment.slotId;
+  }
+
+  // Fire pre-tokenization in the background while we wait on the queue.
+  // The result lands on the activeRequest entry so anyone curious can see
+  // the real token count even before llama-cpp processes it. We don't
+  // currently inject the pre-tokenized prompt — llama.cpp's chat-template
+  // path needs the messages array, not raw tokens. But the result is still
+  // useful for size estimation, prefix-cache hashing, and future work.
+  if (!routing.remote && Array.isArray(req.body.messages)) {
+    preTokenize(requestedModel, req.body.messages, getActiveRequestSignal(activeReqId))
+      .then(tokens => {
+        const ar = activeRequests.get(activeReqId);
+        if (ar && tokens) {
+          ar.preTokenized = tokens.length;
+          ar.preTokenizedAt = Date.now();
+        }
+      })
+      .catch(() => {});
+  }
+  // Ensure active request is cleaned up on any exit path. 'finish' fires
+  // when res.end() is called cleanly. 'close' fires on client disconnect /
+  // socket destroy. Both abort the upstream — leaving abandoned work running
+  // saturates llama-cpp's parallel slots and any new request piles in
+  // behind it. Tradeoff: 0 token work IS thrown away, but llama-cpp does
+  // eventually free the slot via socket-close detection and a new request
+  // gets the freed slot quickly. Net: faster response for fresh requests
+  // when clients disconnect mid-stream.
+  //
+  // cancelReason is captured in handler closure scope so stream catches
+  // can tell "client disconnected" (NOT a backend failure) from "backend
+  // error" (counts toward circuit breaker).
+  let cancelReason = null;
+  const cleanupActive = (reason) => {
+    if (!activeRequests.has(activeReqId)) return;
+    const entry = activeRequests.get(activeReqId);
+    cancelReason = reason;
+    try { entry?.abortController?.abort(); } catch { /* ignore */ }
+    endActiveRequest(activeReqId, { status: reason });
+  };
+  res.on('finish', () => cleanupActive(res.statusCode >= 400 ? 'error' : 'complete'));
+  res.on('close', () => cleanupActive('client_disconnect'));
 
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
@@ -4552,7 +5554,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         method: 'POST',
         headers: { ...routing.headers },
         body: JSON.stringify(remoteBody)
-      }, { label: 'chat/completions', model: routing.targetModel });
+      }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId) });
 
       if (!response.ok) {
         const error = await response.text();
@@ -4571,6 +5573,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -4579,14 +5582,28 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         let model = routing.targetModel;
         let responseText = '';
 
+        // Same keepalive-during-silence trick as the local path. Remote
+        // backends (especially Ollama under load) can take 30-90s for first
+        // token; without periodic comment lines, clients with 60-90s read
+        // timeouts abort and we log 502 'This operation was aborted'.
+        let lastChunkAt = Date.now();
+        const keepaliveTicker = setInterval(() => {
+          if (Date.now() - lastChunkAt > 20_000 && !res.writableEnded) {
+            try { res.write(`: processing waited=${Math.round((Date.now() - startTime) / 1000)}s backend=${backend.id}\n\n`); } catch {}
+          }
+        }, 10_000);
+
         const processStream = async () => {
           try {
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
+              lastChunkAt = Date.now();
               const chunk = decoder.decode(value);
-              res.write(chunk);
+              // Normalize model field in remote streaming chunks to match requested model
               const lines = chunk.split('\n');
+              const rewrittenLines = [];
+              let needsRewrite = false;
               for (const line of lines) {
                 if (line.startsWith('data: ') && line !== 'data: [DONE]') {
                   try {
@@ -4597,11 +5614,25 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                       if (text) { completionTokens++; responseText += text; updateActiveRequest(activeReqId, text); }
                     }
                     if (data.usage) { promptTokens = data.usage.prompt_tokens || promptTokens; completionTokens = data.usage.completion_tokens || completionTokens; }
-                    if (data.model) model = data.model;
-                  } catch { /* skip */ }
+                    if (data.model && data.model !== requestedModel) {
+                      data.model = requestedModel;
+                      needsRewrite = true;
+                    }
+                    if (needsRewrite) {
+                      rewrittenLines.push('data: ' + JSON.stringify(data));
+                    } else {
+                      rewrittenLines.push(line);
+                    }
+                  } catch {
+                    rewrittenLines.push(line);
+                  }
+                } else {
+                  rewrittenLines.push(line);
                 }
               }
+              res.write(needsRewrite ? rewrittenLines.join('\n') : chunk);
             }
+            clearInterval(keepaliveTicker);
             res.end();
             const duration = Date.now() - startTime;
             const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
@@ -4615,36 +5646,66 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             });
             endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
           } catch (e) {
+            clearInterval(keepaliveTicker);
             const duration = Date.now() - startTime;
             addLlmLog({
               endpoint: 'chat/completions', model, stream: true, status: 500, duration, promptTokens, completionTokens, tokensPerSecond: 0,
               messages: req.body.messages || null, prompt: null, response: responseText || null, error: `Stream error: ${e.message}`,
               backend: backend.id, requestBody: req.body
             });
+            // Stream-abort counts as a backend failure for circuit-breaker
+            // purposes — UNLESS the cancel came from our own client (close
+            // event). Client disconnects are not backend faults; counting
+            // them would falsely trip the circuit breaker.
+            if (cancelReason !== 'client_disconnect') {
+              recordBackendFailure(backend.id, backend.name);
+            }
             endActiveRequest(activeReqId, { status: 'error' });
             res.end();
           }
         };
         processStream();
       } else {
-        const data = await response.json();
+        // Non-streaming. Same heartbeat-whitespace trick as the local path
+        // so opencode-style clients (60-90s TCP read timeout, stream:false)
+        // don't abort during the remote backend's first-token wait.
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Transfer-Encoding', 'chunked');
+        res.flushHeaders();
+        const heartbeatTicker = setInterval(() => {
+          if (!res.writableEnded) {
+            try { res.write('\n'); } catch {}
+          }
+        }, 20_000);
+        let data;
+        try {
+          data = await response.json();
+        } finally {
+          clearInterval(heartbeatTicker);
+        }
         const duration = Date.now() - startTime;
         const usage = data.usage || {};
         const promptTokens = usage.prompt_tokens || 0;
         const completionTokens = usage.completion_tokens || 0;
         const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration, backend: backend.name });
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({
-          endpoint: 'chat/completions', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens,
+          endpoint: 'chat/completions', model: requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens,
           tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
           messages: req.body.messages || null, prompt: null,
           response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || data.choices?.[0]?.message?.reasoning || null, error: null,
           backend: backend.id, requestBody: req.body
         });
-        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        // Normalize model field to match what was requested
+        if (data.model) data.model = requestedModel;
+        data._llama_manager = enrichLlamaManagerMeta(
+          { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id },
+          { completionTokens }
+        );
         endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
-        res.json(data);
+        // Headers already flushed; write JSON body and end manually.
+        if (!res.writableEnded) { res.write(JSON.stringify(data)); res.end(); }
       }
     } catch (error) {
       endActiveRequest(activeReqId, { status: 'error' });
@@ -4655,7 +5716,14 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         messages: req.body.messages || null, prompt: null, response: null, error: error.message,
         backend: routing.backend.id, requestBody: req.body
       });
-      res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+      // Headers may already be flushed from the non-streaming heartbeat —
+      // in that case write the error as a JSON object after the whitespace.
+      if (!res.headersSent) {
+        res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
+      } else if (!res.writableEnded) {
+        res.write(JSON.stringify({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message }));
+        res.end();
+      }
     }
     return;
   }
@@ -4665,7 +5733,146 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   function logLlm(entry) {
     addLlmLog({ ...entry, retries: retryInfo.retries, retryErrors: retryInfo.retryErrors, backend: 'local', requestBody: entry.requestBody || req.body });
   }
-  let totalQueueWait = 0;
+  // If this is a streaming request, flush SSE headers up front. That way we can
+  // emit `:` comment lines while we're blocked on the local queue, keeping the
+  // connection alive past any reverse-proxy read timeout. Comments are ignored
+  // by SSE clients (including OpenAI-compatible ones) so this is invisible to
+  // the consumer except for the kept-open socket.
+  //
+  // CAUTION: flushing headers makes res.headersSent === true, which several
+  // downstream branches use as a "real body already committed" sentinel. We use
+  // `sseKeepaliveActive` to distinguish these two states so the streaming/catch
+  // paths can still finalize the response properly after keepalive started.
+  let sseKeepaliveActive = false;
+  const flushSseHeaders = () => {
+    if (sseKeepaliveActive || res.headersSent) return;
+    sseKeepaliveActive = true;
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+    res.flushHeaders();
+  };
+  // bodyCommitted goes true the moment we start writing the actual upstream
+  // response body (or sent json for non-streaming). Replaces res.headersSent
+  // as the "already committed" check now that headers may be flushed early
+  // for keepalive.
+  let bodyCommitted = false;
+  // For non-streaming requests, we need to keep the client's TCP socket alive
+  // while llama-cpp builds the full JSON response (which can take 60-120s for
+  // big prompts). HTTP/JSON trick: commit Content-Type: application/json with
+  // Transfer-Encoding: chunked up front, then write `\n` heartbeat bytes
+  // periodically. The client's socket sees activity (read timeout resets) and
+  // JSON.parse happily skips leading whitespace when we eventually write the
+  // real body. This MUST start before doFetch since for non-streaming the
+  // entire wait is inside the fetch (llama-cpp doesn't send headers until the
+  // full response is composed).
+  let nonStreamingHeartbeatTicker = null;
+  if (!isStreaming) {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+    res.flushHeaders();
+    // Disable Nagle's algorithm so the 1-byte heartbeat goes on the wire
+    // immediately instead of waiting up to 200ms for more bytes.
+    try { req.socket?.setNoDelay?.(true); } catch {}
+    nonStreamingHeartbeatTicker = setInterval(() => {
+      if (!res.writableEnded) {
+        try { res.write('\n'); } catch {}
+      }
+    }, 20_000);
+    // Auto-clear on any response end path (success, error, client disconnect)
+    // so we don't leak intervals if a downstream branch forgets.
+    const clearHeartbeat = () => {
+      if (nonStreamingHeartbeatTicker) {
+        clearInterval(nonStreamingHeartbeatTicker);
+        nonStreamingHeartbeatTicker = null;
+      }
+    };
+    res.on('close', clearHeartbeat);
+    res.on('finish', clearHeartbeat);
+  }
+  // Acquire local queue slot for the lifetime of this response. Released automatically
+  // via res.on('close'/'finish') even if the handler errors out partway.
+  // Wrapped in try/catch because the queue can reject pending acquires (flush,
+  // cancel, client disconnect) — without this catch the rejection propagates up
+  // as an unhandled promise rejection and crashes the Node process.
+  let initialQueueWait = 0;
+  try {
+    const slot = await acquireLocalSlot(req, res, {
+      model: requestedModel, endpoint: 'chat/completions', activeReqId,
+      onWait: isStreaming ? ({ position, pending, waitedMs }) => {
+        flushSseHeaders();
+        const pos = position != null ? position + 1 : '?';
+        res.write(`: queued position=${pos}/${pending} waited=${Math.round(waitedMs / 1000)}s\n\n`);
+      } : null
+    });
+    initialQueueWait = slot.queueWait;
+  } catch (err) {
+    // Acquire was rejected (flush / cancel / reroute / client disconnect).
+    // If the reroute scanner cancelled us because a remote backend opened up,
+    // signal that to the client via 503 + Retry-After: 0 so it retries
+    // immediately — and the retry's resolveBackend will land on remote.
+    const entry = activeRequests.get(activeReqId);
+    const wasReroute = !!entry?._rerouteHint;
+    if (activeRequests.has(activeReqId)) {
+      endActiveRequest(activeReqId, { status: 'cancelled' });
+    }
+    const reason = wasReroute
+      ? `Rerouted: a remote backend now has capacity for ${requestedModel}. Retry.`
+      : `Request cancelled while queued (${err.message})`;
+    if (!res.headersSent) {
+      if (wasReroute) res.setHeader('Retry-After', '0');
+      res.status(503).json({ error: reason });
+    } else if (!res.writableEnded) {
+      if (sseKeepaliveActive) {
+        try { res.write(`event: error\ndata: ${JSON.stringify({ status: 503, error: reason })}\n\n`); } catch {}
+      } else if (nonStreamingHeartbeatTicker || !isStreaming) {
+        try { res.write(JSON.stringify({ error: reason, status: 503 })); } catch {}
+      }
+      try { res.end(); } catch {}
+    }
+    return;
+  }
+  let totalQueueWait = initialQueueWait;
+
+  // SSE keepalive ticker — for STREAMING requests, start writing
+  // `: processing waited=Xs` comments BEFORE doFetch fires. Llama-cpp
+  // on a slow/CPU backend can take 60-120s to even start responding
+  // to its own /chat/completions endpoint while it processes the
+  // prompt. During that gap, nginx (openresty in front of the proxy)
+  // sees zero bytes from the upstream and times out at 60-90s,
+  // returning 504 Gateway Time-out to the client.
+  //
+  // The non-streaming flow already handles this (line ~5779) by
+  // committing chunked headers + JSON-whitespace heartbeats up front.
+  // The streaming flow used to only emit keepalives during the local
+  // queue wait via onWait, and again AFTER doFetch returned via the
+  // per-chunk ticker — leaving the window between queue-acquire and
+  // first-byte-from-llama-cpp wide open. Fixed by promoting the
+  // ticker here so it covers doFetch as well.
+  //
+  // `lastChunkAt` is updated by the chunk-reading loop later so once
+  // tokens flow normally we don't emit redundant comments.
+  let lastChunkAt = Date.now();
+  let streamingKeepaliveTicker = null;
+  if (isStreaming) {
+    flushSseHeaders();
+    streamingKeepaliveTicker = setInterval(() => {
+      if (Date.now() - lastChunkAt > 20_000 && !res.writableEnded) {
+        try { res.write(`: processing waited=${Math.round((Date.now() - startTime) / 1000)}s\n\n`); } catch {}
+      }
+    }, 10_000);
+    const clearStreamingKeepalive = () => {
+      if (streamingKeepaliveTicker) {
+        clearInterval(streamingKeepaliveTicker);
+        streamingKeepaliveTicker = null;
+      }
+    };
+    res.on('close', clearStreamingKeepalive);
+    res.on('finish', clearStreamingKeepalive);
+  }
+
   async function doFetch(body) {
     const result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
       method: 'POST',
@@ -4673,14 +5880,59 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       body: JSON.stringify(body)
     }, { label: 'chat/completions', model: body.model, signal: getActiveRequestSignal(activeReqId) });
     retryInfo = { retries: result.retries, retryErrors: result.retryErrors, restarted: result.restarted };
-    totalQueueWait += result.queueWait || 0;
     req._retryInfo = retryInfo;
     return result.response;
   }
 
+  // Start backfill race timer — if this request stalls (no tokens after backfillStallMs),
+  // race it against the fastest available remote backend. Whoever responds first wins.
+  const backfillTimer = setupBackfillRace(req, res, {
+    requestedModel, endpoint: 'chat/completions', proxyBody, isStreaming, startTime, activeReqId
+  });
+
+  // Helper: send a JSON error response if we haven't started the real body yet.
+  // Distinguishes "keepalive headers flushed" from "real response started" so
+  // SSE keepalive doesn't accidentally short-circuit error reporting. When
+  // keepalive is active, we send the error as an SSE event instead of HTTP json.
+  const sendErrorIfPossible = (status, errText) => {
+    if (bodyCommitted) return;
+    bodyCommitted = true;
+    if (sseKeepaliveActive) {
+      // Headers already sent as SSE; emit the error as an SSE data event then close.
+      res.write(`event: error\ndata: ${JSON.stringify({ status, error: errText })}\n\n`);
+      res.end();
+    } else if (nonStreamingHeartbeatTicker || (res.headersSent && !isStreaming)) {
+      // Non-streaming heartbeat already flushed headers and may have written
+      // whitespace bytes. Write the error as a JSON object — the leading
+      // whitespace is valid before a JSON value, so the client's JSON.parse
+      // still works.
+      if (!res.writableEnded) {
+        res.write(JSON.stringify({ error: errText, status }));
+        res.end();
+      }
+    } else if (!res.headersSent) {
+      res.status(status).send(errText);
+    } else {
+      res.end();
+    }
+  };
+
   try {
+    // Auto-swap llama-server mode/preset if the requested model isn't served
+    // by the currently-loaded mode. We hold the local queue slot here (only
+    // one request runs at a time), so swapping won't kill anyone else's
+    // in-flight inference. Pending requests stay queued during the swap.
+    await ensureModelServed(requestedModel);
     let response = await doFetch(proxyBody);
     let activeBody = proxyBody;
+
+    // If backfill won while we were fetching, bail out
+    if (bodyCommitted) {
+      if (backfillTimer) clearTimeout(backfillTimer);
+      return;
+    }
+    // Primary got a response — cancel backfill timer
+    if (backfillTimer) clearTimeout(backfillTimer);
 
     // If model failed to load (e.g. too large), unload others and retry
     if (!response.ok) {
@@ -4706,7 +5958,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                 promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
                 messages: req.body.messages || null, prompt: null, response: null, error: retryError
               });
-              return res.status(response.status).send(retryError);
+              sendErrorIfPossible(response.status, retryError);
+              return;
             }
           }
         } else {
@@ -4719,7 +5972,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
             messages: req.body.messages || null, prompt: null, response: null, error: errorText
           });
-          return res.status(response.status).send(errorText);
+          sendErrorIfPossible(response.status, errorText);
+          return;
         }
       } else if (isTemplateSanitizable(errorText) && proxyBody.messages) {
         // Template rejects the message format, retry with sanitized messages
@@ -4736,7 +5990,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
           messages: req.body.messages || null, prompt: null, response: null, error: errorText
         });
-        return res.status(response.status).send(errorText);
+        sendErrorIfPossible(response.status, errorText);
+        return;
       }
     }
 
@@ -4750,14 +6005,28 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         promptTokens: 0, completionTokens: 0, tokensPerSecond: 0,
         messages: req.body.messages || null, prompt: null, response: null, error
       });
-      return res.status(response.status).send(error);
+      sendErrorIfPossible(response.status, error);
+      return;
     }
 
+    // Final commit check before streaming the real body
+    if (bodyCommitted) return;
+    bodyCommitted = true;
+
     if (isStreaming) {
-      // Stream the response and track tokens
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
+      // Stream the response and track tokens. If keepalive already flushed SSE
+      // headers, skip the setHeader calls (they'd throw on already-sent headers).
+      if (!sseKeepaliveActive) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+      }
+
+      // SSE keepalive: the streamingKeepaliveTicker started right after
+      // queue-acquire (see above) is already covering the doFetch wait
+      // AND will continue covering this streaming read loop. We share
+      // its `lastChunkAt` clock — each chunk we read below updates it
+      // so we only emit `: processing` comments during silent gaps.
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -4772,12 +6041,16 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            lastChunkAt = Date.now();
 
             const chunk = decoder.decode(value);
-            res.write(chunk);
 
-            // Parse SSE data to count tokens
+            // Normalize model field in streaming chunks: replace llama-server's
+            // reported model (which may be a different loaded model) with what was requested
+            let outputChunk = chunk;
             const lines = chunk.split('\n');
+            const rewrittenLines = [];
+            let needsRewrite = false;
             for (const line of lines) {
               if (line.startsWith('data: ') && line !== 'data: [DONE]') {
                 try {
@@ -4798,14 +6071,32 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                   if (data.timings) {
                     serverTimings = data.timings;
                   }
-                  if (data.model) {
-                    model = data.model;
+                  // Normalize the model field to match the requested model
+                  if (data.model && data.model !== requestedModel && requestedModel !== 'default') {
+                    data.model = requestedModel;
+                    needsRewrite = true;
+                  }
+                  if (needsRewrite) {
+                    rewrittenLines.push('data: ' + JSON.stringify(data));
+                  } else {
+                    rewrittenLines.push(line);
                   }
                 } catch (e) {
-                  // Skip parse errors
+                  // Skip parse errors, pass line through unchanged
+                  rewrittenLines.push(line);
                 }
+              } else {
+                rewrittenLines.push(line);
               }
             }
+            if (needsRewrite) {
+              outputChunk = rewrittenLines.join('\n');
+            }
+            res.write(outputChunk);
+          }
+          if (streamingKeepaliveTicker) {
+            clearInterval(streamingKeepaliveTicker);
+            streamingKeepaliveTicker = null;
           }
           res.end();
 
@@ -4837,6 +6128,10 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           });
           endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
         } catch (e) {
+          if (streamingKeepaliveTicker) {
+            clearInterval(streamingKeepaliveTicker);
+            streamingKeepaliveTicker = null;
+          }
           console.error('[proxy] Stream error:', e);
           const duration = Date.now() - startTime;
           logLlm({
@@ -4853,8 +6148,12 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 
       processStream();
     } else {
-      // Non-streaming response
+      // Non-streaming response. Heartbeat ticker was started at the top of
+      // the handler (before doFetch) so it's been keeping the client socket
+      // alive throughout this whole flow. We just read the body and clear it.
       const data = await response.json();
+      clearInterval(nonStreamingHeartbeatTicker);
+      nonStreamingHeartbeatTicker = null;
 
       // Extract token stats — prefer server-reported timings (excludes queue wait)
       const wallDuration = Date.now() - startTime;
@@ -4872,30 +6171,55 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         promptTokens,
         completionTokens,
         tokensPerSecond,
-        model: data.model || req.body.model || 'unknown',
+        model: requestedModel,
         duration: inferDuration
       });
 
       logLlm({
-        endpoint: 'chat/completions', model: data.model || req.body.model || 'unknown',
+        endpoint: 'chat/completions', model: requestedModel,
         stream: false, status: 200, duration: wallDuration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
         response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || data.choices?.[0]?.message?.reasoning || null, error: null
       });
 
-      // Add our tracking info to response
-      data._llama_manager = {
-        duration: wallDuration,
-        tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
-        backend: 'local'
-      };
+      // Normalize model field: return what was requested, not what llama-server reports
+      // (llama-server returns the currently-loaded model name which may differ during model switches)
+      if (data.model && requestedModel !== 'default') {
+        data.model = requestedModel;
+      }
+
+      // Add our tracking info to response (with compute/warning derivation)
+      data._llama_manager = enrichLlamaManagerMeta(
+        {
+          duration: wallDuration,
+          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+          backend: 'local'
+        },
+        { completionTokens }
+      );
 
       endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText: data.choices?.[0]?.message?.content || '' });
-      res.json(data);
+      // Headers were already flushed for the heartbeat; write the JSON body
+      // and end manually instead of res.json() (which would try to set
+      // Content-Type a second time).
+      if (!res.writableEnded) {
+        res.write(JSON.stringify(data));
+        res.end();
+      }
     }
   } catch (error) {
-    endActiveRequest(activeReqId, { status: 'error' });
+    if (backfillTimer) clearTimeout(backfillTimer);
+    if (nonStreamingHeartbeatTicker) {
+      clearInterval(nonStreamingHeartbeatTicker);
+      nonStreamingHeartbeatTicker = null;
+    }
+    // Always finalize the activeRequest so it doesn't leak in the backfill
+    // scan loop forever. (Pre-fix: an SSE-keepalive-active request that
+    // errored would skip endActiveRequest because res.headersSent was true.)
+    if (activeRequests.has(activeReqId)) {
+      endActiveRequest(activeReqId, { status: 'error' });
+    }
     if (error.retryErrors) retryInfo = { retries: error.retries, retryErrors: error.retryErrors };
     logLlm({
       endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
@@ -4904,7 +6228,25 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       messages: req.body.messages || null, prompt: null,
       response: null, error: error.message
     });
-    res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
+    // If body already committed (real streaming started, or backfill won), just close.
+    // Otherwise send the 502 (handling SSE-keepalive-active path via sendErrorIfPossible).
+    if (bodyCommitted) {
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    if (sseKeepaliveActive) {
+      bodyCommitted = true;
+      res.write(`event: error\ndata: ${JSON.stringify({ status: 502, error: error.message })}\n\n`);
+      res.end();
+    } else if (!res.headersSent) {
+      res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
+    } else if (!res.writableEnded) {
+      // Non-streaming heartbeat already flushed headers but no body yet.
+      // Write the error as a JSON object — the leading heartbeat newlines
+      // are valid whitespace before a JSON value.
+      res.write(JSON.stringify({ error: 'Failed to reach llama server', details: error.message }));
+      res.end();
+    }
   }
 });
 
@@ -4955,9 +6297,10 @@ app.post('/api/v1/completions', async (req, res) => {
         const promptTokens = usage.prompt_tokens || 0;
         const completionTokens = usage.completion_tokens || 0;
         const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || requestedModel, duration, backend: backend.name });
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
-        addLlmLog({ endpoint: 'completions', model: data.model || requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: req.body.prompt || null, response: data.choices?.[0]?.text || null, error: null, backend: backend.id, requestBody: req.body });
+        addLlmLog({ endpoint: 'completions', model: requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: req.body.prompt || null, response: data.choices?.[0]?.text || null, error: null, backend: backend.id, requestBody: req.body });
+        if (data.model) data.model = requestedModel;
         res.json(data);
       }
     } catch (error) {
@@ -4967,8 +6310,22 @@ app.post('/api/v1/completions', async (req, res) => {
     return;
   }
 
+  // Hold a local queue slot for the lifetime of the response (released on res close/finish)
+  let completionsQueueWait = 0;
   try {
-    const { response, retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted, queueWait: completionsQueueWait } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
+    const slot = await acquireLocalSlot(req, res, {
+      model: requestedModel, endpoint: 'completions', activeReqId: null
+    });
+    completionsQueueWait = slot.queueWait;
+  } catch (err) {
+    if (!res.headersSent) return res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
+    if (!res.writableEnded) res.end();
+    return;
+  }
+
+  try {
+    await ensureModelServed(requestedModel);
+    const { response, retries: fetchRetries, retryErrors: fetchRetryErrors, restarted: fetchRestarted } = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body)
@@ -5066,18 +6423,22 @@ app.post('/api/v1/completions', async (req, res) => {
         promptTokens,
         completionTokens,
         tokensPerSecond,
-        model: data.model || requestedModel,
+        model: requestedModel,
         duration: inferDuration
       });
 
       addLlmLog({
-        endpoint: 'completions', model: data.model || requestedModel,
+        endpoint: 'completions', model: requestedModel,
         stream: false, status: 200, duration: wallDuration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: null, prompt: req.body.prompt || null,
         response: data.choices?.[0]?.text || null, error: null, ...retryFields
       });
 
+      // Normalize model field to match requested model
+      if (data.model && requestedModel !== 'unknown') {
+        data.model = requestedModel;
+      }
       res.json(data);
     }
   } catch (error) {
@@ -5183,7 +6544,7 @@ app.post('/api/v1/responses', async (req, res) => {
   console.log(`[responses] Request for model: ${requestedModel}`);
 
   // Inject reasoning_effort if configured
-  const proxyBody = injectReasoningEffort(req.body);
+  const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'responses', req.body);
@@ -5228,7 +6589,10 @@ app.post('/api/v1/responses', async (req, res) => {
         recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({ endpoint: 'responses', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: null, response: null, error: null, backend: backend.id, requestBody: req.body });
-        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        data._llama_manager = enrichLlamaManagerMeta(
+          { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id },
+          { completionTokens }
+        );
         res.json(data);
       }
     } catch (error) {
@@ -5241,7 +6605,18 @@ app.post('/api/v1/responses', async (req, res) => {
   let totalRetries = 0;
   let allRetryErrors = [];
   let anyRestarted = false;
+  // Hold a local queue slot for the lifetime of the response (released on res close/finish)
   try {
+    await acquireLocalSlot(req, res, {
+      model: requestedModel, endpoint: 'responses', activeReqId: null
+    });
+  } catch (err) {
+    if (!res.headersSent) return res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
+    if (!res.writableEnded) res.end();
+    return;
+  }
+  try {
+    await ensureModelServed(requestedModel);
     let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -5385,10 +6760,14 @@ app.post('/api/v1/responses', async (req, res) => {
         prompt: null, response: respText, error: null, ...retryFields()
       });
 
-      data._llama_manager = {
-        duration,
-        tokensPerSecond: Math.round(tokensPerSecond * 10) / 10
-      };
+      data._llama_manager = enrichLlamaManagerMeta(
+        {
+          duration,
+          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+          backend: 'local'
+        },
+        { completionTokens }
+      );
 
       res.json(data);
     }
@@ -5414,7 +6793,7 @@ app.post('/api/v1/messages', async (req, res) => {
   console.log(`[messages] Request for model: ${requestedModel}`);
 
   // Inject reasoning_effort if configured
-  const proxyBody = injectReasoningEffort(req.body);
+  const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'messages', req.body);
@@ -5459,7 +6838,10 @@ app.post('/api/v1/messages', async (req, res) => {
         recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || routing.targetModel, duration, backend: backend.name });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({ endpoint: 'messages', model: data.model || routing.targetModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: req.body.messages || null, prompt: null, response: null, error: null, backend: backend.id, requestBody: req.body });
-        data._llama_manager = { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id };
+        data._llama_manager = enrichLlamaManagerMeta(
+          { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id },
+          { completionTokens }
+        );
         res.json(data);
       }
     } catch (error) {
@@ -5472,7 +6854,18 @@ app.post('/api/v1/messages', async (req, res) => {
   let totalRetries = 0;
   let allRetryErrors = [];
   let anyRestarted = false;
+  // Hold a local queue slot for the lifetime of the response (released on res close/finish)
   try {
+    await acquireLocalSlot(req, res, {
+      model: requestedModel, endpoint: 'messages', activeReqId: null
+    });
+  } catch (err) {
+    if (!res.headersSent) return res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
+    if (!res.writableEnded) res.end();
+    return;
+  }
+  try {
+    await ensureModelServed(requestedModel);
     let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -5608,10 +7001,14 @@ app.post('/api/v1/messages', async (req, res) => {
         response: data.content?.[0]?.text || null, error: null, ...retryFields()
       });
 
-      data._llama_manager = {
-        duration,
-        tokensPerSecond: Math.round(tokensPerSecond * 10) / 10
-      };
+      data._llama_manager = enrichLlamaManagerMeta(
+        {
+          duration,
+          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
+          backend: 'local'
+        },
+        { completionTokens: outputTokens }
+      );
 
       res.json(data);
     }
@@ -5751,6 +7148,247 @@ function isLlamaServerHeaviestProcess() {
     return false;
   }
 }
+
+// Check llama-cpp's slots for the given model. Returns true if any slot is
+// currently processing — meaning the upstream is genuinely working, just
+// slowly. The watchdog uses this to avoid the cascade where killing a
+// long-prompt-processing handler frees the JS slot, the next request starts
+// a NEW upstream slot (llama-cpp doesn't notice TCP close during prompt
+// processing), and we end up with N stuck slots competing for the GPU.
+async function isUpstreamProcessing(model) {
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return false;
+    const slots = await r.json();
+    return Array.isArray(slots) && slots.some(s => s.is_processing);
+  } catch { return false; }
+}
+
+// Fetch full slot details for proof-of-life UI updates. Returns the raw slot
+// array (or null on error). Short timeout (1.5s) so a busy llama-cpp doesn't
+// gum up the probe cadence — we'd rather skip a tick than block forever.
+async function fetchSlots(model) {
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(1500) });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+// Periodic proof-of-life probe. For each active local request, query
+// llama.cpp /slots once per model and stamp upstreamProbe so the UI can
+// distinguish "alive, processing prompt" from "wedged". Runs every 3s; cheap
+// because we batch by model (one HTTP call per model regardless of how many
+// active requests share it).
+const UPSTREAM_PROBE_INTERVAL_MS = 3000;
+setInterval(async () => {
+  // Collect distinct models that have at least one active local slot holder
+  const slotHolders = new Set();
+  for (const item of llamaQueue.activeItems.values()) {
+    if (item.activeReqId != null) slotHolders.add(item.activeReqId);
+  }
+  const modelsToProbe = new Set();
+  for (const [id, entry] of activeRequests) {
+    if (entry.backend !== 'local') continue;
+    if (!slotHolders.has(id)) continue;
+    if (entry.model) modelsToProbe.add(entry.model);
+  }
+  if (modelsToProbe.size === 0) return;
+
+  // Probe each model in parallel (typically just 1)
+  const probedAt = Date.now();
+  const slotsByModel = new Map();
+  await Promise.all([...modelsToProbe].map(async (model) => {
+    const slots = await fetchSlots(model);
+    if (slots) slotsByModel.set(model, slots);
+  }));
+
+  // Attach probe to each active entry
+  for (const [id, entry] of activeRequests) {
+    if (entry.backend !== 'local') continue;
+    if (!slotHolders.has(id)) continue;
+    const slots = slotsByModel.get(entry.model);
+    if (!slots) continue;
+    // Try to find the specific slot this request is on. If we injected
+    // id_slot for prefix cache, we know it. Otherwise grab the first
+    // processing slot for the model (best effort).
+    let mySlot = null;
+    if (entry.idSlot != null) {
+      mySlot = slots.find(s => s.id === entry.idSlot);
+    }
+    if (!mySlot) {
+      mySlot = slots.find(s => s.is_processing) || null;
+    }
+    const isProcessing = !!mySlot?.is_processing;
+    const nDecoded = mySlot?.next_token?.[0]?.n_decoded ?? 0;
+    const phase = !isProcessing ? 'idle' : (nDecoded > 0 ? 'decoding' : 'prompt-processing');
+    entry.upstreamProbe = {
+      probedAt,
+      slotId: mySlot?.id ?? null,
+      isProcessing,
+      nDecoded,
+      phase
+    };
+  }
+}, UPSTREAM_PROBE_INTERVAL_MS);
+
+// Reroute scanner: scans pending items in the local llamaQueue every few
+// seconds and identifies any whose model is offloadable to a remote backend
+// that now has capacity. Cancels those queue positions (the chat handler's
+// acquireLocalSlot catch sees this, marks the response with Retry-After:0,
+// and the client's retry hits resolveBackend fresh and lands on the remote
+// backend). This prevents the scenario where 8B Qwens block a gemma in the
+// local queue when Borethrax has just freed up.
+const REROUTE_SCAN_INTERVAL_MS = 3000;
+setInterval(() => {
+  if (llamaQueue.queue.length === 0) return;
+  const backends = config?.backends || {};
+  if (!backends.enabled || !backends.directory?.length) return;
+  // Pull these once per pass so the inner loop is cheap.
+  const dir = backends.directory;
+  for (const item of llamaQueue.queue) {
+    if (item.activeReqId == null) continue;
+    const entry = activeRequests.get(item.activeReqId);
+    if (!entry || entry._rerouteHint) continue;
+    const model = entry.model;
+    if (!model) continue;
+    // Find a remote backend that maps this model AND has capacity AND circuit
+    // is closed. If found, mark the entry and cancel the queue position.
+    const viable = dir.find(b => {
+      if (!b.enabled || !b.tested) return false;
+      if (isBackendCircuitOpen(b.id)) return false;
+      if (!b.modelMapping) return false;
+      if (!resolveModelMapping(b.modelMapping, model)) return false;
+      const q = backendQueues.get(b.id);
+      return !q || q.active < q.concurrency;
+    });
+    if (!viable) continue;
+    entry._rerouteHint = { backendId: viable.id, backendName: viable.name };
+    console.log(`[reroute] Cancelling local queue position for activeReqId=${item.activeReqId} (model=${model}) — ${viable.name} has capacity`);
+    llamaQueue.cancel(item.id);
+  }
+}, REROUTE_SCAN_INTERVAL_MS);
+
+// Stall watchdog: scans active local requests every STALL_WATCHDOG_INTERVAL ms.
+// Two-tier:
+//  1. Soft tier (stallMs): if entry has gone stallMs without tokens AND
+//     llama-cpp shows no active processing for the model, kill it.
+//     If llama-cpp IS processing, extend lastActivityAt — prompt processing
+//     for a long context can legitimately take many minutes.
+//  2. Hard tier (stallMs * STALL_HARD_CAP_MULTIPLIER): kill regardless of
+//     upstream state. Catches truly wedged llama-cpp (no progress at all).
+const STALL_HARD_CAP_MULTIPLIER = 6; // e.g. 10min soft → 60min hard cap
+// Remote backends use a tighter threshold: a wedged Ollama/etc. that accepts
+// the request but never streams data has no GPU work to "extend" — we should
+// give up fairly quickly and let the caller fail/retry/route elsewhere.
+// Remote stall threshold. 120s rather than 60s gives a slow-but-not-stuck
+// Ollama backend a fair chance to deliver the first token under load. Truly
+// wedged remotes still get torn down — just after a longer grace window.
+const REMOTE_STALL_MS = 120_000;
+
+setInterval(async () => {
+  const stallMs = config?.localStallMs ?? DEFAULT_LOCAL_STALL_MS;
+  if (!Number.isFinite(stallMs) || stallMs <= 0) return; // disabled
+  const hardCapMs = stallMs * STALL_HARD_CAP_MULTIPLIER;
+  const now = Date.now();
+  // Local: only candidates that hold a real queue slot are eligible.
+  const slotHolders = new Set();
+  for (const item of llamaQueue.activeItems.values()) {
+    if (item.activeReqId != null) slotHolders.add(item.activeReqId);
+  }
+  // Leaked-slot detector: any llamaQueue.activeItems entry whose
+  // activeReqId points at an activeRequest that no longer exists is a leak
+  // (handler died without firing release()). Force-release it. Threshold is
+  // intentionally generous to avoid killing in-progress prompt-processing for
+  // non-chat endpoints (completions/responses/messages don't register
+  // activeRequests so they always look "leaked").
+  for (const item of llamaQueue.activeItems.values()) {
+    const heldFor = now - (item.startedAt || item.enqueuedAt);
+    if (heldFor < stallMs) continue;
+    const tracked = item.activeReqId != null && activeRequests.has(item.activeReqId);
+    if (tracked) continue;
+    // For chat/completions slot holders, activeReqId IS set — so if the entry
+    // is missing now, it leaked. For other endpoints, activeReqId is null and
+    // we can't tell tracked vs untracked. Use hardCap for the latter.
+    const isChatLeak = item.activeReqId != null;
+    if (!isChatLeak && heldFor < hardCapMs) continue;
+    const msg = `Stall watchdog: force-releasing leaked llamaQueue slot ${item.id} (model=${item.model}, endpoint=${item.endpoint}, held ${Math.round(heldFor / 1000)}s, activeReqId=${item.activeReqId})`;
+    console.warn(`[watchdog] ${msg}`);
+    addLog('system', msg);
+    requestStatsAccum.watchdogKills++;
+    watchdogStats.totalKills++;
+    watchdogStats.lastKillAt = now;
+    watchdogStats.lastKillModel = item.model;
+    watchdogStats.lastKillStallMs = heldFor;
+    llamaQueue.release(item.id);
+  }
+  for (const [id, entry] of activeRequests) {
+    if (entry._watchdogKilled) continue;
+    const idle = now - (entry.lastActivityAt || entry.startTime);
+    if (entry.backend === 'local') {
+      if (!slotHolders.has(id)) continue;
+      if (idle < stallMs) continue;
+      const totalElapsed = now - entry.startTime;
+      const hardCapHit = totalElapsed >= hardCapMs;
+      if (!hardCapHit) {
+        // Check llama-cpp slot state. is_processing=true on its own can be
+        // a zombie slot — we've seen cases where llama-server shows slots
+        // is_processing but n_decoded stays at 0 and the worker is at 0% CPU.
+        // Real "upstream is making progress" means n_decoded ADVANCED since
+        // we last looked, not just is_processing=true. Track it per entry.
+        const slots = await fetchSlots(entry.model);
+        const procSlots = Array.isArray(slots) ? slots.filter(s => s.is_processing) : [];
+        const totalDecoded = procSlots.reduce((s, x) => {
+          const nt = x.next_token?.[0] || {};
+          return s + (nt.n_decoded || 0);
+        }, 0);
+        const upstreamBusy = procSlots.length > 0;
+        const lastDecoded = entry._lastUpstreamDecoded ?? -1;
+        const advanced = totalDecoded > lastDecoded;
+        entry._lastUpstreamDecoded = totalDecoded;
+        if (upstreamBusy && advanced) {
+          entry.lastActivityAt = now;
+          if (!entry._extendedByWatchdog) {
+            entry._extendedByWatchdog = true;
+            const extendMsg = `Stall watchdog: extending request ${id} (model: ${entry.model}) — upstream is still processing (idle ${Math.round(idle / 1000)}s, hardcap ${Math.round(hardCapMs / 1000)}s)`;
+            console.log(`[watchdog] ${extendMsg}`);
+            addLog('system', extendMsg);
+          }
+          continue;
+        }
+      }
+      entry._watchdogKilled = true;
+      const reason = hardCapHit ? `hardcap ${Math.round(hardCapMs / 1000)}s` : `idle ${Math.round(idle / 1000)}s ≥ ${Math.round(stallMs / 1000)}s`;
+      const msg = `Stall watchdog: aborting local request ${id} (model: ${entry.model}, ${entry.tokens} tokens, ${reason})`;
+      console.warn(`[watchdog] ${msg}`);
+      addLog('system', msg);
+      requestStatsAccum.watchdogKills++;
+      watchdogStats.totalKills++;
+      watchdogStats.lastKillAt = now;
+      watchdogStats.lastKillModel = entry.model;
+      watchdogStats.lastKillStallMs = idle;
+      try { entry.abortController?.abort(); } catch { /* ignore */ }
+    } else {
+      // Remote backend stall. Tighter threshold (60s default) — there's no
+      // way to "verify upstream is processing" via /slots, and a wedged remote
+      // (Dahaka's OpenAI compat layer hanging is the canonical case) just
+      // ties up the request indefinitely. Abort propagates via the
+      // activeRequest signal that we now pass to fetchRemoteBackend, which
+      // tears down the fetch + body stream.
+      if (idle < REMOTE_STALL_MS) continue;
+      entry._watchdogKilled = true;
+      const msg = `Stall watchdog: aborting remote request ${id} (backend: ${entry.backend}, model: ${entry.model}, ${entry.tokens} tokens, idle ${Math.round(idle / 1000)}s ≥ ${Math.round(REMOTE_STALL_MS / 1000)}s)`;
+      console.warn(`[watchdog] ${msg}`);
+      addLog('system', msg);
+      requestStatsAccum.watchdogKills++;
+      watchdogStats.totalKills++;
+      watchdogStats.lastKillAt = now;
+      watchdogStats.lastKillModel = entry.model;
+      watchdogStats.lastKillStallMs = idle;
+      try { entry.abortController?.abort(); } catch { /* ignore */ }
+    }
+  }
+}, STALL_WATCHDOG_INTERVAL);
 
 setInterval(() => {
   if (!llamaProcess || memWatchdogCooldown || restartInProgress) return;

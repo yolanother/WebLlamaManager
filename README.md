@@ -289,6 +289,108 @@ Enable lingering: `sudo loginctl enable-linger $USER`
 - Try reducing `modelsMax` in config.json
 - Try a smaller quantization (Q4 instead of Q5/Q6)
 
+### Strix Halo / Ryzen AI MAX: `amdxdna` NPU driver breaks GPU compute (`/dev/kfd` EINVAL)
+
+**Affects:** AMD Strix Halo / Ryzen AI MAX systems (gfx1151 iGPU) on any
+Linux kernel that ships the in-tree `amdxdna` NPU driver. We hit this
+multiple times on this hardware — it is the single biggest cause of
+"tok/s collapsed and the GPU meter shows nothing" on Strix Halo.
+
+**Symptoms**
+
+- `llama-server` starts but logs at model-load time:
+  ```
+  ggml_cuda_init: failed to initialize ROCm: no ROCm-capable device is detected
+  load_tensors:          CPU model buffer size = ... MiB
+  load_tensors:   CPU_REPACK model buffer size = ... MiB
+  ```
+  Every tensor buffer lands on CPU even though `-ngl 99` is set.
+- `rocminfo` (host or inside the distrobox container) returns:
+  ```
+  ROCk module is loaded
+  Unable to open /dev/kfd read-write: Invalid argument
+  ```
+- `cat /sys/class/drm/card*/device/gpu_busy_percent` stays at `0` during
+  prompt processing AND generation (not "low" — literally zero).
+- Token rate drops to <1 tok/s on a model that should do 10-40 tok/s on
+  the iGPU. The whole inference runs on the CPU's vector units instead.
+- `dmesg` typically shows lines like
+  `amdxdna 0000:c7:00.1: [drm] *ERROR* amdxdna_drm_open: SVA bind device failed, ret -19`
+  — that's the smoking gun.
+
+**Cause**
+
+On Strix Halo two drivers want the same char device. Both `amdxdna` (the
+NPU compute driver) and `amdgpu`'s KFD path expose themselves through
+`/dev/kfd`. If `amdxdna` loads first — or in some kernel versions, if it
+loads *at all* alongside `amdgpu` — it corrupts the IOMMU/SVA state that
+the KFD interface relies on. After that, ROCm's `open("/dev/kfd", O_RDWR)`
+returns `EINVAL` and HIP cannot see the iGPU at all. The device node is
+still there with mode `0666`, so `chmod` / render-group fiddling /
+container privilege flags will *not* fix it — it is a kernel-internal
+state issue, not a permissions issue.
+
+**Fix and why it works**
+
+Permanently blacklist `amdxdna` so it never loads, then reboot once so
+`amdgpu` can initialize KFD cleanly without `amdxdna` having corrupted
+the IOMMU state first.
+
+The bundled wrapper script does the blacklist write, attempts an unload,
+restarts `llama-manager`, and verifies the GPU is back:
+
+```bash
+./scripts/fix-strix-halo-npu-conflict.sh
+```
+
+Equivalent manual steps:
+
+```bash
+echo "blacklist amdxdna" | sudo tee /etc/modprobe.d/blacklist-amdxdna.conf
+sudo reboot   # required the first time — see note below
+```
+
+> ⚠️ **A reboot is almost always required the first time.** Unloading
+> `amdxdna` with `modprobe -r` does NOT unwind the broken KFD state
+> already wedged inside `amdgpu` — the only ways to clear it are
+> (1) a full host reboot (recommended; the blacklist file keeps
+> `amdxdna` out so a fresh `amdgpu` initializes alone), or
+> (2) a full `amdgpu` driver reload via
+> [`scripts/fix-gpu-passthrough.sh`](scripts/fix-gpu-passthrough.sh),
+> which is risky — it will kill any running display server and every
+> GPU-using process, and must be run from a TTY with the desktop stopped.
+> If `modprobe -r amdxdna` fails with `Module is in use`, something is
+> still holding `/dev/accel*` open and reboot is the only safe option.
+
+**Why the blacklist is the right fix, not a workaround**
+
+We are not using the NPU for anything — `llama.cpp` targets the iGPU
+via ROCm/HIP, not the XDNA NPU. The `amdxdna` driver provides zero
+value on this stack, and its presence breaks the path we actually
+depend on. Removing it permanently is strictly an improvement; there
+is nothing to give up. The blacklist file persists across reboots and
+kernel updates, so the fix is durable as long as that file stays in
+place. Re-verify after any major distro upgrade.
+
+**Verify after the reboot**
+
+```bash
+lsmod | grep amdxdna                                           # should be empty
+python3 -c "import os; os.open('/dev/kfd', os.O_RDWR)"         # should succeed (no EINVAL)
+podman exec llama-rocm-7rc-rocwmma rocminfo | grep -E 'gfx|Marketing Name'
+# Expected: gfx1151 and "AMD Radeon Graphics" (or similar)
+
+watch -n1 'cat /sys/class/drm/card*/device/gpu_busy_percent'
+# Send a chat request — busy% should rise during prompt processing/generation.
+# (Note: on Strix Halo even this kernel counter often under-reports;
+# look at power draw via rocm-smi or the Llama Manager dashboard for a
+# more reliable "GPU is doing work" signal — see GOTCHAS for why.)
+```
+
+See [`docs/GOTCHAS.md`](docs/GOTCHAS.md) for the full archive of
+Strix-Halo-specific issues we've hit (stale KFD state needing a full
+`amdgpu` reload, GTT/UMA tuning, etc.) and how to report a new one.
+
 ## OpenCode Setup
 
 Llama Manager works with [OpenCode](https://opencode.ai) as an OpenAI-compatible provider.
