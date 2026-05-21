@@ -5835,6 +5835,44 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     return;
   }
   let totalQueueWait = initialQueueWait;
+
+  // SSE keepalive ticker — for STREAMING requests, start writing
+  // `: processing waited=Xs` comments BEFORE doFetch fires. Llama-cpp
+  // on a slow/CPU backend can take 60-120s to even start responding
+  // to its own /chat/completions endpoint while it processes the
+  // prompt. During that gap, nginx (openresty in front of the proxy)
+  // sees zero bytes from the upstream and times out at 60-90s,
+  // returning 504 Gateway Time-out to the client.
+  //
+  // The non-streaming flow already handles this (line ~5779) by
+  // committing chunked headers + JSON-whitespace heartbeats up front.
+  // The streaming flow used to only emit keepalives during the local
+  // queue wait via onWait, and again AFTER doFetch returned via the
+  // per-chunk ticker — leaving the window between queue-acquire and
+  // first-byte-from-llama-cpp wide open. Fixed by promoting the
+  // ticker here so it covers doFetch as well.
+  //
+  // `lastChunkAt` is updated by the chunk-reading loop later so once
+  // tokens flow normally we don't emit redundant comments.
+  let lastChunkAt = Date.now();
+  let streamingKeepaliveTicker = null;
+  if (isStreaming) {
+    flushSseHeaders();
+    streamingKeepaliveTicker = setInterval(() => {
+      if (Date.now() - lastChunkAt > 20_000 && !res.writableEnded) {
+        try { res.write(`: processing waited=${Math.round((Date.now() - startTime) / 1000)}s\n\n`); } catch {}
+      }
+    }, 10_000);
+    const clearStreamingKeepalive = () => {
+      if (streamingKeepaliveTicker) {
+        clearInterval(streamingKeepaliveTicker);
+        streamingKeepaliveTicker = null;
+      }
+    };
+    res.on('close', clearStreamingKeepalive);
+    res.on('finish', clearStreamingKeepalive);
+  }
+
   async function doFetch(body) {
     const result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
       method: 'POST',
@@ -5984,18 +6022,11 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         res.setHeader('Connection', 'keep-alive');
       }
 
-      // SSE keepalive during prompt processing. Llama-cpp doesn't emit any
-      // bytes between accepting the request and producing the first token —
-      // that gap can be 30-90s for a fresh large prompt on a slow backend.
-      // Many HTTP clients have a 60-90s read timeout and abort during that
-      // silence. Send a `: processing` comment every 20s to keep the socket
-      // warm. Reset on every real chunk so we only emit during silent gaps.
-      let lastChunkAt = Date.now();
-      const keepaliveTicker = setInterval(() => {
-        if (Date.now() - lastChunkAt > 20_000 && !res.writableEnded) {
-          try { res.write(`: processing waited=${Math.round((Date.now() - startTime) / 1000)}s\n\n`); } catch {}
-        }
-      }, 10_000);
+      // SSE keepalive: the streamingKeepaliveTicker started right after
+      // queue-acquire (see above) is already covering the doFetch wait
+      // AND will continue covering this streaming read loop. We share
+      // its `lastChunkAt` clock — each chunk we read below updates it
+      // so we only emit `: processing` comments during silent gaps.
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -6063,7 +6094,10 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             }
             res.write(outputChunk);
           }
-          clearInterval(keepaliveTicker);
+          if (streamingKeepaliveTicker) {
+            clearInterval(streamingKeepaliveTicker);
+            streamingKeepaliveTicker = null;
+          }
           res.end();
 
           // Record stats after stream completes
@@ -6094,7 +6128,10 @@ app.post('/api/v1/chat/completions', async (req, res) => {
           });
           endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
         } catch (e) {
-          clearInterval(keepaliveTicker);
+          if (streamingKeepaliveTicker) {
+            clearInterval(streamingKeepaliveTicker);
+            streamingKeepaliveTicker = null;
+          }
           console.error('[proxy] Stream error:', e);
           const duration = Date.now() - startTime;
           logLlm({
