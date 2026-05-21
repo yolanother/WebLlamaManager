@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, NavLink, useLocation, useParams, useNavigate } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart,
-  BarChart, Bar
+  BarChart, Bar, Cell
 } from 'recharts';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
@@ -664,6 +664,65 @@ function TemperatureChart({ data, height = 140 }) {
           <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpu)" strokeWidth={2} dot={false} />
           <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpu)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
         </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// Horizontal bar chart ranking models by recent average tok/s, fastest
+// at the top. Data source: analytics.tokenStats.modelAvgTps (backend/model
+// -> avg t/s over recent requests). Empty until we have generation data.
+function ModelTpsRankChart({ modelAvgTps, height = 200 }) {
+  const data = React.useMemo(() => {
+    if (!modelAvgTps) return [];
+    return Object.entries(modelAvgTps)
+      .map(([model, tps]) => ({
+        // Trim backend prefix in the display, but keep the full id so duplicate
+        // model names from different backends don't collide.
+        model,
+        label: model.length > 40 ? model.slice(0, 37) + '…' : model,
+        tps: Math.round(tps * 10) / 10
+      }))
+      .filter(d => d.tps > 0)
+      .sort((a, b) => b.tps - a.tps);
+  }, [modelAvgTps]);
+
+  if (data.length === 0) {
+    return (
+      <div className="chart-container" style={{ height }}>
+        <div className="chart-empty">No per-model speed data yet — send a chat request</div>
+      </div>
+    );
+  }
+
+  // Color by rank using the existing palette
+  const palette = ['#10b981', '#3b82f6', '#a855f7', '#f59e0b', '#ef4444', '#06b6d4', '#ec4899', '#84cc16'];
+
+  return (
+    <div className="chart-container" style={{ height }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart
+          data={data}
+          layout="vertical"
+          margin={{ top: 5, right: 40, left: 5, bottom: 5 }}
+        >
+          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" horizontal={false} />
+          <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <YAxis
+            type="category"
+            dataKey="label"
+            tick={{ fill: '#bbb', fontSize: 11 }}
+            tickLine={false}
+            axisLine={false}
+            width={240}
+          />
+          <Tooltip content={<ChartTooltip unit=" tok/s" />} />
+          <Bar dataKey="tps" name="tok/s" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: '#ccc', fontSize: 11, formatter: (v) => v.toFixed(1) }}>
+            {data.map((entry, i) => (
+              <Cell key={entry.model} fill={palette[i % palette.length]} />
+            ))}
+          </Bar>
+        </BarChart>
       </ResponsiveContainer>
     </div>
   );
@@ -2040,6 +2099,15 @@ function Dashboard({ stats, activeRequest }) {
                 <div className="token-stat-label">Completion Tokens</div>
               </div>
             </div>
+          </div>
+
+          {/* Per-Model tok/s ranking */}
+          <div className="chart-card">
+            <h4>
+              Model Speed Ranking
+              <span className="chart-value">avg tok/s (recent)</span>
+            </h4>
+            <ModelTpsRankChart modelAvgTps={analytics?.tokenStats?.modelAvgTps} height={Math.max(200, Object.keys(analytics?.tokenStats?.modelAvgTps || {}).length * 32 + 40)} />
           </div>
 
           {/* Context Usage Chart */}
