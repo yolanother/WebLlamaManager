@@ -5836,9 +5836,14 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       res.status(503).json({ error: reason });
     } else if (!res.writableEnded) {
       if (sseKeepaliveActive) {
-        try { res.write(`event: error\ndata: ${JSON.stringify({ status: 503, error: reason })}\n\n`); } catch {}
+        // OpenAI-compatible streaming error envelope — see sendErrorIfPossible()
+        // for why we don't use `event: error` + string payloads.
+        try {
+          res.write(`data: ${JSON.stringify({ error: { message: reason, type: wasReroute ? 'rerouted' : 'queue_cancelled', code: 503 } })}\n\n`);
+          res.write('data: [DONE]\n\n');
+        } catch {}
       } else if (nonStreamingHeartbeatTicker || !isStreaming) {
-        try { res.write(JSON.stringify({ error: reason, status: 503 })); } catch {}
+        try { res.write(JSON.stringify({ error: { message: reason, type: wasReroute ? 'rerouted' : 'queue_cancelled', code: 503 } })); } catch {}
       }
       try { res.end(); } catch {}
     }
@@ -5908,16 +5913,24 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     if (bodyCommitted) return;
     bodyCommitted = true;
     if (sseKeepaliveActive) {
-      // Headers already sent as SSE; emit the error as an SSE data event then close.
-      res.write(`event: error\ndata: ${JSON.stringify({ status, error: errText })}\n\n`);
+      // Headers already sent as SSE; emit the error in OpenAI's streaming
+      // error envelope, then close. OpenAI-compatible client SDKs (opencode,
+      // ai-sdk/openai-compatible) expect either {choices:[...]} or
+      // {error:{message,type,code}} on data: lines — `error` must be an
+      // OBJECT, never a string. Emitting `event: error` with a string
+      // payload (the old shape) made the SDK's Zod schema reject every
+      // data line and abort the worker mid-task.
+      res.write(`data: ${JSON.stringify({ error: { message: errText, type: 'upstream_error', code: status } })}\n\n`);
+      res.write('data: [DONE]\n\n');
       res.end();
     } else if (nonStreamingHeartbeatTicker || (res.headersSent && !isStreaming)) {
       // Non-streaming heartbeat already flushed headers and may have written
       // whitespace bytes. Write the error as a JSON object — the leading
       // whitespace is valid before a JSON value, so the client's JSON.parse
-      // still works.
+      // still works. OpenAI-compatible non-stream error shape uses
+      // {error:{message,type,code}} too.
       if (!res.writableEnded) {
-        res.write(JSON.stringify({ error: errText, status }));
+        res.write(JSON.stringify({ error: { message: errText, type: 'upstream_error', code: status } }));
         res.end();
       }
     } else if (!res.headersSent) {
@@ -6246,7 +6259,12 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     }
     if (sseKeepaliveActive) {
       bodyCommitted = true;
-      res.write(`event: error\ndata: ${JSON.stringify({ status: 502, error: error.message })}\n\n`);
+      // OpenAI-compatible streaming error envelope: {error: {message, type, code}}
+      // — see sendErrorIfPossible() for the rationale. Custom `event: error`
+      // frames are silently dropped by the @ai-sdk/openai-compatible SDK; a
+      // {status:N,error:"string"} data payload fails its Zod schema.
+      res.write(`data: ${JSON.stringify({ error: { message: error.message, type: 'upstream_unreachable', code: 502 } })}\n\n`);
+      res.write('data: [DONE]\n\n');
       res.end();
     } else if (!res.headersSent) {
       res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
