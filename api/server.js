@@ -5141,7 +5141,17 @@ function isProxyConnectionError(status, text) {
     lower.includes('connection refused') ||
     lower.includes('econnrefused') ||
     lower.includes('econnreset') ||
-    lower.includes('socket hang up');
+    lower.includes('socket hang up') ||
+    // llama.cpp upstream proxy errors — its embedded HTTP server emits these
+    // when its slot subsystem fails to read/write the upstream KV proxy or
+    // when a slot acquire-then-disconnect race fires. Treat them as
+    // transient: retry (and on multiple failures restart the server).
+    // Without this, an opencode streaming dispatch sees a raw HTTP-500
+    // body mid-stream and Zod-rejects it as not-a-chat-chunk, killing
+    // the worker.
+    lower.includes('failed to read connection') ||
+    lower.includes('failed to write connection') ||
+    lower.includes('proxy error:');
 }
 
 // Wait for llama.cpp server to become healthy again (e.g. after OOM model reload)
