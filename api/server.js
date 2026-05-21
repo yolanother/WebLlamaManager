@@ -6165,6 +6165,20 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             response: responseText || null, error: `Stream error: ${e.message}`
           });
           endActiveRequest(activeReqId, { status: 'error' });
+          // Send an OpenAI-style structured error before closing so the
+          // client SDK doesn't interpret the abrupt FIN as an
+          // AbortError. Without this the @ai-sdk/openai-compatible SDK
+          // (and opencode) reports a generic "This operation was
+          // aborted" UnknownError, the worker exits with no useful
+          // diagnostic, and the dispatched task ends without writing a
+          // report. Match the envelope shape used elsewhere in this
+          // handler (sendErrorIfPossible, catch-block 502 path).
+          if (!res.writableEnded) {
+            try {
+              res.write(`data: ${JSON.stringify({ error: { message: `Stream error: ${e.message}`, type: 'stream_aborted', code: 500 } })}\n\n`);
+              res.write('data: [DONE]\n\n');
+            } catch {}
+          }
           res.end();
         }
       };
