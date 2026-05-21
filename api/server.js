@@ -6080,11 +6080,26 @@ app.post('/api/v1/chat/completions', async (req, res) => {
                   const data = JSON.parse(line.slice(6));
                   const delta = data.choices?.[0]?.delta;
                   if (delta) {
-                    const text = delta.content || delta.reasoning_content || delta.reasoning || '';
+                    // Extract any field that carries model output. Qwen 3.6's
+                    // thinking-mode streaming uses fields beyond OpenAI's
+                    // canonical `content` — we've seen `reasoning_content`,
+                    // `reasoning`, `thinking`, `text`. Without this the stall
+                    // watchdog sees 0 tokens for the request and tears down
+                    // an in-progress generation after stallMs (default 10
+                    // min) because updateActiveRequest was never called.
+                    const text = delta.content || delta.reasoning_content ||
+                                 delta.reasoning || delta.thinking ||
+                                 delta.text || '';
                     if (text) {
                       completionTokens++;
                       responseText += text;
                       updateActiveRequest(activeReqId, text);
+                    } else if (Object.keys(delta).length > 0) {
+                      // Delta exists with non-text payload (tool_calls, role,
+                      // or some other thinking-mode shape). Still progress —
+                      // refresh lastActivityAt so the stall watchdog doesn't
+                      // mistake "no text field matched" for "model is wedged".
+                      updateActiveRequest(activeReqId, '');
                     }
                   }
                   if (data.usage) {
