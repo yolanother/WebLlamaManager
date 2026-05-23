@@ -7393,6 +7393,25 @@ setInterval(async () => {
         // is_processing but n_decoded stays at 0 and the worker is at 0% CPU.
         // Real "upstream is making progress" means n_decoded ADVANCED since
         // we last looked, not just is_processing=true. Track it per entry.
+        //
+        // EXCEPTION — prompt-processing phase. For a big context on a
+        // CPU-only backend (GPU wedged, or an unusually large opencode
+        // tool-bundle prompt), llama.cpp can sit in pre-decode prompt
+        // processing for 10-30 minutes. During that window every probed
+        // slot reports is_processing=true with n_decoded=0. The "decoded
+        // advanced" check above flips false from probe #2 onward
+        // (-1 → 0 = advance on first probe, then 0 → 0 = no advance),
+        // and the watchdog kills the request even though llama.cpp is
+        // actively crunching the prompt. To distinguish this from a
+        // true zombie, also extend when:
+        //   * is_processing AND id_task is set (a real request is bound
+        //     to the slot) AND
+        //   * n_decoded is still 0 (we haven't started emitting tokens
+        //     yet — i.e. we're in the prompt-processing window) AND
+        //   * we haven't already extended for prompt processing more
+        //     than PROMPT_PROCESSING_MAX_EXTENSIONS times (cap so a
+        //     truly wedged slot eventually dies).
+        const PROMPT_PROCESSING_MAX_EXTENSIONS = 6; // 60 min at 10-min stallMs
         const slots = await fetchSlots(entry.model);
         const procSlots = Array.isArray(slots) ? slots.filter(s => s.is_processing) : [];
         const totalDecoded = procSlots.reduce((s, x) => {
@@ -7400,6 +7419,9 @@ setInterval(async () => {
           return s + (nt.n_decoded || 0);
         }, 0);
         const upstreamBusy = procSlots.length > 0;
+        const inPromptProcessing = upstreamBusy &&
+          totalDecoded === 0 &&
+          procSlots.some(s => s.id_task != null);
         const lastDecoded = entry._lastUpstreamDecoded ?? -1;
         const advanced = totalDecoded > lastDecoded;
         entry._lastUpstreamDecoded = totalDecoded;
@@ -7412,6 +7434,20 @@ setInterval(async () => {
             addLog('system', extendMsg);
           }
           continue;
+        }
+        if (inPromptProcessing) {
+          const promptExtensions = (entry._promptProcessingExtensions ?? 0) + 1;
+          if (promptExtensions <= PROMPT_PROCESSING_MAX_EXTENSIONS) {
+            entry._promptProcessingExtensions = promptExtensions;
+            entry.lastActivityAt = now;
+            const extendMsg = `Stall watchdog: extending request ${id} (model: ${entry.model}) — slot in prompt-processing phase (id_task set, n_decoded=0); extension ${promptExtensions}/${PROMPT_PROCESSING_MAX_EXTENSIONS}`;
+            console.log(`[watchdog] ${extendMsg}`);
+            addLog('system', extendMsg);
+            continue;
+          }
+          // Cap hit — fall through to the kill path. Truly wedged prompt
+          // processing (e.g. CPU 27B that's been pre-decoding for 60+
+          // min) deserves to be reaped.
         }
       }
       entry._watchdogKilled = true;
