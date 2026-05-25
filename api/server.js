@@ -5031,6 +5031,83 @@ app.get('/api/analytics/history', (req, res) => {
 });
 
 // Get crash event history
+// Per-model performance breakdown across 24h / 7d / 30d / all-time windows.
+// Aggregates analyticsHistory minute records via request-count-weighted average
+// of the per-model tok/s map (mtps) using mc (per-model request counts).
+//
+// Response shape:
+//   {
+//     models: [
+//       {
+//         name: "Dahaka Ollama/Qwen_Qwen3-8B-GGUF",
+//         backend: "Dahaka Ollama",  // null when local
+//         isRemote: true,
+//         windows: {
+//           "24h": { tps: 87.3, requests: 1240 },
+//           "7d":  { tps: 84.1, requests: 9842 },
+//           "30d": { tps: 83.2, requests: 41020 },
+//           "all": { tps: 82.7, requests: 88203 }
+//         }
+//       },
+//       ...
+//     ]
+//   }
+// Sorted by 24h tps desc, falling back to all-time tps when the 24h window is empty.
+app.get('/api/analytics/models', (req, res) => {
+  const now = Date.now();
+  const windows = {
+    '24h': 24 * 3600000,
+    '7d': 7 * 86400000,
+    '30d': 30 * 86400000,
+    'all': null
+  };
+
+  // models[name] -> { windows: { key -> {sumTpsWeighted, totalRequests} } }
+  const models = {};
+
+  for (const rec of analyticsHistory) {
+    if (!rec.mtps || !rec.mc) continue;
+    for (const [name, tps] of Object.entries(rec.mtps)) {
+      const count = rec.mc[name] || 0;
+      if (count <= 0 || !(tps > 0)) continue;
+      if (!models[name]) {
+        models[name] = {
+          windows: Object.fromEntries(Object.keys(windows).map(k => [k, { sum: 0, requests: 0 }]))
+        };
+      }
+      for (const [key, windowMs] of Object.entries(windows)) {
+        if (windowMs != null && rec.ts < now - windowMs) continue;
+        const slot = models[name].windows[key];
+        slot.sum += tps * count;
+        slot.requests += count;
+      }
+    }
+  }
+
+  const result = Object.entries(models).map(([name, agg]) => {
+    const slashIdx = name.indexOf('/');
+    const isRemote = slashIdx > 0;
+    const backend = isRemote ? name.slice(0, slashIdx) : null;
+    const displayModel = isRemote ? name.slice(slashIdx + 1) : name;
+    const windowsOut = {};
+    for (const [key, slot] of Object.entries(agg.windows)) {
+      windowsOut[key] = {
+        tps: slot.requests > 0 ? Math.round((slot.sum / slot.requests) * 10) / 10 : 0,
+        requests: slot.requests
+      };
+    }
+    return { name, backend, isRemote, model: displayModel, windows: windowsOut };
+  });
+
+  result.sort((a, b) => {
+    const at = a.windows['24h'].tps || a.windows.all.tps;
+    const bt = b.windows['24h'].tps || b.windows.all.tps;
+    return bt - at;
+  });
+
+  res.json({ models: result });
+});
+
 app.get('/api/analytics/crashes', (req, res) => {
   const range = req.query.range || '1w';
   const now = Date.now();

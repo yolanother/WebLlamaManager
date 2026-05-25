@@ -669,34 +669,52 @@ function TemperatureChart({ data, height = 140 }) {
   );
 }
 
-// Horizontal bar chart ranking models by recent average tok/s, fastest
-// at the top. Data source: analytics.tokenStats.modelAvgTps (backend/model
-// -> avg t/s over recent requests). Empty until we have generation data.
-function ModelTpsRankChart({ modelAvgTps, height = 200 }) {
+// Color scheme for backend distinction. Local = greens; each remote backend
+// gets a stable color derived from its name hash so the same backend looks
+// the same every render.
+const LOCAL_BAR_COLOR = '#10b981';
+const REMOTE_BAR_PALETTE = ['#3b82f6', '#a855f7', '#f59e0b', '#06b6d4', '#ec4899', '#ef4444', '#84cc16', '#f97316'];
+function backendColor(backend) {
+  if (!backend) return LOCAL_BAR_COLOR;
+  let h = 0;
+  for (let i = 0; i < backend.length; i++) h = (h * 31 + backend.charCodeAt(i)) & 0xffffffff;
+  return REMOTE_BAR_PALETTE[Math.abs(h) % REMOTE_BAR_PALETTE.length];
+}
+
+// Horizontal bar chart ranking models by tok/s for a given window
+// ('24h' | '7d' | '30d' | 'all'), fastest at the top. Data source:
+// /api/analytics/models which aggregates the full analytics history,
+// so it includes every model that has ever served traffic (not just
+// the in-memory recent-requests buffer).
+function ModelTpsRankChart({ modelBreakdown, window = 'all', height = 200 }) {
   const data = React.useMemo(() => {
-    if (!modelAvgTps) return [];
-    return Object.entries(modelAvgTps)
-      .map(([model, tps]) => ({
-        // Trim backend prefix in the display, but keep the full id so duplicate
-        // model names from different backends don't collide.
-        model,
-        label: model.length > 40 ? model.slice(0, 37) + '…' : model,
-        tps: Math.round(tps * 10) / 10
+    const models = modelBreakdown?.models || [];
+    return models
+      .map(m => ({
+        key: m.name,
+        // Keep backend prefix in the label but visually demote it so the
+        // actual model name reads first; the color encodes the host too.
+        backend: m.backend,
+        model: m.model,
+        isRemote: m.isRemote,
+        label: m.isRemote ? `${m.backend} · ${m.model}` : m.model,
+        tps: m.windows?.[window]?.tps || 0,
+        requests: m.windows?.[window]?.requests || 0
       }))
       .filter(d => d.tps > 0)
       .sort((a, b) => b.tps - a.tps);
-  }, [modelAvgTps]);
+  }, [modelBreakdown, window]);
 
   if (data.length === 0) {
     return (
       <div className="chart-container" style={{ height }}>
-        <div className="chart-empty">No per-model speed data yet — send a chat request</div>
+        <div className="chart-empty">No per-model speed data for this window yet</div>
       </div>
     );
   }
 
-  // Color by rank using the existing palette
-  const palette = ['#10b981', '#3b82f6', '#a855f7', '#f59e0b', '#ef4444', '#06b6d4', '#ec4899', '#84cc16'];
+  // Truncate long labels from the front so the model name stays readable
+  const labelFor = (d) => d.label.length > 38 ? '…' + d.label.slice(-37) : d.label;
 
   return (
     <div className="chart-container" style={{ height }}>
@@ -704,26 +722,94 @@ function ModelTpsRankChart({ modelAvgTps, height = 200 }) {
         <BarChart
           data={data}
           layout="vertical"
-          margin={{ top: 5, right: 40, left: 5, bottom: 5 }}
+          margin={{ top: 5, right: 48, left: 5, bottom: 5 }}
         >
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" horizontal={false} />
           <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
           <YAxis
             type="category"
             dataKey="label"
-            tick={{ fill: '#bbb', fontSize: 11 }}
+            tick={({ x, y, payload }) => {
+              const d = data.find(r => r.label === payload.value);
+              if (!d) return null;
+              return (
+                <g transform={`translate(${x},${y})`}>
+                  <text x={-6} y={0} dy={4} textAnchor="end" fill={d.isRemote ? '#9ca3af' : '#10b981'} fontSize={11}>
+                    {labelFor(d)}
+                  </text>
+                </g>
+              );
+            }}
             tickLine={false}
             axisLine={false}
-            width={240}
+            width={260}
           />
           <Tooltip content={<ChartTooltip unit=" tok/s" />} />
           <Bar dataKey="tps" name="tok/s" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: '#ccc', fontSize: 11, formatter: (v) => v.toFixed(1) }}>
-            {data.map((entry, i) => (
-              <Cell key={entry.model} fill={palette[i % palette.length]} />
+            {data.map((entry) => (
+              <Cell key={entry.key} fill={backendColor(entry.backend)} />
             ))}
           </Bar>
         </BarChart>
       </ResponsiveContainer>
+    </div>
+  );
+}
+
+// Tabular long-term breakdown: per model, average tok/s for 24h / 7d / 30d /
+// all-time windows. Color-codes the backend cell so users can tell local
+// vs each remote backend at a glance.
+function ModelPerformanceBreakdown({ modelBreakdown }) {
+  const models = modelBreakdown?.models || [];
+  if (models.length === 0) {
+    return <div className="chart-empty">No model data yet</div>;
+  }
+  const windows = [
+    { key: '24h', label: '24h' },
+    { key: '7d', label: '7 days' },
+    { key: '30d', label: '30 days' },
+    { key: 'all', label: 'all time' }
+  ];
+  return (
+    <div className="model-breakdown-table-wrap">
+      <table className="model-breakdown-table">
+        <thead>
+          <tr>
+            <th>Host</th>
+            <th>Model</th>
+            {windows.map(w => <th key={w.key} className="num">{w.label}</th>)}
+            <th className="num">requests (all)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {models.map(m => (
+            <tr key={m.name}>
+              <td>
+                <span className="model-backend-pill" style={{ background: backendColor(m.backend), color: '#0a0a0a' }}>
+                  {m.isRemote ? m.backend : 'local'}
+                </span>
+              </td>
+              <td className="model-cell-name" title={m.model}>{m.model}</td>
+              {windows.map(w => {
+                const t = m.windows?.[w.key]?.tps || 0;
+                const r = m.windows?.[w.key]?.requests || 0;
+                return (
+                  <td key={w.key} className="num">
+                    {t > 0 ? (
+                      <>
+                        <span className="model-tps-val">{t.toFixed(1)}</span>
+                        <span className="model-tps-unit"> tok/s</span>
+                        <div className="model-tps-reqs">{r.toLocaleString()} req</div>
+                      </>
+                    ) : <span className="model-tps-empty">—</span>}
+                  </td>
+                );
+              })}
+              <td className="num">{(m.windows?.all?.requests || 0).toLocaleString()}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -1056,6 +1142,7 @@ function Dashboard({ stats, activeRequest }) {
   const [historyRange, setHistoryRange] = useState('1h');
   const [historyData, setHistoryData] = useState(null);
   const [crashData, setCrashData] = useState(null);
+  const [modelBreakdown, setModelBreakdown] = useState(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const fullscreenTimerRef = useRef(null);
@@ -1081,6 +1168,15 @@ function Dashboard({ stats, activeRequest }) {
     }
   }, []);
 
+  const fetchModelBreakdown = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/analytics/models`);
+      setModelBreakdown(await res.json());
+    } catch (err) {
+      console.error('Failed to fetch model breakdown:', err);
+    }
+  }, []);
+
   const fetchHistory = useCallback(async () => {
     try {
       const [histRes, crashRes] = await Promise.all([
@@ -1098,15 +1194,19 @@ function Dashboard({ stats, activeRequest }) {
     fetchModels();
     fetchAnalytics();
     fetchHistory();
+    fetchModelBreakdown();
     const modelsInterval = setInterval(fetchModels, 10000);
     const analyticsInterval = setInterval(fetchAnalytics, 2000);
     const historyInterval = setInterval(fetchHistory, 60000);
+    // Breakdown aggregates the full analytics history file — refresh slowly.
+    const breakdownInterval = setInterval(fetchModelBreakdown, 30000);
     return () => {
       clearInterval(modelsInterval);
       clearInterval(analyticsInterval);
       clearInterval(historyInterval);
+      clearInterval(breakdownInterval);
     };
-  }, [fetchModels, fetchAnalytics, fetchHistory]);
+  }, [fetchModels, fetchAnalytics, fetchHistory, fetchModelBreakdown]);
 
   // Refetch history when range changes
   useEffect(() => {
@@ -2101,13 +2201,19 @@ function Dashboard({ stats, activeRequest }) {
             </div>
           </div>
 
-          {/* Per-Model tok/s ranking */}
-          <div className="chart-card">
+          {/* Per-Model tok/s ranking — pulls from long-term aggregated history so
+              every model that ever served traffic appears, not just the in-memory
+              recent-requests buffer. Color encodes local vs each remote backend. */}
+          <div className="chart-card chart-card-wide">
             <h4>
               Model Speed Ranking
-              <span className="chart-value">avg tok/s (recent)</span>
+              <span className="chart-value">avg tok/s · all time</span>
             </h4>
-            <ModelTpsRankChart modelAvgTps={analytics?.tokenStats?.modelAvgTps} height={Math.max(200, Object.keys(analytics?.tokenStats?.modelAvgTps || {}).length * 32 + 40)} />
+            <ModelTpsRankChart
+              modelBreakdown={modelBreakdown}
+              window="all"
+              height={Math.max(220, ((modelBreakdown?.models || []).filter(m => (m.windows?.all?.tps || 0) > 0).length * 32) + 50)}
+            />
           </div>
 
           {/* Context Usage Chart */}
@@ -2215,6 +2321,16 @@ function Dashboard({ stats, activeRequest }) {
             </div>
           </div>
         )}
+
+        {/* Long-term per-model performance breakdown table */}
+        <h4 className="analytics-section-header">Model Performance Breakdown</h4>
+        <div className="chart-card-wide model-breakdown-card">
+          <h4>
+            Average tok/s by Time Window
+            <span className="chart-value">all models · weighted by request count</span>
+          </h4>
+          <ModelPerformanceBreakdown modelBreakdown={modelBreakdown} />
+        </div>
 
         <h4 className="analytics-section-header">System Resources</h4>
         <div className="charts-grid-wide">
