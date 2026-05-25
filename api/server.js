@@ -2661,6 +2661,67 @@ app.get('/api/backends/:id/models', async (req, res) => {
 });
 
 // Test backend connectivity — fetches models list first, then sends a test chat request
+// Probe a remote backend's /v1/models list — NO chat completion required.
+// Independent of /test so the UI can populate the model-mapping dropdown
+// before any mapping exists (escapes the chicken-and-egg where /test
+// needed a model that picking a mapping needed this list to populate).
+//
+// Works for both saved and unsaved backends:
+//   - body.url present  → probe that URL directly (new-backend form)
+//   - else              → look up backend by params.id (saved backend)
+// Body may also include { apiKeyEnvVar, extraHeaders } overrides.
+async function probeBackendModels({ url, apiKeyEnvVar, extraHeaders }) {
+  const apiKey = apiKeyEnvVar ? process.env[apiKeyEnvVar] : null;
+  const baseUrl = String(url || '').replace(/\/+$/, '');
+  const startTime = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const r = await fetch(`${baseUrl}/models`, {
+      headers: {
+        ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {}),
+        ...(extraHeaders || {})
+      },
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    const latencyMs = Date.now() - startTime;
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      return { success: false, status: r.status, latencyMs, remoteModels: [],
+        error: `Backend returned HTTP ${r.status}: ${body.slice(0, 200)}` };
+    }
+    const data = await r.json();
+    const remoteModels = (data.data || data.models || [])
+      .map(m => (typeof m === 'string' ? m : m.id || m.name || ''))
+      .filter(Boolean)
+      .sort();
+    return { success: true, status: r.status, latencyMs, remoteModels };
+  } catch (err) {
+    clearTimeout(timeout);
+    return { success: false, status: 0, latencyMs: Date.now() - startTime, remoteModels: [],
+      error: err.name === 'AbortError' ? 'Timeout fetching /v1/models (10s)' : err.message };
+  }
+}
+
+// Existing backend by id — uses its stored URL unless body overrides.
+app.post('/api/backends/:id/refresh-models', async (req, res) => {
+  const backend = config.backends?.directory?.find(b => b.id === req.params.id);
+  const url = req.body?.url || backend?.url;
+  if (!url) return res.status(404).json({ error: 'Backend not found and no url in body' });
+  res.json(await probeBackendModels({
+    url,
+    apiKeyEnvVar: req.body?.apiKeyEnvVar ?? backend?.apiKeyEnvVar,
+    extraHeaders: req.body?.extraHeaders ?? backend?.extraHeaders
+  }));
+});
+
+// Unsaved backend — caller supplies the URL in the body.
+app.post('/api/backends/refresh-models', async (req, res) => {
+  if (!req.body?.url) return res.status(400).json({ error: 'Missing url' });
+  res.json(await probeBackendModels(req.body));
+});
+
 app.post('/api/backends/:id/test', async (req, res) => {
   const backend = config.backends?.directory?.find(b => b.id === req.params.id);
   if (!backend) {

@@ -5258,9 +5258,52 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
 }
 
 // Shared form fields for backend add/edit
-function BackendFormFields({ values, onChange, localModels = [], remoteModels = [] }) {
+function BackendFormFields({ values, onChange, localModels = [], remoteModels: remoteModelsProp = [] }) {
   const update = (key, value) => onChange({ ...values, [key]: value });
   const updateCost = (key, value) => onChange({ ...values, costs: { ...values.costs, [key]: value } });
+
+  // Local copy of remoteModels — initialised from prop, can be refreshed
+  // independently of running a full backend test. This breaks the
+  // chicken-and-egg where /test needed a model and picking the model
+  // needed the list /test returns.
+  const [remoteModels, setRemoteModels] = React.useState(remoteModelsProp);
+  const [refreshState, setRefreshState] = React.useState({ loading: false, error: null, ts: null });
+  React.useEffect(() => { setRemoteModels(remoteModelsProp); }, [remoteModelsProp]);
+
+  const refreshRemoteModels = async () => {
+    if (!values.url) {
+      setRefreshState({ loading: false, error: 'Set the URL first', ts: Date.now() });
+      return;
+    }
+    setRefreshState({ loading: true, error: null, ts: null });
+    try {
+      // Prefer the by-id endpoint when we have an id (uses any server-side
+      // env-var-resolved API key); fall back to the URL-only endpoint for
+      // brand-new backends that haven't been saved yet.
+      const path = values.id
+        ? `${API_BASE}/backends/${values.id}/refresh-models`
+        : `${API_BASE}/backends/refresh-models`;
+      const r = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: values.url,
+          apiKeyEnvVar: values.apiKeyEnvVar || undefined,
+          extraHeaders: values.extraHeaders || undefined
+        })
+      });
+      const data = await r.json();
+      if (data.success) {
+        setRemoteModels(data.remoteModels || []);
+        setRefreshState({ loading: false, error: null, ts: Date.now(), count: (data.remoteModels || []).length, latencyMs: data.latencyMs });
+      } else {
+        setRemoteModels([]);
+        setRefreshState({ loading: false, error: data.error || `HTTP ${data.status}`, ts: Date.now() });
+      }
+    } catch (err) {
+      setRefreshState({ loading: false, error: err.message, ts: Date.now() });
+    }
+  };
 
   // Model mapping editor
   const mappingEntries = Object.entries(values.modelMapping || { '*': '' });
@@ -5337,8 +5380,30 @@ function BackendFormFields({ values, onChange, localModels = [], remoteModels = 
 
       {/* Model mapping with dropdowns */}
       <div className="setting-item" style={{ gridColumn: '1 / -1' }}>
-        <label>Model Mapping</label>
-        <p className="setting-hint">Map local models to remote models. Use * (wildcard) to match all local models to a single remote model.</p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '12px' }}>
+          <label>Model Mapping</label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <button
+              type="button"
+              className="btn-secondary"
+              style={{ padding: '4px 10px', fontSize: '0.85em' }}
+              onClick={refreshRemoteModels}
+              disabled={refreshState.loading || !values.url}
+              title={!values.url ? 'Enter the backend URL first' : 'Fetch the remote /v1/models list (no chat completion sent)'}
+            >
+              {refreshState.loading ? 'Refreshing…' : '↻ Refresh models'}
+            </button>
+            {refreshState.error && (
+              <span style={{ color: 'var(--error, #ef4444)', fontSize: '0.8em' }}>{refreshState.error}</span>
+            )}
+            {!refreshState.error && refreshState.ts && (
+              <span style={{ color: 'var(--text-secondary)', fontSize: '0.8em' }}>
+                {refreshState.count} model{refreshState.count === 1 ? '' : 's'} · {refreshState.latencyMs}ms
+              </span>
+            )}
+          </div>
+        </div>
+        <p className="setting-hint">Map local models to remote models. Use * (wildcard) to match all local models to a single remote model. Click <strong>Refresh models</strong> to populate the remote-model dropdown without running a full backend test.</p>
         {mappingEntries.map(([key, value], idx) => (
           <div key={idx} style={{ display: 'flex', gap: '8px', marginBottom: '6px', alignItems: 'center' }}>
             {/* Local model selector */}
@@ -5375,7 +5440,7 @@ function BackendFormFields({ values, onChange, localModels = [], remoteModels = 
                   )}
                 </select>
               ) : (
-                <input type="text" value={value} onChange={(e) => updateMappingValue(key, e.target.value)} placeholder="Remote model ID (test backend to load list)" style={{ width: '100%' }} />
+                <input type="text" value={value} onChange={(e) => updateMappingValue(key, e.target.value)} placeholder="Remote model ID (or click Refresh models above)" style={{ width: '100%' }} />
               )}
             </div>
             <button className="btn-secondary" style={{ padding: '4px 8px', fontSize: '0.85em' }} onClick={() => removeMapping(key)}>x</button>
