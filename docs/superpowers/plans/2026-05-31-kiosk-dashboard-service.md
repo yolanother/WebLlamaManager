@@ -615,9 +615,8 @@ git commit -m "feat(kiosk): installer CLI parsing, sudo re-exec, dispatch"
 ### Task 5: Install flow
 
 **Files:**
-- Modify: `scripts/lib/kiosk-common.sh` (replace stub `kiosk_install`)
-- Modify: `scripts/install-kiosk.sh` (call `ensure_root` inside install path)
-- Modify: `tests/kiosk/run-tests.sh` (add test + call)
+- Modify: `scripts/lib/kiosk-common.sh` (dry-run-guard `kiosk_manifest_set`/`kiosk_backup_file`; replace the three stubs with real `kiosk_install` + `kiosk_restart` + helpers)
+- Modify: `tests/kiosk/run-tests.sh` (add `test_install_flow` + `test_dry_run_no_mutation` + calls)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -667,9 +666,30 @@ test_install_flow() {
 
     rm -rf "$sb"
 }
+
+# A --dry-run install must change NOTHING on disk: no manifest, no backups, no
+# session file. (Regression guard: manifest/backup writes are not gated by the
+# kiosk_run wrapper, so they must check dry-run themselves — otherwise a real
+# non-root `install --dry-run` fails trying to mkdir /var/backups.)
+test_dry_run_no_mutation() {
+    printf 'test_dry_run_no_mutation\n'
+    local sb; sb="$(new_sandbox)"
+    mkdir -p "$sb/etc/gdm3"
+    printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install --dry-run --root "$sb" >/dev/null 2>&1
+    assert_eq "dry-run install exit 0" "0" "$?"
+    assert_no_file "dry-run wrote no manifest" "$sb/var/backups/llama-kiosk/manifest"
+    assert_no_file "dry-run wrote no gdm backup" "$sb/var/backups/llama-kiosk/gdm_custom_conf"
+    assert_no_file "dry-run wrote no session file" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    # The pre-existing gdm config is untouched (still no autologin line).
+    assert_eq "dry-run did not edit gdm config" "no" \
+      "$(grep -q 'AutomaticLogin' "$sb/etc/gdm3/custom.conf" && echo yes || echo no)"
+    rm -rf "$sb"
+}
 ```
 
-Then add `test_install_flow` to the run section.
+Then add `test_install_flow` and `test_dry_run_no_mutation` to the run section.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -678,7 +698,56 @@ Expected: FAIL — stub `kiosk_install` writes nothing; session/autologin assert
 
 - [ ] **Step 3: Write minimal implementation**
 
-In `scripts/lib/kiosk-common.sh`, **remove** the entire temporary stub block from Task 4 (all three stubs) and append the real install + restart helpers. `kiosk_restart` must be defined here because the always-on `test_cli` invokes `restart --dry-run`; `kiosk_uninstall` is added in Task 6 and is not invoked before then.
+First, make the two non-`kiosk_run` mutators dry-run-aware so a real `install --dry-run` writes nothing. **Replace** the existing `kiosk_manifest_set` (from Task 2) and `kiosk_backup_file` (from Task 3) bodies with these dry-run-guarded versions (only the guard lines are added — the rest is unchanged):
+
+```bash
+# Set (creating or replacing) a manifest key.
+# Args: $1 = key, $2 = value. No-op under dry-run (the manifest lives under
+# /var/backups and must not be written when previewing).
+kiosk_manifest_set() {
+    local key="$1" val="$2" mf tmp
+    [ "$KIOSK_DRY_RUN" = "true" ] && return 0
+    mf="$(kiosk_manifest_path)"
+    mkdir -p "$(dirname "$mf")"
+    if [ -f "$mf" ] && grep -qE "^${key}=" "$mf"; then
+        tmp="$(mktemp)"
+        grep -vE "^${key}=" "$mf" > "$tmp" || true
+        printf '%s=%s\n' "$key" "$val" >> "$tmp"
+        mv "$tmp" "$mf"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$mf"
+    fi
+}
+
+# Idempotently back up a system file before install modifies it. No-op under
+# dry-run (logs intent only). Only the FIRST backup is kept, so re-running
+# install never clobbers the pristine original. Records backup.<name>.existed
+# (true/false) and backup.<name>.path in the manifest.
+# Args: $1 = logical name (manifest/file key), $2 = logical source path.
+kiosk_backup_file() {
+    local name="$1" src_logical="$2" src backup
+    if [ "$KIOSK_DRY_RUN" = "true" ]; then
+        kiosk_log "DRY-RUN would back up $src_logical"
+        return 0
+    fi
+    src="$(kiosk_path "$src_logical")"
+    backup="$(kiosk_backup_dir)/$name"
+    mkdir -p "$(kiosk_backup_dir)"
+    # Already recorded? Preserve the pristine first backup.
+    if [ -n "$(kiosk_manifest_get "backup.$name.existed")" ]; then
+        return 0
+    fi
+    if [ -f "$src" ]; then
+        cp -a "$src" "$backup"
+        kiosk_manifest_set "backup.$name.existed" "true"
+    else
+        kiosk_manifest_set "backup.$name.existed" "false"
+    fi
+    kiosk_manifest_set "backup.$name.path" "$src_logical"
+}
+```
+
+Then, **remove** the entire temporary stub block from Task 4 (all three stubs) and append the real install + restart helpers. `kiosk_restart` must be defined here because the always-on `test_cli` invokes `restart --dry-run`; `kiosk_uninstall` is added in Task 6 and is not invoked before then.
 
 ```bash
 # Verify google-chrome is available (or faked for tests). Echo the binary name.
