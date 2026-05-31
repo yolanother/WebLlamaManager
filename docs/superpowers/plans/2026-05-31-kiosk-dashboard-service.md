@@ -46,31 +46,39 @@ Create `tests/kiosk/run-tests.sh`:
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PASS=0
-FAIL=0
+
+# Counters live in files, not shell variables: the test functions below run
+# their bodies inside subshells (for environment isolation), and variable
+# increments inside a subshell would not propagate back to the parent. Each
+# assertion appends one byte to a pass/fail file; the parent tallies at the end.
+RESULTS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kiosk-results.XXXXXX")"
+PASS_FILE="$RESULTS_DIR/pass"
+FAIL_FILE="$RESULTS_DIR/fail"
+: > "$PASS_FILE"
+: > "$FAIL_FILE"
 
 # Assert string equality. Args: description, expected, actual.
 assert_eq() {
     local desc="$1" expected="$2" actual="$3"
     if [ "$expected" = "$actual" ]; then
-        PASS=$((PASS+1)); printf '  ok   %s\n' "$desc"
+        printf 'P' >> "$PASS_FILE"; printf '  ok   %s\n' "$desc"
     else
-        FAIL=$((FAIL+1)); printf '  FAIL %s\n       expected: %q\n       actual:   %q\n' "$desc" "$expected" "$actual"
+        printf 'F' >> "$FAIL_FILE"; printf '  FAIL %s\n       expected: %q\n       actual:   %q\n' "$desc" "$expected" "$actual"
     fi
 }
 
 # Assert a file exists. Args: description, path.
 assert_file() {
     local desc="$1" path="$2"
-    if [ -f "$path" ]; then PASS=$((PASS+1)); printf '  ok   %s\n' "$desc"
-    else FAIL=$((FAIL+1)); printf '  FAIL %s\n       missing file: %s\n' "$desc" "$path"; fi
+    if [ -f "$path" ]; then printf 'P' >> "$PASS_FILE"; printf '  ok   %s\n' "$desc"
+    else printf 'F' >> "$FAIL_FILE"; printf '  FAIL %s\n       missing file: %s\n' "$desc" "$path"; fi
 }
 
 # Assert a file does NOT exist. Args: description, path.
 assert_no_file() {
     local desc="$1" path="$2"
-    if [ ! -e "$path" ]; then PASS=$((PASS+1)); printf '  ok   %s\n' "$desc"
-    else FAIL=$((FAIL+1)); printf '  FAIL %s\n       file should not exist: %s\n' "$desc" "$path"; fi
+    if [ ! -e "$path" ]; then printf 'P' >> "$PASS_FILE"; printf '  ok   %s\n' "$desc"
+    else printf 'F' >> "$FAIL_FILE"; printf '  FAIL %s\n       file should not exist: %s\n' "$desc" "$path"; fi
 }
 
 # Fresh sandbox dir for a test. Echoes the path.
@@ -102,6 +110,10 @@ test_url_resolution() {
 
 test_url_resolution
 
+# Tally the file-based counters in the parent shell and exit nonzero on any fail.
+PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
+FAIL=$(wc -c < "$FAIL_FILE" | tr -d ' ')
+rm -rf "$RESULTS_DIR"
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
 ```
@@ -485,6 +497,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SESSION_NAME="llama-kiosk"
 
+# Preserve the original CLI arguments so a sudo re-exec can replay them verbatim
+# (the parse loop below consumes "$@" via shift).
+ORIG_ARGV=("$@")
+
 # Print usage to stdout.
 usage() {
     cat <<'EOF'
@@ -537,14 +553,15 @@ fi
 source "$SCRIPT_DIR/lib/kiosk-common.sh"
 
 # Re-exec under sudo for real (non-sandboxed, non-dry-run) runs that touch /etc.
-# Args: original argv.
+# Replays the original CLI arguments (ORIG_ARGV) under sudo so the subcommand
+# and flags survive the re-exec.
 ensure_root() {
     [ "${KIOSK_ROOT%/}" = "" ] || [ "$KIOSK_ROOT" = "/" ] || return 0   # sandboxed: no sudo
     [ "$KIOSK_DRY_RUN" = "true" ] && return 0                            # dry-run: no sudo
     if [ "$(id -u)" -ne 0 ]; then
         if command -v sudo >/dev/null 2>&1; then
             kiosk_log "Re-executing under sudo for system changes..."
-            exec sudo -E "$0" "$@"
+            exec sudo -E "$0" "${ORIG_ARGV[@]}"
         fi
         echo "Error: must run as root (sudo) for system changes." >&2
         exit 1
