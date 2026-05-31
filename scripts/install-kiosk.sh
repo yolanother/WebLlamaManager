@@ -63,7 +63,11 @@ while [ $# -gt 0 ]; do
         install|uninstall|restart) SUBCMD="$1" ;;
         --dry-run)         KIOSK_DRY_RUN="true" ;;
         --no-start)        KIOSK_NO_START="true" ;;
-        --root)            ROOT_OVERRIDE="${2:-}"; shift ;;
+        --root)
+            if [ -z "${2:-}" ] || [ "${2#--}" != "${2:-}" ]; then
+                echo "Error: --root requires a directory argument." >&2; usage >&2; exit 2
+            fi
+            ROOT_OVERRIDE="$2"; shift ;;
         -h|--help)         usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -88,8 +92,10 @@ source "$SCRIPT_DIR/lib/kiosk-common.sh"
 # Replays the original CLI arguments (ORIG_ARGV) under sudo so the subcommand
 # and flags survive the re-exec.
 ensure_root() {
-    [ "${KIOSK_ROOT%/}" = "" ] || [ "$KIOSK_ROOT" = "/" ] || return 0   # sandboxed: no sudo
-    [ "$KIOSK_DRY_RUN" = "true" ] && return 0                            # dry-run: no sudo
+    # Only production root ("/") needs privilege escalation; a --root sandbox
+    # (any other value) and dry-run runs never invoke sudo.
+    [ "${KIOSK_ROOT%/}" = "" ] || [ "$KIOSK_ROOT" = "/" ] || return 0   # sandbox: skip sudo
+    [ "$KIOSK_DRY_RUN" = "true" ] && return 0                            # dry-run: skip sudo
     if [ "$(id -u)" -ne 0 ]; then
         if command -v sudo >/dev/null 2>&1; then
             kiosk_log "Re-executing under sudo for system changes..."

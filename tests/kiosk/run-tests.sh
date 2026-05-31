@@ -151,6 +151,12 @@ test_cli() {
     # Dry-run restart in a sandbox is a no-op that exits 0 (no display-manager touch)
     bash "$REPO_ROOT/scripts/install-kiosk.sh" restart --dry-run --root "$sb" >/dev/null 2>&1
     assert_eq "dry-run restart exit 0" "0" "$?"
+
+    # --root with a missing/flag-shaped value is rejected (does not swallow a flag)
+    bash "$REPO_ROOT/scripts/install-kiosk.sh" install --root --dry-run >/dev/null 2>&1
+    assert_eq "--root eating a flag is rejected" "no" "$([ $? -eq 0 ] && echo yes || echo no)"
+    bash "$REPO_ROOT/scripts/install-kiosk.sh" install --root >/dev/null 2>&1
+    assert_eq "--root with no value is rejected" "no" "$([ $? -eq 0 ] && echo yes || echo no)"
     rm -rf "$sb"
 }
 
