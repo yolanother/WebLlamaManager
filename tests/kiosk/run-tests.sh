@@ -250,6 +250,40 @@ test_uninstall_flow() {
     rm -rf "$sb"
 }
 
+test_launcher() {
+    printf 'test_launcher\n'
+    local sb; sb="$(new_sandbox)"
+
+    # Fake curl that "succeeds" immediately, and fake cage/chrome that just echo
+    # their args into a file so we can assert the launch command without a GUI.
+    mkdir -p "$sb/bin"
+    cat > "$sb/bin/curl"  <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    cat > "$sb/bin/cage"  <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" > "$sb/launch.txt"
+exit 0
+EOF
+    cat > "$sb/bin/google-chrome" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    chmod +x "$sb/bin/"*
+
+    # KIOSK_LAUNCH_ONCE prevents any restart loop; PATH shims override real bins.
+    PATH="$sb/bin:$PATH" KIOSK_LAUNCH_ONCE=1 KIOSK_URL="http://localhost:3001" \
+        KIOSK_WAIT_BUDGET=2 bash "$REPO_ROOT/scripts/llama-kiosk-launch.sh" >/dev/null 2>&1
+    local rc=$?
+    assert_eq "launcher exit 0" "0" "$rc"
+    assert_file "cage was invoked" "$sb/launch.txt"
+    assert_eq "chrome kiosk + url passed" "yes" \
+      "$(grep -q -- '--kiosk' "$sb/launch.txt" && grep -q 'localhost:3001' "$sb/launch.txt" && echo yes || echo no)"
+
+    rm -rf "$sb"
+}
+
 test_url_resolution
 test_manifest
 test_backup
@@ -257,6 +291,7 @@ test_cli
 test_install_flow
 test_dry_run_no_mutation
 test_uninstall_flow
+test_launcher
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
