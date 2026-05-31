@@ -154,10 +154,77 @@ test_cli() {
     rm -rf "$sb"
 }
 
+test_install_flow() {
+    printf 'test_install_flow\n'
+    local sb; sb="$(new_sandbox)"
+
+    # Seed a pre-existing gdm config and an AccountsService record for the user.
+    local user; user="$(id -un)"
+    mkdir -p "$sb/etc/gdm3" "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
+    printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
+    printf '[User]\nSession=ubuntu\nXSession=ubuntu\n' > "$sb/var/lib/AccountsService/users/$user"
+
+    # Real (non-dry-run) install into the sandbox. KIOSK_FAKE_CHROME makes the
+    # chrome presence check pass without a real browser.
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install --root "$sb" >/dev/null 2>&1
+    local rc=$?
+    assert_eq "install exit 0" "0" "$rc"
+
+    # Session desktop file generated and points at the launcher.
+    assert_file "session file created" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    assert_eq "session Exec set" "yes" \
+      "$(grep -q "llama-kiosk-launch.sh" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop" && echo yes || echo no)"
+
+    # gdm autologin enabled for the user.
+    assert_eq "autologin enabled" "yes" \
+      "$(grep -q '^AutomaticLoginEnable=true' "$sb/etc/gdm3/custom.conf" && echo yes || echo no)"
+    assert_eq "autologin user set" "yes" \
+      "$(grep -q "^AutomaticLogin=$user" "$sb/etc/gdm3/custom.conf" && echo yes || echo no)"
+
+    # AccountsService points at the kiosk session.
+    assert_eq "session switched" "yes" \
+      "$(grep -q '^Session=llama-kiosk' "$sb/var/lib/AccountsService/users/$user" && echo yes || echo no)"
+
+    # Originals were backed up.
+    assert_file "gdm backed up" "$sb/var/backups/llama-kiosk/gdm_custom_conf"
+    assert_eq "gdm backup pristine" "yes" \
+      "$(grep -q 'WaylandEnable=true' "$sb/var/backups/llama-kiosk/gdm_custom_conf" && ! grep -q 'AutomaticLogin' "$sb/var/backups/llama-kiosk/gdm_custom_conf" && echo yes || echo no)"
+
+    # Idempotent: second install keeps the pristine backup.
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install --root "$sb" >/dev/null 2>&1
+    assert_eq "backup still pristine after 2nd install" "no" \
+      "$(grep -q 'AutomaticLogin' "$sb/var/backups/llama-kiosk/gdm_custom_conf" && echo yes || echo no)"
+
+    rm -rf "$sb"
+}
+
+# A --dry-run install must change NOTHING on disk: no manifest, no backups, no
+# session file. (Regression guard: manifest/backup writes are not gated by the
+# kiosk_run wrapper, so they must check dry-run themselves — otherwise a real
+# non-root `install --dry-run` fails trying to mkdir /var/backups.)
+test_dry_run_no_mutation() {
+    printf 'test_dry_run_no_mutation\n'
+    local sb; sb="$(new_sandbox)"
+    mkdir -p "$sb/etc/gdm3"
+    printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install --dry-run --root "$sb" >/dev/null 2>&1
+    assert_eq "dry-run install exit 0" "0" "$?"
+    assert_no_file "dry-run wrote no manifest" "$sb/var/backups/llama-kiosk/manifest"
+    assert_no_file "dry-run wrote no gdm backup" "$sb/var/backups/llama-kiosk/gdm_custom_conf"
+    assert_no_file "dry-run wrote no session file" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    # The pre-existing gdm config is untouched (still no autologin line).
+    assert_eq "dry-run did not edit gdm config" "no" \
+      "$(grep -q 'AutomaticLogin' "$sb/etc/gdm3/custom.conf" && echo yes || echo no)"
+    rm -rf "$sb"
+}
+
 test_url_resolution
 test_manifest
 test_backup
 test_cli
+test_install_flow
+test_dry_run_no_mutation
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
