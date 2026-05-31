@@ -71,7 +71,33 @@ test_url_resolution() {
     )
 }
 
+test_manifest() {
+    printf 'test_manifest\n'
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb; sb="$(new_sandbox)"; export KIOSK_ROOT="$sb"
+
+      # Missing key -> empty
+      assert_eq "missing key empty" "" "$(kiosk_manifest_get foo)"
+
+      # Set then get
+      kiosk_manifest_set foo bar
+      assert_eq "get after set" "bar" "$(kiosk_manifest_get foo)"
+      assert_file "manifest created" "$(kiosk_manifest_path)"
+
+      # Replace existing key (no duplicate lines)
+      kiosk_manifest_set foo baz
+      assert_eq "get after replace" "baz" "$(kiosk_manifest_get foo)"
+      assert_eq "single line for key" "1" "$(grep -c '^foo=' "$(kiosk_manifest_path)")"
+
+      # Value may contain '=' and spaces
+      kiosk_manifest_set url "http://x:1/?a=b c"
+      assert_eq "value with = and space" "http://x:1/?a=b c" "$(kiosk_manifest_get url)"
+      rm -rf "$sb"
+    )
+}
+
 test_url_resolution
+test_manifest
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')

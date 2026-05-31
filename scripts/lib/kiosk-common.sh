@@ -38,3 +38,30 @@ kiosk_resolve_url() {
     if [ -n "$url" ]; then printf '%s\n' "$url"; return 0; fi
     printf 'http://localhost:%s\n' "${api_port:-3001}"
 }
+
+# Absolute path to the install manifest (records what install changed).
+kiosk_manifest_path() { kiosk_path /var/backups/llama-kiosk/manifest; }
+
+# Read a manifest key. Arg: $1 = key. Echo: value, or empty string if absent.
+kiosk_manifest_get() {
+    local key="$1" mf; mf="$(kiosk_manifest_path)"
+    [ -f "$mf" ] || return 0
+    grep -E "^${key}=" "$mf" 2>/dev/null | tail -n1 | cut -d= -f2- || true
+}
+
+# Set (creating or replacing) a manifest key.
+# Args: $1 = key, $2 = value. Always writes (not gated by dry-run: the manifest
+# is internal bookkeeping the caller decides whether to invoke).
+kiosk_manifest_set() {
+    local key="$1" val="$2" mf tmp
+    mf="$(kiosk_manifest_path)"
+    mkdir -p "$(dirname "$mf")"
+    if [ -f "$mf" ] && grep -qE "^${key}=" "$mf"; then
+        tmp="$(mktemp)"
+        grep -vE "^${key}=" "$mf" > "$tmp" || true
+        printf '%s=%s\n' "$key" "$val" >> "$tmp"
+        mv "$tmp" "$mf"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$mf"
+    fi
+}
