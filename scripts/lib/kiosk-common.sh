@@ -138,3 +138,10 @@ kiosk_restore_file() {
         kiosk_log "removed $src_logical (no original existed)"
     fi
 }
+
+# Temporary stubs (replaced in Tasks 5/6/7). Allow CLI dispatch to be tested now.
+if ! declare -F kiosk_install >/dev/null; then
+    kiosk_install()   { kiosk_log "install: not yet implemented"; }
+    kiosk_uninstall() { kiosk_log "uninstall: not yet implemented"; }
+    kiosk_restart()   { kiosk_log "restart: not yet implemented"; }
+fi

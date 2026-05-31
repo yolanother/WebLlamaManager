@@ -128,9 +128,36 @@ test_backup() {
     )
 }
 
+test_cli() {
+    printf 'test_cli\n'
+    local out
+    # --help exits 0 and mentions both subcommands
+    out="$(bash "$REPO_ROOT/scripts/install-kiosk.sh" --help 2>&1)"; local rc=$?
+    assert_eq "help exit 0" "0" "$rc"
+    assert_eq "help mentions install" "yes" "$(printf '%s' "$out" | grep -q 'install' && echo yes || echo no)"
+    assert_eq "help mentions uninstall" "yes" "$(printf '%s' "$out" | grep -q 'uninstall' && echo yes || echo no)"
+    assert_eq "help mentions restart" "yes" "$(printf '%s' "$out" | grep -q 'restart' && echo yes || echo no)"
+
+    # Unknown subcommand exits nonzero
+    bash "$REPO_ROOT/scripts/install-kiosk.sh" frobnicate >/dev/null 2>&1
+    assert_eq "unknown subcmd nonzero" "no" "$([ $? -eq 0 ] && echo yes || echo no)"
+
+    # Dry-run install in a sandbox does not require root and writes nothing real
+    local sb; sb="$(new_sandbox)"
+    out="$(bash "$REPO_ROOT/scripts/install-kiosk.sh" install --dry-run --root "$sb" 2>&1)"; rc=$?
+    assert_eq "dry-run install exit 0" "0" "$rc"
+    assert_no_file "dry-run wrote no session file" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+
+    # Dry-run restart in a sandbox is a no-op that exits 0 (no display-manager touch)
+    bash "$REPO_ROOT/scripts/install-kiosk.sh" restart --dry-run --root "$sb" >/dev/null 2>&1
+    assert_eq "dry-run restart exit 0" "0" "$?"
+    rm -rf "$sb"
+}
+
 test_url_resolution
 test_manifest
 test_backup
+test_cli
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
