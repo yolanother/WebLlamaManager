@@ -65,3 +65,76 @@ kiosk_manifest_set() {
         printf '%s=%s\n' "$key" "$val" >> "$mf"
     fi
 }
+
+# --- logging -------------------------------------------------------------
+
+# Log an informational message to stdout with a [kiosk] prefix.
+# Args: $@ = message text.
+kiosk_log()  { printf '[kiosk] %s\n' "$*"; }
+
+# Log a warning message to stderr with a [kiosk] WARN: prefix.
+# Args: $@ = message text.
+kiosk_warn() { printf '[kiosk] WARN: %s\n' "$*" >&2; }
+
+# Run a command, honoring dry-run. In dry-run mode the command is logged and
+# skipped; otherwise it is logged and executed (its exit status is propagated).
+# Args: the command and its arguments.
+kiosk_run() {
+    if [ "$KIOSK_DRY_RUN" = "true" ]; then
+        kiosk_log "DRY-RUN would run: $*"
+        return 0
+    fi
+    "$@"
+}
+
+# --- backup / restore ----------------------------------------------------
+
+# Absolute path of the backup directory (under KIOSK_ROOT).
+# Echo: the fully qualified backup directory path.
+kiosk_backup_dir() { kiosk_path /var/backups/llama-kiosk; }
+
+# Idempotently back up a system file before install modifies it. Only the FIRST
+# backup is kept, so re-running install never clobbers the pristine original.
+# Records backup.<name>.existed (true/false) and backup.<name>.path in the
+# manifest so uninstall can restore precisely.
+# Args: $1 = logical name (manifest/file key), $2 = logical source path.
+kiosk_backup_file() {
+    local name="$1" src_logical="$2" src backup
+    src="$(kiosk_path "$src_logical")"
+    backup="$(kiosk_backup_dir)/$name"
+    mkdir -p "$(kiosk_backup_dir)"
+    # Already recorded? Preserve the pristine first backup.
+    if [ -n "$(kiosk_manifest_get "backup.$name.existed")" ]; then
+        return 0
+    fi
+    if [ -f "$src" ]; then
+        cp -a "$src" "$backup"
+        kiosk_manifest_set "backup.$name.existed" "true"
+    else
+        kiosk_manifest_set "backup.$name.existed" "false"
+    fi
+    kiosk_manifest_set "backup.$name.path" "$src_logical"
+}
+
+# Restore a previously backed-up file (used by uninstall).
+# If existed=true, copies the backup back. If existed=false, removes the file
+# that install created. Unknown/unrecorded name -> warn and no-op.
+# Arg: $1 = logical name used at backup time.
+kiosk_restore_file() {
+    local name="$1" existed src_logical src backup
+    existed="$(kiosk_manifest_get "backup.$name.existed")"
+    src_logical="$(kiosk_manifest_get "backup.$name.path")"
+    if [ -z "$existed" ] || [ -z "$src_logical" ]; then
+        kiosk_warn "no backup recorded for '$name'; skipping restore"
+        return 0
+    fi
+    src="$(kiosk_path "$src_logical")"
+    backup="$(kiosk_backup_dir)/$name"
+    if [ "$existed" = "true" ]; then
+        kiosk_run cp -a "$backup" "$src"
+        kiosk_log "restored $src_logical from backup"
+    else
+        kiosk_run rm -f "$src"
+        kiosk_log "removed $src_logical (no original existed)"
+    fi
+}

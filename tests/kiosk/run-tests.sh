@@ -96,8 +96,41 @@ test_manifest() {
     )
 }
 
+test_backup() {
+    printf 'test_backup\n'
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb; sb="$(new_sandbox)"; export KIOSK_ROOT="$sb"
+
+      # Source file exists -> backed up, manifest records existed=true
+      mkdir -p "$(dirname "$(kiosk_path /etc/gdm3/custom.conf)")"
+      printf 'ORIGINAL\n' > "$(kiosk_path /etc/gdm3/custom.conf)"
+      kiosk_backup_file gdm_custom_conf /etc/gdm3/custom.conf
+      assert_file "backup written" "$(kiosk_path /var/backups/llama-kiosk/gdm_custom_conf)"
+      assert_eq "existed=true" "true" "$(kiosk_manifest_get backup.gdm_custom_conf.existed)"
+      assert_eq "path recorded" "/etc/gdm3/custom.conf" "$(kiosk_manifest_get backup.gdm_custom_conf.path)"
+
+      # Mutate source, back up again -> pristine backup preserved (idempotent)
+      printf 'CHANGED\n' > "$(kiosk_path /etc/gdm3/custom.conf)"
+      kiosk_backup_file gdm_custom_conf /etc/gdm3/custom.conf
+      assert_eq "backup still pristine" "ORIGINAL" "$(cat "$(kiosk_path /var/backups/llama-kiosk/gdm_custom_conf)")"
+
+      # Missing source -> existed=false, no backup file
+      kiosk_backup_file accountsservice /var/lib/AccountsService/users/tester
+      assert_eq "existed=false" "false" "$(kiosk_manifest_get backup.accountsservice.existed)"
+      assert_no_file "no backup for missing src" "$(kiosk_path /var/backups/llama-kiosk/accountsservice)"
+
+      # Dry-run mutating command changes nothing
+      export KIOSK_DRY_RUN=true
+      kiosk_run touch "$sb/should-not-exist"
+      assert_no_file "dry-run no write" "$sb/should-not-exist"
+      export KIOSK_DRY_RUN=false
+      rm -rf "$sb"
+    )
+}
+
 test_url_resolution
 test_manifest
+test_backup
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
