@@ -219,12 +219,44 @@ test_dry_run_no_mutation() {
     rm -rf "$sb"
 }
 
+test_uninstall_flow() {
+    printf 'test_uninstall_flow\n'
+    local sb; sb="$(new_sandbox)"
+    local user; user="$(id -un)"
+
+    mkdir -p "$sb/etc/gdm3" "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
+    printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
+    printf '[User]\nSession=ubuntu\nXSession=ubuntu\n' > "$sb/var/lib/AccountsService/users/$user"
+
+    # Install then uninstall.
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install   --root "$sb" >/dev/null 2>&1
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
+    local rc=$?
+    assert_eq "uninstall exit 0" "0" "$rc"
+
+    # gdm config restored exactly to the pristine original.
+    assert_eq "gdm restored" "yes" \
+      "$(grep -q 'WaylandEnable=true' "$sb/etc/gdm3/custom.conf" && ! grep -q 'AutomaticLogin' "$sb/etc/gdm3/custom.conf" && echo yes || echo no)"
+    # AccountsService restored to original session.
+    assert_eq "session restored" "yes" \
+      "$(grep -q '^Session=ubuntu' "$sb/var/lib/AccountsService/users/$user" && echo yes || echo no)"
+    # Session entry removed.
+    assert_no_file "session entry removed" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+
+    # Uninstall again is safe (idempotent, exit 0).
+    bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
+    assert_eq "second uninstall exit 0" "0" "$?"
+
+    rm -rf "$sb"
+}
+
 test_url_resolution
 test_manifest
 test_backup
 test_cli
 test_install_flow
 test_dry_run_no_mutation
+test_uninstall_flow
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')

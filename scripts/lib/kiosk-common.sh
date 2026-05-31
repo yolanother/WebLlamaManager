@@ -289,3 +289,35 @@ kiosk_restart() {
     kiosk_log "Restarting display manager to enter the kiosk session..."
     kiosk_run systemctl restart display-manager.service
 }
+
+# Full uninstall: restore backups, remove the session entry, report cage status.
+# Safe to run even if install never completed (missing manifest -> warnings).
+# Args: forwarded from the install-kiosk.sh dispatcher (may include --root etc.,
+#       already consumed by the parent; ensure_root re-checks privilege).
+kiosk_uninstall() {
+    local user session_entry
+    ensure_root "$@" || true
+    user="$(kiosk_manifest_get target_user)"
+    [ -z "$user" ] && user="$(kiosk_target_user)"
+    session_entry="$(kiosk_path /usr/share/wayland-sessions/llama-kiosk.desktop)"
+
+    # Restore the two backed-up system files.
+    kiosk_restore_file gdm_custom_conf
+    kiosk_restore_file "accountsservice_$user"
+
+    # Remove the session entry we generated.
+    if [ -e "$session_entry" ]; then
+        kiosk_run rm -f "$session_entry"
+        kiosk_log "removed session entry: $session_entry"
+    fi
+
+    # Report cage (do not auto-remove an apt package).
+    if [ "$(kiosk_manifest_get installed_cage)" = "true" ]; then
+        kiosk_log "Note: 'cage' was installed by this script. To remove it: sudo apt remove cage"
+    fi
+    kiosk_log "Kiosk Chrome profile left at \$HOME/.config/llama-kiosk (delete manually if desired)."
+
+    # Mark uninstalled (keep backups dir for audit; manifest reset of 'installed').
+    kiosk_manifest_set installed false
+    kiosk_log "Kiosk uninstalled. Reboot to return to the normal login screen."
+}
