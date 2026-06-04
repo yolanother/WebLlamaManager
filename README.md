@@ -222,6 +222,17 @@ systemctl --user disable llama-manager
 sudo loginctl enable-linger $USER
 ```
 
+## Kiosk mode (optional)
+
+To dedicate this machine to the dashboard (boot straight into full-screen
+Chrome), see [docs/Utilities/kiosk.md](docs/Utilities/kiosk.md):
+
+```bash
+sudo bash scripts/install-kiosk.sh install     # set up + bring up now
+sudo bash scripts/install-kiosk.sh restart     # re-enter without rebooting
+sudo bash scripts/install-kiosk.sh uninstall   # revert
+```
+
 ## Configuration
 
 Edit `config.json` to change settings:
