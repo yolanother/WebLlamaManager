@@ -60,6 +60,7 @@ launch() {
         --no-first-run
         --disable-session-crashed-bubble
         --disable-features=Translate
+        --password-store=basic
         "--user-data-dir=$PROFILE_DIR"
         "--app=$URL")
     if [ "${KIOSK_LAUNCH_ONCE:-0}" = "1" ]; then

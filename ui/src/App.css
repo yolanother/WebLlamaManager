@@ -5576,6 +5576,18 @@ input::placeholder {
   flex-direction: column;
 }
 
+/* Kiosk appliance view (/kiosk): full-bleed, no pointer cursor. */
+.kiosk-shell {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+.kiosk-shell,
+.kiosk-shell * {
+  cursor: none !important;
+}
+
 .fullscreen-persistent-header {
   flex-shrink: 0;
   padding: 12px 32px 0;

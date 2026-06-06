@@ -1135,7 +1135,12 @@ function TimeRangeSelector({ value, onChange }) {
 }
 
 // Dashboard Page
-function Dashboard({ stats, activeRequest }) {
+//
+// When `kiosk` is true the component renders its glanceable, auto-paging
+// full-screen layout directly (used by the /kiosk route shown on the kiosk
+// appliance). Chrome runs in --kiosk so the page is already full-screen; we do
+// not call the Fullscreen API, and interactive controls are hidden.
+function Dashboard({ stats, activeRequest, kiosk = false }) {
   const [serverModels, setServerModels] = useState([]);
   const [loading, setLoading] = useState({});
   const [analytics, setAnalytics] = useState(null);
@@ -1147,6 +1152,9 @@ function Dashboard({ stats, activeRequest }) {
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const fullscreenTimerRef = useRef(null);
   const FULLSCREEN_PAGES = 3;
+
+  // Kiosk mode reuses the full-screen presentation without the Fullscreen API.
+  const showFullscreen = isFullscreen || kiosk;
 
   const fetchModels = useCallback(async () => {
     try {
@@ -1241,9 +1249,32 @@ function Dashboard({ stats, activeRequest }) {
     return () => document.removeEventListener('fullscreenchange', handler);
   }, [exitFullscreen]);
 
+  // Kiosk: keep the screen awake. The Screen Wake Lock API maps to the
+  // compositor's idle-inhibit protocol under cage/wlroots, preventing the
+  // display from blanking. Re-acquire it whenever the page becomes visible
+  // again (the lock is auto-released on visibility loss).
+  useEffect(() => {
+    if (!kiosk || typeof navigator === 'undefined' || !('wakeLock' in navigator)) return;
+    let lock = null;
+    const acquire = async () => {
+      try {
+        lock = await navigator.wakeLock.request('screen');
+      } catch { /* wake lock unavailable; ignore */ }
+    };
+    acquire();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') acquire();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (lock) lock.release().catch(() => {});
+    };
+  }, [kiosk]);
+
   // Auto-page in fullscreen (fetch interval from settings)
   useEffect(() => {
-    if (isFullscreen) {
+    if (showFullscreen) {
       let cancelled = false;
       (async () => {
         let interval = 30000;
@@ -1266,7 +1297,7 @@ function Dashboard({ stats, activeRequest }) {
         }
       };
     }
-  }, [isFullscreen]);
+  }, [showFullscreen]);
 
   const startServer = async () => {
     setLoading(l => ({ ...l, server: true }));
@@ -1465,7 +1496,7 @@ function Dashboard({ stats, activeRequest }) {
     : [];
 
   // Fullscreen rendering — 2 dense pages
-  if (isFullscreen) {
+  if (showFullscreen) {
     return (
       <div className="fullscreen-dashboard">
         {/* Persistent header — visible on all pages */}
@@ -1515,7 +1546,7 @@ function Dashboard({ stats, activeRequest }) {
                   {' / '}
                   <span className={`queue-count ${(stats?.queue?.pending || 0) > 0 ? 'queue-pending' : ''}`}>{stats?.queue?.pending || 0} pending</span>
                 </span>
-                {(stats?.queue?.pending || 0) > 0 && (
+                {!kiosk && (stats?.queue?.pending || 0) > 0 && (
                   <button className="persistent-flush-btn" onClick={flushQueue}>Flush</button>
                 )}
               </div>
@@ -8154,38 +8185,62 @@ function QueuePage({ stats, activeRequestsMap }) {
   );
 }
 
-// Main App
-function App() {
+// Application layout. Renders the normal shell (sidebar + main + chat panel) for
+// every route except /kiosk, which renders a bare, full-screen Dashboard for the
+// kiosk appliance (no sidebar, no chat, no nav header).
+function AppLayout() {
   const { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs, activeRequest, activeRequestsMap } = useWebSocket();
+  const location = useLocation();
+
+  // Kiosk view: glanceable, auto-paging Dashboard only.
+  if (location.pathname === '/kiosk') {
+    return (
+      <div className="kiosk-shell">
+        {!connected && (
+          <div className="connection-banner">
+            Reconnecting to server...
+          </div>
+        )}
+        <Dashboard stats={stats} activeRequest={activeRequest} kiosk />
+      </div>
+    );
+  }
 
   return (
+    <div className="app-layout">
+      <Sidebar stats={stats} />
+      <main className="main-content">
+        {!connected && (
+          <div className="connection-banner">
+            Reconnecting to server...
+          </div>
+        )}
+        <StatsHeader stats={stats} />
+        <Routes>
+          <Route path="/" element={<Dashboard stats={stats} activeRequest={activeRequest} />} />
+          <Route path="/chat" element={<ChatPage stats={stats} />} />
+          <Route path="/presets" element={<PresetsPage stats={stats} />} />
+          <Route path="/models" element={<ModelsPage stats={stats} />} />
+          <Route path="/download" element={<DownloadPage stats={stats} />} />
+          <Route path="/logs" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
+          <Route path="/logs/:tab" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
+          <Route path="/queue" element={<QueuePage stats={stats} activeRequestsMap={activeRequestsMap} />} />
+          <Route path="/processes" element={<ProcessesPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/docs" element={<DocsPage />} />
+          <Route path="/api-docs" element={<ApiDocsPage />} />
+        </Routes>
+      </main>
+      <QueryPanel stats={stats} />
+    </div>
+  );
+}
+
+// Main App
+function App() {
+  return (
     <BrowserRouter>
-      <div className="app-layout">
-        <Sidebar stats={stats} />
-        <main className="main-content">
-          {!connected && (
-            <div className="connection-banner">
-              Reconnecting to server...
-            </div>
-          )}
-          <StatsHeader stats={stats} />
-          <Routes>
-            <Route path="/" element={<Dashboard stats={stats} activeRequest={activeRequest} />} />
-            <Route path="/chat" element={<ChatPage stats={stats} />} />
-            <Route path="/presets" element={<PresetsPage stats={stats} />} />
-            <Route path="/models" element={<ModelsPage stats={stats} />} />
-            <Route path="/download" element={<DownloadPage stats={stats} />} />
-            <Route path="/logs" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
-            <Route path="/logs/:tab" element={<LogsPage logs={logs} clearLogs={clearLogs} requestLogs={requestLogs} clearRequestLogs={clearRequestLogs} llmLogs={llmLogs} clearLlmLogs={clearLlmLogs} />} />
-            <Route path="/queue" element={<QueuePage stats={stats} activeRequestsMap={activeRequestsMap} />} />
-            <Route path="/processes" element={<ProcessesPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
-            <Route path="/docs" element={<DocsPage />} />
-            <Route path="/api-docs" element={<ApiDocsPage />} />
-          </Routes>
-        </main>
-        <QueryPanel stats={stats} />
-      </div>
+      <AppLayout />
     </BrowserRouter>
   );
 }
