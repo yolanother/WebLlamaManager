@@ -30,6 +30,7 @@ const PROJECT_ROOT = dirname(__dirname);
 // Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
+import { resolveHfToken, maskToken, redactConfig, actionableDownloadError } from './hf-token.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -2398,6 +2399,11 @@ app.get('/api/settings', (req, res) => {
       defaultReasoningEffort: config.defaultReasoningEffort || null,
       modelReasoningEffort: config.modelReasoningEffort || {},
       fullscreenInterval: config.fullscreenInterval || 30000,
+      // HuggingFace token: never return the raw value — only whether one is set
+      // and a masked preview for display.
+      hasHfToken: !!resolveHfToken(config, process.env),
+      hfTokenMask: maskToken(resolveHfToken(config, process.env)),
+      hfTokenSource: (config.hfToken && config.hfToken.trim()) ? 'settings' : (process.env.HF_TOKEN ? 'env' : null),
       backends: {
         enabled: config.backends?.enabled || false,
         offloadPolicy: config.backends?.offloadPolicy || 'overflow',
@@ -2421,7 +2427,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, fullscreenInterval } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, fullscreenInterval, hfToken } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -2516,12 +2522,21 @@ app.post('/api/settings', (req, res) => {
     }
   }
 
+  // HuggingFace token: store in config (preferred over the HF_TOKEN env var).
+  // An explicit empty string clears it (revert to env/none).
+  if (hfToken !== undefined) {
+    config.hfToken = typeof hfToken === 'string' ? hfToken.trim() : '';
+  }
+
   saveConfig(config);
-  addLog('manager', `Settings updated: ${JSON.stringify(req.body)}`);
+  // Never log the raw token.
+  const logBody = { ...req.body };
+  if ('hfToken' in logBody) logBody.hfToken = logBody.hfToken ? '<redacted>' : '';
+  addLog('manager', `Settings updated: ${JSON.stringify(logBody)}`);
 
   res.json({
     success: true,
-    settings: config,
+    settings: redactConfig(config), // strip raw hfToken from the response
     message: 'Settings saved. Restart the server for changes to take effect.'
   });
 });
@@ -3863,7 +3878,7 @@ async function restartLlamaServer() {
         NO_WARMUP: config.noWarmup ? '1' : '',
         FLASH_ATTN: config.flashAttn ? '1' : '',
         GPU_LAYERS: String(config.gpuLayers || 99),
-        HF_TOKEN: process.env.HF_TOKEN || ''
+        HF_TOKEN: resolveHfToken(config, process.env)
       };
 
       console.log('[restart] Starting router mode');
@@ -3943,7 +3958,7 @@ function startEmbedServer() {
     EMBED_PORT: String(ec.port),
     EMBED_GPU_LAYERS: String(ec.gpuLayers),
     EMBED_CTX: String(ec.ctxSize),
-    HF_TOKEN: process.env.HF_TOKEN || ''
+    HF_TOKEN: resolveHfToken(config, process.env)
   };
   console.log(`[embed] Starting embed server on :${ec.port} (model: ${ec.model})`);
   addLog('system', `Starting embedding server on :${ec.port} (model: ${ec.model})`);
@@ -4018,7 +4033,7 @@ app.post('/api/server/start', async (req, res) => {
       NO_WARMUP: config.noWarmup ? '1' : '',
       FLASH_ATTN: config.flashAttn ? '1' : '',
       GPU_LAYERS: String(config.gpuLayers || 99),
-      HF_TOKEN: process.env.HF_TOKEN || ''
+      HF_TOKEN: resolveHfToken(config, process.env)
     };
 
     llamaProcess = spawn('bash', [startScript], {
@@ -4352,7 +4367,7 @@ app.post('/api/pull', async (req, res) => {
         env: {
           ...process.env,
           HF_HUB_ENABLE_HF_TRANSFER: '1',
-          HF_TOKEN: process.env.HF_TOKEN || '',
+          HF_TOKEN: resolveHfToken(config, process.env),
           PYTHONUNBUFFERED: '1'
         },
         cols: 80,
@@ -4364,6 +4379,8 @@ app.post('/api/pull', async (req, res) => {
       downloadInfo.status = 'failed';
       if (err.code === 'ENOENT') {
         downloadInfo.error = `huggingface-cli not found. Run ./install.sh to set up the Python environment.`;
+      } else if (/forkpty/i.test(err.message)) {
+        downloadInfo.error = actionableDownloadError({ forkpty: true });
       } else {
         downloadInfo.error = `Failed to start download: ${err.message}`;
       }
@@ -4423,12 +4440,18 @@ app.post('/api/pull', async (req, res) => {
       } else if (downloadInfo.status !== 'failed') {
         // Only update if status wasn't already set to 'failed' earlier
         downloadInfo.status = 'failed';
-        // Provide helpful error messages for common exit codes
-        let errorMsg = `Process exited with code ${exitCode}.`;
+        // Provide helpful error messages for common exit codes.
+        let errorMsg;
         if (exitCode === 127) {
           errorMsg = `Command not found (exit code 127). Run ./install.sh to set up the Python environment.`;
-        } else if (exitCode === 1) {
-          errorMsg = `Download failed (exit code 1). Check output for details - this may be an authentication issue (set HF_TOKEN env var) or network problem.`;
+        } else {
+          // Inspect output for gated/auth indicators and whether a token is set,
+          // and point the operator at Settings when a token is needed.
+          errorMsg = actionableDownloadError({
+            output: downloadInfo.output || '',
+            exitCode,
+            hasToken: !!resolveHfToken(config, process.env)
+          });
         }
         downloadInfo.error = errorMsg;
         addLog('download', `Download failed: ${repo} (code ${exitCode})`);
@@ -4564,7 +4587,7 @@ async function listRepoFilesWithCli(repoId) {
     const cmd = spawn(HF_CLI_PATH, ['models', 'info', repoId, '--expand=siblings'], {
       env: {
         ...process.env,
-        HF_TOKEN: process.env.HF_TOKEN || ''
+        HF_TOKEN: resolveHfToken(config, process.env)
       },
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -4624,7 +4647,7 @@ async function fetchRepoFilesRecursive(repoId, path = '') {
   try {
     const url = `https://huggingface.co/api/models/${repoId}/tree/main${path ? '/' + path : ''}`;
     const response = await fetch(url, {
-      headers: process.env.HF_TOKEN ? { 'Authorization': `Bearer ${process.env.HF_TOKEN}` } : {}
+      headers: (() => { const t = resolveHfToken(config, process.env); return t ? { 'Authorization': `Bearer ${t}` } : {}; })()
     });
 
     if (!response.ok) {
@@ -4715,11 +4738,11 @@ app.post('/api/config', (req, res) => {
   const updates = req.body;
   config = { ...config, ...updates };
   saveConfig(config);
-  res.json({ success: true, config });
+  res.json({ success: true, config: redactConfig(config) });
 });
 
 app.get('/api/config', (req, res) => {
-  res.json(config);
+  res.json(redactConfig(config));
 });
 
 // Get system stats (REST endpoint for initial load)
