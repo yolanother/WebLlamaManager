@@ -2,6 +2,44 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Seed config.json's embed block (idempotent). Args: <config-path> <model-id>.
+# Only sets embed.model when unset, so re-running install never clobbers a choice.
+embed_seed_config() {
+  local cfg="$1" model="$2"
+  node -e '
+    const fs=require("fs"); const [cfgPath,model]=process.argv.slice(1);
+    let c={}; try{ c=JSON.parse(fs.readFileSync(cfgPath,"utf8")); }catch{}
+    c.embed = c.embed || {};
+    if(!c.embed.model){ c.embed.enabled=true; c.embed.model=model; }
+    if(c.embed.port===undefined) c.embed.port=5252;
+    if(c.embed.gpuLayers===undefined) c.embed.gpuLayers=99;
+    if(c.embed.ctxSize===undefined) c.embed.ctxSize=0;
+    if(c.embed.dimension===undefined) c.embed.dimension=1024;
+    fs.writeFileSync(cfgPath, JSON.stringify(c,null,2));
+  ' "$cfg" "$model"
+}
+
+# Download the bootstrap embedding model into MODELS_DIR if absent. Args: <models-dir>.
+embed_bootstrap_model() {
+  local models_dir="$1"
+  local repo="Qwen/Qwen3-Embedding-0.6B-GGUF"
+  local target="$models_dir/Qwen_Qwen3-Embedding-0.6B-GGUF"
+  if [ -d "$target" ] && ls "$target"/*.gguf >/dev/null 2>&1; then
+    echo "  Embedding model already present: $target"; return 0
+  fi
+  local HF_BIN=""
+  [ -f "$VENV_DIR/bin/hf" ] && HF_BIN="$VENV_DIR/bin/hf"
+  [ -z "$HF_BIN" ] && [ -f "$VENV_DIR/bin/huggingface-cli" ] && HF_BIN="$VENV_DIR/bin/huggingface-cli"
+  if [ -z "$HF_BIN" ]; then echo "  Skipping embedding model download (no HF CLI)."; return 0; fi
+  echo "  Downloading $repo (embedding model, ~600MB)..."
+  "$HF_BIN" download "$repo" --include "*Q8_0.gguf" --local-dir "$target" || \
+    echo "  Warning: embedding model download failed; select one later in the UI."
+}
+
+# Allow tests to source this file for its helpers without running the installer.
+if [ "${EMBED_SEED_LIB:-0}" = "1" ]; then return 0 2>/dev/null || true; fi
+
 SERVICE_NAME="llama-manager"
 
 # Load configuration from .env file
@@ -103,6 +141,17 @@ else
     echo "Warning: Could not set up Python venv. HuggingFace downloads will not work."
 fi
 
+# Bootstrap the embedding model + config so /v1/embeddings works after install.
+echo
+echo "Setting up embedding model..."
+embed_bootstrap_model "$MODELS_DIR"
+EMBED_DEFAULT_MODEL="Qwen_Qwen3-Embedding-0.6B-GGUF/$(ls "$MODELS_DIR/Qwen_Qwen3-Embedding-0.6B-GGUF"/*.gguf 2>/dev/null | head -1 | xargs -r basename)"
+[ "$EMBED_DEFAULT_MODEL" = "Qwen_Qwen3-Embedding-0.6B-GGUF/" ] && EMBED_DEFAULT_MODEL=""
+if [ -n "$EMBED_DEFAULT_MODEL" ]; then
+  embed_seed_config "$SCRIPT_DIR/config.json" "$EMBED_DEFAULT_MODEL"
+  echo "  Embedding config seeded: $EMBED_DEFAULT_MODEL"
+fi
+
 # Check if service is already running
 SERVICE_WAS_RUNNING=false
 SERVICE_WAS_ENABLED=false
@@ -163,6 +212,7 @@ TimeoutStopSec=15
 Environment=NODE_ENV=production
 Environment=API_PORT=$API_PORT
 Environment=LLAMA_PORT=$LLAMA_PORT
+Environment=EMBED_PORT=5252
 Environment=MODELS_DIR=$MODELS_DIR
 Environment=MODELS_MAX=$MODELS_MAX
 Environment=CONTEXT_SIZE=$CONTEXT_SIZE

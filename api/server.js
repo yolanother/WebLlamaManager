@@ -29,6 +29,7 @@ const PROJECT_ROOT = dirname(__dirname);
 
 // Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
 import dotenv from 'dotenv';
+import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -167,6 +168,7 @@ const MODELS_DIR = process.env.MODELS_DIR || join(process.env.HOME, 'models');
 const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
+const EMBED_PORT = process.env.EMBED_PORT || 5252;
 const LLAMA_UI_URL = process.env.LLAMA_UI_URL || null; // Optional override for llama.cpp UI URL
 
 // Python venv for huggingface CLI (created by install.sh)
@@ -178,6 +180,9 @@ const HF_CLI_PATH = existsSync(join(VENV_PATH, 'bin', 'hf'))
 
 // State
 let llamaProcess = null;
+let embedProcess = null;
+let embedRestartInProgress = false;
+let embedIntentionalStop = false;
 let downloadProcesses = new Map();
 let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
@@ -1584,22 +1589,29 @@ function recordTokenStats(stats) {
   const modelKey = backend && backend !== 'local' ? `${backend}/${model || 'unknown'}` : (model || 'unknown');
   requestStatsAccum.modelCounts[modelKey] = (requestStatsAccum.modelCounts[modelKey] || 0) + 1;
 
-  const requestRecord = {
-    timestamp: Date.now(),
-    promptTokens: promptTokens || 0,
-    completionTokens: completionTokens || 0,
-    tokensPerSecond: tokensPerSecond || 0,
-    model: modelKey,
-    duration: duration || 0
-  };
+  // Throughput/perf telemetry is generation-only. Embeddings requests
+  // (completionTokens == 0) are still counted above (token totals + per-model
+  // request counts) but must NOT enter the tok/s time-series or the recent
+  // performance window, where their zero rate would deflate chat throughput
+  // charts and the local processing-time estimate.
+  if ((completionTokens || 0) > 0) {
+    const requestRecord = {
+      timestamp: Date.now(),
+      promptTokens: promptTokens || 0,
+      completionTokens: completionTokens || 0,
+      tokensPerSecond: tokensPerSecond || 0,
+      model: modelKey,
+      duration: duration || 0
+    };
 
-  tokenStats.recentRequests.push(requestRecord);
-  if (tokenStats.recentRequests.length > MAX_RECENT_REQUESTS) {
-    tokenStats.recentRequests.shift();
+    tokenStats.recentRequests.push(requestRecord);
+    if (tokenStats.recentRequests.length > MAX_RECENT_REQUESTS) {
+      tokenStats.recentRequests.shift();
+    }
+
+    // Add to time-series
+    addAnalyticsPoint('tokens', requestRecord);
   }
-
-  // Add to time-series
-  addAnalyticsPoint('tokens', requestRecord);
 }
 
 // Default presets - seeded on first run, can be deleted by user
@@ -1792,6 +1804,10 @@ async function getSystemStats() {
     // Server not running
   }
 
+  // Dedicated embedding server health (null/disabled if not configured).
+  let embedStats = null;
+  try { embedStats = await getEmbedHealth(); } catch { /* embed down */ }
+
   return {
     timestamp: Date.now(),
     cpu: {
@@ -1808,6 +1824,7 @@ async function getSystemStats() {
     },
     gpu: gpuStats,
     llama: llamaStats,
+    embed: embedStats,
     context: contextStats,
     queue: {
       active: llamaQueue.active,
@@ -3906,6 +3923,82 @@ function attachLlamaExitHandler(proc) {
   });
 }
 
+// ── Dedicated embedding server supervisor ────────────────────────────────
+// Runs a second llama-server with --embeddings on EMBED_PORT, independent of
+// the chat router. Started automatically on boot (no user command).
+
+/** Spawn the embed server from config (if runnable). Idempotent: no-op if already running. */
+function startEmbedServer() {
+  const ec = resolveEmbedConfig(config, process.env);
+  if (!ec.runnable) {
+    console.log('[embed] Not started (disabled or no model selected).');
+    return;
+  }
+  if (embedProcess && !embedProcess.killed) return;
+  const startScript = join(PROJECT_ROOT, 'start-embed.sh');
+  const env = {
+    ...process.env,
+    MODELS_DIR,
+    EMBED_MODEL: ec.model,
+    EMBED_PORT: String(ec.port),
+    EMBED_GPU_LAYERS: String(ec.gpuLayers),
+    EMBED_CTX: String(ec.ctxSize),
+    HF_TOKEN: process.env.HF_TOKEN || ''
+  };
+  console.log(`[embed] Starting embed server on :${ec.port} (model: ${ec.model})`);
+  addLog('system', `Starting embedding server on :${ec.port} (model: ${ec.model})`);
+  embedIntentionalStop = false;
+  // Capture the spawned process locally so a delayed exit from a superseded
+  // process (e.g. a slow SIGKILL landing after a restart already spawned a new
+  // one) cannot null the current process or schedule a spurious restart.
+  const proc = spawn('bash', [startScript], { cwd: PROJECT_ROOT, stdio: ['ignore', 'pipe', 'pipe'], env, detached: false });
+  embedProcess = proc;
+  proc.stdout.on('data', (d) => addLog('embed', d));
+  proc.stderr.on('data', (d) => addLog('embed', d));
+  proc.on('exit', (code) => {
+    if (embedProcess !== proc) return; // superseded by a newer process; ignore
+    console.log(`[embed] embed server exited (code ${code})`);
+    const wasIntentional = embedIntentionalStop;
+    embedProcess = null;
+    if (!wasIntentional) {
+      // Auto-restart with a small backoff (mirrors the router's resiliency).
+      setTimeout(() => { startEmbedServer(); }, 5000);
+    }
+  });
+}
+
+/** Stop the embed server (no auto-restart). */
+async function stopEmbedServer() {
+  if (embedProcess && !embedProcess.killed) {
+    embedIntentionalStop = true;
+    embedProcess.kill('SIGTERM');
+    await new Promise(r => setTimeout(r, 1500));
+    if (embedProcess && !embedProcess.killed) embedProcess.kill('SIGKILL');
+    embedProcess = null;
+  }
+}
+
+/** Restart the embed server (used after the selected model changes). */
+async function restartEmbedServer() {
+  if (embedRestartInProgress) return;
+  embedRestartInProgress = true;
+  try { await stopEmbedServer(); startEmbedServer(); }
+  finally { embedRestartInProgress = false; }
+}
+
+/** Fetch embed server health (null if down). */
+async function getEmbedHealth() {
+  const ec = resolveEmbedConfig(config, process.env);
+  if (!ec.runnable) return { status: 'disabled', model: ec.model || null, port: ec.port };
+  try {
+    const r = await fetch(`http://localhost:${ec.port}/health`, { signal: AbortSignal.timeout(3000) });
+    const body = await r.json().catch(() => null);
+    return { status: r.ok ? (body?.status || 'ok') : 'error', model: ec.model, port: ec.port };
+  } catch {
+    return { status: 'unavailable', model: ec.model, port: ec.port };
+  }
+}
+
 // Start llama server in router mode (multi-model)
 app.post('/api/server/start', async (req, res) => {
   idleShutdown = false;
@@ -5236,6 +5329,21 @@ app.get('/api/v1/models', async (req, res) => {
         };
       })
     };
+    // Append the dedicated embedding model so it is selectable by the orchestrator.
+    const ec = resolveEmbedConfig(config, process.env);
+    if (ec.runnable) {
+      let embedId = ec.model;
+      try {
+        const er = await fetch(`http://localhost:${ec.port}/models`, { signal: AbortSignal.timeout(3000) });
+        if (er.ok) { const ej = await er.json(); embedId = ej.data?.[0]?.id || ec.model; }
+      } catch { /* embed server down; fall back to configured id */ }
+      data.data.push({
+        id: embedId, object: 'model', created: Math.floor(Date.now() / 1000),
+        owned_by: 'llamacpp', meta: null, n_ctx: ec.ctxSize || null,
+        displayName: embedId, status: 'embedding', alias: (config.modelAliases || {})[embedId] || null,
+        task: 'embedding', dimension: config.embed?.dimension || null
+      });
+    }
     res.json(data);
   } catch (error) {
     console.error('[v1/models] Error fetching from llama.cpp:', error.message);
@@ -6649,48 +6757,90 @@ app.post('/api/v1/completions', async (req, res) => {
   }
 });
 
-// OpenAI-compatible embeddings endpoint
-app.post('/api/v1/embeddings', async (req, res) => {
+// OpenAI-compatible embeddings endpoint (served by the dedicated embed server).
+// Mounted at the versioned path and an unversioned alias.
+async function handleEmbeddings(req, res) {
+  const startedAt = Date.now();
   const requestedModel = req.body.model || 'default';
 
-  // Route to remote backend if applicable
+  // Route to a remote backend if configured (e.g. an Ollama host).
   const routing = resolveBackend(requestedModel, 'embeddings', req.body);
   if (routing.remote) {
     req._backend = routing.backend.id;
     const remoteBody = { ...req.body, model: routing.targetModel };
     try {
-      const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+      const { response } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
         method: 'POST', headers: { ...routing.headers }, body: JSON.stringify(remoteBody)
       }, { label: 'embeddings', model: routing.targetModel });
-      if (!response.ok) {
-        const error = await response.text();
-        return res.status(response.status).send(error);
+      const text = await response.text();
+      let usage = null; try { usage = JSON.parse(text).usage; } catch { /* ignore */ }
+      addLlmLog(buildEmbedLogEntry({
+        reqBody: req.body, usage, status: response.status, durationMs: Date.now() - startedAt,
+        backend: routing.backend.id, error: response.ok ? null : text.slice(0, 500)
+      }));
+      if (response.ok) {
+        recordTokenStats({ model: requestedModel, backend: routing.backend.id,
+          promptTokens: usage?.prompt_tokens ?? estimateEmbedTokens(req.body.input),
+          completionTokens: 0, duration: Date.now() - startedAt });
       }
-      const data = await response.json();
-      res.json(data);
+      res.status(response.status).type('application/json').send(text);
     } catch (error) {
+      addLlmLog(buildEmbedLogEntry({ reqBody: req.body, usage: null, status: 502,
+        durationMs: Date.now() - startedAt, backend: routing.backend.id, error: error.message }));
       res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
     }
     return;
   }
 
+  // Local path → dedicated embed server (EMBED_PORT), NOT the chat router.
+  const ec = resolveEmbedConfig(config, process.env);
   try {
-    const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/embeddings`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+    const response = await fetch(embedTargetUrl(ec.port), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body)
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      return res.status(response.status).send(error);
+    const text = await response.text();
+    let usage = null; try { usage = JSON.parse(text).usage; } catch { /* ignore */ }
+    addLlmLog(buildEmbedLogEntry({
+      reqBody: req.body, usage, status: response.status, durationMs: Date.now() - startedAt,
+      backend: 'local', error: response.ok ? null : text.slice(0, 500)
+    }));
+    if (response.ok) {
+      recordTokenStats({ model: requestedModel, backend: 'local',
+        promptTokens: usage?.prompt_tokens ?? estimateEmbedTokens(req.body.input),
+        completionTokens: 0, duration: Date.now() - startedAt });
     }
-
-    const data = await response.json();
-    res.json(data);
+    res.status(response.status).type('application/json').send(text);
   } catch (error) {
-    res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
+    addLlmLog(buildEmbedLogEntry({ reqBody: req.body, usage: null, status: 502,
+      durationMs: Date.now() - startedAt, backend: 'local', error: error.message }));
+    res.status(502).json({ error: 'Failed to reach embedding server', details: error.message,
+      hint: ec.runnable ? undefined : 'No embedding model selected. Download/select one in the UI or run install.sh.' });
   }
+}
+app.post('/api/v1/embeddings', handleEmbeddings);
+app.post('/api/embeddings', handleEmbeddings); // unversioned convenience alias
+
+// Health of the dedicated embed server (mirrors /api/v1/health).
+app.get('/api/v1/embed/health', async (req, res) => {
+  const h = await getEmbedHealth();
+  const code = h.status === 'ok' || h.status === 'disabled' ? 200 : 503;
+  res.status(code).json(h);
+});
+
+// Get/set the dedicated embedding model. Setting it persists config + restarts the embed server.
+app.get('/api/embed/model', (req, res) => {
+  const ec = resolveEmbedConfig(config, process.env);
+  res.json({ enabled: ec.enabled, model: ec.model, port: ec.port, dimension: config.embed?.dimension || null });
+});
+app.post('/api/embed/model', async (req, res) => {
+  const { model, enabled } = req.body || {};
+  config.embed = config.embed || {};
+  if (model !== undefined) config.embed.model = model;
+  if (enabled !== undefined) config.embed.enabled = Boolean(enabled);
+  if (config.embed.port === undefined) config.embed.port = Number(EMBED_PORT);
+  saveConfig(config);
+  restartEmbedServer().catch(err => console.error('[embed] restart after model change failed:', err));
+  res.json({ success: true, embed: config.embed });
 });
 
 // OpenAI-compatible single model retrieval
@@ -7310,6 +7460,10 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
       }).catch(err => console.error('Auto-start failed:', err));
     }, 1000);
   }
+
+  // Always auto-start the dedicated embedding server (independent of the chat
+  // router) when one is configured. No user command required.
+  setTimeout(() => { startEmbedServer(); }, 1500);
 });
 
 // Memory watchdog — restart llama-server if system memory >= 95% and it's the heaviest process
@@ -7678,7 +7832,7 @@ function shutdownWithTimeout(signal) {
     process.exit(1);
   }, 10000);
   forceExit.unref();
-  stopLlamaServer().finally(() => process.exit(0));
+  Promise.allSettled([stopLlamaServer(), stopEmbedServer()]).finally(() => process.exit(0));
 }
 
 process.on('SIGTERM', () => shutdownWithTimeout('SIGTERM'));
