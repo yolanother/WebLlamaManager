@@ -833,22 +833,26 @@ Append to `tests/embeddings/run-tests.sh` a test of the seeding helper. First, t
 ```bash
 test_seed_config() {
   printf 'test_seed_config\n'
-  local sb; sb="$(mktemp -d "${TMPDIR:-/tmp}/embed-seed.XXXXXX")"
-  # Source the seeding helper from install.sh without running the installer.
-  EMBED_SEED_LIB=1 . "$REPO_ROOT/install.sh"
+  # Subshell isolates install.sh's `set -euo pipefail` from the harness.
+  (
+    sb="$(mktemp -d "${TMPDIR:-/tmp}/embed-seed.XXXXXX")"
+    # Source the seeding helpers from install.sh without running the installer.
+    EMBED_SEED_LIB=1 . "$REPO_ROOT/install.sh" || true
+    set +eu  # neutralize sourced shell options for the assertions below
 
-  # Empty config -> seeds embed block.
-  printf '{}' > "$sb/config.json"
-  embed_seed_config "$sb/config.json" "Qwen_Qwen3-Embedding-0.6B-GGUF/model.gguf"
-  assert_contains "seeds model" "$(cat "$sb/config.json")" "Qwen3-Embedding-0.6B"
-  assert_contains "enables embed" "$(cat "$sb/config.json")" '"enabled": true'
+    # Empty config -> seeds embed block.
+    printf '{}' > "$sb/config.json"
+    embed_seed_config "$sb/config.json" "Qwen_Qwen3-Embedding-0.6B-GGUF/model.gguf"
+    assert_contains "seeds model" "$(cat "$sb/config.json")" "Qwen3-Embedding-0.6B"
+    assert_contains "enables embed" "$(cat "$sb/config.json")" '"enabled": true'
 
-  # Idempotent: existing embed.model is not overwritten.
-  printf '{"embed":{"enabled":true,"model":"existing.gguf"}}' > "$sb/config.json"
-  embed_seed_config "$sb/config.json" "new.gguf"
-  assert_contains "keeps existing model" "$(cat "$sb/config.json")" "existing.gguf"
-  assert_not_contains "did not add new" "$(cat "$sb/config.json")" "new.gguf"
-  rm -rf "$sb"
+    # Idempotent: existing embed.model is not overwritten.
+    printf '{"embed":{"enabled":true,"model":"existing.gguf"}}' > "$sb/config.json"
+    embed_seed_config "$sb/config.json" "new.gguf"
+    assert_contains "keeps existing model" "$(cat "$sb/config.json")" "existing.gguf"
+    assert_not_contains "did not add new" "$(cat "$sb/config.json")" "new.gguf"
+    rm -rf "$sb"
+  )
 }
 ```
 
