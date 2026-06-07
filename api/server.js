@@ -6725,48 +6725,74 @@ app.post('/api/v1/completions', async (req, res) => {
   }
 });
 
-// OpenAI-compatible embeddings endpoint
-app.post('/api/v1/embeddings', async (req, res) => {
+// OpenAI-compatible embeddings endpoint (served by the dedicated embed server).
+// Mounted at the versioned path and an unversioned alias.
+async function handleEmbeddings(req, res) {
+  const startedAt = Date.now();
   const requestedModel = req.body.model || 'default';
 
-  // Route to remote backend if applicable
+  // Route to a remote backend if configured (e.g. an Ollama host).
   const routing = resolveBackend(requestedModel, 'embeddings', req.body);
   if (routing.remote) {
     req._backend = routing.backend.id;
     const remoteBody = { ...req.body, model: routing.targetModel };
     try {
-      const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+      const { response } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
         method: 'POST', headers: { ...routing.headers }, body: JSON.stringify(remoteBody)
       }, { label: 'embeddings', model: routing.targetModel });
-      if (!response.ok) {
-        const error = await response.text();
-        return res.status(response.status).send(error);
+      const text = await response.text();
+      let usage = null; try { usage = JSON.parse(text).usage; } catch { /* ignore */ }
+      addLlmLog(buildEmbedLogEntry({
+        reqBody: req.body, usage, status: response.status, durationMs: Date.now() - startedAt,
+        backend: routing.backend.id, error: response.ok ? null : text.slice(0, 500)
+      }));
+      if (response.ok) {
+        recordTokenStats({ model: requestedModel, backend: routing.backend.id,
+          promptTokens: usage?.prompt_tokens ?? estimateEmbedTokens(req.body.input),
+          completionTokens: 0, duration: Date.now() - startedAt });
       }
-      const data = await response.json();
-      res.json(data);
+      res.status(response.status).type('application/json').send(text);
     } catch (error) {
+      addLlmLog(buildEmbedLogEntry({ reqBody: req.body, usage: null, status: 502,
+        durationMs: Date.now() - startedAt, backend: routing.backend.id, error: error.message }));
       res.status(502).json({ error: `Failed to reach remote backend ${routing.backend.name}`, details: error.message });
     }
     return;
   }
 
+  // Local path → dedicated embed server (EMBED_PORT), NOT the chat router.
+  const ec = resolveEmbedConfig(config, process.env);
   try {
-    const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/embeddings`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+    const response = await fetch(embedTargetUrl(ec.port), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body)
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      return res.status(response.status).send(error);
+    const text = await response.text();
+    let usage = null; try { usage = JSON.parse(text).usage; } catch { /* ignore */ }
+    addLlmLog(buildEmbedLogEntry({
+      reqBody: req.body, usage, status: response.status, durationMs: Date.now() - startedAt,
+      backend: 'local', error: response.ok ? null : text.slice(0, 500)
+    }));
+    if (response.ok) {
+      recordTokenStats({ model: requestedModel, backend: 'local',
+        promptTokens: usage?.prompt_tokens ?? estimateEmbedTokens(req.body.input),
+        completionTokens: 0, duration: Date.now() - startedAt });
     }
-
-    const data = await response.json();
-    res.json(data);
+    res.status(response.status).type('application/json').send(text);
   } catch (error) {
-    res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
+    addLlmLog(buildEmbedLogEntry({ reqBody: req.body, usage: null, status: 502,
+      durationMs: Date.now() - startedAt, backend: 'local', error: error.message }));
+    res.status(502).json({ error: 'Failed to reach embedding server', details: error.message,
+      hint: ec.runnable ? undefined : 'No embedding model selected. Download/select one in the UI or run install.sh.' });
   }
+}
+app.post('/api/v1/embeddings', handleEmbeddings);
+app.post('/api/embeddings', handleEmbeddings); // unversioned convenience alias
+
+// Health of the dedicated embed server (mirrors /api/v1/health).
+app.get('/api/v1/embed/health', async (req, res) => {
+  const h = await getEmbedHealth();
+  const code = h.status === 'ok' || h.status === 'disabled' ? 200 : 503;
+  res.status(code).json(h);
 });
 
 // OpenAI-compatible single model retrieval
