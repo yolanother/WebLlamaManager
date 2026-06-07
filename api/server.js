@@ -1797,6 +1797,10 @@ async function getSystemStats() {
     // Server not running
   }
 
+  // Dedicated embedding server health (null/disabled if not configured).
+  let embedStats = null;
+  try { embedStats = await getEmbedHealth(); } catch { /* embed down */ }
+
   return {
     timestamp: Date.now(),
     cpu: {
@@ -1813,6 +1817,7 @@ async function getSystemStats() {
     },
     gpu: gpuStats,
     llama: llamaStats,
+    embed: embedStats,
     context: contextStats,
     queue: {
       active: llamaQueue.active,
@@ -5312,6 +5317,21 @@ app.get('/api/v1/models', async (req, res) => {
         };
       })
     };
+    // Append the dedicated embedding model so it is selectable by the orchestrator.
+    const ec = resolveEmbedConfig(config, process.env);
+    if (ec.runnable) {
+      let embedId = ec.model;
+      try {
+        const er = await fetch(`http://localhost:${ec.port}/models`, { signal: AbortSignal.timeout(3000) });
+        if (er.ok) { const ej = await er.json(); embedId = ej.data?.[0]?.id || ec.model; }
+      } catch { /* embed server down; fall back to configured id */ }
+      data.data.push({
+        id: embedId, object: 'model', created: Math.floor(Date.now() / 1000),
+        owned_by: 'llamacpp', meta: null, n_ctx: ec.ctxSize || null,
+        displayName: embedId, status: 'embedding', alias: (config.modelAliases || {})[embedId] || null,
+        task: 'embedding', dimension: config.embed?.dimension || null
+      });
+    }
     res.json(data);
   } catch (error) {
     console.error('[v1/models] Error fetching from llama.cpp:', error.message);

@@ -70,5 +70,14 @@ echo "$L" | grep -q '"endpoint":"embeddings"' && ok "llm log records embeddings"
 H="$(curl -s -m 10 "http://localhost:$API_PORT/api/v1/embed/health")"
 echo "$H" | grep -qE '"status":"(ok|disabled)"' && ok "embed health endpoint" || bad "embed health: $H"
 
+# 7) /api/v1/models responds (embed row only added when a model is configured;
+#    EMBED_ENABLED=false here, so we just assert the list endpoint works).
+M="$(curl -s -m 10 "http://localhost:$API_PORT/api/v1/models")"
+echo "$M" | grep -q '"object":"list"' && ok "models list responds" || bad "models failed: $M"
+
+# 8) stats endpoint carries an embed block (served by GET /api/stats).
+S="$(curl -s -m 10 "http://localhost:$API_PORT/api/stats")"
+echo "$S" | grep -q '"embed"' && ok "stats has embed block" || bad "no embed in stats: ${S:0:200}"
+
 echo; [ "$FAIL" -eq 0 ] && echo "integration: PASS" || echo "integration: FAIL"
 exit $FAIL
