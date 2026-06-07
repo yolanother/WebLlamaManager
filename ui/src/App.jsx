@@ -4589,6 +4589,8 @@ function SettingsPage() {
       const data = await res.json();
       if (data.success) {
         setMessage({ type: 'success', text: data.message });
+        // Refresh so the masked HF-token status updates and the input clears.
+        fetchSettings();
       } else {
         setMessage({ type: 'error', text: data.error });
       }
@@ -4646,6 +4648,30 @@ function SettingsPage() {
           {message.text}
         </div>
       )}
+
+      <section className="page-section">
+        <h3>HuggingFace</h3>
+        <div className="settings-grid">
+          <div className="setting-item">
+            <label htmlFor="hfToken">HuggingFace Token</label>
+            <p className="setting-hint">
+              Used to download gated or private models (e.g. <code>google/gemma-*</code>).
+              Stored in config and preferred over the <code>HF_TOKEN</code> environment variable.
+              {settings?.hasHfToken
+                ? ` Currently set${settings?.hfTokenMask ? ` (${settings.hfTokenMask})` : ''}${settings?.hfTokenSource ? ` via ${settings.hfTokenSource}` : ''}.`
+                : ' Not set.'}
+            </p>
+            <input
+              type="password"
+              id="hfToken"
+              autoComplete="off"
+              placeholder={settings?.hasHfToken ? 'Enter a new token to replace the current one' : 'hf_...'}
+              value={settings?.hfToken || ''}
+              onChange={(e) => updateSetting('hfToken', e.target.value)}
+            />
+          </div>
+        </div>
+      </section>
 
       <section className="page-section">
         <h3>Model Loading</h3>
