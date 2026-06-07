@@ -194,6 +194,25 @@ llama-server/
 | `/v1/completions` | POST | Text completions |
 | `/health` | GET | Health check |
 
+### Embeddings (OpenAI-compatible)
+
+A dedicated always-on `llama-server --embeddings` instance serves
+`POST /api/v1/embeddings` (alias `POST /api/embeddings`) on the same host/port as
+the dashboard — through the existing reverse proxy, e.g.
+`https://llama.lair.jaxns.net/api/v1/embeddings`.
+
+```bash
+curl -s http://localhost:5250/api/v1/embeddings \
+  -H 'content-type: application/json' \
+  -d '{"model":"Qwen3-Embedding-0.6B","input":["hello","world"]}'
+```
+
+Returns `{ "object":"list", "data":[{"embedding":[...]}, ...], "usage":{...} }`.
+Default model **Qwen3-Embedding-0.6B → 1024-dim** vectors; batched input (array)
+is returned in one response. The model is selectable in the UI (Models page) and
+downloadable via the downloader. Setup is handled by `install.sh` — no extra
+commands.
+
 ## Service Management
 
 ```bash
