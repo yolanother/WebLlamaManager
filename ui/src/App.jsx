@@ -1974,6 +1974,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               <span className="link-arrow">↗</span>
             </a>
           </div>
+          {stats?.embed && (
+            <StatCard
+              label="Embeddings"
+              value={stats.embed.status === 'ok' ? 'Ready' : stats.embed.status === 'disabled' ? 'Off' : 'Down'}
+              subValue={stats.embed.model ? `${String(stats.embed.model).split('/').pop()} :${stats.embed.port}` : 'no model'}
+              icon="&#x1F9EE;"
+              status={stats.embed.status === 'ok' ? 'success' : stats.embed.status === 'disabled' ? '' : 'error'}
+            />
+          )}
         </div>
       </section>
 
@@ -3019,6 +3028,34 @@ function PresetsPage({ stats }) {
   );
 }
 
+/**
+ * Embedding model selector — lets the user choose a local GGUF to serve on
+ * the dedicated embedding port (used by /api/v1/embeddings). The chosen model
+ * is persisted via POST /api/embed/model and the embed server is restarted.
+ */
+function EmbeddingModelSelector() {
+  const [current, setCurrent] = React.useState(null);
+  const [models, setModels] = React.useState([]);
+  React.useEffect(() => {
+    fetch(`${API_BASE}/embed/model`).then(r => r.json()).then(setCurrent).catch(() => {});
+    fetch(`${API_BASE}/models`).then(r => r.json()).then(d => setModels(d.localModels || [])).catch(() => {});
+  }, []);
+  const choose = async (model) => {
+    await fetch(`${API_BASE}/embed/model`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, enabled: true }) });
+    const r = await fetch(`${API_BASE}/embed/model`); setCurrent(await r.json());
+  };
+  return (
+    <div className="card">
+      <h3>Embedding model</h3>
+      <p className="hint">Served on a dedicated port for <code>/api/v1/embeddings</code>. Current: <strong>{current?.model || 'none'}</strong></p>
+      <select defaultValue="" onChange={e => e.target.value && choose(e.target.value)}>
+        <option value="" disabled>Select a downloaded model…</option>
+        {models.map(m => { const v = m.path || m.name; return <option key={v} value={v}>{m.alias || m.name}</option>; })}
+      </select>
+    </div>
+  );
+}
+
 // Models Page
 function ModelsPage({ stats }) {
   const [serverModels, setServerModels] = useState([]);
@@ -3139,6 +3176,9 @@ function ModelsPage({ stats }) {
         <h2>Models</h2>
         <span className="models-dir">{modelsDir}</span>
       </div>
+
+      {/* Embedding Model Selector */}
+      <EmbeddingModelSelector />
 
       {/* Loaded Models */}
       {serverModels.length > 0 && (
@@ -3343,6 +3383,12 @@ function DownloadPage({ stats }) {
     }
   };
 
+  const EMBED_SUGGESTIONS = [
+    { repo: 'Qwen/Qwen3-Embedding-0.6B-GGUF', label: 'Qwen3-Embedding-0.6B (1024-dim, recommended)' },
+    { repo: 'nomic-ai/nomic-embed-text-v1.5-GGUF', label: 'nomic-embed-text-v1.5 (768-dim)' },
+    { repo: 'BAAI/bge-m3-GGUF', label: 'BGE-M3 (1024-dim, multilingual)' }
+  ];
+
   return (
     <div className="page">
       <div className="page-header">
@@ -3350,6 +3396,12 @@ function DownloadPage({ stats }) {
       </div>
 
       <div className="search-section">
+        <div className="card">
+          <h3>Recommended embedding models</h3>
+          {EMBED_SUGGESTIONS.map(s => (
+            <button key={s.repo} className="btn-secondary" onClick={() => { setSearchQuery(s.repo); }} title={s.repo}>{s.label}</button>
+          ))}
+        </div>
         <div className="search-bar">
           <input
             type="text"
@@ -5908,10 +5960,10 @@ function ApiDocsPage() {
       id: 'openai-embeddings',
       method: 'POST',
       path: '/api/v1/embeddings',
-      description: 'Create embeddings for text (OpenAI-compatible)',
+      description: 'Create embeddings (OpenAI-compatible). Served by a dedicated embedding model; supports batched input. Default model Qwen3-Embedding-0.6B returns 1024-dim vectors.',
       params: [
-        { name: 'model', type: 'string', required: true, description: 'Model ID to use' },
-        { name: 'input', type: 'string', required: true, description: 'Text to embed (string or array of strings)' }
+        { name: 'model', type: 'string', required: true, description: 'Embedding model id (see /v1/models)' },
+        { name: 'input', type: 'string | string[]', required: true, description: 'Text or array of texts to embed' }
       ],
       example: {
         model: 'model-id',
