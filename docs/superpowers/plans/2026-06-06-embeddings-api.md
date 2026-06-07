@@ -619,7 +619,9 @@ RESP="$(curl -s -m 10 "http://localhost:$API_PORT/api/v1/embeddings" \
   -H 'content-type: application/json' \
   -d '{"model":"test-embed","input":["hello","world"]}')"
 echo "$RESP" | grep -q '"object":"list"' && ok "returns list" || bad "no list: $RESP"
-[ "$(echo "$RESP" | grep -o '"embedding"' | wc -l)" -eq 2 ] && ok "two vectors (batched)" || bad "not 2 vectors: $RESP"
+# Count "index": (one per embedding object) — robust vs "embedding" appearing
+# twice per item (object-type value + vector key).
+[ "$(echo "$RESP" | grep -o '"index":' | wc -l)" -eq 2 ] && ok "two vectors (batched)" || bad "not 2 vectors: $RESP"
 
 # 4) Alias works too.
 A="$(curl -s -m 10 "http://localhost:$API_PORT/api/embeddings" -H 'content-type: application/json' -d '{"model":"test-embed","input":"x"}')"
