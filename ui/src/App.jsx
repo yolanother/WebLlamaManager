@@ -2119,6 +2119,11 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                      info.status === 'failed' ? `Failed: ${info.error}` :
                      info.status === 'starting' ? 'Starting...' : 'Downloading...'}
                   </span>
+                  {info.status === 'failed' && info.gatedUrl && (
+                    <a className="download-gated-link" href={info.gatedUrl} target="_blank" rel="noopener noreferrer">
+                      Request access on HuggingFace ↗
+                    </a>
+                  )}
                 </div>
                 <div className="download-progress">
                   <div className="progress-bar">
@@ -3430,6 +3435,11 @@ function DownloadPage({ stats }) {
                      info.status === 'failed' ? `Failed: ${info.error}` :
                      info.status === 'starting' ? 'Starting...' : 'Downloading...'}
                   </span>
+                  {info.status === 'failed' && info.gatedUrl && (
+                    <a className="download-gated-link" href={info.gatedUrl} target="_blank" rel="noopener noreferrer">
+                      Request access on HuggingFace ↗
+                    </a>
+                  )}
                 </div>
                 <div className="download-progress">
                   <div className="progress-bar">
