@@ -164,7 +164,7 @@ if (existsSync(UI_BUILD_PATH)) {
 }
 
 // Configuration
-const CONFIG_PATH = join(PROJECT_ROOT, 'config.json');
+const CONFIG_PATH = process.env.CONFIG_PATH || join(PROJECT_ROOT, 'config.json');
 const MODELS_DIR = process.env.MODELS_DIR || join(process.env.HOME, 'models');
 const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
