@@ -29,6 +29,7 @@ const PROJECT_ROOT = dirname(__dirname);
 
 // Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
 import dotenv from 'dotenv';
+import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -167,6 +168,7 @@ const MODELS_DIR = process.env.MODELS_DIR || join(process.env.HOME, 'models');
 const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
+const EMBED_PORT = process.env.EMBED_PORT || 5252;
 const LLAMA_UI_URL = process.env.LLAMA_UI_URL || null; // Optional override for llama.cpp UI URL
 
 // Python venv for huggingface CLI (created by install.sh)
@@ -178,6 +180,9 @@ const HF_CLI_PATH = existsSync(join(VENV_PATH, 'bin', 'hf'))
 
 // State
 let llamaProcess = null;
+let embedProcess = null;
+let embedRestartInProgress = false;
+let embedIntentionalStop = false;
 let downloadProcesses = new Map();
 let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
@@ -3906,6 +3911,77 @@ function attachLlamaExitHandler(proc) {
   });
 }
 
+// ── Dedicated embedding server supervisor ────────────────────────────────
+// Runs a second llama-server with --embeddings on EMBED_PORT, independent of
+// the chat router. Started automatically on boot (no user command).
+
+/** Spawn the embed server from config (if runnable). Idempotent: no-op if already running. */
+function startEmbedServer() {
+  const ec = resolveEmbedConfig(config, process.env);
+  if (!ec.runnable) {
+    console.log('[embed] Not started (disabled or no model selected).');
+    return;
+  }
+  if (embedProcess && !embedProcess.killed) return;
+  const startScript = join(PROJECT_ROOT, 'start-embed.sh');
+  const env = {
+    ...process.env,
+    MODELS_DIR,
+    EMBED_MODEL: ec.model,
+    EMBED_PORT: String(ec.port),
+    EMBED_GPU_LAYERS: String(ec.gpuLayers),
+    EMBED_CTX: String(ec.ctxSize),
+    HF_TOKEN: process.env.HF_TOKEN || ''
+  };
+  console.log(`[embed] Starting embed server on :${ec.port} (model: ${ec.model})`);
+  addLog('system', `Starting embedding server on :${ec.port} (model: ${ec.model})`);
+  embedIntentionalStop = false;
+  embedProcess = spawn('bash', [startScript], { cwd: PROJECT_ROOT, stdio: ['ignore', 'pipe', 'pipe'], env, detached: false });
+  embedProcess.stdout.on('data', (d) => addLog('embed', d));
+  embedProcess.stderr.on('data', (d) => addLog('embed', d));
+  embedProcess.on('exit', (code) => {
+    console.log(`[embed] embed server exited (code ${code})`);
+    const wasIntentional = embedIntentionalStop;
+    embedProcess = null;
+    if (!wasIntentional) {
+      // Auto-restart with a small backoff (mirrors the router's resiliency).
+      setTimeout(() => { startEmbedServer(); }, 5000);
+    }
+  });
+}
+
+/** Stop the embed server (no auto-restart). */
+async function stopEmbedServer() {
+  if (embedProcess && !embedProcess.killed) {
+    embedIntentionalStop = true;
+    embedProcess.kill('SIGTERM');
+    await new Promise(r => setTimeout(r, 1500));
+    if (embedProcess && !embedProcess.killed) embedProcess.kill('SIGKILL');
+    embedProcess = null;
+  }
+}
+
+/** Restart the embed server (used after the selected model changes). */
+async function restartEmbedServer() {
+  if (embedRestartInProgress) return;
+  embedRestartInProgress = true;
+  try { await stopEmbedServer(); startEmbedServer(); }
+  finally { embedRestartInProgress = false; }
+}
+
+/** Fetch embed server health (null if down). */
+async function getEmbedHealth() {
+  const ec = resolveEmbedConfig(config, process.env);
+  if (!ec.runnable) return { status: 'disabled', model: ec.model || null, port: ec.port };
+  try {
+    const r = await fetch(`http://localhost:${ec.port}/health`, { signal: AbortSignal.timeout(3000) });
+    const body = await r.json().catch(() => null);
+    return { status: r.ok ? (body?.status || 'ok') : 'error', model: ec.model, port: ec.port };
+  } catch {
+    return { status: 'unavailable', model: ec.model, port: ec.port };
+  }
+}
+
 // Start llama server in router mode (multi-model)
 app.post('/api/server/start', async (req, res) => {
   idleShutdown = false;
@@ -7310,6 +7386,10 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
       }).catch(err => console.error('Auto-start failed:', err));
     }, 1000);
   }
+
+  // Always auto-start the dedicated embedding server (independent of the chat
+  // router) when one is configured. No user command required.
+  setTimeout(() => { startEmbedServer(); }, 1500);
 });
 
 // Memory watchdog — restart llama-server if system memory >= 95% and it's the heaviest process
@@ -7678,7 +7758,7 @@ function shutdownWithTimeout(signal) {
     process.exit(1);
   }, 10000);
   forceExit.unref();
-  stopLlamaServer().finally(() => process.exit(0));
+  Promise.allSettled([stopLlamaServer(), stopEmbedServer()]).finally(() => process.exit(0));
 }
 
 process.on('SIGTERM', () => shutdownWithTimeout('SIGTERM'));
