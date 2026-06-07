@@ -271,6 +271,41 @@ Environment variables (set in systemd service or shell):
 - `MODELS_MAX`: Max simultaneous models (default: `2`)
 - `CONTEXT`: Context size (default: `8192`)
 
+## Stability & thermal protection
+
+A resource guard protects the host from oversized models and overheating (added
+after a gpt-oss-120b incident that drove RAM to 99.9% and the APU to 98–99 °C).
+All knobs live under `config.guard` (sane defaults if omitted):
+
+```json
+{
+  "guard": {
+    "enabled": true,
+    "warnC": 90,            // pause dispatching new requests at/above this temp
+    "resumeC": 80,          // resume when cooled to/below this
+    "criticalC": 96,        // unload the model to force a cooldown at/above this
+    "memThresholdPct": 90,  // memory-watchdog trigger (system RAM %)
+    "maxQueueDepth": 8,     // reject new requests when the backlog is deeper
+    "headroomFrac": 0.12,   // RAM kept free by the pre-flight fit check
+    "kvBytesPerToken": 262144,
+    "overheadBytes": 3221225472,
+    "minContext": 4096
+  }
+}
+```
+
+- **Thermal governor** — governs on the hotter of GPU/CPU; throttles (pauses new
+  requests) above `warnC`, resumes below `resumeC`, and unloads the model above
+  `criticalC`. Current state shows on the dashboard ("Thermal Guard" card) and in
+  `/api/stats` (`guard`).
+- **Memory** — an earlier memory watchdog (`memThresholdPct`) plus a coarse
+  pre-flight that refuses a model whose weights cannot fit available RAM.
+- **Queue** — bounded by `maxQueueDepth` so a stuck model can't pile up requests.
+
+> Note: hitting 98–99 °C indicates marginal cooling for sustained max-power loads.
+> The governor protects against shutdown, but also check physical cooling / the
+> APU power cap if you run large models continuously.
+
 ## Adding Models
 
 ### HuggingFace token (gated/private models)
