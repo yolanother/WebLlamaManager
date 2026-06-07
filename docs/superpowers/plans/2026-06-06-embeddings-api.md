@@ -606,8 +606,9 @@ sleep 1
 AUTO_START=false EMBED_ENABLED=false API_PORT=$API_PORT EMBED_PORT=$EMBED_PORT \
   node "$REPO_ROOT/api/server.js" >/tmp/embed-srv.log 2>&1 & SRV_PID=$!
 
-# Wait for the API to listen.
-for i in $(seq 1 30); do curl -sf "http://localhost:$API_PORT/api/health" >/dev/null 2>&1 && break; sleep 1; done
+# Wait for the API to listen. Use /api/llm-logs — a static 200 that does NOT
+# depend on the llama router being up (there is no /api/health endpoint).
+for i in $(seq 1 30); do curl -sf "http://localhost:$API_PORT/api/llm-logs?limit=1" >/dev/null 2>&1 && break; sleep 1; done
 
 FAIL=0
 ok() { echo "  ok   $1"; }
@@ -749,12 +750,10 @@ In `tests/embeddings/integration-test.sh`, before the final `echo; [ "$FAIL"...`
 M="$(curl -s -m 10 "http://localhost:$API_PORT/api/v1/models")"
 echo "$M" | grep -q '"object":"list"' && ok "models list responds" || bad "models failed: $M"
 
-# 8) stats endpoint carries an embed block.
-S="$(curl -s -m 10 "http://localhost:$API_PORT/api/stats" 2>/dev/null || curl -s -m 10 "http://localhost:$API_PORT/api/system/stats" 2>/dev/null)"
+# 8) stats endpoint carries an embed block (served by GET /api/stats).
+S="$(curl -s -m 10 "http://localhost:$API_PORT/api/stats")"
 echo "$S" | grep -q '"embed"' && ok "stats has embed block" || bad "no embed in stats: ${S:0:200}"
 ```
-
-> If neither `/api/stats` nor `/api/system/stats` exists, grep the server source for the stats endpoint path during implementation and use the correct one in the test (the stats object is built by `getSystemStats()` and served by an endpoint near it / broadcast over WS).
 
 - [ ] **Step 2: Run test to verify it fails**
 
