@@ -273,6 +273,13 @@ Environment variables (set in systemd service or shell):
 
 ## Adding Models
 
+### HuggingFace token (gated/private models)
+Gated models (e.g. `google/gemma-*`) require a HuggingFace token. Set it in
+**Settings → HuggingFace Token** (stored in config, preferred over the
+`HF_TOKEN` environment variable; the raw value is never returned by the API).
+Accept the model's license on huggingface.co as well. If a download fails for a
+gated model, the UI shows an actionable message pointing here.
+
 ### Via Web UI
 1. Go to "Download from HuggingFace" section
 2. Search for a model (e.g., "qwen coder gguf")
