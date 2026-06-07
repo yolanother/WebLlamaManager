@@ -6815,6 +6815,22 @@ app.get('/api/v1/embed/health', async (req, res) => {
   res.status(code).json(h);
 });
 
+// Get/set the dedicated embedding model. Setting it persists config + restarts the embed server.
+app.get('/api/embed/model', (req, res) => {
+  const ec = resolveEmbedConfig(config, process.env);
+  res.json({ enabled: ec.enabled, model: ec.model, port: ec.port, dimension: config.embed?.dimension || null });
+});
+app.post('/api/embed/model', async (req, res) => {
+  const { model, enabled } = req.body || {};
+  config.embed = config.embed || {};
+  if (model !== undefined) config.embed.model = model;
+  if (enabled !== undefined) config.embed.enabled = Boolean(enabled);
+  if (config.embed.port === undefined) config.embed.port = Number(EMBED_PORT);
+  saveConfig(config);
+  restartEmbedServer().catch(err => console.error('[embed] restart after model change failed:', err));
+  res.json({ success: true, embed: config.embed });
+});
+
 // OpenAI-compatible single model retrieval
 app.get('/api/v1/models/:model', async (req, res) => {
   try {
