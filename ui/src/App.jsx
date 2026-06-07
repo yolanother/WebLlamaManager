@@ -1983,6 +1983,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               status={stats.embed.status === 'ok' ? 'success' : stats.embed.status === 'disabled' ? '' : 'error'}
             />
           )}
+          {stats?.guard && stats.guard.state && stats.guard.state !== 'normal' && (
+            <StatCard
+              label="Thermal Guard"
+              value={stats.guard.state === 'critical' ? 'Critical — unloaded' : 'Throttling'}
+              subValue={`${Math.round(stats.guard.maxTempC)}°C (gpu ${Math.round(stats.guard.gpuC)} / cpu ${Math.round(stats.guard.cpuC)})`}
+              icon="&#x1F525;"
+              status="error"
+            />
+          )}
         </div>
       </section>
 

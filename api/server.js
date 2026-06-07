@@ -31,6 +31,7 @@ const PROJECT_ROOT = dirname(__dirname);
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
+import { checkModelFit, thermalDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -1729,6 +1730,85 @@ function saveConfig(config) {
 
 let config = loadConfig();
 
+// ── Resource guard (memory fit + thermal governor) ───────────────────────────
+// Added after the gpt-oss-120b incident (system RAM 99.9%, APU 98-99C, crash
+// loop). Runtime protections: thermal throttle/unload, bounded queue, earlier
+// memory threshold, plus a coarse pre-flight that hard-refuses models whose
+// weights alone cannot fit. All thresholds are configurable via config.guard.
+let guardThermalState = 'normal';
+let guardDispatchPaused = false;
+let guardLast = { state: 'normal', maxTempC: 0, gpuC: 0, cpuC: 0, paused: false, at: 0 };
+
+/** Resolve guard config merged with conservative defaults. */
+function guardCfg() {
+  const g = (config && config.guard) || {};
+  return {
+    enabled: g.enabled !== false,
+    warnC: g.warnC ?? GUARD_DEFAULTS.warnC,
+    resumeC: g.resumeC ?? GUARD_DEFAULTS.resumeC,
+    criticalC: g.criticalC ?? GUARD_DEFAULTS.criticalC,
+    headroomFrac: g.headroomFrac ?? GUARD_DEFAULTS.headroomFrac,
+    kvBytesPerToken: g.kvBytesPerToken ?? GUARD_DEFAULTS.kvBytesPerToken,
+    overheadBytes: g.overheadBytes ?? GUARD_DEFAULTS.overheadBytes,
+    minContext: g.minContext ?? GUARD_DEFAULTS.minContext,
+    memThresholdPct: g.memThresholdPct ?? 90,
+    maxQueueDepth: g.maxQueueDepth ?? 8
+  };
+}
+
+/** Currently-available system memory in bytes (MemAvailable), 0 if unreadable. */
+function memAvailableBytes() {
+  try {
+    const m = readFileSync('/proc/meminfo', 'utf8');
+    return (parseInt(m.match(/MemAvailable:\s+(\d+)/)?.[1] || '0', 10)) * 1024;
+  } catch { return 0; }
+}
+
+/** Best-effort: on-disk size (bytes) of the GGUF backing a model id (0 = unknown). */
+function resolveModelSizeBytes(modelId) {
+  if (!modelId) return 0;
+  try {
+    const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const target = norm(modelId);
+    let best = 0;
+    for (const m of scanLocalModels()) {
+      const n = norm(m.name);
+      if (n === target || n.includes(target) || target.includes(n)) {
+        best = Math.max(best, m.size || 0);
+      }
+    }
+    return best;
+  } catch { return 0; }
+}
+
+/**
+ * Coarse pre-flight memory guard. Hard-refuses (throws MODEL_TOO_LARGE) only when
+ * the model's weights cannot fit the memory budget at all; otherwise logs a
+ * warning (the per-token KV estimate is approximate, so we don't block on it —
+ * the runtime memory/thermal guards are the reliable backstop). Fail-open when
+ * the model size can't be resolved.
+ */
+function preflightModelGuard(modelId, contextSize) {
+  const cfg = guardCfg();
+  if (!cfg.enabled) return;
+  const fileBytes = resolveModelSizeBytes(modelId);
+  if (!fileBytes) return; // unknown size -> fail open
+  const fit = checkModelFit({
+    fileBytes, contextSize: contextSize || cfg.minContext, availableBytes: memAvailableBytes(),
+    kvBytesPerToken: cfg.kvBytesPerToken, overheadBytes: cfg.overheadBytes,
+    headroomFrac: cfg.headroomFrac, minContext: cfg.minContext
+  });
+  const gib = (n) => (n / (2 ** 30)).toFixed(1);
+  if (fit.fits) return;
+  if (fit.recommendedContext === null) {
+    const err = new Error(`Model "${modelId}" is too large to serve safely: needs ~${gib(fit.requiredBytes)} GiB but only ~${gib(fit.budgetBytes)} GiB is free. Use a smaller quant or free memory.`);
+    err.code = 'MODEL_TOO_LARGE';
+    err.statusCode = 507;
+    throw err;
+  }
+  addLog('system', `[guard] ${modelId}: context ${contextSize} may not fit (~${gib(fit.requiredBytes)} GiB vs budget ${gib(fit.budgetBytes)} GiB); recommended <= ${fit.recommendedContext}. Monitoring memory at runtime.`);
+}
+
 // Apply configured concurrency limit
 if (config.maxConcurrentRequests) {
   llamaQueue.setConcurrency(config.maxConcurrentRequests);
@@ -1826,6 +1906,7 @@ async function getSystemStats() {
     gpu: gpuStats,
     llama: llamaStats,
     embed: embedStats,
+    guard: guardLast,
     context: contextStats,
     queue: {
       active: llamaQueue.active,
@@ -3780,6 +3861,10 @@ function presetServesModel(preset, modelName) {
 // + acquireLocalSlot path serializes new requests during the window.
 let modeSwitchPromise = null;
 async function ensureModelServed(modelName) {
+  // Pre-flight memory guard: hard-refuse a model whose weights can't fit at all
+  // (throws MODEL_TOO_LARGE -> surfaced to the caller). Coarse cases only warn.
+  preflightModelGuard(modelName, config.contextSize);
+
   // Two correctness rules:
   //   (1) If the model has an autoActivate preset and we're not in it -> swap to it.
   //   (2) If we're in a single-mode preset that doesn't serve this model -> swap
@@ -5484,6 +5569,24 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
 // share the held slot.
 async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait } = {}) {
   const queueStart = Date.now();
+
+  // Guard: bounded queue — reject when the backlog is already too deep so a
+  // stuck/overloaded model can't accumulate a huge pile-up (incident: 13+).
+  const _gc = guardCfg();
+  if (_gc.enabled && llamaQueue.pending >= _gc.maxQueueDepth) {
+    const e = new Error(`Server busy: ${llamaQueue.pending} requests already queued (max ${_gc.maxQueueDepth}). Try again shortly.`);
+    e.code = 'QUEUE_FULL'; e.statusCode = 503;
+    throw e;
+  }
+
+  // Guard: thermal throttle — hold new dispatch while the governor has paused us
+  // (APU too hot), until it cools below the resume threshold or a max wait elapses.
+  if (_gc.enabled && guardDispatchPaused) {
+    const tStart = Date.now();
+    while (guardDispatchPaused && (Date.now() - tStart) < 120000) {
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
 
   // Fire onWait every 5s while we're blocked on acquire(). Callers use this to
   // ship SSE keepalive comments so reverse proxies don't 504 on long queue waits.
@@ -7838,7 +7941,7 @@ setInterval(() => {
   if (!llamaProcess || memWatchdogCooldown || restartInProgress) return;
 
   const memPercent = getSystemMemoryPercent();
-  if (memPercent >= MEM_WATCHDOG_THRESHOLD) {
+  if (memPercent >= guardCfg().memThresholdPct) {
     if (isLlamaServerHeaviestProcess()) {
       memWatchdogCooldown = true;
       const msg = `Memory watchdog triggered: system at ${memPercent.toFixed(1)}% and llama-server is heaviest process. Restarting...`;
@@ -7861,6 +7964,47 @@ setInterval(() => {
     }
   }
 }, MEM_WATCHDOG_INTERVAL);
+
+// ── Thermal governor ─────────────────────────────────────────────────────────
+// Polls APU temperature (max of GPU edge + CPU) and protects the hardware:
+// above the warn threshold it pauses dispatching new requests (acquireLocalSlot
+// holds the queue); above the critical threshold it unloads the model to force a
+// cooldown. Added after the incident where the APU sat at 98-99 C. Governs on the
+// hotter of GPU/CPU and ignores all-zero readings (telemetry dark).
+const THERMAL_INTERVAL = 5_000;
+setInterval(async () => {
+  const cfg = guardCfg();
+  if (!cfg.enabled) { guardDispatchPaused = false; guardThermalState = 'normal'; return; }
+  let gpuC = 0;
+  try { const g = await getGpuStats(); gpuC = Number(g?.temperature) || 0; } catch { /* telemetry dark */ }
+  const cpuC = Number(getCpuTemperature()) || 0;
+  const maxTempC = Math.max(gpuC, cpuC);
+
+  const prev = guardThermalState;
+  const decision = thermalDecision({
+    tempC: maxTempC, prevState: prev,
+    warnC: cfg.warnC, resumeC: cfg.resumeC, criticalC: cfg.criticalC
+  });
+  guardThermalState = decision.state;
+  guardDispatchPaused = decision.pauseDispatch && maxTempC > 0;
+  guardLast = { state: decision.state, maxTempC, gpuC, cpuC, paused: guardDispatchPaused, at: Date.now() };
+
+  // Log only on transitions to avoid spamming every interval.
+  if (decision.state !== prev) {
+    if (decision.state === 'critical') {
+      addLog('system', `[thermal] CRITICAL ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}) >= ${cfg.criticalC}C — unloading model to cool down`);
+    } else if (decision.state === 'throttled') {
+      addLog('system', `[thermal] throttling: ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}) >= ${cfg.warnC}C — pausing new requests until <= ${cfg.resumeC}C`);
+    } else if (decision.state === 'normal') {
+      addLog('system', `[thermal] recovered: ${maxTempC.toFixed(1)}C <= ${cfg.resumeC}C — resuming normal dispatch`);
+    }
+  }
+
+  if (decision.unload && maxTempC > 0 && llamaProcess && !llamaProcess.killed && !restartInProgress) {
+    intentionalStop = true;
+    try { await stopLlamaServer(); } finally { intentionalStop = false; }
+  }
+}, THERMAL_INTERVAL);
 
 // Idle shutdown — stop llama-server after 15 min with no requests
 const IDLE_SHUTDOWN_MINUTES = 15;
