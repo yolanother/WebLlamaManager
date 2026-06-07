@@ -50,8 +50,19 @@ A second llama-server process, supervised by the Node server, runs **only** the
 embedding model with `--embeddings`. The chat router is untouched, so chat and
 embeddings are available concurrently with no mode-switching.
 
-- **Start script** `start-embed.sh` (mirrors `start-preset.sh`): enters the
-  distrobox and runs:
+**No new commands to run.** The embed server is started **automatically by the
+Node server** (the same process systemd runs) — exactly how the chat router is
+started today via `start-llama.sh`. The only setup command remains `install.sh`.
+
+- **Supervisor** in `api/server.js`: on server startup, if `embed.enabled` and
+  `embed.model` is set, spawn the embed instance; health-poll `:EMBED_PORT/health`;
+  auto-restart on exit with backoff; `restartEmbedServer()` when the selected
+  model changes. Parallel to the router supervisor but simpler (one fixed model,
+  no router/preset modes). This makes the embed server come up on every normal
+  service start with zero manual steps.
+- **Internal start script** `start-embed.sh` — a *secondary* script invoked **by
+  the Node supervisor only** (never by the user), mirroring `start-llama.sh`: it
+  sources `.env`, enters the distrobox, and runs:
   ```
   llama-server --model <embed.gguf> --embeddings \
     --host 0.0.0.0 --port $EMBED_PORT -ngl $EMBED_GPU_LAYERS --no-mmap \
@@ -60,27 +71,40 @@ embeddings are available concurrently with no mode-switching.
   GPU by default (`-ngl 99`) — the model is tiny (~600 MB for Qwen3-0.6B), so the
   VRAM/GTT footprint is negligible. A `--print-cmd` (dry-run) mode prints the
   assembled command without launching (test seam).
-- **Supervisor** in `api/server.js`: spawn on startup (when `embed.enabled`),
-  health-poll `:EMBED_PORT/health`, auto-restart on exit with backoff, and a
-  `restartEmbedServer()` used when the selected model changes. Parallel to the
-  router supervisor but simpler (one fixed model, no router/preset modes).
 - **Routing change**: the local path of `POST /api/v1/embeddings` targets
   `http://localhost:${EMBED_PORT}/v1/embeddings` instead of `LLAMA_PORT`. Remote
   (Ollama) routing via `resolveBackend` stays as a fallback.
+
+### 3a. External routing (reverse proxy)
+
+`/api/v1/embeddings` is a standard `/api/` route served by the same Node app
+(`API_PORT` 5250) that already serves the dashboard and chat endpoints. The
+external reverse proxy (e.g. `llama.lair.jaxns.net`, managed outside this repo)
+already forwards `/api/*` to that port, so embeddings are reachable through the
+same hostname with **no new proxy rule** — e.g.
+`https://llama.lair.jaxns.net/api/v1/embeddings`. The embed server's own port
+(`:5252`) stays internal/localhost and is never exposed directly. A convenience
+alias `POST /api/embeddings` → the same handler is added so the unversioned path
+the operator expects also works.
 
 ## 4. Model selection via the downloader
 
 The embedding model is **not hardcoded** — it is whichever model `config.embed.model`
 points to.
 
-- **Bootstrap**: Qwen3-Embedding-0.6B (1024-dim, Matryoshka-truncatable) is the
-  *recommended* default, but the server does **not** auto-download on startup. If
-  `config.embed.model` is empty, the embed server stays down and the UI prompts
-  to download/select a model (the curated suggestion makes Qwen3-0.6B one click /
-  one documented `hf download` away). Once a model is selected the embed server
-  starts. This avoids a heavy download blocking boot.
-- **Download**: the existing HF downloader already fetches any GGUF into
-  `MODELS_DIR`; no change needed to download embedding models.
+- **Bootstrap via `install.sh`**: `install.sh` (the single setup script) fetches
+  Qwen3-Embedding-0.6B (1024-dim) into `MODELS_DIR` using the venv `hf` CLI it
+  already provisions, and seeds `config.embed.model` + `embed.enabled=true` if
+  unset. So after `install.sh`, embeddings work with no extra steps and the Node
+  server auto-starts the embed instance on the next service start. The download
+  is part of install (one time), **not** the runtime boot path, so booting never
+  blocks on a download. `install.sh` skips the download if the model is already
+  present or `embed.model` is already set (idempotent).
+- **Runtime selection/change**: the existing HF downloader already fetches any
+  GGUF into `MODELS_DIR`; to *change* the embedding model later, select a
+  downloaded model in the UI (writes `config.embed.model`, restarts the embed
+  server). No new model-type taxonomy — just a curated suggestion list +
+  "set as embedding model".
 - **Curated suggestions**: the downloader UI gets a small built-in list of
   recommended embedding models (Qwen3-Embedding-0.6B, nomic-embed-text-v1.5,
   BGE-M3) so they are easy to find. This is additive, not a model-type taxonomy.
@@ -182,19 +206,25 @@ Mirrors the repo's dependency-free bash style plus a documented live check:
 ## 10. File-level change map
 
 - `api/server.js` — repoint `/api/v1/embeddings` local path to `EMBED_PORT`; add
-  `addLlmLog`/`recordTokenStats` in the handler; add embed supervisor
-  (`startEmbedServer`/`restartEmbedServer`/health), `EMBED_*` config/env,
+  the `POST /api/embeddings` alias; add `addLlmLog`/`recordTokenStats` in the
+  handler; add the embed supervisor (`startEmbedServer`/`restartEmbedServer`/
+  health, started automatically on server boot), `EMBED_*` config/env,
   `GET /api/v1/embed/health`, `GET/POST /api/embed/model`; include embed model in
   `/api/v1/models`; add `embed` to `getSystemStats()`.
-- `start-embed.sh` — new launcher (distrobox + `llama-server --embeddings`),
-  `--print-cmd` seam.
-- `config.json` — `embed` block (+ defaults seeded by server if absent).
+- `start-embed.sh` — new **internal** launcher invoked only by the Node
+  supervisor (distrobox + `llama-server --embeddings`, sources `.env` like
+  `start-llama.sh`), with a `--print-cmd` seam. Not a user-facing command.
+- `install.sh` — download the bootstrap embedding model (Qwen3-Embedding-0.6B)
+  via the venv `hf` CLI and seed `config.embed` if unset (idempotent). Keeps
+  `install.sh` the single setup entry point.
+- `config.json` — `embed` block (+ defaults seeded by the server if absent).
 - `ui/src/App.jsx` — embed-server health card on the Dashboard; embedding-model
   selector; curated embedding suggestions in the downloader; ApiDocs embeddings
   example/dimension.
-- `README.md`, UI ApiDocsPage — embeddings usage + dimension/host/port docs.
+- `README.md`, UI ApiDocsPage — embeddings usage + dimension/host/port +
+  external URL (`/api/v1/embeddings` through the existing reverse proxy).
 - `tests/embeddings/run-tests.sh` — bash tests.
-- `.env` / install docs — `EMBED_PORT` etc. defaults.
+- `.env` / install: `EMBED_PORT` (default 5252) etc. defaults; no new run commands.
 
 ## 11. Headers & docs conventions
 
