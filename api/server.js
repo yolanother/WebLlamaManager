@@ -1589,22 +1589,29 @@ function recordTokenStats(stats) {
   const modelKey = backend && backend !== 'local' ? `${backend}/${model || 'unknown'}` : (model || 'unknown');
   requestStatsAccum.modelCounts[modelKey] = (requestStatsAccum.modelCounts[modelKey] || 0) + 1;
 
-  const requestRecord = {
-    timestamp: Date.now(),
-    promptTokens: promptTokens || 0,
-    completionTokens: completionTokens || 0,
-    tokensPerSecond: tokensPerSecond || 0,
-    model: modelKey,
-    duration: duration || 0
-  };
+  // Throughput/perf telemetry is generation-only. Embeddings requests
+  // (completionTokens == 0) are still counted above (token totals + per-model
+  // request counts) but must NOT enter the tok/s time-series or the recent
+  // performance window, where their zero rate would deflate chat throughput
+  // charts and the local processing-time estimate.
+  if ((completionTokens || 0) > 0) {
+    const requestRecord = {
+      timestamp: Date.now(),
+      promptTokens: promptTokens || 0,
+      completionTokens: completionTokens || 0,
+      tokensPerSecond: tokensPerSecond || 0,
+      model: modelKey,
+      duration: duration || 0
+    };
 
-  tokenStats.recentRequests.push(requestRecord);
-  if (tokenStats.recentRequests.length > MAX_RECENT_REQUESTS) {
-    tokenStats.recentRequests.shift();
+    tokenStats.recentRequests.push(requestRecord);
+    if (tokenStats.recentRequests.length > MAX_RECENT_REQUESTS) {
+      tokenStats.recentRequests.shift();
+    }
+
+    // Add to time-series
+    addAnalyticsPoint('tokens', requestRecord);
   }
-
-  // Add to time-series
-  addAnalyticsPoint('tokens', requestRecord);
 }
 
 // Default presets - seeded on first run, can be deleted by user
@@ -3941,10 +3948,15 @@ function startEmbedServer() {
   console.log(`[embed] Starting embed server on :${ec.port} (model: ${ec.model})`);
   addLog('system', `Starting embedding server on :${ec.port} (model: ${ec.model})`);
   embedIntentionalStop = false;
-  embedProcess = spawn('bash', [startScript], { cwd: PROJECT_ROOT, stdio: ['ignore', 'pipe', 'pipe'], env, detached: false });
-  embedProcess.stdout.on('data', (d) => addLog('embed', d));
-  embedProcess.stderr.on('data', (d) => addLog('embed', d));
-  embedProcess.on('exit', (code) => {
+  // Capture the spawned process locally so a delayed exit from a superseded
+  // process (e.g. a slow SIGKILL landing after a restart already spawned a new
+  // one) cannot null the current process or schedule a spurious restart.
+  const proc = spawn('bash', [startScript], { cwd: PROJECT_ROOT, stdio: ['ignore', 'pipe', 'pipe'], env, detached: false });
+  embedProcess = proc;
+  proc.stdout.on('data', (d) => addLog('embed', d));
+  proc.stderr.on('data', (d) => addLog('embed', d));
+  proc.on('exit', (code) => {
+    if (embedProcess !== proc) return; // superseded by a newer process; ignore
     console.log(`[embed] embed server exited (code ${code})`);
     const wasIntentional = embedIntentionalStop;
     embedProcess = null;

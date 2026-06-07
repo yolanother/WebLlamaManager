@@ -60,14 +60,19 @@ DISTROBOX="/usr/local/bin/distrobox"
 echo "Starting embedding server in distrobox '$CONTAINER_NAME' on port $EMBED_PORT (model: $MODEL_ARG)"
 
 # Enter the container; set the same AMD/ROCm unified-memory env container-start.sh
-# uses, then exec the embeddings llama-server.
-exec "$DISTROBOX" enter "$CONTAINER_NAME" -- bash -c "
+# uses, then exec the embeddings llama-server. Values are passed as POSITIONAL
+# ARGS to the inner shell (not interpolated into the command string) and the
+# argv is rebuilt inside with proper quoting, so a model path containing spaces
+# or shell metacharacters can never be word-split or injected.
+exec "$DISTROBOX" enter "$CONTAINER_NAME" -- bash -c '
   export HSA_OVERRIDE_GFX_VERSION=11.5.1
   export ROCM_LLVM_PRE_VEGA=1
   export GGML_HIP_UMA=1
   export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
-  export LLAMA_CACHE='$MODELS_DIR'
-  export HF_TOKEN='$HF_TOKEN'
-  mkdir -p '$MODELS_DIR'
-  exec $(build_cmd)
-"
+  export LLAMA_CACHE="$1"
+  export HF_TOKEN="$2"
+  mkdir -p "$1"
+  args=(--model "$3" --embeddings --host 0.0.0.0 --port "$4" -ngl "$5" --no-mmap)
+  [ "$6" != "0" ] && args+=(--ctx-size "$6")
+  exec llama-server "${args[@]}"
+' embed-launch "$MODELS_DIR" "$HF_TOKEN" "$MODEL_ARG" "$EMBED_PORT" "$EMBED_GPU_LAYERS" "$EMBED_CTX"
