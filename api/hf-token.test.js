@@ -2,7 +2,7 @@
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveHfToken, maskToken, redactConfig, actionableDownloadError } from './hf-token.js';
+import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 
 test('resolveHfToken: config preferred over env', () => {
   assert.equal(resolveHfToken({ hfToken: 'hf_cfg' }, { HF_TOKEN: 'hf_env' }), 'hf_cfg');
@@ -58,4 +58,20 @@ test('actionableDownloadError: gated with token suggests license acceptance', ()
 test('actionableDownloadError: generic fallback includes exit code', () => {
   const m = actionableDownloadError({ output: 'some network blip', exitCode: 7, hasToken: true });
   assert.match(m, /exit code 7/);
+});
+
+test('isGatedOutput: detects gated/auth, ignores benign', () => {
+  assert.equal(isGatedOutput('Error: 403 Forbidden, access to model is restricted'), true);
+  assert.equal(isGatedOutput('401 Unauthorized'), true);
+  assert.equal(isGatedOutput('You must be authenticated'), true);
+  assert.equal(isGatedOutput('downloading shard 1 of 4'), false);
+  assert.equal(isGatedOutput(''), false);
+});
+
+test('hfModelUrl: builds model page url, strips :quant suffix', () => {
+  assert.equal(hfModelUrl('google/gemma-4-12B-it-qat-q4_0-gguf:Q4_0'),
+    'https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf');
+  assert.equal(hfModelUrl('org/model'), 'https://huggingface.co/org/model');
+  assert.equal(hfModelUrl('  org/model  '), 'https://huggingface.co/org/model');
+  assert.equal(hfModelUrl(''), null);
 });

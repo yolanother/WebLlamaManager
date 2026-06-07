@@ -30,7 +30,7 @@ const PROJECT_ROOT = dirname(__dirname);
 // Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
-import { resolveHfToken, maskToken, redactConfig, actionableDownloadError } from './hf-token.js';
+import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -1865,7 +1865,7 @@ async function getSystemStats() {
     downloads: Object.fromEntries(
       Array.from(downloadProcesses.entries()).map(([id, info]) => [
         id,
-        { progress: info.progress, status: info.status, error: info.error, output: info.output, startedAt: info.startedAt }
+        { progress: info.progress, status: info.status, error: info.error, output: info.output, startedAt: info.startedAt, gatedUrl: info.gatedUrl || null }
       ])
     ),
     backends: config.backends?.enabled ? Object.fromEntries(
@@ -2968,7 +2968,7 @@ app.get('/api/status', async (req, res) => {
       downloads: Object.fromEntries(
         Array.from(downloadProcesses.entries()).map(([id, info]) => [
           id,
-          { progress: info.progress, status: info.status, error: info.error }
+          { progress: info.progress, status: info.status, error: info.error, gatedUrl: info.gatedUrl || null }
         ])
       ),
       queue: {
@@ -4358,36 +4358,65 @@ app.post('/api/pull', async (req, res) => {
     // Helper to strip ANSI escape sequences from PTY output
     const stripAnsi = (str) => str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
 
-    // Run huggingface-cli using node-pty to get real-time progress updates
-    // PTY prevents output buffering that causes progress indicator to not update
+    // Shared environment for the download process.
+    const downloadEnv = {
+      ...process.env,
+      HF_HUB_ENABLE_HF_TRANSFER: '1',
+      HF_TOKEN: resolveHfToken(config, process.env),
+      PYTHONUNBUFFERED: '1'
+    };
+
+    // Adapt a child_process to the node-pty interface (onData/onExit/kill) so the
+    // downstream handlers work unchanged when we fall back to a non-PTY spawn.
+    const adaptChildProcess = (cp) => ({
+      pid: cp.pid,
+      onData: (cb) => {
+        cp.stdout?.on('data', (d) => cb(d.toString()));
+        cp.stderr?.on('data', (d) => cb(d.toString()));
+      },
+      onExit: (cb) => { cp.on('close', (code) => cb({ exitCode: code ?? 0 })); },
+      kill: (sig) => { try { cp.kill(sig); } catch { /* already gone */ } }
+    });
+
+    // Prefer node-pty for live progress; fall back to a plain child_process when
+    // PTY allocation fails (e.g. forkpty(3) failed) so downloads still work.
     let downloadProcess;
     try {
-      downloadProcess = pty.spawn(HF_CLI_PATH, hfArgs, {
-        cwd: PROJECT_ROOT,
-        env: {
-          ...process.env,
-          HF_HUB_ENABLE_HF_TRANSFER: '1',
-          HF_TOKEN: resolveHfToken(config, process.env),
-          PYTHONUNBUFFERED: '1'
-        },
-        cols: 80,
-        rows: 24
-      });
+      downloadProcess = pty.spawn(HF_CLI_PATH, hfArgs, { cwd: PROJECT_ROOT, env: downloadEnv, cols: 80, rows: 24 });
     } catch (err) {
-      // Handle spawn failures (e.g., missing HF_CLI_PATH)
-      console.error(`[download] Process error: ${err.message}`);
-      downloadInfo.status = 'failed';
       if (err.code === 'ENOENT') {
+        console.error(`[download] Process error: ${err.message}`);
+        downloadInfo.status = 'failed';
         downloadInfo.error = `huggingface-cli not found. Run ./install.sh to set up the Python environment.`;
-      } else if (/forkpty/i.test(err.message)) {
-        downloadInfo.error = actionableDownloadError({ forkpty: true });
-      } else {
-        downloadInfo.error = `Failed to start download: ${err.message}`;
+        downloadInfo.output += `\nError: ${err.message}`;
+        addLog('download', `Download failed: ${repo} (${err.message})`);
+        setTimeout(() => downloadProcesses.delete(downloadId), 300000);
+        return res.status(500).json({ error: downloadInfo.error });
       }
-      downloadInfo.output += `\nError: ${err.message}`;
-      addLog('download', `Download failed: ${repo} (${err.message})`);
-      setTimeout(() => downloadProcesses.delete(downloadId), 300000);
-      return res.status(500).json({ error: downloadInfo.error });
+      // PTY unavailable (e.g. forkpty) — fall back to a non-PTY child process.
+      console.warn(`[download] pty.spawn failed (${err.message}); falling back to child_process (no live progress)`);
+      addLog('download', `PTY unavailable (${err.message}); downloading without live progress bars`);
+      downloadInfo.output += `\n[notice] PTY unavailable (${err.message}); downloading without live progress.\n`;
+      try {
+        const cp = spawn(HF_CLI_PATH, hfArgs, { cwd: PROJECT_ROOT, env: downloadEnv });
+        cp.on('error', (e) => {
+          downloadInfo.status = 'failed';
+          downloadInfo.error = e.code === 'ENOENT'
+            ? `huggingface-cli not found. Run ./install.sh to set up the Python environment.`
+            : `Failed to start download: ${e.message}`;
+          addLog('download', `Download failed: ${repo} (${e.message})`);
+        });
+        downloadProcess = adaptChildProcess(cp);
+      } catch (err2) {
+        downloadInfo.status = 'failed';
+        downloadInfo.error = err2.code === 'ENOENT'
+          ? `huggingface-cli not found. Run ./install.sh to set up the Python environment.`
+          : `Failed to start download: ${err2.message}`;
+        downloadInfo.output += `\nError: ${err2.message}`;
+        addLog('download', `Download failed: ${repo} (${err2.message})`);
+        setTimeout(() => downloadProcesses.delete(downloadId), 300000);
+        return res.status(500).json({ error: downloadInfo.error });
+      }
     }
 
     // Store process handle for cleanup
@@ -4452,6 +4481,11 @@ app.post('/api/pull', async (req, res) => {
             exitCode,
             hasToken: !!resolveHfToken(config, process.env)
           });
+          // Gated/approval-required model: surface a direct link to its HF page
+          // so the operator can request access instead of just seeing a failure.
+          if (isGatedOutput(downloadInfo.output || '')) {
+            downloadInfo.gatedUrl = hfModelUrl(repo);
+          }
         }
         downloadInfo.error = errorMsg;
         addLog('download', `Download failed: ${repo} (code ${exitCode})`);
@@ -4483,7 +4517,8 @@ app.get('/api/pull/:downloadId(*)', (req, res) => {
     progress: info.progress,
     status: info.status,
     error: info.error,
-    output: info.output
+    output: info.output,
+    gatedUrl: info.gatedUrl || null
   });
 });
 
@@ -4495,7 +4530,8 @@ app.get('/api/downloads', (req, res) => {
     status: info.status,
     error: info.error,
     output: info.output,
-    startedAt: info.startedAt
+    startedAt: info.startedAt,
+    gatedUrl: info.gatedUrl || null
   }));
   res.json({ downloads });
 });

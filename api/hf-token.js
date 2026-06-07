@@ -43,6 +43,26 @@ export function redactConfig(config = {}) {
 }
 
 /**
+ * Detect whether download output indicates a gated/auth failure.
+ * @param {string} output
+ * @returns {boolean}
+ */
+export function isGatedOutput(output) {
+  return /\b401\b|\b403\b|gated|restricted|awaiting a review|access to model|not authorized|must be authenticated|cannot access/i
+    .test(String(output || ''));
+}
+
+/**
+ * Direct URL to a model's HuggingFace page, stripping any `:quant` suffix.
+ * @param {string} repo e.g. "google/gemma-4-12B-it-qat-q4_0-gguf:Q4_0"
+ * @returns {string|null} the model page URL, or null when repo is empty.
+ */
+export function hfModelUrl(repo) {
+  const r = String(repo || '').trim().split(':')[0];
+  return r ? `https://huggingface.co/${r}` : null;
+}
+
+/**
  * Build an actionable, user-facing message for a failed model download.
  * @param {{output?:string, exitCode?:number, forkpty?:boolean, hasToken?:boolean}} a
  * @returns {string}
@@ -51,9 +71,7 @@ export function actionableDownloadError({ output = '', exitCode = 1, forkpty = f
   if (forkpty) {
     return 'PTY allocation failed (forkpty). Restart the Llama Manager service and retry.';
   }
-  const o = String(output).toLowerCase();
-  const gated = /\b401\b|\b403\b|gated|restricted|awaiting a review|access to model|not authorized|must be authenticated|cannot access/.test(o);
-  if (gated) {
+  if (isGatedOutput(output)) {
     return hasToken
       ? 'Download failed: access denied (gated model). Your HuggingFace token may lack access — accept the model license on huggingface.co, then retry.'
       : 'Download failed: this model is gated. Add a HuggingFace token in Settings (and accept the model license on huggingface.co), then retry.';
