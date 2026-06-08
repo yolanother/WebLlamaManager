@@ -523,6 +523,13 @@ function Sidebar({ stats }) {
           <span className="nav-icon">&#x1F4D6;</span>
           API Docs
         </NavLink>
+
+        <div className="nav-divider" />
+
+        <NavLink to="/settings" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+          <span className="nav-icon">&#x2699;</span>
+          Settings
+        </NavLink>
       </div>
 
       <div className="sidebar-footer">
@@ -4598,6 +4605,7 @@ function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
+  const [activeTab, setActiveTab] = useState('general'); // 'general' | 'hosts' | 'mapping'
 
   const fetchSettings = useCallback(async () => {
     try {
@@ -4672,12 +4680,16 @@ function SettingsPage() {
       <div className="page-header">
         <h2>Settings</h2>
         <div className="header-actions">
-          <button className="btn-secondary" onClick={restartServer}>
-            Restart Server
-          </button>
-          <button className="btn-primary" onClick={saveSettings} disabled={saving}>
-            {saving ? 'Saving...' : 'Save Settings'}
-          </button>
+          {activeTab === 'general' && (
+            <>
+              <button className="btn-secondary" onClick={restartServer}>
+                Restart Server
+              </button>
+              <button className="btn-primary" onClick={saveSettings} disabled={saving}>
+                {saving ? 'Saving...' : 'Save Settings'}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -4687,6 +4699,14 @@ function SettingsPage() {
         </div>
       )}
 
+      <div className="settings-tabs">
+        <button className={`tab-btn ${activeTab === 'general' ? 'active' : ''}`} onClick={() => setActiveTab('general')}>General</button>
+        <button className={`tab-btn ${activeTab === 'hosts' ? 'active' : ''}`} onClick={() => setActiveTab('hosts')}>Remote Hosts</button>
+        <button className={`tab-btn ${activeTab === 'mapping' ? 'active' : ''}`} onClick={() => setActiveTab('mapping')}>Model Mapping</button>
+      </div>
+
+      {activeTab === 'general' && (
+        <>
       <section className="page-section">
         <h3>HuggingFace</h3>
         <div className="settings-grid">
@@ -4971,8 +4991,6 @@ function SettingsPage() {
         </div>
       </section>
 
-      <BackendsSection settings={settings} updateSetting={updateSetting} setMessage={setMessage} />
-
       <LlamaCppUpdateSection />
 
       <section className="page-section">
@@ -4981,7 +4999,198 @@ function SettingsPage() {
           {JSON.stringify(settings, null, 2)}
         </pre>
       </section>
+        </>
+      )}
+
+      {activeTab === 'hosts' && (
+        <BackendsSection settings={settings} updateSetting={updateSetting} setMessage={setMessage} />
+      )}
+
+      {activeTab === 'mapping' && (
+        <ModelMappingSection setMessage={setMessage} />
+      )}
     </div>
+  );
+}
+
+// Model Mapping Section — unified table mapping local model ids to a remote host's model.
+// Rows are flattened from every backend's modelMapping; saving rebuilds each
+// backend's mapping and PUTs it back. Local and remote fields are datalist
+// comboboxes (pick a known model or free-type a custom id for models that may not
+// be on the local server).
+function ModelMappingSection({ setMessage }) {
+  const [backends, setBackends] = React.useState([]);
+  const [localModels, setLocalModels] = React.useState([]);
+  const [remoteByBackend, setRemoteByBackend] = React.useState({}); // backendId -> string[]
+  const [rows, setRows] = React.useState([]); // { rowId, backendId, localKey, remoteValue }
+  const [saving, setSaving] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
+  const rowIdRef = React.useRef(1);
+  // Snapshot of each backend's mapping at load time, so save only rewrites the
+  // hosts whose mapping actually changed — existing mappings are never clobbered.
+  const originalRef = React.useRef({});
+
+  const loadAll = React.useCallback(async () => {
+    let bks = [];
+    try { const r = await fetch(`${API_BASE}/backends`); bks = (await r.json()).backends || []; } catch { /* ignore */ }
+    setBackends(bks);
+
+    // Flatten existing mappings into editable rows + snapshot the originals.
+    const rs = [];
+    const orig = {};
+    for (const b of bks) {
+      orig[b.id] = { ...(b.modelMapping || {}) };
+      for (const [k, v] of Object.entries(b.modelMapping || {})) {
+        rs.push({ rowId: rowIdRef.current++, backendId: b.id, localKey: k, remoteValue: v });
+      }
+    }
+    originalRef.current = orig;
+    setRows(rs);
+
+    // Local model suggestions: /v1/models ids (now includes downloaded models)
+    // unioned with any model ids already used as mapping keys.
+    let lm = [];
+    try { const r = await fetch(`${API_BASE}/v1/models`); lm = ((await r.json()).data || []).map(m => m.id).filter(Boolean); } catch { /* ignore */ }
+    const keys = new Set(lm);
+    for (const b of bks) for (const k of Object.keys(b.modelMapping || {})) if (k && k !== '*') keys.add(k);
+    setLocalModels([...keys].sort());
+
+    // Seed remote-model suggestions per host from the cached /models endpoint.
+    const rm = {};
+    await Promise.all(bks.map(async b => {
+      try { rm[b.id] = (await (await fetch(`${API_BASE}/backends/${b.id}/models`)).json()).models || []; }
+      catch { rm[b.id] = []; }
+    }));
+    setRemoteByBackend(rm);
+  }, []);
+
+  React.useEffect(() => { loadAll(); }, [loadAll]);
+
+  const refreshRemote = async () => {
+    setRefreshing(true);
+    const rm = { ...remoteByBackend };
+    await Promise.all(backends.map(async b => {
+      try {
+        const r = await fetch(`${API_BASE}/backends/${b.id}/refresh-models`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({})
+        });
+        const d = await r.json();
+        if (d.success) rm[b.id] = d.remoteModels || [];
+      } catch { /* leave existing */ }
+    }));
+    setRemoteByBackend(rm);
+    setRefreshing(false);
+  };
+
+  const updateRow = (rowId, patch) => setRows(rs => rs.map(r => r.rowId === rowId ? { ...r, ...patch } : r));
+  const removeRow = (rowId) => setRows(rs => rs.filter(r => r.rowId !== rowId));
+  const addRow = () => setRows(rs => [...rs, { rowId: rowIdRef.current++, backendId: backends[0]?.id || '', localKey: '', remoteValue: '' }]);
+
+  // Stable stringify (sorted keys) so key-order differences don't read as changes.
+  const norm = (m) => JSON.stringify(Object.fromEntries(Object.entries(m || {}).sort(([a], [b]) => a.localeCompare(b))));
+
+  const save = async () => {
+    if (!backends.length) { setMessage({ type: 'error', text: 'Add a remote host first (Remote Hosts tab).' }); return; }
+    setSaving(true);
+    // Rebuild each host's mapping from its rows.
+    const mapByBackend = {};
+    for (const b of backends) mapByBackend[b.id] = {};
+    for (const r of rows) {
+      if (!r.backendId || !r.localKey) continue;
+      (mapByBackend[r.backendId] = mapByBackend[r.backendId] || {})[r.localKey] = r.remoteValue || '';
+    }
+    // Only PUT hosts whose mapping actually changed — never rewrite untouched ones.
+    const changed = backends.filter(b => norm(mapByBackend[b.id]) !== norm(originalRef.current[b.id]));
+    if (changed.length === 0) {
+      setSaving(false);
+      setMessage({ type: 'info', text: 'No mapping changes to save.' });
+      return;
+    }
+    let ok = 0, fail = 0;
+    for (const b of changed) {
+      try {
+        const res = await fetch(`${API_BASE}/backends/${b.id}`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ modelMapping: mapByBackend[b.id] })
+        });
+        (await res.json()).success ? ok++ : fail++;
+      } catch { fail++; }
+    }
+    setSaving(false);
+    setMessage(fail
+      ? { type: 'error', text: `Saved ${ok} host(s); ${fail} failed` }
+      : { type: 'success', text: `Model mappings saved (${ok} host${ok === 1 ? '' : 's'} updated)` });
+    loadAll();
+  };
+
+  return (
+    <section className="page-section">
+      <h3>Model Mapping</h3>
+      <p className="setting-hint" style={{ marginBottom: '12px' }}>
+        Map a local model id (what clients request) to the model name on a remote host. Pick from the list or
+        type a custom id for models that aren&apos;t on the local server. Use <code>*</code> as the local model to
+        match all models for that host.
+      </p>
+      {backends.length === 0 ? (
+        <p className="setting-hint">No remote hosts configured. Add one in the <strong>Remote Hosts</strong> tab first.</p>
+      ) : (
+        <>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', gap: '8px' }}>
+            <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={refreshRemote} disabled={refreshing}>
+              {refreshing ? 'Refreshing…' : '↻ Refresh remote models'}
+            </button>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={addRow}>+ Add Mapping</button>
+              <button className="btn-primary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save Mappings'}</button>
+            </div>
+          </div>
+
+          <datalist id="mapping-local-models">
+            <option value="*" />
+            {localModels.map(m => <option key={m} value={m} />)}
+          </datalist>
+          {backends.map(b => (
+            <datalist key={b.id} id={`mapping-remote-${b.id}`}>
+              {(remoteByBackend[b.id] || []).map(m => <option key={m} value={m} />)}
+            </datalist>
+          ))}
+
+          <table className="model-map-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ textAlign: 'left', color: 'var(--text-secondary)', fontSize: '0.8em' }}>
+                <th style={{ padding: '4px 6px', width: '38%' }}>Local model (requested)</th>
+                <th style={{ padding: '4px 6px', width: '24%' }}>Remote host</th>
+                <th style={{ padding: '4px 6px', width: '34%' }}>Remote model</th>
+                <th style={{ width: '4%' }}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && (
+                <tr><td colSpan={4} style={{ padding: '8px 6px', color: 'var(--text-muted)' }}>No mappings yet — click “+ Add Mapping”.</td></tr>
+              )}
+              {rows.map(r => (
+                <tr key={r.rowId}>
+                  <td style={{ padding: '4px 6px' }}>
+                    <input list="mapping-local-models" value={r.localKey} placeholder="local model id or *" onChange={e => updateRow(r.rowId, { localKey: e.target.value })} style={{ width: '100%' }} />
+                  </td>
+                  <td style={{ padding: '4px 6px' }}>
+                    <select value={r.backendId} onChange={e => updateRow(r.rowId, { backendId: e.target.value })} style={{ width: '100%' }}>
+                      {backends.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                    </select>
+                  </td>
+                  <td style={{ padding: '4px 6px' }}>
+                    <input list={`mapping-remote-${r.backendId}`} value={r.remoteValue} placeholder="remote model id" onChange={e => updateRow(r.rowId, { remoteValue: e.target.value })} style={{ width: '100%' }} />
+                  </td>
+                  <td style={{ padding: '4px 6px' }}>
+                    <button className="btn-secondary" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => removeRow(r.rowId)} title="Remove mapping">×</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -5525,75 +5734,13 @@ function BackendFormFields({ values, onChange, localModels = [], remoteModels: r
         </div>
       </div>
 
-      {/* Model mapping with dropdowns */}
+      {/* Model mapping is managed in the dedicated "Model Mapping" settings tab. */}
       <div className="setting-item" style={{ gridColumn: '1 / -1' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '12px' }}>
-          <label>Model Mapping</label>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <button
-              type="button"
-              className="btn-secondary"
-              style={{ padding: '4px 10px', fontSize: '0.85em' }}
-              onClick={refreshRemoteModels}
-              disabled={refreshState.loading || !values.url}
-              title={!values.url ? 'Enter the backend URL first' : 'Fetch the remote /v1/models list (no chat completion sent)'}
-            >
-              {refreshState.loading ? 'Refreshing…' : '↻ Refresh models'}
-            </button>
-            {refreshState.error && (
-              <span style={{ color: 'var(--error, #ef4444)', fontSize: '0.8em' }}>{refreshState.error}</span>
-            )}
-            {!refreshState.error && refreshState.ts && (
-              <span style={{ color: 'var(--text-secondary)', fontSize: '0.8em' }}>
-                {refreshState.count} model{refreshState.count === 1 ? '' : 's'} · {refreshState.latencyMs}ms
-              </span>
-            )}
-          </div>
-        </div>
-        <p className="setting-hint">Map local models to remote models. Use * (wildcard) to match all local models to a single remote model. Click <strong>Refresh models</strong> to populate the remote-model dropdown without running a full backend test.</p>
-        {mappingEntries.map(([key, value], idx) => (
-          <div key={idx} style={{ display: 'flex', gap: '8px', marginBottom: '6px', alignItems: 'center' }}>
-            {/* Local model selector */}
-            <div style={{ flex: 1 }}>
-              <select
-                value={key}
-                onChange={(e) => updateMappingKey(key, e.target.value)}
-                style={{ width: '100%' }}
-              >
-                <option value="*">* (all models)</option>
-                {localModels.map(m => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-                {key && key !== '*' && !localModels.includes(key) && (
-                  <option value={key}>{key} (custom)</option>
-                )}
-              </select>
-            </div>
-            <span style={{ color: 'var(--text-muted)', padding: '0 4px' }}>{'→'}</span>
-            {/* Remote model selector */}
-            <div style={{ flex: 1 }}>
-              {remoteModels.length > 0 ? (
-                <select
-                  value={value}
-                  onChange={(e) => updateMappingValue(key, e.target.value)}
-                  style={{ width: '100%' }}
-                >
-                  <option value="">-- Select remote model --</option>
-                  {remoteModels.map(m => (
-                    <option key={m} value={m}>{m}</option>
-                  ))}
-                  {value && !remoteModels.includes(value) && (
-                    <option value={value}>{value} (custom)</option>
-                  )}
-                </select>
-              ) : (
-                <input type="text" value={value} onChange={(e) => updateMappingValue(key, e.target.value)} placeholder="Remote model ID (or click Refresh models above)" style={{ width: '100%' }} />
-              )}
-            </div>
-            <button className="btn-secondary" style={{ padding: '4px 8px', fontSize: '0.85em' }} onClick={() => removeMapping(key)}>x</button>
-          </div>
-        ))}
-        <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em', marginTop: '4px' }} onClick={addMapping}>+ Add Mapping</button>
+        <label>Model Mapping</label>
+        <p className="setting-hint">
+          Model mappings for this host are managed in the <strong>Model Mapping</strong> tab. Existing
+          mappings are preserved when you edit a host here.
+        </p>
       </div>
     </div>
   );
@@ -6552,9 +6699,6 @@ function StatsHeader({ stats }) {
             {isHealthy ? (stats?.mode === 'single' ? 'Single' : 'Router') : (stats?.mode ? 'Starting' : 'Stopped')}
           </span>
         </div>
-        <NavLink to="/settings" className="stats-header-settings" title="Settings">
-          <span>&#x2699;</span>
-        </NavLink>
       </div>
     </div>
   );

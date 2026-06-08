@@ -1833,6 +1833,16 @@ input::placeholder {
   padding: 2px;
 }
 
+.settings-tabs {
+  display: flex;
+  gap: 4px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  padding: 2px;
+  margin-bottom: 20px;
+  width: fit-content;
+}
+
 .tab-btn {
   padding: 6px 16px;
   border: none;
