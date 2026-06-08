@@ -5506,41 +5506,62 @@ app.get('/api/analytics/crashes', (req, res) => {
 // OpenAI-compatible models endpoint - returns models from llama.cpp that can be loaded
 app.get('/api/v1/models', async (req, res) => {
   try {
-    // Get models from llama.cpp - these are the models that can actually be loaded
-    const response = await fetch(`http://localhost:${LLAMA_PORT}/models`);
-    if (!response.ok) {
-      throw new Error(`llama.cpp returned ${response.status}`);
-    }
-    const llamaModels = await response.json();
-
-    // Get aliases from config
+    // Aliases from config
     const aliases = config.modelAliases || {};
 
-    // Format with our extra info
-    const data = {
-      object: 'list',
-      data: (llamaModels.data || []).map(m => {
-        // Extract runtime context size from loaded model's args
-        const args = m.status?.args || [];
-        const ctxIndex = args.indexOf('--ctx-size');
-        const n_ctx = ctxIndex >= 0 ? parseInt(args[ctxIndex + 1]) : null;
+    // Build a merged model list: the running router's models (authoritative,
+    // with live status) take precedence, and every downloaded model on disk is
+    // also listed so /v1/models reflects what is AVAILABLE even when the router
+    // is idle/stopped (previously this returned nothing unless a model was loaded).
+    const byId = new Map();
+    const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const seenNorm = new Set();
 
-        return {
-          id: m.id,
-          object: 'model',
-          created: m.created || Math.floor(Date.now() / 1000),
-          owned_by: m.owned_by || 'llamacpp',
-          // Model metadata from GGUF (includes n_ctx_train, n_params, etc.)
-          meta: m.meta || null,
-          // Runtime context size (configured via --ctx-size)
-          n_ctx: n_ctx || config.contextSize || null,
-          // Include extra info for UI
-          displayName: m.id,
-          status: m.status?.value || 'unknown',
-          alias: aliases[m.id] || null
-        };
-      })
-    };
+    // 1) Models reported by the running router (if it is up).
+    try {
+      const response = await fetch(`http://localhost:${LLAMA_PORT}/models`, { signal: AbortSignal.timeout(3000) });
+      if (response.ok) {
+        const llamaModels = await response.json();
+        for (const m of (llamaModels.data || [])) {
+          const args = m.status?.args || [];
+          const ctxIndex = args.indexOf('--ctx-size');
+          const n_ctx = ctxIndex >= 0 ? parseInt(args[ctxIndex + 1]) : null;
+          byId.set(m.id, {
+            id: m.id,
+            object: 'model',
+            created: m.created || Math.floor(Date.now() / 1000),
+            owned_by: m.owned_by || 'llamacpp',
+            meta: m.meta || null,
+            n_ctx: n_ctx || config.contextSize || null,
+            displayName: m.id,
+            status: m.status?.value || 'unknown',
+            alias: aliases[m.id] || null
+          });
+          seenNorm.add(norm(m.id));
+        }
+      }
+    } catch {
+      // Router idle/stopped — fall through to the filesystem list.
+    }
+
+    // 2) Downloaded models on disk that the router did not already report.
+    for (const lm of scanLocalModels()) {
+      if (byId.has(lm.name) || seenNorm.has(norm(lm.name))) continue;
+      byId.set(lm.name, {
+        id: lm.name,
+        object: 'model',
+        created: Math.floor((lm.modified ? new Date(lm.modified).getTime() : Date.now()) / 1000),
+        owned_by: 'llamacpp',
+        meta: null,
+        n_ctx: config.contextSize || null,
+        displayName: lm.name,
+        status: 'available',
+        alias: aliases[lm.name] || null,
+        size: lm.size || 0
+      });
+    }
+
+    const data = { object: 'list', data: [...byId.values()] };
     // Append the dedicated embedding model so it is selectable by the orchestrator.
     const ec = resolveEmbedConfig(config, process.env);
     if (ec.runnable) {
