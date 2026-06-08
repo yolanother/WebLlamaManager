@@ -2202,6 +2202,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 <span className="chart-legend-dot cpu"></span>
                 CPU
               </div>
+              <div className="chart-legend-item">
+                <span className="chart-legend-dot" style={{ background: CHART_COLORS.appUsage }}></span>
+                App CPU
+              </div>
             </div>
           </div>
 
@@ -2237,6 +2241,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               <div className="chart-legend-item">
                 <span className="chart-legend-dot system"></span>
                 System
+              </div>
+              <div className="chart-legend-item">
+                <span className="chart-legend-dot" style={{ background: CHART_COLORS.appUsage }}></span>
+                App
               </div>
             </div>
           </div>
