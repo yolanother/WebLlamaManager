@@ -32,6 +32,7 @@ import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { checkModelFit, thermalDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
+import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -3821,6 +3822,12 @@ async function stopLlamaServer() {
 // Restart llama server in its current mode (router or preset)
 // Used by fetchWithRetry when the server appears to have crashed
 let restartInProgress = false;
+// Timestamps of recent governed restarts, fed to the restart governor so a
+// stampede of failing local requests can't drive an infinite kill/restart loop
+// (the gpt-oss-120b wedge). Reset implicitly by time/window aging, not on every
+// "ready" — a restart that brings the router up but still can't serve the model
+// must still count toward the breaker.
+let llamaRestartHistory = [];
 // Find the preset that should serve the given model name, if any.
 // Only considers presets with autoActivate=true so manual presets (like
 // the qwen3-coder-next preset) don't auto-trigger on every related request.
@@ -3881,7 +3888,7 @@ async function ensureModelServed(modelName) {
       console.log(`[mode-switch] ${fromDesc} -> preset=${targetPreset} for model ${modelName}`);
       addLog('system', `Auto-switching llama-server mode: ${fromDesc} -> preset=${targetPreset} (triggered by request for ${modelName})`);
       modeSwitchPromise = (async () => {
-        try { currentMode = 'single'; currentPreset = targetPreset; await restartLlamaServer(); }
+        try { currentMode = 'single'; currentPreset = targetPreset; await restartLlamaServer({ governed: false }); }
         finally { modeSwitchPromise = null; }
       })();
       await modeSwitchPromise;
@@ -3898,7 +3905,7 @@ async function ensureModelServed(modelName) {
         console.log(`[mode-switch] preset=${currentPreset} cannot serve ${modelName}, swapping to router`);
         addLog('system', `Auto-switching llama-server mode: preset=${currentPreset} -> router (preset cannot serve ${modelName})`);
         modeSwitchPromise = (async () => {
-          try { currentMode = 'router'; currentPreset = null; await restartLlamaServer(); }
+          try { currentMode = 'router'; currentPreset = null; await restartLlamaServer({ governed: false }); }
           finally { modeSwitchPromise = null; }
         })();
         await modeSwitchPromise;
@@ -3910,7 +3917,7 @@ async function ensureModelServed(modelName) {
   }
 }
 
-async function restartLlamaServer() {
+async function restartLlamaServer({ governed = true } = {}) {
   if (restartInProgress) {
     console.log('[restart] Restart already in progress, waiting for it to complete...');
     // Wait for the in-progress restart to finish
@@ -3918,6 +3925,22 @@ async function restartLlamaServer() {
       await new Promise(r => setTimeout(r, 1000));
     }
     return;
+  }
+
+  // Restart governor: collapse stampedes (debounce) and back off sustained restart
+  // loops (circuit breaker) so a failing local model can't wedge the manager. Only
+  // auto/crash/fetch-retry paths are governed; explicit mode-switches, idle wake,
+  // and the memory watchdog pass { governed: false } and always run.
+  if (governed) {
+    const knobs = { ...RESTART_DEFAULTS, ...(config.guard?.restart || {}) };
+    const decision = restartDecision({ history: llamaRestartHistory, now: Date.now(), ...knobs });
+    if (!decision.allow) {
+      const secs = Math.ceil(decision.retryAfterMs / 1000);
+      console.warn(`[restart] Suppressed by governor (${decision.reason}); retry in ~${secs}s. Router keeps serving remote backends.`);
+      addLog('system', `Restart suppressed (${decision.reason}); backing off ~${secs}s to avoid restart thrash`);
+      return;
+    }
+    llamaRestartHistory = decision.history;
   }
 
   restartInProgress = true;
@@ -5667,7 +5690,7 @@ async function fetchWithRetry(url, options, { retries = 5, baseDelay = 1000, lab
     console.log(`[idle] ${msg}`);
     addLog('system', msg);
     idleShutdown = false;
-    await restartLlamaServer();
+    await restartLlamaServer({ governed: false });
   }
 
   const result = await _fetchWithRetryInner(url, options, { retries, baseDelay, label, model, signal });
@@ -7949,7 +7972,7 @@ setInterval(() => {
       addLog('system', msg);
       recordCrashEvent({ exitCode: null, trigger: 'memory_watchdog' });
 
-      restartLlamaServer()
+      restartLlamaServer({ governed: false })
         .then(() => {
           addLog('system', 'Memory watchdog restart completed successfully');
         })
