@@ -33,6 +33,7 @@ import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogE
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { checkModelFit, thermalDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
+import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -1848,6 +1849,43 @@ function getCpuTemperature() {
 }
 
 // System stats collection
+// Previous CPU sample for the app-usage delta (pid -> jiffies, plus total).
+let prevAppCpuSample = null;
+
+/**
+ * Measure the llama.cpp inference stack's own memory and CPU footprint by
+ * scanning /proc for processes whose comm is "llama-server" (the model router,
+ * its per-model child processes, and the embedding server — all host-visible
+ * since distrobox shares the host PID namespace). CPU is a delta between
+ * broadcasts, so the first call returns 0% for CPU. Pure parsing/math lives in
+ * app-usage.js; this only does the /proc reads.
+ * @param {number} totalMemKb Total system memory in kB.
+ * @returns {{memUsage:number, cpuUsage:number}} Percentages 0..100 (1 decimal).
+ */
+function getAppUsage(totalMemKb) {
+  const rssKbList = [];
+  const curProc = {};
+  try {
+    for (const pid of readdirSync('/proc')) {
+      if (!/^\d+$/.test(pid)) continue;
+      let comm;
+      try { comm = readFileSync(`/proc/${pid}/comm`, 'utf-8').trim(); } catch { continue; }
+      if (comm !== 'llama-server') continue;
+      try { rssKbList.push(parseRssKb(readFileSync(`/proc/${pid}/status`, 'utf-8'))); } catch {}
+      try { curProc[pid] = parseProcCpuJiffies(readFileSync(`/proc/${pid}/stat`, 'utf-8')); } catch {}
+    }
+  } catch {}
+  let curTotal = 0;
+  try { curTotal = parseTotalCpuJiffies(readFileSync('/proc/stat', 'utf-8')); } catch {}
+
+  const memUsage = appMemoryPercent(rssKbList, totalMemKb);
+  const cpuUsage = prevAppCpuSample
+    ? appCpuPercent(prevAppCpuSample.proc, curProc, prevAppCpuSample.total, curTotal)
+    : 0;
+  prevAppCpuSample = { proc: curProc, total: curTotal };
+  return { memUsage: Math.round(memUsage * 10) / 10, cpuUsage: Math.round(cpuUsage * 10) / 10 };
+}
+
 async function getSystemStats() {
   const cpuCores = cpus();
   const cpuUsage = cpuCores.reduce((acc, cpu) => {
@@ -1860,6 +1898,9 @@ async function getSystemStats() {
   const freeMem = freemem();
   const usedMem = totalMem - freeMem;
   const memUsage = (usedMem / totalMem) * 100;
+
+  // App's own memory + CPU footprint (llama.cpp router + children + embed).
+  const appUsage = getAppUsage(totalMem / 1024);
 
   // Get CPU temperature
   const cpuTemp = getCpuTemperature();
@@ -1894,6 +1935,7 @@ async function getSystemStats() {
     timestamp: Date.now(),
     cpu: {
       usage: Math.round(cpuUsage * 10) / 10,
+      appUsage: appUsage.cpuUsage,
       cores: cpuCores.length,
       loadAvg: loadavg(),
       temperature: cpuTemp
@@ -1902,7 +1944,8 @@ async function getSystemStats() {
       total: totalMem,
       used: usedMem,
       free: freeMem,
-      usage: Math.round(memUsage * 10) / 10
+      usage: Math.round(memUsage * 10) / 10,
+      appUsage: appUsage.memUsage
     },
     gpu: gpuStats,
     llama: llamaStats,
@@ -2274,11 +2317,13 @@ async function broadcastStats() {
       addAnalyticsPoint('memory', {
         vram: stats.gpu.vram?.usage || 0,
         gtt: stats.gpu.gtt?.usage || 0,
-        system: stats.memory?.usage || 0
+        system: stats.memory?.usage || 0,
+        app: stats.memory?.appUsage || 0
       });
       addAnalyticsPoint('usage', {
         gpu: stats.gpu.usage || 0,
-        cpu: stats.cpu?.usage || 0
+        cpu: stats.cpu?.usage || 0,
+        appCpu: stats.cpu?.appUsage || 0
       });
     } else if (stats.cpu?.temperature) {
       addAnalyticsPoint('temperature', {

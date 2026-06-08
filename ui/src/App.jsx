@@ -598,6 +598,7 @@ const CHART_COLORS = {
   power: '#f59e0b',
   memory: '#22c55e',
   memorySecondary: '#8b5cf6',
+  appUsage: '#38bdf8',
   tokens: '#3b82f6',
   requestOk: '#22c55e',
   requestErr: '#ef4444',
@@ -838,6 +839,10 @@ function UsageChart({ data, height = 140 }) {
               <stop offset="5%" stopColor={CHART_COLORS.temperatureCpu} stopOpacity={0.2} />
               <stop offset="95%" stopColor={CHART_COLORS.temperatureCpu} stopOpacity={0} />
             </linearGradient>
+            <linearGradient id="gradAppUse" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={CHART_COLORS.appUsage} stopOpacity={0.2} />
+              <stop offset="95%" stopColor={CHART_COLORS.appUsage} stopOpacity={0} />
+            </linearGradient>
           </defs>
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
           <XAxis dataKey="timestamp" hide />
@@ -845,6 +850,7 @@ function UsageChart({ data, height = 140 }) {
           <Tooltip content={<ChartTooltip unit="%" />} />
           <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpuUse)" strokeWidth={2} dot={false} />
           <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpuUse)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
+          <Area type="monotone" dataKey="appCpu" name="App CPU" stroke={CHART_COLORS.appUsage} fill="url(#gradAppUse)" strokeWidth={2} dot={false} strokeDasharray="2 2" />
         </AreaChart>
       </ResponsiveContainer>
     </div>
@@ -907,6 +913,10 @@ function MemoryChart({ data, primaryKey = 'vram', height = 140 }) {
               <stop offset="5%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0.2} />
               <stop offset="95%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0} />
             </linearGradient>
+            <linearGradient id="gradAppMem" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={CHART_COLORS.appUsage} stopOpacity={0.2} />
+              <stop offset="95%" stopColor={CHART_COLORS.appUsage} stopOpacity={0} />
+            </linearGradient>
           </defs>
           <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
           <XAxis dataKey="timestamp" hide />
@@ -914,6 +924,7 @@ function MemoryChart({ data, primaryKey = 'vram', height = 140 }) {
           <Tooltip content={<ChartTooltip unit="%" />} />
           <Area type="monotone" dataKey={primaryKey} name={primaryKey.toUpperCase()} stroke={CHART_COLORS.memory} fill="url(#gradMem)" strokeWidth={2} dot={false} />
           <Area type="monotone" dataKey="system" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
+          <Area type="monotone" dataKey="app" name="App" stroke={CHART_COLORS.appUsage} fill="url(#gradAppMem)" strokeWidth={2} dot={false} strokeDasharray="2 2" />
         </AreaChart>
       </ResponsiveContainer>
     </div>
