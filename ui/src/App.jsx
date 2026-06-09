@@ -1269,24 +1269,41 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
 
   // Kiosk: keep the screen awake. The Screen Wake Lock API maps to the
   // compositor's idle-inhibit protocol under cage/wlroots, preventing the
-  // display from blanking. Re-acquire it whenever the page becomes visible
-  // again (the lock is auto-released on visibility loss).
+  // display from blanking (which on the appliance leads to a lock/lost dashboard).
+  //
+  // The lock is fragile: the system releases it not only when the tab is hidden
+  // but on its own (power events, compositor churn), and a request can fail
+  // transiently before the page is focused. The previous version only re-acquired
+  // on visibilitychange, so a single system-initiated release left the screen
+  // unprotected forever. Here we re-acquire on the sentinel's own `release` event,
+  // on visibility changes, AND via a periodic heartbeat — so the lock is
+  // effectively always held while the kiosk page is visible.
   useEffect(() => {
     if (!kiosk || typeof navigator === 'undefined' || !('wakeLock' in navigator)) return;
-    let lock = null;
+    let sentinel = null;
+    let cancelled = false;
+
     const acquire = async () => {
+      if (cancelled || document.visibilityState !== 'visible') return;
+      if (sentinel && !sentinel.released) return; // already held
       try {
-        lock = await navigator.wakeLock.request('screen');
-      } catch { /* wake lock unavailable; ignore */ }
+        sentinel = await navigator.wakeLock.request('screen');
+        // The system can drop the lock on its own — re-acquire immediately.
+        sentinel.addEventListener('release', () => { if (!cancelled) acquire(); });
+      } catch { /* transient — the heartbeat/visibility handler will retry */ }
     };
+
     acquire();
-    const onVisibility = () => {
-      if (document.visibilityState === 'visible') acquire();
-    };
+    const onVisibility = () => { if (document.visibilityState === 'visible') acquire(); };
     document.addEventListener('visibilitychange', onVisibility);
+    // Defensive heartbeat: re-acquire if the lock was lost for any reason.
+    const heartbeat = setInterval(acquire, 15000);
+
     return () => {
+      cancelled = true;
+      clearInterval(heartbeat);
       document.removeEventListener('visibilitychange', onVisibility);
-      if (lock) lock.release().catch(() => {});
+      if (sentinel && !sentinel.released) sentinel.release().catch(() => {});
     };
   }, [kiosk]);
 
