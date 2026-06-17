@@ -3783,6 +3783,52 @@ app.delete('/api/presets/:presetId', (req, res) => {
 });
 
 // Helper to stop llama server
+// Tracks consecutive container-exec (distrobox/podman) timeouts. Once the podman
+// layer is wedged, issuing more `distrobox enter` kills just piles up D-state
+// processes INSIDE the container (under conmon) — group-killing the host-side
+// client can't reap them, and that accumulation is what locked the host. So after
+// a couple of timeouts we stop issuing container execs entirely and rely on the
+// host-side kills, which reach the container's processes anyway (distrobox shares
+// the host PID namespace) and free the port (host networking). Reset on success.
+let containerExecWedged = 0;
+const CONTAINER_EXEC_WEDGED_LIMIT = 2;
+
+/**
+ * Run a kill command with a hard timeout. On timeout the spawned process GROUP is
+ * SIGKILLed so a hung exec is never leaked. Container execs that time out bump the
+ * wedge counter; a clean exit resets it.
+ * @returns {Promise<'exit'|'error'|'timeout'>}
+ */
+function runKillCommand({ label, command, useContainer, timeoutMs = 4000 }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (status) => { if (!settled) { settled = true; resolve(status); } };
+    let child;
+    try {
+      child = useContainer
+        ? spawn('/usr/local/bin/distrobox', ['enter', CONTAINER_NAME, '--', 'bash', '-c', command],
+            { cwd: PROJECT_ROOT, env: { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' }, stdio: 'pipe', detached: true })
+        : spawn('bash', ['-c', command], { stdio: 'pipe', detached: true });
+    } catch (err) {
+      console.error(`[stop] ${label} spawn failed: ${err.message}`);
+      return finish('error');
+    }
+    child.on('exit', () => { if (useContainer) containerExecWedged = 0; finish('exit'); });
+    child.on('error', (err) => { console.error(`[stop] ${label} error: ${err.message}`); finish('error'); });
+    setTimeout(() => {
+      // Kill the whole spawned process group so the hung exec client is never leaked.
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+      if (useContainer) {
+        containerExecWedged++;
+        console.warn(`[stop] ${label} timed out (container exec wedged x${containerExecWedged})`);
+      } else {
+        console.warn(`[stop] ${label} timed out`);
+      }
+      finish('timeout');
+    }, timeoutMs);
+  });
+}
+
 async function stopLlamaServer() {
   console.log('[stop] Stopping llama server...');
   intentionalStop = true;
@@ -3798,69 +3844,26 @@ async function stopLlamaServer() {
   }
   llamaProcess = null;
 
-  // Kill ALL llama-server processes inside the container
-  // Router mode spawns workers on dynamic ports, so we must kill by process name
-  console.log('[stop] Killing all llama-server processes...');
+  // Primary kill — host side only. distrobox shares the host PID namespace, so a
+  // host pkill also kills the container's (dynamic-port) llama-server workers, and
+  // the port is on the host network so host fuser frees it. Neither touches the
+  // podman layer, so neither can hang in D-state.
+  console.log('[stop] Killing all llama-server processes (host)...');
+  await runKillCommand({ label: 'host pkill', command: 'pkill -9 -f "llama-server" || true', useContainer: false });
+  await runKillCommand({ label: 'host fuser', command: `fuser -k ${LLAMA_PORT}/tcp 2>/dev/null || true`, useContainer: false });
 
-  await new Promise((resolve) => {
-    const killCommand = `pkill -9 -f "llama-server" || true`;
-
-    const killProcess = spawn('/usr/local/bin/distrobox', [
-      'enter', CONTAINER_NAME, '--',
-      'bash', '-c', killCommand
-    ], {
-      cwd: PROJECT_ROOT,
-      env: { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' },
-      stdio: 'pipe'
-    });
-
-    killProcess.on('exit', () => {
-      console.log('[stop] Kill command completed');
-      resolve();
-    });
-
-    killProcess.on('error', (err) => {
-      console.error('[stop] Kill command error:', err);
-      resolve();
-    });
-
-    // Timeout after 5 seconds
-    setTimeout(() => {
-      console.log('[stop] Kill command timeout');
-      resolve();
-    }, 5000);
-  });
-
-  // Also kill any llama-server processes directly on the host
-  // (distrobox shares the host process namespace, but this ensures we catch everything)
-  await new Promise((resolve) => {
-    exec('pkill -9 -f "llama-server" || true', (err) => {
-      if (err) console.error('[stop] Host pkill error:', err.message);
-      resolve();
-    });
-    setTimeout(() => resolve(), 3000);
-  });
-
-  // Also try to kill by port using fuser/lsof inside the container
-  await new Promise((resolve) => {
-    const fuserCommand = `fuser -k ${LLAMA_PORT}/tcp 2>/dev/null || true`;
-
-    const fuserProcess = spawn('/usr/local/bin/distrobox', [
-      'enter', CONTAINER_NAME, '--',
-      'bash', '-c', fuserCommand
-    ], {
-      cwd: PROJECT_ROOT,
-      env: { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' },
-      stdio: 'pipe'
-    });
-
-    fuserProcess.on('exit', () => resolve());
-    fuserProcess.on('error', () => resolve());
-    setTimeout(() => resolve(), 3000);
-  });
+  // Best-effort container-side cleanup, but ONLY while the container exec layer is
+  // healthy. If it has wedged recently, skip it — issuing more container execs is
+  // exactly what piled up D-state processes and locked the host; the host kills
+  // above already cover it.
+  if (containerExecWedged < CONTAINER_EXEC_WEDGED_LIMIT) {
+    await runKillCommand({ label: 'container pkill', command: 'pkill -9 -f "llama-server" || true', useContainer: true });
+  } else {
+    console.warn(`[stop] Skipping container kill — exec wedged (x${containerExecWedged}); relying on host kills`);
+  }
 
   // Give processes time to fully terminate
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  await new Promise(resolve => setTimeout(resolve, 500));
   console.log('[stop] Llama server stopped');
 }
 

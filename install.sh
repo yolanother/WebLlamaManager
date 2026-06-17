@@ -199,6 +199,11 @@ cat > ~/.config/systemd/user/${SERVICE_NAME}.service << EOF
 [Unit]
 Description=Llama Manager API and Multi-Model Server
 After=network.target
+# Stop the infinite restart/leak loop: if the service fails >5 times in 2min,
+# systemd gives up instead of relaunching every 10s (each relaunch used to leak a
+# hung distrobox/fuser into a wedged container and lock the host).
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
