@@ -236,6 +236,17 @@ Environment=HOME=$HOME
 WantedBy=default.target
 EOF
 
+# Remove any legacy direct llama-server launcher unit. It predates llama-manager,
+# conflicts with it (both drive llama-server on the same GPU/ports), and with
+# Restart=always and no StartLimit it crash-loops on a missing wrapper and has
+# hard-locked the host. llama-manager is the one canonical service.
+LEGACY_UNIT="$HOME/.config/systemd/user/llama-server.service"
+if [ -f "$LEGACY_UNIT" ]; then
+    echo "  Removing legacy conflicting unit: llama-server.service"
+    systemctl --user disable --now llama-server.service 2>/dev/null || true
+    rm -f "$LEGACY_UNIT"
+fi
+
 # Reload systemd
 systemctl --user daemon-reload
 
