@@ -1821,8 +1821,10 @@ initBackendQueues();
 
 // WebSocket stats broadcasting
 const STATS_INTERVAL = parseInt(process.env.STATS_INTERVAL) || 1000; // Default 1 second
+const GPU_STATS_CACHE_MS = parseInt(process.env.GPU_STATS_CACHE_MS) || 5000;
 let statsInterval = null;
 let connectedClients = new Set();
+let statsBroadcastInFlight = false;
 
 // Get CPU temperature from thermal zones
 function getCpuTemperature() {
@@ -2100,53 +2102,41 @@ async function getContextStats() {
 // Read GTT (Graphics Translation Table) memory stats from sysfs
 // This is the relevant metric for APUs with unified memory
 async function getGttStats() {
-  return new Promise((resolve) => {
-    // Try multiple card paths (card0, card1, etc.)
-    const cmd = spawn('bash', [
-      '-c',
-      `for card in /sys/class/drm/card*/device/mem_info_gtt_total; do
-        if [ -f "$card" ]; then
-          dir=$(dirname "$card")
-          total=$(cat "$dir/mem_info_gtt_total" 2>/dev/null || echo 0)
-          used=$(cat "$dir/mem_info_gtt_used" 2>/dev/null || echo 0)
-          if [ "$total" != "0" ]; then
-            echo "$total $used"
-            exit 0
-          fi
-        fi
-      done
-      echo "0 0"`
-    ], {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let output = '';
-    cmd.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    cmd.on('close', () => {
-      try {
-        const [totalStr, usedStr] = output.trim().split(' ');
-        const total = parseInt(totalStr) || 0;
-        const used = parseInt(usedStr) || 0;
-        const usage = total > 0 ? Math.round((used / total) * 1000) / 10 : 0;
-        resolve({ total, used, usage });
-      } catch {
-        resolve({ total: 0, used: 0, usage: 0 });
+  try {
+    for (const card of readdirSync('/sys/class/drm')) {
+      const dir = `/sys/class/drm/${card}/device`;
+      const totalPath = `${dir}/mem_info_gtt_total`;
+      const usedPath = `${dir}/mem_info_gtt_used`;
+      if (!existsSync(totalPath) || !existsSync(usedPath)) continue;
+      const total = parseInt(readFileSync(totalPath, 'utf-8').trim(), 10) || 0;
+      const used = parseInt(readFileSync(usedPath, 'utf-8').trim(), 10) || 0;
+      if (total > 0) {
+        return { total, used, usage: Math.round((used / total) * 1000) / 10 };
       }
-    });
-
-    cmd.on('error', () => resolve({ total: 0, used: 0, usage: 0 }));
-    setTimeout(() => resolve({ total: 0, used: 0, usage: 0 }), 2000);
-  });
+    }
+  } catch {
+    // sysfs not available or not readable
+  }
+  return { total: 0, used: 0, usage: 0 };
 }
 
-async function getGpuStats() {
+let gpuStatsCache = { at: 0, value: null };
+let gpuStatsInflight = null;
+
+async function collectGpuStats() {
   // Get GTT stats first (important for APUs with unified memory)
   const gttStats = await getGttStats();
 
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeout = null;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      resolve(value);
+    };
+
     const cmd = spawn('/usr/local/bin/distrobox', [
       'enter', CONTAINER_NAME, '--',
       'bash', '-c',
@@ -2204,7 +2194,7 @@ async function getGpuStats() {
               Math.round(((power - POWER_IDLE) / (POWER_MAX - POWER_IDLE)) * 100)
             ));
           }
-          resolve({
+          finish({
             temperature: parseFloat(card['Temperature (Sensor edge) (C)'] || card.temperature || 0),
             usage,
             usageRaw: reportedUsage,
@@ -2222,7 +2212,7 @@ async function getGpuStats() {
         } else {
           // rocm-smi failed, but we might still have GTT stats
           if (gttStats.total > 0) {
-            resolve({
+            finish({
               temperature: 0,
               usage: 0,
               power: 0,
@@ -2233,13 +2223,13 @@ async function getGpuStats() {
               isAPU: true
             });
           } else {
-            resolve(null);
+            finish(null);
           }
         }
       } catch {
         // Even if parsing fails, return GTT stats if available
         if (gttStats.total > 0) {
-          resolve({
+          finish({
             temperature: 0,
             usage: 0,
             power: 0,
@@ -2250,14 +2240,14 @@ async function getGpuStats() {
             isAPU: true
           });
         } else {
-          resolve(null);
+          finish(null);
         }
       }
     });
 
     cmd.on('error', () => {
       if (gttStats.total > 0) {
-        resolve({
+        finish({
           temperature: 0,
           usage: 0,
           vram: { total: 0, used: 0, usage: 0 },
@@ -2265,11 +2255,43 @@ async function getGpuStats() {
           isAPU: true
         });
       } else {
-        resolve(null);
+        finish(null);
       }
     });
-    setTimeout(() => resolve(null), 3000);
+
+    timeout = setTimeout(() => {
+      try { cmd.kill('SIGTERM'); } catch {}
+      finish(gttStats.total > 0 ? {
+        temperature: 0,
+        usage: 0,
+        power: 0,
+        coreClock: 0,
+        memClock: 0,
+        vram: { total: 0, used: 0, usage: 0 },
+        gtt: gttStats,
+        isAPU: true,
+        stale: true
+      } : null);
+    }, 3000);
   });
+}
+
+async function getGpuStats({ maxAgeMs = GPU_STATS_CACHE_MS } = {}) {
+  const now = Date.now();
+  if (gpuStatsCache.at > 0 && now - gpuStatsCache.at <= maxAgeMs) {
+    return gpuStatsCache.value;
+  }
+  if (gpuStatsInflight) return gpuStatsInflight;
+
+  gpuStatsInflight = collectGpuStats()
+    .then((value) => {
+      gpuStatsCache = { at: Date.now(), value };
+      return value;
+    })
+    .finally(() => {
+      gpuStatsInflight = null;
+    });
+  return gpuStatsInflight;
 }
 
 // WebSocket connection handling
@@ -2301,7 +2323,9 @@ wss.on('connection', (ws) => {
 // Broadcast stats to all connected clients
 async function broadcastStats() {
   if (connectedClients.size === 0) return;
+  if (statsBroadcastInFlight) return;
 
+  statsBroadcastInFlight = true;
   try {
     const stats = await getSystemStats();
 
@@ -2371,6 +2395,8 @@ async function broadcastStats() {
     }
   } catch (err) {
     console.error('[ws] Broadcast error:', err);
+  } finally {
+    statsBroadcastInFlight = false;
   }
 }
 
@@ -8064,37 +8090,44 @@ setInterval(() => {
 // cooldown. Added after the incident where the APU sat at 98-99 C. Governs on the
 // hotter of GPU/CPU and ignores all-zero readings (telemetry dark).
 const THERMAL_INTERVAL = 5_000;
+let thermalPollInFlight = false;
 setInterval(async () => {
+  if (thermalPollInFlight) return;
   const cfg = guardCfg();
   if (!cfg.enabled) { guardDispatchPaused = false; guardThermalState = 'normal'; return; }
+  thermalPollInFlight = true;
   let gpuC = 0;
-  try { const g = await getGpuStats(); gpuC = Number(g?.temperature) || 0; } catch { /* telemetry dark */ }
-  const cpuC = Number(getCpuTemperature()) || 0;
-  const maxTempC = Math.max(gpuC, cpuC);
+  try {
+    try { const g = await getGpuStats(); gpuC = Number(g?.temperature) || 0; } catch { /* telemetry dark */ }
+    const cpuC = Number(getCpuTemperature()) || 0;
+    const maxTempC = Math.max(gpuC, cpuC);
 
-  const prev = guardThermalState;
-  const decision = thermalDecision({
-    tempC: maxTempC, prevState: prev,
-    warnC: cfg.warnC, resumeC: cfg.resumeC, criticalC: cfg.criticalC
-  });
-  guardThermalState = decision.state;
-  guardDispatchPaused = decision.pauseDispatch && maxTempC > 0;
-  guardLast = { state: decision.state, maxTempC, gpuC, cpuC, paused: guardDispatchPaused, at: Date.now() };
+    const prev = guardThermalState;
+    const decision = thermalDecision({
+      tempC: maxTempC, prevState: prev,
+      warnC: cfg.warnC, resumeC: cfg.resumeC, criticalC: cfg.criticalC
+    });
+    guardThermalState = decision.state;
+    guardDispatchPaused = decision.pauseDispatch && maxTempC > 0;
+    guardLast = { state: decision.state, maxTempC, gpuC, cpuC, paused: guardDispatchPaused, at: Date.now() };
 
-  // Log only on transitions to avoid spamming every interval.
-  if (decision.state !== prev) {
-    if (decision.state === 'critical') {
-      addLog('system', `[thermal] CRITICAL ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}) >= ${cfg.criticalC}C — unloading model to cool down`);
-    } else if (decision.state === 'throttled') {
-      addLog('system', `[thermal] throttling: ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}) >= ${cfg.warnC}C — pausing new requests until <= ${cfg.resumeC}C`);
-    } else if (decision.state === 'normal') {
-      addLog('system', `[thermal] recovered: ${maxTempC.toFixed(1)}C <= ${cfg.resumeC}C — resuming normal dispatch`);
+    // Log only on transitions to avoid spamming every interval.
+    if (decision.state !== prev) {
+      if (decision.state === 'critical') {
+        addLog('system', `[thermal] CRITICAL ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}) >= ${cfg.criticalC}C — unloading model to cool down`);
+      } else if (decision.state === 'throttled') {
+        addLog('system', `[thermal] throttling: ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}) >= ${cfg.warnC}C — pausing new requests until <= ${cfg.resumeC}C`);
+      } else if (decision.state === 'normal') {
+        addLog('system', `[thermal] recovered: ${maxTempC.toFixed(1)}C <= ${cfg.resumeC}C — resuming normal dispatch`);
+      }
     }
-  }
 
-  if (decision.unload && maxTempC > 0 && llamaProcess && !llamaProcess.killed && !restartInProgress) {
-    intentionalStop = true;
-    try { await stopLlamaServer(); } finally { intentionalStop = false; }
+    if (decision.unload && maxTempC > 0 && llamaProcess && !llamaProcess.killed && !restartInProgress) {
+      intentionalStop = true;
+      try { await stopLlamaServer(); } finally { intentionalStop = false; }
+    }
+  } finally {
+    thermalPollInFlight = false;
   }
 }, THERMAL_INTERVAL);
 
