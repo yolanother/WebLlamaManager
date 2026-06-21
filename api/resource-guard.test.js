@@ -2,7 +2,7 @@
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkModelFit, thermalDecision, planMemoryRecovery, DEFAULTS } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, DEFAULTS } from './resource-guard.js';
 
 const GiB = 2 ** 30;
 
@@ -140,4 +140,28 @@ test('planMemoryRecovery: nothing reclaimable and does not fit => refuse (no poi
     alreadyLoaded: false, reclaimableBytes: 0, ...KNOBS
   });
   assert.equal(r.action, 'refuse');
+});
+
+// ── dispatchPreference: try remote-first when prefer-remote OR thermally paused ─
+test('dispatchPreference: prefer local when not paused and preferLocal=true', () => {
+  const r = dispatchPreference({ preferLocal: true, thermalPaused: false });
+  assert.equal(r.tryRemoteFirst, false);
+});
+
+test('dispatchPreference: preferLocal=false spreads offloadable work to remote', () => {
+  const r = dispatchPreference({ preferLocal: false, thermalPaused: false });
+  assert.equal(r.tryRemoteFirst, true);
+  assert.match(r.reason, /preferLocal/i);
+});
+
+test('dispatchPreference: thermal throttle forces remote-first even when preferLocal=true', () => {
+  const r = dispatchPreference({ preferLocal: true, thermalPaused: true });
+  assert.equal(r.tryRemoteFirst, true);
+  assert.match(r.reason, /thermal/i);
+});
+
+test('dispatchPreference: thermal reason takes priority over preferLocal=false', () => {
+  const r = dispatchPreference({ preferLocal: false, thermalPaused: true });
+  assert.equal(r.tryRemoteFirst, true);
+  assert.match(r.reason, /thermal/i);
 });
