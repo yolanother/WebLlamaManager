@@ -77,6 +77,80 @@ export function checkModelFit({
 }
 
 /**
+ * Decide how to recover memory so a requested model can be served, given what is
+ * currently holding RAM. Pure decision logic — the caller performs the actual
+ * unload/restart and re-measures, then re-runs the normal fit check.
+ *
+ * Returns one of three actions:
+ *   - 'serve'   : serve now (already fits, the model is already loaded, or the
+ *                 size is unknown so we fail open).
+ *   - 'reclaim' : the model does not fit at the current MemAvailable, but the
+ *                 weights would fit once `reclaimableBytes` (RAM held by other
+ *                 loaded models / a stale llama stack) is freed — worth freeing
+ *                 RAM (unload then restart) and retrying.
+ *   - 'refuse'  : the weights cannot fit even on a fully-freed box, so freeing
+ *                 RAM would not help — refuse immediately (no restart thrash).
+ *
+ * @param {object} a
+ * @param {number} a.fileBytes Requested model weights size in bytes (0 = unknown -> serve).
+ * @param {number} a.contextSize Requested context length.
+ * @param {number} a.availableBytes Current MemAvailable in bytes.
+ * @param {boolean} a.alreadyLoaded Whether the requested model is already loaded.
+ * @param {number} a.reclaimableBytes RAM (bytes) that freeing other models / restarting returns to MemAvailable.
+ * @param {number} [a.kvBytesPerToken]
+ * @param {number} [a.overheadBytes]
+ * @param {number} [a.headroomFrac]
+ * @param {number} [a.minContext]
+ * @returns {{action:'serve'|'reclaim'|'refuse', requiredBytes:number, budgetBytes:number, reclaimableBudgetBytes:number, reason:string}}
+ */
+export function planMemoryRecovery({
+  fileBytes, contextSize, availableBytes, alreadyLoaded = false, reclaimableBytes = 0,
+  kvBytesPerToken = DEFAULTS.kvBytesPerToken,
+  overheadBytes = DEFAULTS.overheadBytes,
+  headroomFrac = DEFAULTS.headroomFrac,
+  minContext = DEFAULTS.minContext
+}) {
+  const knobs = { kvBytesPerToken, overheadBytes, headroomFrac, minContext };
+  const cur = checkModelFit({ fileBytes, contextSize, availableBytes, ...knobs });
+
+  // Unknown size -> fail open. Already-loaded -> its memory is already committed,
+  // so a low MemAvailable is expected; refusing would be a false positive.
+  if (!fileBytes || alreadyLoaded) {
+    return {
+      action: 'serve', requiredBytes: cur.requiredBytes, budgetBytes: cur.budgetBytes,
+      reclaimableBudgetBytes: cur.budgetBytes,
+      reason: !fileBytes ? 'unknown size (fail open)' : 'model already loaded'
+    };
+  }
+
+  if (cur.fits) {
+    return {
+      action: 'serve', requiredBytes: cur.requiredBytes, budgetBytes: cur.budgetBytes,
+      reclaimableBudgetBytes: cur.budgetBytes, reason: 'fits at current available memory'
+    };
+  }
+
+  // Would the weights fit on a box where the reclaimable RAM is freed?
+  const freedAvailable = availableBytes + Math.max(0, reclaimableBytes);
+  const freed = checkModelFit({ fileBytes, contextSize, availableBytes: freedAvailable, ...knobs });
+  const fitsWhenFreed = freed.fits || freed.recommendedContext !== null;
+
+  if (!fitsWhenFreed) {
+    return {
+      action: 'refuse', requiredBytes: cur.requiredBytes, budgetBytes: cur.budgetBytes,
+      reclaimableBudgetBytes: freed.budgetBytes,
+      reason: 'weights too large even after freeing all reclaimable memory'
+    };
+  }
+
+  return {
+    action: 'reclaim', requiredBytes: cur.requiredBytes, budgetBytes: cur.budgetBytes,
+    reclaimableBudgetBytes: freed.budgetBytes,
+    reason: 'fits after reclaiming memory held by other models'
+  };
+}
+
+/**
  * Hysteresis thermal state machine. Governs on a single temperature (the caller
  * passes max(GPU, CPU)). Once throttled, stays throttled until cooled to resumeC.
  * @param {object} a

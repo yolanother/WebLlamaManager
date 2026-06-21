@@ -31,7 +31,7 @@ const PROJECT_ROOT = dirname(__dirname);
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
-import { checkModelFit, thermalDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
@@ -1754,7 +1754,14 @@ function guardCfg() {
     overheadBytes: g.overheadBytes ?? GUARD_DEFAULTS.overheadBytes,
     minContext: g.minContext ?? GUARD_DEFAULTS.minContext,
     memThresholdPct: g.memThresholdPct ?? 90,
-    maxQueueDepth: g.maxQueueDepth ?? 8
+    maxQueueDepth: g.maxQueueDepth ?? 8,
+    // Memory-recovery knobs: when a model would be refused for lack of free RAM
+    // but the RAM is reclaimable (held by other loaded models / a stale stack),
+    // free it and retry instead of returning 507. recoveryEnabled gates the
+    // whole behaviour; recoveryRestartCooldownMs throttles the restart fallback
+    // so a burst of requests can't kill/restart in a loop.
+    recoveryEnabled: g.recovery !== false,
+    recoveryRestartCooldownMs: g.recoveryRestartCooldownMs ?? 30000
   };
 }
 
@@ -1783,32 +1790,130 @@ function resolveModelSizeBytes(modelId) {
   } catch { return 0; }
 }
 
-/**
- * Coarse pre-flight memory guard. Hard-refuses (throws MODEL_TOO_LARGE) only when
- * the model's weights cannot fit the memory budget at all; otherwise logs a
- * warning (the per-token KV estimate is approximate, so we don't block on it —
- * the runtime memory/thermal guards are the reliable backstop). Fail-open when
- * the model size can't be resolved.
- */
-function preflightModelGuard(modelId, contextSize) {
-  const cfg = guardCfg();
-  if (!cfg.enabled) return;
+/** Total resident memory (bytes) held by all running llama-server processes. */
+function llamaServerRssBytes() {
+  let kb = 0;
+  try {
+    for (const pid of readdirSync('/proc')) {
+      if (!/^\d+$/.test(pid)) continue;
+      let comm;
+      try { comm = readFileSync(`/proc/${pid}/comm`, 'utf-8').trim(); } catch { continue; }
+      if (comm !== 'llama-server') continue;
+      try { kb += parseRssKb(readFileSync(`/proc/${pid}/status`, 'utf-8')); } catch {}
+    }
+  } catch {}
+  return kb * 1024;
+}
+
+/** Ids of the models the router currently reports as loaded ([] on any error). */
+async function listLoadedModelIds() {
+  try {
+    const res = await fetch(`http://localhost:${LLAMA_PORT}/models`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.data || []).filter(m => m.status?.value === 'loaded').map(m => m.id);
+  } catch { return []; }
+}
+
+/** Format bytes as a 1-decimal GiB string for guard log/error messages. */
+function gibStr(n) { return (n / (2 ** 30)).toFixed(1); }
+
+/** Throw the MODEL_TOO_LARGE (507) error with the standard message. */
+function throwModelTooLarge(modelId, requiredBytes, budgetBytes) {
+  const err = new Error(`Model "${modelId}" is too large to serve safely: needs ~${gibStr(requiredBytes)} GiB but only ~${gibStr(budgetBytes)} GiB is free. Use a smaller quant or free memory.`);
+  err.code = 'MODEL_TOO_LARGE';
+  err.statusCode = 507;
+  throw err;
+}
+
+/** Log the coarse context-cap warning when the requested context may not fit. */
+function warnContextMayNotFit(modelId, contextSize, cfg) {
   const fileBytes = resolveModelSizeBytes(modelId);
-  if (!fileBytes) return; // unknown size -> fail open
+  if (!fileBytes) return;
   const fit = checkModelFit({
     fileBytes, contextSize: contextSize || cfg.minContext, availableBytes: memAvailableBytes(),
     kvBytesPerToken: cfg.kvBytesPerToken, overheadBytes: cfg.overheadBytes,
     headroomFrac: cfg.headroomFrac, minContext: cfg.minContext
   });
-  const gib = (n) => (n / (2 ** 30)).toFixed(1);
-  if (fit.fits) return;
-  if (fit.recommendedContext === null) {
-    const err = new Error(`Model "${modelId}" is too large to serve safely: needs ~${gib(fit.requiredBytes)} GiB but only ~${gib(fit.budgetBytes)} GiB is free. Use a smaller quant or free memory.`);
-    err.code = 'MODEL_TOO_LARGE';
-    err.statusCode = 507;
-    throw err;
+  if (fit.fits || fit.recommendedContext === null) return;
+  addLog('system', `[guard] ${modelId}: context ${contextSize} may not fit (~${gibStr(fit.requiredBytes)} GiB vs budget ${gibStr(fit.budgetBytes)} GiB); recommended <= ${fit.recommendedContext}. Monitoring memory at runtime.`);
+}
+
+// Timestamp of the last memory-recovery restart, so a burst of requests for an
+// oversized model can't drive a kill/restart loop (the cooldown forces a refuse
+// instead once we've already restarted recently).
+let lastRecoveryRestartAt = 0;
+
+/**
+ * Pre-flight memory guard with graceful recovery. Decides, via planMemoryRecovery,
+ * whether the requested model can be served at the current MemAvailable. When it
+ * can't but the shortfall is reclaimable (RAM held by other loaded models or a
+ * stale llama stack), it frees memory and retries instead of refusing:
+ *   1. unload other loaded models via the router API (fast, keeps the router warm),
+ *   2. if that isn't enough, restart llama-server (the proven recovery), throttled
+ *      by a cooldown so it can't thrash.
+ * Only when the weights cannot fit even on a fully-freed box does it throw
+ * MODEL_TOO_LARGE (507). Already-loaded models and unknown sizes are served
+ * (fail-open); the coarse context-cap case only warns.
+ */
+async function preflightModelGuard(modelId, contextSize) {
+  const cfg = guardCfg();
+  if (!cfg.enabled) return;
+  const fileBytes = resolveModelSizeBytes(modelId);
+  if (!fileBytes) return; // unknown size -> fail open
+
+  const knobs = {
+    kvBytesPerToken: cfg.kvBytesPerToken, overheadBytes: cfg.overheadBytes,
+    headroomFrac: cfg.headroomFrac, minContext: cfg.minContext
+  };
+  const ctx = contextSize || cfg.minContext;
+
+  const loaded = await listLoadedModelIds();
+  const alreadyLoaded = loaded.includes(modelId);
+  const plan = planMemoryRecovery({
+    fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(),
+    alreadyLoaded, reclaimableBytes: llamaServerRssBytes(), ...knobs
+  });
+
+  if (plan.action === 'serve') { warnContextMayNotFit(modelId, contextSize, cfg); return; }
+  if (plan.action === 'refuse') throwModelTooLarge(modelId, plan.requiredBytes, plan.budgetBytes);
+
+  // plan.action === 'reclaim': free RAM and retry. Honour the recovery toggle —
+  // if disabled, fall back to the original hard refuse.
+  if (!cfg.recoveryEnabled) throwModelTooLarge(modelId, plan.requiredBytes, plan.budgetBytes);
+
+  addLog('system', `[guard] ${modelId} needs ~${gibStr(plan.requiredBytes)} GiB but only ~${gibStr(plan.budgetBytes)} GiB free; reclaiming memory (budget after free ~${gibStr(plan.reclaimableBudgetBytes)} GiB) and retrying.`);
+
+  // Step 1: unload other loaded models (fast, no restart). Give the kernel a
+  // moment to reclaim the pages, then re-measure.
+  const unloaded = await unloadOtherModels(modelId);
+  if (unloaded) {
+    await new Promise(r => setTimeout(r, 1500));
+    if (planMemoryRecovery({ fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(), alreadyLoaded: false, reclaimableBytes: llamaServerRssBytes(), ...knobs }).action === 'serve') {
+      addLog('system', `[guard] ${modelId}: freed enough memory by unloading other models; serving.`);
+      warnContextMayNotFit(modelId, contextSize, cfg);
+      return;
+    }
   }
-  addLog('system', `[guard] ${modelId}: context ${contextSize} may not fit (~${gib(fit.requiredBytes)} GiB vs budget ${gib(fit.budgetBytes)} GiB); recommended <= ${fit.recommendedContext}. Monitoring memory at runtime.`);
+
+  // Step 2: restart llama-server to free everything (the proven fix), throttled
+  // by a cooldown so a request burst can't kill/restart in a loop.
+  const sinceRestart = Date.now() - lastRecoveryRestartAt;
+  if (sinceRestart < cfg.recoveryRestartCooldownMs) {
+    addLog('system', `[guard] ${modelId}: still short after unload but restarted ${Math.round(sinceRestart / 1000)}s ago (cooldown ${Math.round(cfg.recoveryRestartCooldownMs / 1000)}s); refusing to avoid restart thrash.`);
+    throwModelTooLarge(modelId, plan.requiredBytes, plan.budgetBytes);
+  }
+  addLog('system', `[guard] ${modelId}: unload insufficient; restarting llama-server to free memory.`);
+  lastRecoveryRestartAt = Date.now();
+  await restartLlamaServer({ governed: false });
+
+  // Re-evaluate on the freshly-restarted (nothing-loaded) box.
+  const after = planMemoryRecovery({
+    fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(),
+    alreadyLoaded: false, reclaimableBytes: llamaServerRssBytes(), ...knobs
+  });
+  if (after.action === 'serve') { warnContextMayNotFit(modelId, contextSize, cfg); return; }
+  throwModelTooLarge(modelId, after.requiredBytes, after.budgetBytes);
 }
 
 // Apply configured concurrency limit
@@ -3942,9 +4047,11 @@ function presetServesModel(preset, modelName) {
 // + acquireLocalSlot path serializes new requests during the window.
 let modeSwitchPromise = null;
 async function ensureModelServed(modelName) {
-  // Pre-flight memory guard: hard-refuse a model whose weights can't fit at all
-  // (throws MODEL_TOO_LARGE -> surfaced to the caller). Coarse cases only warn.
-  preflightModelGuard(modelName, config.contextSize);
+  // Pre-flight memory guard with graceful recovery: if the model doesn't fit the
+  // current free RAM but the shortfall is reclaimable, free memory (unload other
+  // models, then restart llama-server) and retry; only refuse (MODEL_TOO_LARGE)
+  // when the weights can't fit even on a fully-freed box.
+  await preflightModelGuard(modelName, config.contextSize);
 
   // Two correctness rules:
   //   (1) If the model has an autoActivate preset and we're not in it -> swap to it.
