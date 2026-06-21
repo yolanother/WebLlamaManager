@@ -31,7 +31,7 @@ const PROJECT_ROOT = dirname(__dirname);
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
-import { checkModelFit, thermalDecision, planMemoryRecovery, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
@@ -522,14 +522,17 @@ function resolveBackend(requestedModel, endpoint, body) {
     return { remote: false };
   }
 
-  // preferLocal=false means "spread offloadable work to remote whenever possible".
-  // Don't tie up the local slot with requests that have a viable remote backend —
-  // reserve local for non-offloadable models (those with no remote mapping). When
-  // a request is offloadable AND a remote has capacity, we offload even if local
-  // is idle. Falls back to local automatically if no remote candidate is viable
-  // (mapping missing, circuit open, queue full, etc.).
+  // Try a remote BEFORE taking the local slot when either the operator
+  // configured prefer-remote (preferLocal=false) OR the local APU is thermally
+  // throttled. preferLocal=false means "spread offloadable work to remote
+  // whenever possible" — reserve the local slot for non-offloadable models. The
+  // thermal case offloads work off the hot APU so it cools instead of holding
+  // the request in the up-to-2-minute thermal dispatch pause. Either way we fall
+  // back to local automatically if no remote candidate is viable (mapping
+  // missing, circuit open, queue full, etc.).
   const preferLocal = backends.preferLocal !== false;
-  if (!preferLocal) {
+  const pref = dispatchPreference({ preferLocal, thermalPaused: guardDispatchPaused });
+  if (pref.tryRemoteFirst) {
     const endpointKey = endpoint.replace(/\//g, '/');
     const hasViableRemote = backends.directory.some(b => {
       if (!b.enabled || !b.tested) return false;
@@ -543,7 +546,7 @@ function resolveBackend(requestedModel, endpoint, body) {
     });
     if (hasViableRemote) {
       shouldOffload = true;
-      console.log(`[routing] Prefer-remote: "${requestedModel}" has a viable remote backend (preferLocal=false), keeping local slot free for non-offloadable work`);
+      console.log(`[routing] Try-remote (${pref.reason}): "${requestedModel}" has a viable remote backend; keeping local slot free`);
     }
   }
 

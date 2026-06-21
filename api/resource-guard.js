@@ -151,6 +151,28 @@ export function planMemoryRecovery({
 }
 
 /**
+ * Decide whether an offloadable request should try a remote backend BEFORE
+ * taking the local slot. Returns tryRemoteFirst=true when either the operator
+ * configured prefer-remote (preferLocal=false) OR the local APU is thermally
+ * throttled. In the thermal case, routing offloadable work to a remote keeps
+ * clients served and removes load from the APU so it cools faster — instead of
+ * holding the request in the up-to-2-minute thermal dispatch pause. Non-
+ * offloadable models (no remote mapping) are unaffected; the caller still falls
+ * back to the local pause when no viable remote exists.
+ * @param {{preferLocal?:boolean, thermalPaused?:boolean}} a
+ * @returns {{tryRemoteFirst:boolean, reason:string}}
+ */
+export function dispatchPreference({ preferLocal = true, thermalPaused = false } = {}) {
+  if (thermalPaused) {
+    return { tryRemoteFirst: true, reason: 'thermal throttle — offload to cool the local APU' };
+  }
+  if (!preferLocal) {
+    return { tryRemoteFirst: true, reason: 'preferLocal=false — spread offloadable work to remote' };
+  }
+  return { tryRemoteFirst: false, reason: 'prefer local' };
+}
+
+/**
  * Hysteresis thermal state machine. Governs on a single temperature (the caller
  * passes max(GPU, CPU)). Once throttled, stays throttled until cooled to resumeC.
  * @param {object} a
