@@ -34,6 +34,7 @@ import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGat
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
+import { findLeakedSlots } from './slot-reaper.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -8035,22 +8036,23 @@ setInterval(async () => {
   for (const item of llamaQueue.activeItems.values()) {
     if (item.activeReqId != null) slotHolders.add(item.activeReqId);
   }
-  // Leaked-slot detector: any llamaQueue.activeItems entry whose
-  // activeReqId points at an activeRequest that no longer exists is a leak
-  // (handler died without firing release()). Force-release it. Threshold is
-  // intentionally generous to avoid killing in-progress prompt-processing for
-  // non-chat endpoints (completions/responses/messages don't register
-  // activeRequests so they always look "leaked").
-  for (const item of llamaQueue.activeItems.values()) {
-    const heldFor = now - (item.startedAt || item.enqueuedAt);
-    if (heldFor < stallMs) continue;
-    const tracked = item.activeReqId != null && activeRequests.has(item.activeReqId);
-    if (tracked) continue;
-    // For chat/completions slot holders, activeReqId IS set — so if the entry
-    // is missing now, it leaked. For other endpoints, activeReqId is null and
-    // we can't tell tracked vs untracked. Use hardCap for the latter.
-    const isChatLeak = item.activeReqId != null;
-    if (!isChatLeak && heldFor < hardCapMs) continue;
+  // Leaked-slot detector: a chat slot whose activeReqId no longer maps to a live
+  // activeRequest is a DEFINITIVE leak (handler ended without firing release()).
+  // Reap it on a short grace (LEAK_REAP_GRACE_MS) rather than the generous
+  // stallMs — a stuck slot blocks ALL local dispatch (concurrency is small), so
+  // waiting the full prompt-processing window (up to localStallMs, e.g. 10min)
+  // needlessly starves local serving. Non-chat slots (activeReqId null) can't be
+  // told apart from legit long prompt-processing, so they only reap at hardCapMs.
+  const LEAK_REAP_GRACE_MS = Math.min(stallMs, 10_000);
+  const liveReqIds = new Set(activeRequests.keys());
+  const leakedSlotIds = findLeakedSlots({
+    items: [...llamaQueue.activeItems.values()], liveReqIds, now,
+    graceMs: LEAK_REAP_GRACE_MS, hardCapMs
+  });
+  for (const slotId of leakedSlotIds) {
+    const item = llamaQueue.activeItems.get(slotId);
+    if (!item) continue;
+    const heldFor = now - (item.startedAt || item.enqueuedAt || now);
     const msg = `Stall watchdog: force-releasing leaked llamaQueue slot ${item.id} (model=${item.model}, endpoint=${item.endpoint}, held ${Math.round(heldFor / 1000)}s, activeReqId=${item.activeReqId})`;
     console.warn(`[watchdog] ${msg}`);
     addLog('system', msg);
