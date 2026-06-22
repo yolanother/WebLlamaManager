@@ -4623,6 +4623,16 @@ function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
   const [activeTab, setActiveTab] = useState('general'); // 'general' | 'hosts' | 'mapping'
+  // Real model ids for the default-big/default-small target dropdowns (the synthetic
+  // alias entries are excluded so an alias can't be pointed at itself).
+  const [modelOptions, setModelOptions] = useState([]);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/v1/models`)
+      .then(r => r.json())
+      .then(d => setModelOptions((d.data || []).filter(m => m.status !== 'alias').map(m => m.id)))
+      .catch(() => {});
+  }, []);
 
   const fetchSettings = useCallback(async () => {
     try {
@@ -4870,6 +4880,41 @@ function SettingsPage() {
               <option value="low">Low</option>
               <option value="medium">Medium</option>
               <option value="high">High</option>
+            </select>
+          </div>
+
+          <div className="setting-item">
+            <label htmlFor="defaultBigModel">Default Big Model</label>
+            <p className="setting-hint">
+              Target for the <code>default-big</code> model alias. Clients can request
+              <code>default-big</code> instead of a concrete name to avoid unnecessary model shifts.
+            </p>
+            <select
+              id="defaultBigModel"
+              value={settings?.defaultBigModel || ''}
+              onChange={(e) => updateSetting('defaultBigModel', e.target.value || null)}
+            >
+              <option value="">— none —</option>
+              {[...new Set([settings?.defaultBigModel, ...modelOptions].filter(Boolean))].map(id => (
+                <option key={id} value={id}>{id}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="setting-item">
+            <label htmlFor="defaultSmallModel">Default Small Model</label>
+            <p className="setting-hint">
+              Target for the <code>default-small</code> model alias.
+            </p>
+            <select
+              id="defaultSmallModel"
+              value={settings?.defaultSmallModel || ''}
+              onChange={(e) => updateSetting('defaultSmallModel', e.target.value || null)}
+            >
+              <option value="">— none —</option>
+              {[...new Set([settings?.defaultSmallModel, ...modelOptions].filter(Boolean))].map(id => (
+                <option key={id} value={id}>{id}</option>
+              ))}
             </select>
           </div>
         </div>
