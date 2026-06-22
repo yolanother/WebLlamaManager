@@ -35,6 +35,7 @@ import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference,
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots } from './slot-reaper.js';
+import { resolveDefaultModel, defaultModelListEntries } from './default-models.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -2660,6 +2661,9 @@ app.get('/api/settings', (req, res) => {
       localStallMs: config.localStallMs ?? DEFAULT_LOCAL_STALL_MS,
       defaultReasoningEffort: config.defaultReasoningEffort || null,
       modelReasoningEffort: config.modelReasoningEffort || {},
+      // Targets for the default-big / default-small request-time model aliases.
+      defaultBigModel: config.defaultBigModel || null,
+      defaultSmallModel: config.defaultSmallModel || null,
       fullscreenInterval: config.fullscreenInterval || 30000,
       // HuggingFace token: never return the raw value — only whether one is set
       // and a masked preview for display.
@@ -2689,7 +2693,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, fullscreenInterval, hfToken } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -2782,6 +2786,25 @@ app.post('/api/settings', (req, res) => {
     } else {
       return res.status(400).json({ error: 'Fullscreen interval must be between 5000 and 300000 ms' });
     }
+  }
+
+  // Targets for the default-big / default-small aliases. Accept any string (we do not
+  // reject an unknown/not-yet-loaded name, matching direct requests to such a model);
+  // an empty/blank string clears the alias (stored as null).
+  if (defaultBigModel !== undefined) {
+    if (defaultBigModel !== null && typeof defaultBigModel !== 'string') {
+      return res.status(400).json({ error: 'defaultBigModel must be a string or null' });
+    }
+    const v = typeof defaultBigModel === 'string' ? defaultBigModel.trim() : '';
+    config.defaultBigModel = v.length ? v : null;
+  }
+
+  if (defaultSmallModel !== undefined) {
+    if (defaultSmallModel !== null && typeof defaultSmallModel !== 'string') {
+      return res.status(400).json({ error: 'defaultSmallModel must be a string or null' });
+    }
+    const v = typeof defaultSmallModel === 'string' ? defaultSmallModel.trim() : '';
+    config.defaultSmallModel = v.length ? v : null;
   }
 
   // HuggingFace token: store in config (preferred over the HF_TOKEN env var).
@@ -5702,6 +5725,11 @@ app.get('/api/v1/models', async (req, res) => {
     }
 
     const data = { object: 'list', data: [...byId.values()] };
+    // Advertise the configured default-big/default-small aliases so clients can
+    // discover them (only those with a configured target are listed).
+    for (const entry of defaultModelListEntries(config, Math.floor(Date.now() / 1000))) {
+      data.data.push(entry);
+    }
     // Append the dedicated embedding model so it is selectable by the orchestrator.
     const ec = resolveEmbedConfig(config, process.env);
     if (ec.runnable) {
@@ -6101,7 +6129,11 @@ function injectModelSamplingDefaults(body) {
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
-  const requestedModel = req.body.model || 'default';
+  // Resolve default-big/default-small aliases to the configured real target before
+  // routing, and forward the resolved name to the backend so the alias never reaches
+  // llama.cpp as an unknown model name.
+  const requestedModel = resolveDefaultModel(req.body.model || 'default', config);
+  if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
 
@@ -6947,7 +6979,9 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 // OpenAI-compatible completions (legacy endpoint)
 app.post('/api/v1/completions', async (req, res) => {
   const startTime = Date.now();
-  const requestedModel = req.body.model || 'unknown';
+  // Resolve default-big/default-small aliases and forward the resolved name downstream.
+  const requestedModel = resolveDefaultModel(req.body.model || 'unknown', config);
+  if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
   const isStreaming = req.body.stream === true;
 
   // Route to remote backend if applicable
@@ -7152,7 +7186,9 @@ app.post('/api/v1/completions', async (req, res) => {
 // Mounted at the versioned path and an unversioned alias.
 async function handleEmbeddings(req, res) {
   const startedAt = Date.now();
-  const requestedModel = req.body.model || 'default';
+  // Resolve default-big/default-small aliases and forward the resolved name downstream.
+  const requestedModel = resolveDefaultModel(req.body.model || 'default', config);
+  if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   // Route to a remote backend if configured (e.g. an Ollama host).
   const routing = resolveBackend(requestedModel, 'embeddings', req.body);
