@@ -97,3 +97,69 @@ test('RESTART_DEFAULTS exposes sane operator knobs', () => {
   assert.ok(RESTART_DEFAULTS.windowMs > RESTART_DEFAULTS.debounceMs);
   assert.ok(RESTART_DEFAULTS.cooldownMs > 0);
 });
+
+// ── Wedged-hold escalation ──────────────────────────────────────────────────
+// When the exec/GPU layer is demonstrably wedged (un-killable D-state), probing
+// once per normal cooldown still spawns a fresh llama-server onto a locked GPU
+// every minute, accumulating D-state processes until the host freezes. The
+// `wedged` signal escalates to a much longer hold so probes drop ~15x and the
+// router stays in remote-offload mode until manual recovery.
+
+const WEDGE_KNOBS = { ...KNOBS, wedgedCooldownMs: 900_000 };
+
+test('wedged: a single prior attempt holds long even below the attempt cap (not circuit-open)', () => {
+  // One allowed attempt, then a wedged trigger past debounce but well under maxAttempts.
+  const first = restartDecision({ history: [], now: 1_000, ...WEDGE_KNOBS });
+  const r = restartDecision({
+    history: first.history, now: 1_000 + KNOBS.debounceMs + 1, wedged: true, ...WEDGE_KNOBS
+  });
+  assert.equal(r.allow, false);
+  assert.equal(r.reason, 'wedged-hold');
+  assert.ok(r.retryAfterMs > KNOBS.cooldownMs, 'hold should exceed the normal cooldown');
+  assert.deepEqual(r.history, first.history, 'suppressed triggers do not grow history');
+});
+
+test('wedged hold outlasts the normal cooldown (a probe that would be allowed un-wedged is suppressed)', () => {
+  const first = restartDecision({ history: [], now: 0, ...WEDGE_KNOBS });
+  const last = first.history[first.history.length - 1];
+  // Just past the normal cooldown: un-wedged this would allow a probe...
+  const unwedged = restartDecision({ history: first.history, now: last + KNOBS.cooldownMs + 1, ...WEDGE_KNOBS });
+  assert.equal(unwedged.allow, true, 'sanity: un-wedged allows a probe after cooldown');
+  // ...but wedged it is still held.
+  const wedged = restartDecision({ history: first.history, now: last + KNOBS.cooldownMs + 1, wedged: true, ...WEDGE_KNOBS });
+  assert.equal(wedged.allow, false);
+  assert.equal(wedged.reason, 'wedged-hold');
+});
+
+test('wedged: after wedgedCooldownMs a single recovery probe is allowed', () => {
+  const first = restartDecision({ history: [], now: 0, ...WEDGE_KNOBS });
+  const last = first.history[first.history.length - 1];
+  const mid = restartDecision({ history: first.history, now: last + WEDGE_KNOBS.wedgedCooldownMs - 1, wedged: true, ...WEDGE_KNOBS });
+  assert.equal(mid.allow, false);
+  assert.equal(mid.reason, 'wedged-hold');
+  const after = restartDecision({ history: first.history, now: last + WEDGE_KNOBS.wedgedCooldownMs + 1, wedged: true, ...WEDGE_KNOBS });
+  assert.equal(after.allow, true, 'one probe allowed once the long hold elapses');
+});
+
+test('wedged with empty history still allows the first attempt (nothing to hold against yet)', () => {
+  const r = restartDecision({ history: [], now: 5_000, wedged: true, ...WEDGE_KNOBS });
+  assert.equal(r.allow, true);
+  assert.equal(r.reason, 'ok');
+});
+
+test('wedged=false preserves the original circuit-breaker behavior', () => {
+  // Build a tripped state, then confirm a probe is allowed right after the normal cooldown.
+  let history = [];
+  let now = 0;
+  for (let i = 0; i < KNOBS.maxAttempts; i++) {
+    now += KNOBS.debounceMs + 1;
+    history = restartDecision({ history, now, wedged: false, ...WEDGE_KNOBS }).history;
+  }
+  const last = now;
+  const after = restartDecision({ history, now: last + KNOBS.cooldownMs + 1, wedged: false, ...WEDGE_KNOBS });
+  assert.equal(after.allow, true);
+});
+
+test('RESTART_DEFAULTS includes a wedged-hold cooldown longer than the normal cooldown', () => {
+  assert.ok(RESTART_DEFAULTS.wedgedCooldownMs > RESTART_DEFAULTS.cooldownMs);
+});

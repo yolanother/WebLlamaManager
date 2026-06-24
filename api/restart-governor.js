@@ -8,19 +8,27 @@
 // otherwise enters an infinite kill/restart loop (which also starves the distrobox
 // exec layer, so the kill itself times out) and never recovers on its own.
 //
-// Two protections, both driven off a caller-held array of attempt timestamps:
+// Three protections, all driven off a caller-held array of attempt timestamps:
 //   - Debounce: collapse a stampede of triggers into a single restart.
 //   - Circuit breaker: after maxAttempts restarts within windowMs, suppress further
 //     restarts for cooldownMs (then allow one recovery probe). The router keeps
 //     serving remote-routable models while the breaker is open. A healthy restart
 //     resets the history (the caller clears it), so an isolated later failure
 //     restarts immediately.
+//   - Wedged-hold: when the caller signals the exec/GPU layer is wedged (un-killable
+//     D-state — kernel hung_task in amdgpu_ctx_mgr_entity_flush, "container exec
+//     wedged"/"pkill timed out", or repeated failures to become ready), the normal
+//     60s recovery probe is futile and harmful: each probe spawns a fresh
+//     llama-server onto the locked GPU, piling up D-state until the host freezes.
+//     In that state restarts are held for the much longer wedgedCooldownMs and an
+//     alert is surfaced, so probes drop ~15x and the box can be recovered manually.
 
 export const RESTART_DEFAULTS = {
-  debounceMs: 5_000,    // ignore triggers arriving within this of the last allowed restart
-  maxAttempts: 4,       // allowed restarts within windowMs before the breaker trips
-  windowMs: 60_000,     // sliding window over which attempts are counted
-  cooldownMs: 60_000    // once tripped, suppress restarts for this long (then probe once)
+  debounceMs: 5_000,        // ignore triggers arriving within this of the last allowed restart
+  maxAttempts: 4,           // allowed restarts within windowMs before the breaker trips
+  windowMs: 60_000,         // sliding window over which attempts are counted
+  cooldownMs: 60_000,       // once tripped, suppress restarts for this long (then probe once)
+  wedgedCooldownMs: 900_000 // when the exec/GPU layer is wedged, hold this long instead (15 min)
 };
 
 /**
@@ -39,7 +47,11 @@ export const RESTART_DEFAULTS = {
  * @param {number} [a.maxAttempts]
  * @param {number} [a.windowMs]
  * @param {number} [a.cooldownMs]
- * @returns {{allow:boolean, reason:'ok'|'debounce'|'circuit-open', history:number[], retryAfterMs:number}}
+ * @param {boolean} [a.wedged] Caller signal that the exec/GPU layer is wedged
+ *   (un-killable D-state). When true and a prior attempt exists, restarts are held
+ *   for wedgedCooldownMs instead of the normal cooldown, regardless of attempt count.
+ * @param {number} [a.wedgedCooldownMs]
+ * @returns {{allow:boolean, reason:'ok'|'debounce'|'circuit-open'|'wedged-hold', history:number[], retryAfterMs:number}}
  */
 export function restartDecision({
   history = [],
@@ -47,13 +59,24 @@ export function restartDecision({
   debounceMs = RESTART_DEFAULTS.debounceMs,
   maxAttempts = RESTART_DEFAULTS.maxAttempts,
   windowMs = RESTART_DEFAULTS.windowMs,
-  cooldownMs = RESTART_DEFAULTS.cooldownMs
+  cooldownMs = RESTART_DEFAULTS.cooldownMs,
+  wedged = false,
+  wedgedCooldownMs = RESTART_DEFAULTS.wedgedCooldownMs
 } = {}) {
   const last = history.length ? history[history.length - 1] : null;
 
   // Debounce: a fresh trigger right after a restart is the stampede — skip it.
   if (last !== null && now - last < debounceMs) {
     return { allow: false, reason: 'debounce', history, retryAfterMs: debounceMs - (now - last) };
+  }
+
+  // Wedged-hold: once the exec/GPU layer is demonstrably wedged, probing every
+  // cooldownMs just re-locks the GPU and accumulates D-state. Hold for the much
+  // longer wedgedCooldownMs (then allow a single recovery probe). Takes precedence
+  // over the circuit breaker and applies even below the attempt cap. Needs a prior
+  // attempt to hold against; the very first restart of an episode still proceeds.
+  if (last !== null && now - last < wedgedCooldownMs && wedged) {
+    return { allow: false, reason: 'wedged-hold', history, retryAfterMs: wedgedCooldownMs - (now - last) };
   }
 
   // Circuit breaker: if the last `maxAttempts` restarts were bunched within

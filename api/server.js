@@ -4034,6 +4034,12 @@ let restartInProgress = false;
 // "ready" — a restart that brings the router up but still can't serve the model
 // must still count toward the breaker.
 let llamaRestartHistory = [];
+// Consecutive governed restarts that failed to become ready. Together with
+// containerExecWedged this forms the "wedged" signal handed to the restart
+// governor: a wedged exec layer or repeated ready-failures means probing every
+// cooldown is futile and harmful, so the governor escalates to a long hold.
+let consecutiveFailedRestarts = 0;
+const FAILED_RESTART_LIMIT = 3;
 // Find the preset that should serve the given model name, if any.
 // Only considers presets with autoActivate=true so manual presets (like
 // the qwen3-coder-next preset) don't auto-trigger on every related request.
@@ -4141,11 +4147,22 @@ async function restartLlamaServer({ governed = true } = {}) {
   // and the memory watchdog pass { governed: false } and always run.
   if (governed) {
     const knobs = { ...RESTART_DEFAULTS, ...(config.guard?.restart || {}) };
-    const decision = restartDecision({ history: llamaRestartHistory, now: Date.now(), ...knobs });
+    // The exec/GPU layer is wedged when container execs keep timing out (un-killable
+    // D-state) or restarts repeatedly fail to become ready. In that state the governor
+    // holds for the long wedgedCooldownMs instead of probing every 60s onto a locked GPU.
+    const wedged = containerExecWedged >= CONTAINER_EXEC_WEDGED_LIMIT
+      || consecutiveFailedRestarts >= FAILED_RESTART_LIMIT;
+    const decision = restartDecision({ history: llamaRestartHistory, now: Date.now(), wedged, ...knobs });
     if (!decision.allow) {
       const secs = Math.ceil(decision.retryAfterMs / 1000);
-      console.warn(`[restart] Suppressed by governor (${decision.reason}); retry in ~${secs}s. Router keeps serving remote backends.`);
-      addLog('system', `Restart suppressed (${decision.reason}); backing off ~${secs}s to avoid restart thrash`);
+      if (decision.reason === 'wedged-hold') {
+        const mins = Math.ceil(decision.retryAfterMs / 60_000);
+        console.warn(`[restart] Held by governor (wedged-hold); GPU/exec layer appears wedged. Holding ~${mins}m and serving remote backends only. Manual recovery may be needed (restart llama-manager / SIGKILL gpu-manager).`);
+        addLog('system', `Restart HELD (wedged-hold): GPU/exec layer wedged (execWedged=${containerExecWedged}, failedRestarts=${consecutiveFailedRestarts}); holding ~${mins}m to avoid freezing the host. Manual recovery may be needed.`);
+      } else {
+        console.warn(`[restart] Suppressed by governor (${decision.reason}); retry in ~${secs}s. Router keeps serving remote backends.`);
+        addLog('system', `Restart suppressed (${decision.reason}); backing off ~${secs}s to avoid restart thrash`);
+      }
       return;
     }
     llamaRestartHistory = decision.history;
@@ -4220,11 +4237,13 @@ async function restartLlamaServer({ governed = true } = {}) {
     // Wait for server to become healthy
     const ready = await waitForServerReady({ maxWait: 60000, label: 'restart' });
     if (ready) {
+      consecutiveFailedRestarts = 0; // recovery cleared the wedge signal
       console.log('[restart] Llama server restarted successfully');
       addLog('system', 'Llama server restarted successfully');
     } else {
-      console.error('[restart] Llama server failed to become ready after restart');
-      addLog('system', 'Llama server failed to become ready after restart');
+      consecutiveFailedRestarts++;
+      console.error(`[restart] Llama server failed to become ready after restart (consecutive failures: ${consecutiveFailedRestarts})`);
+      addLog('system', `Llama server failed to become ready after restart (consecutive failures: ${consecutiveFailedRestarts})`);
     }
   } finally {
     restartInProgress = false;
