@@ -163,3 +163,59 @@ test('wedged=false preserves the original circuit-breaker behavior', () => {
 test('RESTART_DEFAULTS includes a wedged-hold cooldown longer than the normal cooldown', () => {
   assert.ok(RESTART_DEFAULTS.wedgedCooldownMs > RESTART_DEFAULTS.cooldownMs);
 });
+
+// ── Sustained-thrash (slow-loop) escalation ─────────────────────────────────
+// The 60s circuit-breaker window can't see a loop whose period exceeds it: the
+// observed "router restarts ready, model unservable ~30s later, restart again"
+// pattern recurs ~every 2.4 min, so it never gets 4 restarts inside 60s and never
+// trips — yet it churns indefinitely. A second, longer detector trips the long
+// hold when there are sustainedAttempts restarts within sustainedWindowMs,
+// regardless of whether each restart reported the router "ready".
+
+const SLOW_KNOBS = { ...KNOBS, wedgedCooldownMs: 900_000, sustainedAttempts: 5, sustainedWindowMs: 900_000 };
+
+// Build N allowed restarts spaced `spacingMs` apart starting at t=0. Asserts each
+// is allowed (so the test fails loudly if the circuit breaker trips unexpectedly).
+function buildAllowed(n, spacingMs, knobs) {
+  let history = [];
+  let now = 0;
+  for (let i = 0; i < n; i++) {
+    const r = restartDecision({ history, now, ...knobs });
+    assert.equal(r.allow, true, `restart ${i} at t=${now} should be allowed`);
+    history = r.history;
+    now += spacingMs;
+  }
+  return { history, lastNow: now - spacingMs, nextNow: now };
+}
+
+test('sustained-thrash: a slow loop (period > 60s window) trips the long hold even though the circuit never bunches', () => {
+  // 5 restarts 3 min apart: each past debounce, never 4-within-60s, so circuit-open never fires.
+  const { history, nextNow } = buildAllowed(5, 180_000, SLOW_KNOBS);
+  const r = restartDecision({ history, now: nextNow, ...SLOW_KNOBS });
+  assert.equal(r.allow, false);
+  assert.equal(r.reason, 'sustained-thrash');
+  assert.ok(r.retryAfterMs > KNOBS.cooldownMs, 'sustained hold should exceed the normal cooldown');
+  assert.deepEqual(r.history, history, 'suppressed triggers do not grow history');
+});
+
+test('sustained-thrash: a healthy slow cadence (slower than sustainedWindowMs/sustainedAttempts) is NOT flagged', () => {
+  // 5 min apart > the 3-min effective threshold (900s / 5): pruning keeps history short, no trip.
+  const { history, nextNow } = buildAllowed(5, 300_000, SLOW_KNOBS);
+  const r = restartDecision({ history, now: nextNow, ...SLOW_KNOBS });
+  assert.equal(r.allow, true);
+  assert.equal(r.reason, 'ok');
+});
+
+test('sustained-thrash: after the long hold elapses, one probe is allowed', () => {
+  const { history, lastNow } = buildAllowed(5, 180_000, SLOW_KNOBS);
+  const mid = restartDecision({ history, now: lastNow + SLOW_KNOBS.wedgedCooldownMs - 1, ...SLOW_KNOBS });
+  assert.equal(mid.allow, false);
+  assert.equal(mid.reason, 'sustained-thrash');
+  const after = restartDecision({ history, now: lastNow + SLOW_KNOBS.wedgedCooldownMs + 1, ...SLOW_KNOBS });
+  assert.equal(after.allow, true, 'one probe allowed once the long hold elapses');
+});
+
+test('RESTART_DEFAULTS exposes sustained-thrash knobs (slow-loop detection over a long window)', () => {
+  assert.ok(RESTART_DEFAULTS.sustainedAttempts >= RESTART_DEFAULTS.maxAttempts);
+  assert.ok(RESTART_DEFAULTS.sustainedWindowMs > RESTART_DEFAULTS.windowMs);
+});

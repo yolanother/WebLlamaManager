@@ -4159,6 +4159,10 @@ async function restartLlamaServer({ governed = true } = {}) {
         const mins = Math.ceil(decision.retryAfterMs / 60_000);
         console.warn(`[restart] Held by governor (wedged-hold); GPU/exec layer appears wedged. Holding ~${mins}m and serving remote backends only. Manual recovery may be needed (restart llama-manager / SIGKILL gpu-manager).`);
         addLog('system', `Restart HELD (wedged-hold): GPU/exec layer wedged (execWedged=${containerExecWedged}, failedRestarts=${consecutiveFailedRestarts}); holding ~${mins}m to avoid freezing the host. Manual recovery may be needed.`);
+      } else if (decision.reason === 'sustained-thrash') {
+        const mins = Math.ceil(decision.retryAfterMs / 60_000);
+        console.warn(`[restart] Held by governor (sustained-thrash); a slow restart loop is churning (router restarts ready but the model stays unservable). Holding ~${mins}m and serving remote backends only. Check why the local model won't serve (thermal / OOM / model load failure).`);
+        addLog('system', `Restart HELD (sustained-thrash): slow restart loop detected; holding ~${mins}m and staying remote-only. Investigate why the local model won't serve.`);
       } else {
         console.warn(`[restart] Suppressed by governor (${decision.reason}); retry in ~${secs}s. Router keeps serving remote backends.`);
         addLog('system', `Restart suppressed (${decision.reason}); backing off ~${secs}s to avoid restart thrash`);

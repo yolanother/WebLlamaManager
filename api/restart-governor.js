@@ -8,7 +8,7 @@
 // otherwise enters an infinite kill/restart loop (which also starves the distrobox
 // exec layer, so the kill itself times out) and never recovers on its own.
 //
-// Three protections, all driven off a caller-held array of attempt timestamps:
+// Four protections, all driven off a caller-held array of attempt timestamps:
 //   - Debounce: collapse a stampede of triggers into a single restart.
 //   - Circuit breaker: after maxAttempts restarts within windowMs, suppress further
 //     restarts for cooldownMs (then allow one recovery probe). The router keeps
@@ -22,13 +22,22 @@
 //     llama-server onto the locked GPU, piling up D-state until the host freezes.
 //     In that state restarts are held for the much longer wedgedCooldownMs and an
 //     alert is surfaced, so probes drop ~15x and the box can be recovered manually.
+//   - Sustained-thrash: a slow restart loop whose period exceeds windowMs never
+//     bunches enough to trip the circuit breaker, yet churns indefinitely. Observed
+//     live: the router restarts and reports "ready", but the model is unservable, so
+//     a new request restarts it ~every 2.4 min — far slower than the 60s window. When
+//     sustainedAttempts restarts fall within sustainedWindowMs, hold for the long
+//     wedgedCooldownMs. Router-ready restarts still count: history is intentionally
+//     NOT cleared on success, so this detector sees the loop the circuit breaker can't.
 
 export const RESTART_DEFAULTS = {
-  debounceMs: 5_000,        // ignore triggers arriving within this of the last allowed restart
-  maxAttempts: 4,           // allowed restarts within windowMs before the breaker trips
-  windowMs: 60_000,         // sliding window over which attempts are counted
-  cooldownMs: 60_000,       // once tripped, suppress restarts for this long (then probe once)
-  wedgedCooldownMs: 900_000 // when the exec/GPU layer is wedged, hold this long instead (15 min)
+  debounceMs: 5_000,         // ignore triggers arriving within this of the last allowed restart
+  maxAttempts: 4,            // allowed restarts within windowMs before the breaker trips
+  windowMs: 60_000,          // sliding window over which attempts are counted
+  cooldownMs: 60_000,        // once tripped, suppress restarts for this long (then probe once)
+  wedgedCooldownMs: 900_000, // when wedged or sustained-thrashing, hold this long (15 min)
+  sustainedAttempts: 5,      // restarts within sustainedWindowMs that mark a slow thrash loop
+  sustainedWindowMs: 900_000 // long window for detecting loops the 60s window can't see (15 min)
 };
 
 /**
@@ -51,7 +60,10 @@ export const RESTART_DEFAULTS = {
  *   (un-killable D-state). When true and a prior attempt exists, restarts are held
  *   for wedgedCooldownMs instead of the normal cooldown, regardless of attempt count.
  * @param {number} [a.wedgedCooldownMs]
- * @returns {{allow:boolean, reason:'ok'|'debounce'|'circuit-open'|'wedged-hold', history:number[], retryAfterMs:number}}
+ * @param {number} [a.sustainedAttempts] Restarts within sustainedWindowMs that mark a
+ *   slow thrash loop the 60s circuit breaker can't see.
+ * @param {number} [a.sustainedWindowMs]
+ * @returns {{allow:boolean, reason:'ok'|'debounce'|'circuit-open'|'wedged-hold'|'sustained-thrash', history:number[], retryAfterMs:number}}
  */
 export function restartDecision({
   history = [],
@@ -61,7 +73,9 @@ export function restartDecision({
   windowMs = RESTART_DEFAULTS.windowMs,
   cooldownMs = RESTART_DEFAULTS.cooldownMs,
   wedged = false,
-  wedgedCooldownMs = RESTART_DEFAULTS.wedgedCooldownMs
+  wedgedCooldownMs = RESTART_DEFAULTS.wedgedCooldownMs,
+  sustainedAttempts = RESTART_DEFAULTS.sustainedAttempts,
+  sustainedWindowMs = RESTART_DEFAULTS.sustainedWindowMs
 } = {}) {
   const last = history.length ? history[history.length - 1] : null;
 
@@ -79,6 +93,18 @@ export function restartDecision({
     return { allow: false, reason: 'wedged-hold', history, retryAfterMs: wedgedCooldownMs - (now - last) };
   }
 
+  // Sustained-thrash: a slow loop (period > windowMs) never bunches enough to trip
+  // the circuit breaker, but sustainedAttempts restarts within sustainedWindowMs is
+  // an unmistakable loop. Hold for the long wedgedCooldownMs (then probe once). This
+  // catches the "router restarts ready but the model stays unservable" churn, where
+  // each restart looks successful yet a new request re-triggers it minutes later.
+  if (last !== null && now - last < wedgedCooldownMs && history.length >= sustainedAttempts) {
+    const lastN = history.slice(-sustainedAttempts);
+    if ((last - lastN[0]) <= sustainedWindowMs) {
+      return { allow: false, reason: 'sustained-thrash', history, retryAfterMs: wedgedCooldownMs - (now - last) };
+    }
+  }
+
   // Circuit breaker: if the last `maxAttempts` restarts were bunched within
   // `windowMs`, the breaker is tripped and stays open until `cooldownMs` after the
   // most recent attempt (independent of window aging), then allows one probe.
@@ -90,9 +116,10 @@ export function restartDecision({
     }
   }
 
-  // Allowed: record this attempt, pruning anything older than the retention span
-  // (max of window/cooldown) so the breaker's trip detection survives the cooldown.
-  const retentionMs = Math.max(windowMs, cooldownMs);
+  // Allowed: record this attempt, pruning anything older than the retention span so
+  // both the short circuit-breaker window and the long sustained/wedged horizons
+  // survive (a slow loop must still be visible 15 min later).
+  const retentionMs = Math.max(windowMs, cooldownMs, sustainedWindowMs, wedgedCooldownMs);
   const retained = history.filter(t => now - t < retentionMs);
   return { allow: true, reason: 'ok', history: [...retained, now], retryAfterMs: 0 };
 }
