@@ -90,15 +90,35 @@ do_watchdog() {
     echo "  a hardware watchdog is required — check BIOS for a WDT/TCO option)."
     run "modprobe softdog soft_panic=1 || true"
   fi
-  echo "  persisting the module across boots (/etc/modules-load.d/gpu-watchdog.conf)"
-  run "bash -c 'printf \"sp5100_tco\\nsoftdog\\n\" > /etc/modules-load.d/gpu-watchdog.conf'"
+  # Persist the load via a post-sysinit service. /etc/modules-load.d runs too early on
+  # Strix Halo (the FCH watchdog isn't probeable yet, so the load silently no-ops);
+  # loading after sysinit.target works reliably.
+  echo "  installing gpu-watchdog.service (loads the watchdog after sysinit, every boot)"
+  if [ "$DRY" = 1 ]; then
+    echo "  DRY: write /etc/systemd/system/gpu-watchdog.service + systemctl enable it"
+    echo "  DRY: rm -f /etc/modules-load.d/gpu-watchdog.conf (superseded by the service)"
+  else
+    cat > /etc/systemd/system/gpu-watchdog.service <<'UNIT'
+[Unit]
+Description=Load AMD FCH watchdog (sp5100_tco) for reboot auto-recovery
+After=sysinit.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/modprobe sp5100_tco
+ExecStart=/bin/sh -c '[ -e /dev/watchdog ] || /sbin/modprobe softdog'
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable gpu-watchdog.service
+    rm -f /etc/modules-load.d/gpu-watchdog.conf
+  fi
   echo "  setting RebootWatchdogSec=$REBOOT_WATCHDOG_SEC in /etc/systemd/system.conf"
   run "cp -a /etc/systemd/system.conf '/etc/systemd/system.conf.bak-$TS'"
   run "sed -i -E 's/^#?RebootWatchdogSec=.*/RebootWatchdogSec=$REBOOT_WATCHDOG_SEC/' /etc/systemd/system.conf"
-  echo "[watchdog] done. After the NEXT clean reboot the watchdog is active; from then on a"
-  echo "           stalled reboot hard-resets after $REBOOT_WATCHDOG_SEC instead of needing a power cycle."
-  echo "           Tip for the CURRENT hung-reboot situation: 'sudo systemctl reboot' then if it"
-  echo "           stalls, force it with 'echo b > /proc/sysrq-trigger' (after 'echo s' to sync)."
+  echo "[watchdog] done. gpu-watchdog.service loads the watchdog on every boot; a stalled"
+  echo "           reboot now hard-resets after $REBOOT_WATCHDOG_SEC instead of needing a power cycle."
 }
 
 CMD="${1:-all}"
