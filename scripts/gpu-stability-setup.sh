@@ -33,7 +33,16 @@ set -euo pipefail
 LINUX_FIRMWARE_REPO="${LINUX_FIRMWARE_REPO:-https://gitlab.com/kernel-firmware/linux-firmware.git}"
 LINUX_FIRMWARE_REF="${LINUX_FIRMWARE_REF:-20260410}"
 REBOOT_WATCHDOG_SEC="${REBOOT_WATCHDOG_SEC:-2min}"
-CMDLINE_ADD="${CMDLINE_ADD:-amdgpu.cwsr_enable=0 amdgpu.runpm=0}"
+# NOTE: amdgpu.cwsr_enable=0 was tried (to work around the MES suspend wedge) but it
+# traded that for "Illegal opcode in command stream" (gfx_v11_0_bad_op_irq) faults under
+# heavy compute (gpt-oss-120b), which also hung the box. Rely on the MES-0x86 firmware
+# for the suspend wedge instead, and keep only runpm=0. If the MES wedge returns without
+# cwsr=0, the RuntimeWatchdogSec safety net (below) auto-recovers it.
+CMDLINE_ADD="${CMDLINE_ADD:-amdgpu.runpm=0}"
+# A reboot-hang fires RebootWatchdogSec; a *runtime* hang (ssh/servers unresponsive, the
+# 2026-06-25 lockup) needs RuntimeWatchdogSec — systemd pets the hw watchdog during normal
+# operation and the chip hard-resets the box if petting stops.
+RUNTIME_WATCHDOG_SEC="${RUNTIME_WATCHDOG_SEC:-60s}"
 WORKDIR="${WORKDIR:-/var/tmp/linux-firmware-update}"
 TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo backup)"
 
@@ -65,6 +74,12 @@ do_firmware() {
 # ---- 2. kernel cmdline -------------------------------------------------------
 do_cmdline() {
   local grub=/etc/default/grub
+  # Remove the deprecated amdgpu.cwsr_enable=0 (caused Illegal-opcode faults). Idempotent.
+  if grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=.*amdgpu\.cwsr_enable=0' "$grub" 2>/dev/null; then
+    echo "[cmdline] removing deprecated amdgpu.cwsr_enable=0"
+    run "cp -a '$grub' '$grub.bak-$TS'"
+    run "sed -i -E 's/ ?amdgpu\\.cwsr_enable=0//' '$grub'"
+  fi
   echo "[cmdline] ensuring '$CMDLINE_ADD' on GRUB_CMDLINE_LINUX_DEFAULT"
   local cur; cur="$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub" | head -1)"
   echo "  current: $cur"
@@ -114,11 +129,15 @@ UNIT
     systemctl enable gpu-watchdog.service
     rm -f /etc/modules-load.d/gpu-watchdog.conf
   fi
-  echo "  setting RebootWatchdogSec=$REBOOT_WATCHDOG_SEC in /etc/systemd/system.conf"
+  echo "  setting RebootWatchdogSec=$REBOOT_WATCHDOG_SEC + RuntimeWatchdogSec=$RUNTIME_WATCHDOG_SEC in /etc/systemd/system.conf"
   run "cp -a /etc/systemd/system.conf '/etc/systemd/system.conf.bak-$TS'"
   run "sed -i -E 's/^#?RebootWatchdogSec=.*/RebootWatchdogSec=$REBOOT_WATCHDOG_SEC/' /etc/systemd/system.conf"
-  echo "[watchdog] done. gpu-watchdog.service loads the watchdog on every boot; a stalled"
-  echo "           reboot now hard-resets after $REBOOT_WATCHDOG_SEC instead of needing a power cycle."
+  run "sed -i -E 's/^#?RuntimeWatchdogSec=.*/RuntimeWatchdogSec=$RUNTIME_WATCHDOG_SEC/' /etc/systemd/system.conf"
+  # Arm the runtime watchdog NOW (without a reboot) so a hang is auto-recovered immediately.
+  run "systemctl daemon-reexec"
+  echo "[watchdog] done. RuntimeWatchdogSec=$RUNTIME_WATCHDOG_SEC: if the box hangs (ssh/servers"
+  echo "           unresponsive) and systemd stops petting the watchdog, the chip hard-resets it —"
+  echo "           no physical power cycle. RebootWatchdogSec=$REBOOT_WATCHDOG_SEC covers stalled reboots."
 }
 
 CMD="${1:-all}"
