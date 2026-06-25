@@ -306,6 +306,68 @@ All knobs live under `config.guard` (sane defaults if omitted):
 > The governor protects against shutdown, but also check physical cooling / the
 > APU power cap if you run large models continuously.
 
+### GPU wedge alerting (Discord / email)
+
+On AMD Strix Halo (gfx1151) the iGPU can wedge under the ROCm-7-RC / older-firmware
+MES suspend bug — `/dev/kfd` starts returning `EINVAL` and local models go offline
+until a reboot. `scripts/gpu-wedge-alert.sh` is a standalone systemd-timer watchdog
+that detects this and **pings the operator directly**, independent of llama-manager
+(so it still alerts even if the manager itself is down or thrashing).
+
+What it does, every 2 minutes:
+- Detects a wedge from **`/dev/kfd` `EINVAL`** or **new fatal `amdgpu` kernel log lines**
+  (`MES failed to respond`, `GPU reset`, `unrecoverable`, ring timeouts).
+- On a state change (healthy→wedged, and wedged→recovered) sends a **Discord webhook**
+  message and an **email**, plus a local `wall`. It is debounced — it alerts on
+  transitions, not on every poll.
+
+Setup:
+
+```bash
+# 1. Install the timer + a chmod-600 config template at /etc/gpu-wedge-alert.env
+sudo ./scripts/gpu-wedge-alert.sh install
+
+# 2. Fill in your channels (the webhook URL is a secret — keep it in this file only)
+sudo nano /etc/gpu-wedge-alert.env
+#   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+#   ALERT_EMAIL=you@example.com        # needs an MTA (msmtp/sendmail); Discord works without one
+#   HOSTLABEL=Frostburn                # shown in the alert
+
+# 3. Verify both channels fire
+sudo ./scripts/gpu-wedge-alert.sh test
+```
+
+Create the Discord webhook under **Server Settings → Integrations → Webhooks**. Email
+requires a working `mail`/`sendmail` on the host; if you don't have one, Discord alone
+is fine. Check it's running with `systemctl status gpu-wedge-alert.timer`.
+
+### GPU stability hardening & reboot recovery
+
+`scripts/gpu-stability-setup.sh` prepares the host to run for days/weeks and to
+**recover a hung reboot without a physical power cycle**. It is backed-up, supports
+`--dry-run`, and never auto-reboots — firmware/cmdline changes apply on your next
+reboot.
+
+```bash
+sudo ./scripts/gpu-stability-setup.sh all --dry-run   # preview everything
+sudo ./scripts/gpu-stability-setup.sh all             # apply, then reboot when ready
+# or run a single concern: firmware | cmdline | watchdog
+```
+
+- **`firmware`** — updates `/lib/firmware/amdgpu` to current upstream (MES `0x86`,
+  which fixes the page-fault/hang class). Verify the pinned `LINUX_FIRMWARE_REF`
+  carries the gfx1151 blob before relying on it.
+- **`cmdline`** — adds `amdgpu.cwsr_enable=0 amdgpu.runpm=0` (workarounds for the
+  MES queue-suspend hang) to GRUB.
+- **`watchdog`** — loads the AMD FCH watchdog (`sp5100_tco`) and sets
+  `RebootWatchdogSec`, so a reboot that stalls on amdgpu shutdown **auto-hard-resets**
+  instead of hanging until a physical power cycle. (If the current GPU is already
+  wedged and a reboot stalls, force it with `echo s > /proc/sysrq-trigger; echo b > /proc/sysrq-trigger`.)
+
+Full background and the engine build process are in
+[`docs/llama-cpp-rocm-build-and-deployment.md`](docs/llama-cpp-rocm-build-and-deployment.md);
+the `system-health-monitor` skill watches these signals proactively.
+
 ## Adding Models
 
 ### HuggingFace token (gated/private models)
