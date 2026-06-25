@@ -59,8 +59,14 @@ echo
 # Start the Server in Router Mode
 ##
 
-# Build command with optional flags
-CMD="llama-server"
+# Build command with optional flags.
+# Use the FULL PATH to the managed binary, not a bare `llama-server`. The container's
+# non-login PATH resolves bare `llama-server` to a stale /usr/local/bin/llama-server,
+# which (with the freshly rebuilt shared libs in ~/llama.cpp/build/bin) is an
+# ABI mismatch and makes every model fail to load. The router also spawns its
+# per-model child servers using this same binary, so it must be the current build.
+LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$HOME/.local/bin/llama-server}"
+CMD="$LLAMA_SERVER_BIN"
 CMD="$CMD --models-dir $MODELS_DIR"
 CMD="$CMD --models-max $MODELS_MAX"
 CMD="$CMD --ctx-size $CONTEXT"
