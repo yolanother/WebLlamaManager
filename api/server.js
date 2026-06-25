@@ -36,6 +36,7 @@ import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots } from './slot-reaper.js';
 import { resolveDefaultModel, defaultModelListEntries } from './default-models.js';
+import { upstreamRetryPlan } from './upstream-retry.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -5985,17 +5986,14 @@ async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 100
           requestStatsAccum.retries++;
           // Track the upstream 500 in status codes so it appears in error code breakdown
           requestStatsAccum.statusCodes['500'] = (requestStatsAccum.statusCodes['500'] || 0) + 1;
-          // After 2 consecutive proxy errors, restart the server
-          if (attempt >= 1 && !hasRestarted) {
-            console.log(`[${label}] Multiple proxy errors, restarting llama server...`);
-            addLog(label, 'Multiple proxy errors detected, restarting llama server');
-            hasRestarted = true;
-            requestStatsAccum.restarts++;
-            recordCrashEvent({ exitCode: 500, trigger: 'fetch_retry', model });
-            await restartLlamaServer();
-          } else {
-            await waitForServerReady({ label });
-          }
+          // A proxy-error 500 means the ROUTER responded (so it is UP) and a child
+          // server is still loading the model. NEVER restart the router here — that
+          // kills the loading child, so a large model (gemma-4-12b+mmproj, gpt-oss-120b)
+          // can never finish loading. Just wait (the child keeps loading and stays warm)
+          // and retry. Restarts are reserved for connection errors (router unreachable).
+          const plan = upstreamRetryPlan({ kind: 'proxy', attempt, retries });
+          console.log(`[${label}] Router proxy error (child loading); waiting ${plan.delayMs}ms then retrying (attempt ${attempt + 1}/${retries + 1})`);
+          await new Promise(r => setTimeout(r, plan.delayMs));
           continue;
         }
         // Not a proxy error — return the original unconsumed response
