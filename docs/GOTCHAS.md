@@ -86,13 +86,13 @@ After the reboot:
 ```bash
 lsmod | grep amdxdna                              # should be empty
 python3 -c "import os; os.open('/dev/kfd', os.O_RDWR)"  # should succeed
-podman exec llama-rocm-7rc-rocwmma rocminfo | grep -E 'Marketing Name|gfx'
+podman exec llama-rocm-7.2.4 rocminfo | grep -E 'Marketing Name|gfx'
 ```
 
 **Verify**
 
 ```bash
-podman exec llama-rocm-7rc-rocwmma rocminfo | grep -E 'Marketing Name|gfx'
+podman exec llama-rocm-7.2.4 rocminfo | grep -E 'Marketing Name|gfx'
 # Should print: gfx1151 (or similar) and the Radeon marketing name.
 
 watch -n1 'cat /sys/class/drm/card*/device/gpu_busy_percent'
@@ -184,7 +184,7 @@ This is already baked into `container-start.sh`. If you launch
 After loading a model larger than VRAM:
 
 ```bash
-podman exec llama-rocm-7rc-rocwmma rocm-smi --showmeminfo all
+podman exec llama-rocm-7.2.4 rocm-smi --showmeminfo all
 ```
 
 GTT_Used should grow into the GB-range for a 7B+ model. With both this

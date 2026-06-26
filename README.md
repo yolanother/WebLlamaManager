@@ -87,8 +87,13 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
 ## Requirements
 
 - Node.js 18+
-- distrobox with the `llama-rocm-7rc-rocwmma` container (configurable via `DISTROBOX_CONTAINER` in `.env`)
-- llama.cpp compiled with ROCm support (inside the container)
+- distrobox with the ROCm 7.2.4 toolbox `llama-rocm-7.2.4` (image
+  `docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4`; selectable via
+  `DISTROBOX_CONTAINER`). It ships a prebuilt `/usr/local/bin/llama-server` — no
+  build step is required for normal operation.
+- llama.cpp with ROCm support — provided prebuilt by the toolbox above (a custom
+  build via `scripts/build-llama-cpp.sh` is optional). See
+  [`docs/llama-cpp-rocm-build-and-deployment.md`](docs/llama-cpp-rocm-build-and-deployment.md).
 
 ## Quick Start
 
@@ -308,9 +313,9 @@ All knobs live under `config.guard` (sane defaults if omitted):
 
 ### GPU wedge alerting (Discord / email)
 
-On AMD Strix Halo (gfx1151) the iGPU can wedge under the ROCm-7-RC / older-firmware
-MES suspend bug — `/dev/kfd` starts returning `EINVAL` and local models go offline
-until a reboot. `scripts/gpu-wedge-alert.sh` is a standalone systemd-timer watchdog
+On AMD Strix Halo (gfx1151) the iGPU can wedge under the older-firmware MES suspend
+bug — `/dev/kfd` starts returning `EINVAL` and local models go offline until a
+reboot. `scripts/gpu-wedge-alert.sh` is a standalone systemd-timer watchdog
 that detects this and **pings the operator directly**, independent of llama-manager
 (so it still alerts even if the manager itself is down or thrashing).
 
@@ -357,8 +362,9 @@ sudo ./scripts/gpu-stability-setup.sh all             # apply, then reboot when 
 - **`firmware`** — updates `/lib/firmware/amdgpu` to current upstream (MES `0x86`,
   which fixes the page-fault/hang class). Verify the pinned `LINUX_FIRMWARE_REF`
   carries the gfx1151 blob before relying on it.
-- **`cmdline`** — adds `amdgpu.cwsr_enable=0 amdgpu.runpm=0` (workarounds for the
-  MES queue-suspend hang) to GRUB.
+- **`cmdline`** — adds `amdgpu.runpm=0` (workaround for the MES queue-suspend hang)
+  to GRUB, and removes the deprecated `amdgpu.cwsr_enable=0` (it was a red herring
+  and caused illegal-opcode faults of its own).
 - **`watchdog`** — loads the AMD FCH watchdog (`sp5100_tco`) and sets
   `RebootWatchdogSec`, so a reboot that stalls on amdgpu shutdown **auto-hard-resets**
   instead of hanging until a physical power cycle. (If the current GPU is already
@@ -408,7 +414,11 @@ Check logs: `journalctl --user -u llama-manager -f`
 
 ### distrobox errors
 Ensure the container exists: `distrobox list`
-If not running, initialize it: `distrobox enter llama-rocm-7rc-rocwmma` (or set `DISTROBOX_CONTAINER` in `.env` to use a different container)
+If not running, initialize it: `distrobox enter llama-rocm-7.2.4` (or set
+`DISTROBOX_CONTAINER` in the `llama-manager.service` env to use a different
+container — note `.env` alone does not override the systemd user environment; see
+[`docs/llama-cpp-rocm-build-and-deployment.md`](docs/llama-cpp-rocm-build-and-deployment.md)).
+To create it: `distrobox create --name llama-rocm-7.2.4 --image docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4 --yes`
 
 ### Permission denied
 ```bash
@@ -511,7 +521,7 @@ place. Re-verify after any major distro upgrade.
 ```bash
 lsmod | grep amdxdna                                           # should be empty
 python3 -c "import os; os.open('/dev/kfd', os.O_RDWR)"         # should succeed (no EINVAL)
-podman exec llama-rocm-7rc-rocwmma rocminfo | grep -E 'gfx|Marketing Name'
+podman exec llama-rocm-7.2.4 rocminfo | grep -E 'gfx|Marketing Name'
 # Expected: gfx1151 and "AMD Radeon Graphics" (or similar)
 
 watch -n1 'cat /sys/class/drm/card*/device/gpu_busy_percent'
