@@ -38,6 +38,7 @@ import { findLeakedSlots } from './slot-reaper.js';
 import { resolveDefaultModel, defaultModelListEntries } from './default-models.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
+import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -197,6 +198,12 @@ let currentPreset = null;
 let lastUsedModel = null;   // most recently used model name
 let lastUsedModelTime = 0;  // timestamp of last use
 let activeLocalModel = null; // model currently being processed/loaded on local backend
+// Background-refreshed snapshot of the models the local router currently has resident,
+// as [{ id, sizeBytes }]. Read synchronously on the routing hot path by the
+// protect-resident offload gate (see protect-resident.js) so that gate never does I/O.
+// Refreshed off the hot path by refreshLoadedModelsSnapshot(); stale-on-error (kept, not
+// cleared) so a transient router blip can't toggle protection and cause an evict/reload.
+let loadedModelsSnapshot = [];
 let idleShutdown = false;   // true when server was stopped due to idle timeout
 
 // Request concurrency limiter for llama.cpp upstream requests
@@ -656,22 +663,23 @@ function resolveBackend(requestedModel, endpoint, body) {
   // missing, circuit open, queue full, etc.).
   const preferLocal = backends.preferLocal !== false;
   const pref = dispatchPreference({ preferLocal, thermalPaused: guardDispatchPaused });
-  if (pref.tryRemoteFirst) {
-    const endpointKey = endpoint.replace(/\//g, '/');
-    const hasViableRemote = backends.directory.some(b => {
-      if (!b.enabled || !b.tested) return false;
-      if (isBackendCircuitOpen(b.id)) return false;
-      if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
-      if (!b.modelMapping) return false;
-      if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
-      const queue = backendQueues.get(b.id);
-      if (queue && queue.active >= queue.concurrency) return false;
-      return true;
-    });
-    if (hasViableRemote) {
-      shouldOffload = true;
-      console.log(`[routing] Try-remote (${pref.reason}): "${requestedModel}" has a viable remote backend; keeping local slot free`);
-    }
+  // Whether some enabled/tested/non-tripped/under-capacity remote backend can serve the
+  // requested model. Computed once here and reused by both the try-remote-first path and the
+  // protect-resident gate below (which both need it).
+  const viableRemoteEndpointKey = endpoint.replace(/\//g, '/');
+  const hasViableRemote = backends.directory.some(b => {
+    if (!b.enabled || !b.tested) return false;
+    if (isBackendCircuitOpen(b.id)) return false;
+    if (b.supportedEndpoints && !b.supportedEndpoints.includes(viableRemoteEndpointKey)) return false;
+    if (!b.modelMapping) return false;
+    if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
+    const queue = backendQueues.get(b.id);
+    if (queue && queue.active >= queue.concurrency) return false;
+    return true;
+  });
+  if (pref.tryRemoteFirst && hasViableRemote) {
+    shouldOffload = true;
+    console.log(`[routing] Try-remote (${pref.reason}): "${requestedModel}" has a viable remote backend; keeping local slot free`);
   }
 
   if (!shouldOffload) {
@@ -724,6 +732,30 @@ function resolveBackend(requestedModel, endpoint, body) {
         shouldOffload = true;
         console.log(`[routing] Offloading: ~${inputTokens} input tokens, estimated ${Math.round(estimatedMs)}ms local processing > ${offloadThresholdMs}ms threshold`);
       }
+    }
+  }
+
+  // Protect-resident gate (anti-thrash for the big model). If a large model (e.g. the 65GB
+  // gpt-oss-120b) is resident locally and the local slots are full, loading a DIFFERENT model
+  // would evict it -> slow reload + amdgpu suspend-wedge risk. When a remote can serve this
+  // request instead, offload it and keep the big model resident. This is an ADDITIONAL offload
+  // reason layered on top of the policy checks above: it only fires when nothing else already
+  // chose to offload, and is a strict no-op whenever no protected model is resident (or when a
+  // free slot fits, or no viable remote exists) per protectResidentDecision().
+  if (!shouldOffload) {
+    const prCfg = backends.protectResident || {};
+    const prDecision = protectResidentDecision({
+      requestedModel,
+      loadedModels: loadedModelsSnapshot,
+      modelsMax: parseInt(process.env.MODELS_MAX) || 2,
+      hasViableRemote,
+      protectMinBytes: prCfg.minBytes ?? DEFAULT_PROTECT_MIN_BYTES,
+      enabled: prCfg.enabled !== false,
+    });
+    if (prDecision.offload) {
+      shouldOffload = true;
+      const bigModel = prDecision.reason.replace(/^protect-resident:/, '');
+      console.log(`[routing] protect-resident: keeping ${bigModel} resident, offloading ${requestedModel} to remote (${prDecision.reason})`);
     }
   }
 
@@ -1916,6 +1948,81 @@ function resolveModelSizeBytes(modelId) {
     return best;
   } catch { return 0; }
 }
+
+// path -> on-disk size cache so the loaded-models snapshot refresher never re-stats an
+// unchanged GGUF. Sizes only change when a file is replaced, which is rare relative to the
+// per-few-seconds refresh, so a simple unbounded cache keyed by absolute path is fine.
+const ggufFileSizeCache = new Map();
+
+/**
+ * Best-effort on-disk size (bytes) of the GGUF at `modelPath`, summing split parts
+ * (`-00001-of-000NN.gguf`) so a multi-part big model isn't undercounted below the protect
+ * threshold. Cached by path; returns 0 on any failure (treated as "unknown" -> not protected).
+ * @param {string} modelPath Absolute path to the (first) GGUF file, from `--model <path>`.
+ * @returns {number} Total bytes, or 0 if unreadable.
+ */
+function ggufFileSizeBytes(modelPath) {
+  if (!modelPath) return 0;
+  if (ggufFileSizeCache.has(modelPath)) return ggufFileSizeCache.get(modelPath);
+  let size = 0;
+  try {
+    const split = modelPath.match(/^(.*)-(\d{5})-of-(\d{5})\.gguf$/);
+    if (split) {
+      const total = parseInt(split[3], 10);
+      for (let i = 1; i <= total; i++) {
+        const part = `${split[1]}-${String(i).padStart(5, '0')}-of-${split[3]}.gguf`;
+        try { size += statSync(part).size; } catch {}
+      }
+    } else {
+      size = statSync(modelPath).size;
+    }
+  } catch { size = 0; }
+  ggufFileSizeCache.set(modelPath, size);
+  return size;
+}
+
+/**
+ * Pure: turn a router `/v1/models` `data` array into the `[{ id, sizeBytes }]` shape that
+ * protectResidentDecision() consumes. Keeps only models the router reports as resident
+ * (`status.value === 'loaded'`) and resolves each size via the injected `sizeOf` resolver,
+ * extracting the GGUF path from the model's `--model <path>` launch arg. Side-effect free so
+ * it can be unit-tested against captured router responses.
+ * @param {Array<object>} modelsData The `data` array from a router /v1/models response.
+ * @param {(path: (string|null), id: string) => number} sizeOf Resolves bytes for a model.
+ * @returns {Array<{id: string, sizeBytes: number}>} Resident models with sizes.
+ */
+function buildLoadedModels(modelsData, sizeOf) {
+  if (!Array.isArray(modelsData)) return [];
+  return modelsData
+    .filter(m => m && m.status?.value === 'loaded')
+    .map(m => {
+      const args = Array.isArray(m.status?.args) ? m.status.args : [];
+      const i = args.indexOf('--model');
+      const path = i >= 0 && i + 1 < args.length ? args[i + 1] : null;
+      return { id: m.id, sizeBytes: sizeOf(path, m.id) };
+    });
+}
+
+/**
+ * Refresh loadedModelsSnapshot from the local router's model list. Runs off the routing hot
+ * path (interval + at boot). Sizes come from the on-disk GGUF (cached); if the GGUF path is
+ * missing/unreadable it falls back to name-matching the local model catalog. On any fetch/parse
+ * error the previous snapshot is intentionally KEPT (not cleared) so a transient router blip
+ * can't briefly disable protect-resident and trigger an evict/reload of the big model.
+ */
+async function refreshLoadedModelsSnapshot() {
+  try {
+    const res = await fetch(`http://localhost:${LLAMA_PORT}/models`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return;
+    const data = await res.json();
+    loadedModelsSnapshot = buildLoadedModels(
+      data.data,
+      (path, id) => ggufFileSizeBytes(path) || resolveModelSizeBytes(id)
+    );
+  } catch { /* keep the last good snapshot; tolerate transient failures */ }
+}
+setInterval(refreshLoadedModelsSnapshot, 5000).unref?.();
+refreshLoadedModelsSnapshot();
 
 /** Total resident memory (bytes) held by all running llama-server processes. */
 function llamaServerRssBytes() {
