@@ -2165,87 +2165,134 @@ async function getSystemStats() {
   };
 }
 
-// Get context usage stats from loaded models
+// Best-effort per-slot occupied-context token count. llama.cpp's /slots shape
+// varies by build: newer router builds (e.g. the v9820 engine) return a minimal
+// slot object ({ id, n_ctx, speculative, is_processing }) with no token counts,
+// while older/verbose builds expose occupancy fields and/or a `next_token` array.
+// Probe the known numeric fields in priority order, then fall back to the legacy
+// next_token shape. Returns 0 when the build exposes no occupancy data.
+function slotUsedTokens(slot) {
+  if (!slot || typeof slot !== 'object') return 0;
+  // Direct numeric occupancy fields, most-meaningful first.
+  // n_past = tokens currently in the KV cache (true context occupancy);
+  // n_decoded / n_prompt_tokens are processing-time fallbacks.
+  for (const key of ['n_past', 'n_decoded', 'n_prompt_tokens']) {
+    const v = slot[key];
+    if (typeof v === 'number' && v > 0) return v;
+  }
+  // Legacy verbose shape: array of pending decode entries.
+  if (Array.isArray(slot.next_token)) {
+    let sum = 0;
+    for (const nt of slot.next_token) sum += nt?.n_decoded || 0;
+    return sum;
+  }
+  return 0;
+}
+
+// Pure context-stats reducer (no IO, so it can be unit-tested in isolation).
+// Given the router's loaded models and the slots data fetched for each (keyed by
+// model id), compute per-model and aggregate context totals. A null entry in
+// slotsByModel means the /slots fetch failed; an empty/absent array means the
+// build returned no slots — in both cases the model is still reported as loaded
+// using its configured --ctx-size so the dashboard Context card shows it.
+//
+// @param {Array<{id: string, status?: {args?: string[]}}>} loadedModels
+// @param {Map<string, Array<object>|null>} slotsByModel
+// @returns {{models: Array, totalContext: number, usedContext: number, usage: number}}
+function computeContextStats(loadedModels, slotsByModel) {
+  const modelStats = [];
+  let totalContext = 0;
+  let usedContext = 0;
+
+  for (const model of loadedModels) {
+    // Extract the configured context window from the spawn args as a fallback.
+    const args = model.status?.args || [];
+    const ctxIndex = args.indexOf('--ctx-size');
+    const configuredCtx = ctxIndex >= 0 ? (parseInt(args[ctxIndex + 1]) || 0) : 0;
+
+    const slots = slotsByModel.get(model.id);
+
+    if (Array.isArray(slots) && slots.length > 0) {
+      let modelTotalCtx = 0;
+      let modelUsedCtx = 0;
+      for (const slot of slots) {
+        modelTotalCtx += slot.n_ctx || 0;
+        modelUsedCtx += slotUsedTokens(slot);
+      }
+      // Builds that omit n_ctx fall back to the configured context size.
+      if (modelTotalCtx === 0 && configuredCtx > 0) modelTotalCtx = configuredCtx;
+
+      modelStats.push({
+        id: model.id,
+        slots: slots.length,
+        totalContext: modelTotalCtx,
+        usedContext: modelUsedCtx,
+        usage: modelTotalCtx > 0 ? Math.round((modelUsedCtx / modelTotalCtx) * 1000) / 10 : 0
+      });
+      totalContext += modelTotalCtx;
+      usedContext += modelUsedCtx;
+    } else {
+      // Slots unavailable (fetch failed, or build returned none). Still surface
+      // the model as loaded with its configured context window.
+      const stat = {
+        id: model.id,
+        slots: 0,
+        totalContext: configuredCtx,
+        usedContext: 0,
+        usage: 0
+      };
+      if (slots === null) stat.error = 'unreachable';
+      modelStats.push(stat);
+      totalContext += configuredCtx;
+    }
+  }
+
+  return {
+    models: modelStats,
+    totalContext,
+    usedContext,
+    usage: totalContext > 0 ? Math.round((usedContext / totalContext) * 1000) / 10 : 0
+  };
+}
+
+// Get context usage stats from loaded models. Fetches the router's model list,
+// then asks the router's /slots proxy for each loaded model's slot info.
+//
+// IMPORTANT: slots MUST be fetched from the router (LLAMA_PORT) using
+// `/slots?model=<id>`, NOT from the child server's --port pulled out of
+// status.args. The child --port is internal to the router and is not reachable
+// from the manager, so the old per-child-port fetch always failed — which left
+// modelStats empty and made the dashboard report "No models loaded" even when
+// models were loaded. This mirrors how fetchSlots()/isUpstreamProcessing()/
+// probeSlotCount() talk to the router elsewhere in this file.
 async function getContextStats() {
   try {
-    // Get list of models
+    // Get list of models from the router.
     const modelsResponse = await fetch(`http://localhost:${LLAMA_PORT}/models`);
     if (!modelsResponse.ok) return null;
 
     const modelsData = await modelsResponse.json();
     const models = modelsData.data || [];
 
-    // Find loaded models and get their slot info
     const loadedModels = models.filter(m => m.status?.value === 'loaded');
     if (loadedModels.length === 0) return { models: [], totalContext: 0, usedContext: 0, usage: 0 };
 
-    const modelStats = [];
-    let totalContext = 0;
-    let usedContext = 0;
-
+    // Fetch slot info per loaded model via the router's /slots proxy.
+    const slotsByModel = new Map();
     for (const model of loadedModels) {
-      // Extract port from args
-      const args = model.status?.args || [];
-      const portIndex = args.indexOf('--port');
-      const port = portIndex >= 0 ? parseInt(args[portIndex + 1]) : null;
-
-      // Extract ctx-size from args
-      const ctxIndex = args.indexOf('--ctx-size');
-      const configuredCtx = ctxIndex >= 0 ? parseInt(args[ctxIndex + 1]) : 0;
-
-      if (port && port > 0) {
-        try {
-          const slotsResponse = await fetch(`http://localhost:${port}/slots`, { signal: AbortSignal.timeout(2000) });
-          if (slotsResponse.ok) {
-            const slots = await slotsResponse.json();
-            // Sum up context across all slots
-            let modelTotalCtx = 0;
-            let modelUsedCtx = 0;
-
-            for (const slot of slots) {
-              modelTotalCtx += slot.n_ctx || 0;
-              // n_decoded represents tokens in the context
-              if (slot.next_token && Array.isArray(slot.next_token)) {
-                for (const nt of slot.next_token) {
-                  modelUsedCtx += nt.n_decoded || 0;
-                }
-              }
-            }
-
-            modelStats.push({
-              id: model.id,
-              port,
-              slots: slots.length,
-              totalContext: modelTotalCtx,
-              usedContext: modelUsedCtx,
-              usage: modelTotalCtx > 0 ? Math.round((modelUsedCtx / modelTotalCtx) * 1000) / 10 : 0
-            });
-
-            totalContext += modelTotalCtx;
-            usedContext += modelUsedCtx;
-          }
-        } catch {
-          // Worker might be busy or unreachable
-          modelStats.push({
-            id: model.id,
-            port,
-            slots: 0,
-            totalContext: configuredCtx,
-            usedContext: 0,
-            usage: 0,
-            error: 'unreachable'
-          });
-          totalContext += configuredCtx;
-        }
+      try {
+        const slotsResponse = await fetch(
+          `http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model.id)}`,
+          { signal: AbortSignal.timeout(2000) }
+        );
+        slotsByModel.set(model.id, slotsResponse.ok ? await slotsResponse.json() : null);
+      } catch {
+        // Router busy or unreachable for this model.
+        slotsByModel.set(model.id, null);
       }
     }
 
-    return {
-      models: modelStats,
-      totalContext,
-      usedContext,
-      usage: totalContext > 0 ? Math.round((usedContext / totalContext) * 1000) / 10 : 0
-    };
+    return computeContextStats(loadedModels, slotsByModel);
   } catch {
     return null;
   }
