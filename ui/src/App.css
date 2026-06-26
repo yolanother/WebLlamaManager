@@ -5519,6 +5519,90 @@ input::placeholder {
 .model-tps-empty {
   color: var(--text-secondary, #4b5563);
 }
+.model-breakdown-none {
+  text-align: center;
+  color: var(--text-secondary, #6b7280);
+  font-style: italic;
+  padding: 14px 12px;
+}
+.model-breakdown-toggle {
+  margin-top: 8px;
+  background: transparent;
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: 6px;
+  color: var(--text-secondary, #9ca3af);
+  font-size: 12px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.model-breakdown-toggle:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--accent);
+  color: var(--text-primary, #e5e7eb);
+}
+
+/* Compact Server Status strip + tighter card row */
+.server-status-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 16px;
+  margin-bottom: 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 8px;
+}
+.server-status-strip.success { border-left-color: var(--success); }
+.server-status-strip.warning { border-left-color: var(--warning); }
+.server-status-strip.error { border-left-color: var(--error); }
+.status-strip-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.status-strip-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  flex-shrink: 0;
+}
+.status-strip-dot.success { background: var(--success); box-shadow: 0 0 8px var(--success); }
+.status-strip-dot.warning { background: var(--warning); box-shadow: 0 0 8px var(--warning); }
+.status-strip-dot.error { background: var(--error); }
+.status-strip-state {
+  font-size: 14px;
+  font-weight: 600;
+}
+.status-strip-right {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.status-strip-temp {
+  color: var(--text-secondary);
+}
+.status-strip-guard {
+  font-weight: 600;
+}
+.status-strip-guard.throttling { color: var(--warning, #f59e0b); }
+.status-strip-guard.critical { color: var(--error, #ef4444); }
+
+/* Compact card row (post-redesign Server Status) */
+.status-grid-compact {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+.status-grid-compact .stat-card {
+  padding: 12px 16px;
+}
+.status-grid-compact .loaded-models-card.compact {
+  padding: 12px 16px;
+}
 
 .loaded-models-list {
   display: flex;

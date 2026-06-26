@@ -774,6 +774,9 @@ function ModelTpsRankChart({ modelBreakdown, window = 'all', height = 200 }) {
 // all-time windows. Color-codes the backend cell so users can tell local
 // vs each remote backend at a glance.
 function ModelPerformanceBreakdown({ modelBreakdown }) {
+  // Stale models (no activity in the last 24h) are collapsed behind a
+  // "show more" toggle by default so the table only surfaces what ran recently.
+  const [showStale, setShowStale] = useState(false);
   const models = modelBreakdown?.models || [];
   if (models.length === 0) {
     return <div className="chart-empty">No model data yet</div>;
@@ -784,6 +787,39 @@ function ModelPerformanceBreakdown({ modelBreakdown }) {
     { key: '30d', label: '30 days' },
     { key: 'all', label: 'all time' }
   ];
+  // A model is "active" if it has a real tok/s value in the last 24h window.
+  const isActive24h = (m) => (m.windows?.['24h']?.tps || 0) > 0;
+  const activeModels = models.filter(isActive24h);
+  const staleModels = models.filter(m => !isActive24h(m));
+  const visibleModels = showStale ? [...activeModels, ...staleModels] : activeModels;
+
+  const renderRow = (m) => (
+    <tr key={m.name}>
+      <td>
+        <span className="model-backend-pill" style={{ background: backendColor(m.backend), color: '#0a0a0a' }}>
+          {m.isRemote ? m.backend : 'local'}
+        </span>
+      </td>
+      <td className="model-cell-name" title={m.model}>{m.model}</td>
+      {windows.map(w => {
+        const t = m.windows?.[w.key]?.tps || 0;
+        const r = m.windows?.[w.key]?.requests || 0;
+        return (
+          <td key={w.key} className="num">
+            {t > 0 ? (
+              <>
+                <span className="model-tps-val">{t.toFixed(1)}</span>
+                <span className="model-tps-unit"> tok/s</span>
+                <div className="model-tps-reqs">{r.toLocaleString()} req</div>
+              </>
+            ) : <span className="model-tps-empty">—</span>}
+          </td>
+        );
+      })}
+      <td className="num">{(m.windows?.all?.requests || 0).toLocaleString()}</td>
+    </tr>
+  );
+
   return (
     <div className="model-breakdown-table-wrap">
       <table className="model-breakdown-table">
@@ -796,34 +832,25 @@ function ModelPerformanceBreakdown({ modelBreakdown }) {
           </tr>
         </thead>
         <tbody>
-          {models.map(m => (
-            <tr key={m.name}>
-              <td>
-                <span className="model-backend-pill" style={{ background: backendColor(m.backend), color: '#0a0a0a' }}>
-                  {m.isRemote ? m.backend : 'local'}
-                </span>
+          {visibleModels.length === 0 && (
+            <tr>
+              <td colSpan={windows.length + 3} className="model-breakdown-none">
+                No models active in the last 24h
               </td>
-              <td className="model-cell-name" title={m.model}>{m.model}</td>
-              {windows.map(w => {
-                const t = m.windows?.[w.key]?.tps || 0;
-                const r = m.windows?.[w.key]?.requests || 0;
-                return (
-                  <td key={w.key} className="num">
-                    {t > 0 ? (
-                      <>
-                        <span className="model-tps-val">{t.toFixed(1)}</span>
-                        <span className="model-tps-unit"> tok/s</span>
-                        <div className="model-tps-reqs">{r.toLocaleString()} req</div>
-                      </>
-                    ) : <span className="model-tps-empty">—</span>}
-                  </td>
-                );
-              })}
-              <td className="num">{(m.windows?.all?.requests || 0).toLocaleString()}</td>
             </tr>
-          ))}
+          )}
+          {visibleModels.map(renderRow)}
         </tbody>
       </table>
+      {staleModels.length > 0 && (
+        <button
+          type="button"
+          className="model-breakdown-toggle"
+          onClick={() => setShowStale(s => !s)}
+        >
+          {showStale ? 'Show less' : `Show ${staleModels.length} more`}
+        </button>
+      )}
     </div>
   );
 }
@@ -1375,6 +1402,20 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const llamaPort = stats?.llamaPort || 5251;
   const llamaUiUrl = stats?.llamaUiUrl || `http://${window.location.hostname}:${llamaPort}`;
 
+  // Count of models that are ACTUALLY loaded — not all available models.
+  // serverModels is the full available-model list reported by the llama.cpp
+  // router (e.g. 16 entries), but only a couple are loaded at a time. The
+  // router reports each model's real state in status.value ('loaded' |
+  // 'unloaded'), so prefer that. If serverModels carries no status info, fall
+  // back to the router's loaded set in stats.context.models.
+  const serverModelsHaveStatus = serverModels.some(m => m && m.status != null);
+  const loadedModelCount = serverModelsHaveStatus
+    ? serverModels.filter(m => (m.status?.value ?? m.status) === 'loaded').length
+    : (stats?.context?.models?.length || 0);
+
+  // Thermal-guard state — folded into the status strip's right side.
+  const guardActive = !!(stats?.guard && stats.guard.state && stats.guard.state !== 'normal');
+
   // Prepare history chart data
   const historyPoints = (historyData?.points || []).map(p => ({
     ...p,
@@ -1619,7 +1660,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               <div className="stat-card loaded-models-card">
                 <span className="stat-icon">&#x1F4E6;</span>
                 <div className="stat-content">
-                  <span className="stat-value">{serverModels.length} Loaded</span>
+                  <span className="stat-value">{loadedModelCount} Loaded</span>
                   <span className="stat-label">Models</span>
                   {serverModels.length > 0 && (
                     <div className="loaded-models-list">
@@ -1962,13 +2003,25 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
       {/* Server Status */}
       <section className="dashboard-section">
         <h3>Server Status</h3>
-        <div className="status-grid">
-          <StatCard
-            label="Status"
-            value={isHealthy ? 'Running' : stats?.mode ? 'Starting' : 'Stopped'}
-            status={isHealthy ? 'success' : stats?.mode ? 'warning' : 'error'}
-            icon="&#x1F7E2;"
-          />
+        {/* Thin status strip: run-state on the left, thermal guard / temps on the right */}
+        <div className={`server-status-strip ${guardActive ? (stats.guard.state === 'critical' ? 'error' : 'warning') : (isHealthy ? 'success' : stats?.mode ? 'warning' : 'error')}`}>
+          <div className="status-strip-left">
+            <span className={`status-strip-dot ${isHealthy ? 'success' : stats?.mode ? 'warning' : 'error'}`} />
+            <span className="status-strip-state">{isHealthy ? 'Running' : stats?.mode ? 'Starting' : 'Stopped'}</span>
+          </div>
+          <div className="status-strip-right">
+            {guardActive ? (
+              <span className={`status-strip-guard ${stats.guard.state === 'critical' ? 'critical' : 'throttling'}`}>
+                &#x1F525; {stats.guard.state === 'critical' ? 'Critical — unloaded' : 'Throttling'} {Math.round(stats.guard.maxTempC)}°C (gpu {Math.round(stats.guard.gpuC)} / cpu {Math.round(stats.guard.cpuC)})
+              </span>
+            ) : stats?.gpu?.temperature != null ? (
+              <span className="status-strip-temp">
+                GPU {stats.gpu.temperature.toFixed(0)}°C{stats?.cpu?.temperature ? ` · CPU ${stats.cpu.temperature}°C` : ''}
+              </span>
+            ) : null}
+          </div>
+        </div>
+        <div className="status-grid status-grid-compact">
           <StatCard
             label="Mode"
             value={isSingleMode ? 'Single Model' : 'Router (Multi)'}
@@ -1976,12 +2029,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             icon="&#x1F3AF;"
             status={stats?.activeModel ? 'active' : undefined}
           />
-          <div className="stat-card loaded-models-card">
+          <div className="stat-card loaded-models-card compact">
             <span className="stat-icon">&#x1F4E6;</span>
             <div className="stat-content">
-              <span className="stat-value">{serverModels.length} Loaded</span>
+              <span className="stat-value">{loadedModelCount} Loaded</span>
               <span className="stat-label">Models</span>
-              {serverModels.length > 0 ? (
+              {loadedModelCount === 0 && (
+                <span className="loaded-model-none">No models loaded</span>
+              )}
+              {serverModels.length > 0 && (
                 <div className="loaded-models-list">
                   {serverModels.map((m, i) => {
                     const modelId = m.id || m.model || '';
@@ -1996,24 +2052,8 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     );
                   })}
                 </div>
-              ) : (
-                <span className="loaded-model-none">No models loaded</span>
               )}
             </div>
-          </div>
-          <div className="stat-card link-card">
-            <a
-              href={llamaUiUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              <span className="stat-icon">&#x1F310;</span>
-              <div className="stat-content">
-                <span className="stat-value">Open llama.cpp</span>
-                <span className="stat-label">{stats?.llamaUiUrl ? 'External' : `Port ${llamaPort}`}</span>
-              </div>
-              <span className="link-arrow">↗</span>
-            </a>
           </div>
           {stats?.embed && (
             <StatCard
@@ -2022,15 +2062,6 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               subValue={stats.embed.model ? `${String(stats.embed.model).split('/').pop()} :${stats.embed.port}` : 'no model'}
               icon="&#x1F9EE;"
               status={stats.embed.status === 'ok' ? 'success' : stats.embed.status === 'disabled' ? '' : 'error'}
-            />
-          )}
-          {stats?.guard && stats.guard.state && stats.guard.state !== 'normal' && (
-            <StatCard
-              label="Thermal Guard"
-              value={stats.guard.state === 'critical' ? 'Critical — unloaded' : 'Throttling'}
-              subValue={`${Math.round(stats.guard.maxTempC)}°C (gpu ${Math.round(stats.guard.gpuC)} / cpu ${Math.round(stats.guard.cpuC)})`}
-              icon="&#x1F525;"
-              status="error"
             />
           )}
         </div>
