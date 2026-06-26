@@ -377,7 +377,13 @@ function useWebSocket() {
             });
           } else if (message.type === 'llmLog') {
             setLlmLogs(prev => {
-              const newLogs = [...prev, message.data];
+              // Replace in place if this id was already seen (the server can broadcast
+              // the same entry twice — e.g. a backfill replay), so the list never holds
+              // duplicate ids that would collide as React keys.
+              const i = message.data.id != null ? prev.findIndex(l => l.id === message.data.id) : -1;
+              const newLogs = i >= 0
+                ? prev.map((l, j) => (j === i ? message.data : l))
+                : [...prev, message.data];
               return newLogs.slice(-MAX_LLM_LOGS);
             });
           } else if (message.type === 'activeRequest') {
@@ -3758,9 +3764,15 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
   }, [activeTab, llmLogsLoaded]);
 
   const allLlmLogs = React.useMemo(() => {
-    const wsIds = new Set(llmLogs.map(l => l.id));
-    const historical = fetchedLlmLogs.filter(l => !wsIds.has(l.id));
-    return [...historical, ...llmLogs].slice(-50);
+    // Dedupe by id across BOTH sources and within each (the server can emit the same
+    // entry twice — e.g. a backfill replays an id). A Map keyed by id keeps the first
+    // seen position (chronological) while letting the live WS copy win on value, so the
+    // list never renders duplicate React keys (which silently mis-render cards).
+    const byId = new Map();
+    let autoKey = 0;
+    for (const l of fetchedLlmLogs) byId.set(l.id ?? `h${autoKey++}`, l);
+    for (const l of llmLogs) byId.set(l.id ?? `w${autoKey++}`, l);
+    return [...byId.values()].slice(-50);
   }, [fetchedLlmLogs, llmLogs]);
 
   const handleClearLlmLogs = async () => {
