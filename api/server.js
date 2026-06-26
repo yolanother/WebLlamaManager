@@ -5902,6 +5902,49 @@ async function waitForServerReady({ maxWait = 30000, pollInterval = 2000, label 
   return false;
 }
 
+// Max time to wait for a model to finish loading before giving up. A 65GB model
+// (gpt-oss-120b) can take well over a minute to load, especially under contention —
+// far longer than the old 30s ready window. Tunable via env.
+const MODEL_LOAD_WAIT_MS = parseInt(process.env.MODEL_LOAD_WAIT_MS) || 180000;
+
+// Is the llama.cpp ROUTER itself reachable? Used to distinguish "a model is still
+// loading" (router up, child not yet serving — wait it out) from "the router crashed"
+// (unreachable — restart). Checking the router's own /health (not the child) is what
+// stops the restart-thrash that used to kill a loading 65GB child and loop.
+async function isRouterHealthy() {
+  try {
+    const res = await fetch(`http://localhost:${LLAMA_PORT}/health`, { signal: AbortSignal.timeout(2000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Poll the router until `model` reports status 'loaded'. Returns true once loaded,
+// false on timeout. Lets a connection error during a model load be WAITED OUT instead
+// of misread as a crash. Falls back to a plain readiness wait when no model is given.
+async function waitForModelReady(model, { maxWait = MODEL_LOAD_WAIT_MS, pollInterval = 2000, label = 'proxy' } = {}) {
+  if (!model) return waitForServerReady({ label, maxWait });
+  const deadline = Date.now() + maxWait;
+  console.log(`[${label}] Waiting up to ${maxWait / 1000}s for model "${model}" to finish loading...`);
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://localhost:${LLAMA_PORT}/v1/models`, { signal: AbortSignal.timeout(3000) });
+      if (res.ok) {
+        const data = await res.json();
+        const m = (data.data || []).find(x => x.id === model);
+        if (m?.status?.value === 'loaded') {
+          console.log(`[${label}] model "${model}" finished loading`);
+          return true;
+        }
+      }
+    } catch { /* router momentarily unreachable — keep polling */ }
+    await new Promise(r => setTimeout(r, pollInterval));
+  }
+  console.error(`[${label}] model "${model}" did not finish loading within ${maxWait / 1000}s`);
+  return false;
+}
+
 // Acquire a llamaQueue slot tied to the response lifecycle. The slot is held until
 // the HTTP response closes or finishes — covering the full body stream so concurrency=1
 // actually serializes GPU work. Returns { release, queueWait }. Safe to call once per
@@ -6085,18 +6128,24 @@ async function _fetchWithRetryInner(url, options, { retries = 5, baseDelay = 100
       }
       const delay = baseDelay * Math.pow(2, attempt);
       console.log(`[${label}] Connection failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delay}ms: ${err.message} (code: ${realCode || 'none'})`);
-      // If connection failed, server may have crashed
+      // If connection failed, the model may simply still be LOADING (a 65GB model can
+      // take far longer than the old 30s window). Only treat this as a crash + restart
+      // if the ROUTER ITSELF is unreachable — restarting on a still-loading child killed
+      // it and thrashed (each restart caused more ECONNREFUSED -> more restarts). If the
+      // router answers /health, a child is loading/briefly unavailable: WAIT for the
+      // model to finish loading instead of restarting.
       if (isConnectionError) {
-        // After 2 consecutive connection failures, restart the server
-        if (attempt >= 1 && !hasRestarted) {
-          console.log(`[${label}] Server appears crashed (${realCode || err.message}), restarting llama server...`);
-          addLog(label, `Server appears crashed (${realCode || err.message}), restarting llama server`);
+        const routerHealthy = await isRouterHealthy();
+        if (!routerHealthy && attempt >= 1 && !hasRestarted) {
+          console.log(`[${label}] Router unreachable (${realCode || err.message}), restarting llama server...`);
+          addLog(label, `Router unreachable (${realCode || err.message}), restarting llama server`);
           hasRestarted = true;
           requestStatsAccum.restarts++;
           recordCrashEvent({ exitCode: realCode || 'CONNFAIL', trigger: 'fetch_retry', model });
           await restartLlamaServer();
         } else {
-          await waitForServerReady({ label });
+          // Router is up (model still loading) or first attempt — wait it out.
+          await waitForModelReady(model, { label });
         }
       } else {
         await new Promise(r => setTimeout(r, delay));
