@@ -13,6 +13,11 @@ set -euo pipefail
 : "${NO_WARMUP:=}"
 : "${FLASH_ATTN:=}"
 : "${GPU_LAYERS:=99}"
+# Where the router (and the per-model children it spawns) persist slot KV caches.
+# The manager (api/server.js) saves/restores conversation contexts here so a model
+# reload doesn't force a cold re-prefill. distrobox shares $HOME, so this same path
+# is visible to the manager on the host. Empty disables slot persistence.
+: "${SLOT_SAVE_PATH:=$HOME/.cache/llama-slots}"
 
 # AMD GPU settings
 export HSA_OVERRIDE_GFX_VERSION=11.5.1
@@ -35,6 +40,9 @@ export LLAMA_CACHE="$MODELS_DIR"
 # Ensure models directory exists
 mkdir -p "$MODELS_DIR"
 
+# Ensure the slot-save directory exists (router writes KV dumps here)
+[ -n "$SLOT_SAVE_PATH" ] && mkdir -p "$SLOT_SAVE_PATH"
+
 ##
 # Log the config
 ##
@@ -48,6 +56,7 @@ echo "CONTEXT=$CONTEXT"
 echo "GPU_LAYERS=$GPU_LAYERS"
 [ -n "$NO_WARMUP" ] && echo "NO_WARMUP=enabled"
 [ -n "$FLASH_ATTN" ] && echo "FLASH_ATTN=enabled"
+[ -n "$SLOT_SAVE_PATH" ] && echo "SLOT_SAVE_PATH=$SLOT_SAVE_PATH"
 echo
 echo "Available models:"
 find "$MODELS_DIR" -name "*.gguf" -type f 2>/dev/null | head -20 || echo "  (none yet)"
@@ -77,6 +86,9 @@ CMD="$CMD --host 0.0.0.0"
 CMD="$CMD --port $PORT"
 [ -n "$NO_WARMUP" ] && CMD="$CMD --no-warmup"
 [ -n "$FLASH_ATTN" ] && CMD="$CMD --flash-attn on"
+# --slot-save-path is propagated by the router to every per-model child server,
+# enabling POST /slots/{id}?action=save|restore for conversation KV persistence.
+[ -n "$SLOT_SAVE_PATH" ] && CMD="$CMD --slot-save-path $SLOT_SAVE_PATH"
 
 echo "Command: $CMD"
 exec $CMD

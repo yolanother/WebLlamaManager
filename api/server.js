@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { spawn, exec, execSync } from 'child_process';
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, basename } from 'path';
 import { createServer } from 'http';
@@ -37,6 +37,7 @@ import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent
 import { findLeakedSlots } from './slot-reaper.js';
 import { resolveDefaultModel, defaultModelListEntries } from './default-models.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
+import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -378,6 +379,126 @@ function lookupOrAssignSlot(model, messages) {
     conversationSlotMap.delete(oldestKey);
   }
   return { slotId, hit: false, key };
+}
+
+// === Slot KV-cache disk persistence =================================================
+// The `--models-dir` router evicts + reloads child llama-server processes as
+// models are swapped under MODELS_MAX (the 65GB gpt-oss-120b is the worst hit).
+// Every reload drops all per-slot KV caches, so a previously-warmed conversation
+// is re-prefilled COLD on its next turn — the dominant latency cost on this box.
+// llama.cpp can persist a slot's KV cache to disk (`--slot-save-path` +
+// `POST /slots/{id}?action=save|restore`). We save the active conversation's
+// slot after each completed local request and, on a later request whose slot is
+// cold (i.e. the child was reloaded since), restore it BEFORE proxying so the
+// already-seen prefix is skipped instead of re-prefilled.
+//
+// SLOT_SAVE_DIR must match the router's --slot-save-path. distrobox shares $HOME,
+// so the host path and the in-container path are identical; the router writes the
+// dumps and this manager (running on the host) reads their sizes / evicts them.
+const SLOT_SAVE_DIR = process.env.SLOT_SAVE_PATH || join(process.env.HOME || '/root', '.cache', 'llama-slots');
+const SLOT_CACHE_DEFAULTS = { enabled: true, maxBytes: 24 * 1024 * 1024 * 1024, maxCount: 64 };
+// conversation prefix key -> { filename, model, slotId, bytes, savedAt }
+const conversationSlotFiles = new Map();
+try { mkdirSync(SLOT_SAVE_DIR, { recursive: true }); } catch { /* best-effort */ }
+
+/** Resolve the effective slot-cache config (config.slotCache overrides defaults). */
+function slotCacheCfg() {
+  return { ...SLOT_CACHE_DEFAULTS, ...(config?.slotCache || {}) };
+}
+
+/**
+ * Delete the oldest slot dumps until the on-disk cache is under both the byte
+ * and count caps. The just-saved `keepFilename` is never evicted. Best-effort:
+ * unlink failures are ignored (the in-memory record is still dropped).
+ * @param {string} [keepFilename] - A filename that must survive this pass.
+ */
+function enforceSlotDiskBound(keepFilename) {
+  const cfg = slotCacheCfg();
+  const files = [...conversationSlotFiles.values()];
+  const toEvict = planSlotEviction({ files, maxBytes: cfg.maxBytes, maxCount: cfg.maxCount, keep: keepFilename });
+  if (!toEvict.length) return;
+  const evictSet = new Set(toEvict);
+  for (const [key, rec] of conversationSlotFiles) {
+    if (!evictSet.has(rec.filename)) continue;
+    try { unlinkSync(join(SLOT_SAVE_DIR, rec.filename)); } catch { /* already gone */ }
+    conversationSlotFiles.delete(key);
+  }
+  console.log(`[slot-cache] evicted ${toEvict.length} dump(s) to stay under cap (max ${cfg.maxCount} files / ${Math.round(cfg.maxBytes / 1e9)}GB)`);
+}
+
+/**
+ * Restore a conversation's saved slot dump into its assigned llama.cpp slot when
+ * that slot is cold (empty + idle), e.g. right after a child reload. Skips warm
+ * or busy slots (shouldRestoreSlot). Best-effort: any failure falls through to a
+ * normal cold prefill. MUST be called while holding the local queue slot so no
+ * other local request races the slot. Returns true iff a restore was performed.
+ * @param {string} model - The requested model id (router child to target).
+ * @param {{slotId:number,key:string}|null} slotAssignment - From lookupOrAssignSlot.
+ */
+async function maybeRestoreSlot(model, slotAssignment) {
+  if (!slotCacheCfg().enabled) return false;
+  if (!slotAssignment || slotAssignment.slotId == null || !slotAssignment.key) return false;
+  const rec = conversationSlotFiles.get(slotAssignment.key);
+  if (!rec) return false;
+  try {
+    // Probe the assigned slot's current state to decide cold-vs-warm.
+    let slotState = null;
+    try {
+      const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
+      if (r.ok) {
+        const arr = await r.json();
+        if (Array.isArray(arr)) slotState = arr.find(s => s.id === slotAssignment.slotId) || null;
+      }
+    } catch { /* treat as cold */ }
+    if (!shouldRestoreSlot({ savedFile: rec, slotState })) return false;
+    const rr = await fetch(`http://localhost:${LLAMA_PORT}/slots/${slotAssignment.slotId}?action=restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: rec.filename, model }),
+      signal: AbortSignal.timeout(60000)
+    });
+    if (rr.ok) {
+      const j = await rr.json().catch(() => ({}));
+      console.log(`[slot-cache] RESTORE model=${model} slot=${slotAssignment.slotId} file=${rec.filename} n_restored=${j?.n_restored ?? '?'}`);
+      return true;
+    }
+    // Restore failed (missing/stale dump, ctx mismatch). Drop the dangling record.
+    const txt = await rr.text().catch(() => '');
+    console.warn(`[slot-cache] restore failed slot=${slotAssignment.slotId} file=${rec.filename}: ${rr.status} ${txt.slice(0, 120)}`);
+    conversationSlotFiles.delete(slotAssignment.key);
+  } catch { /* best-effort */ }
+  return false;
+}
+
+/**
+ * Save a conversation's slot KV cache to disk after a completed local request,
+ * keyed by the conversation prefix. Async + best-effort: never blocks the
+ * response and silently no-ops if the engine lacks --slot-save-path (501) or the
+ * slot is empty (n_saved 0). Enforces the disk bound after a successful write.
+ * @param {string} model - The requested model id.
+ * @param {{slotId:number,key:string}|null} slotAssignment - From lookupOrAssignSlot.
+ */
+async function saveSlotAfterRequest(model, slotAssignment) {
+  if (!slotCacheCfg().enabled) return;
+  if (!slotAssignment || slotAssignment.slotId == null || !slotAssignment.key) return;
+  const filename = slotCacheFilename(slotAssignment.key);
+  try {
+    const r = await fetch(`http://localhost:${LLAMA_PORT}/slots/${slotAssignment.slotId}?action=save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, model }),
+      signal: AbortSignal.timeout(60000)
+    });
+    if (!r.ok) return; // 501 (no --slot-save-path) or slot busy — skip silently
+    const j = await r.json().catch(() => ({}));
+    if (!j || !(j.n_saved > 0)) return; // empty slot, nothing worth keeping
+    conversationSlotFiles.set(slotAssignment.key, {
+      filename, model, slotId: slotAssignment.slotId,
+      bytes: j.n_written || 0, savedAt: Date.now()
+    });
+    console.log(`[slot-cache] SAVE model=${model} slot=${slotAssignment.slotId} file=${filename} n_saved=${j.n_saved} bytes=${j.n_written || 0}`);
+    enforceSlotDiskBound(filename);
+  } catch { /* best-effort */ }
 }
 
 // === Pre-tokenization queue =========================================================
@@ -6350,6 +6471,17 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   res.on('finish', () => cleanupActive(res.statusCode >= 400 ? 'error' : 'complete'));
   res.on('close', () => cleanupActive('client_disconnect'));
 
+  // Slot KV-cache persistence: once a local request finishes successfully, the
+  // assigned slot holds the full prompt+completion KV — snapshot it to disk
+  // (async, best-effort) so a future model reload can restore instead of cold-
+  // prefilling. Fires first on 'finish', before another queued request can grab
+  // and overwrite the slot (queue-acquire + model-serve happens long after).
+  res.on('finish', () => {
+    if (!routing.remote && res.statusCode < 400 && slotAssignment && slotAssignment.slotId != null) {
+      saveSlotAfterRequest(requestedModel, slotAssignment).catch(() => {});
+    }
+  });
+
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
     req._backend = routing.backend.id;
@@ -6744,6 +6876,14 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     // one request runs at a time), so swapping won't kill anyone else's
     // in-flight inference. Pending requests stay queued during the swap.
     await ensureModelServed(requestedModel);
+    // If this conversation has a disk-saved slot dump and its assigned slot is
+    // now cold (the child was reloaded since we saved), restore the KV cache
+    // before proxying so llama.cpp matches the prefix and skips re-prefill.
+    // Safe here: we hold the local queue slot, so no other local request is
+    // touching slots concurrently.
+    if (slotAssignment && slotAssignment.slotId != null) {
+      await maybeRestoreSlot(requestedModel, slotAssignment);
+    }
     let response = await doFetch(proxyBody);
     let activeBody = proxyBody;
 
