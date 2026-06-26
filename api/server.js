@@ -1961,6 +1961,47 @@ function getCpuTemperature() {
   return null;
 }
 
+// Read AMD GPU stats directly from amdgpu sysfs (host-side). On Strix Halo, rocm-smi
+// returns NO data at all on recent kernels (6.18+), so these sysfs reads are the reliable
+// source for the dashboard + thermal governor: edge temperature, package power, core
+// clock, and busy %. Without them the dashboard shows 0 °C / 0 W / 0 MHz / 0 % and the
+// governor never throttles a hot APU. Each field is 0 if its sensor is unavailable.
+// Returns { temperature(°C), power(W), coreClock(MHz), busyPercent(%) }.
+function getGpuSysfsStats() {
+  const out = { temperature: 0, power: 0, coreClock: 0, busyPercent: 0 };
+  try {
+    for (const card of readdirSync('/sys/class/drm')) {
+      if (!/^card\d+$/.test(card)) continue;
+      const dev = `/sys/class/drm/${card}/device`;
+      let hwmon = null;
+      try {
+        for (const hw of readdirSync(`${dev}/hwmon`)) {
+          if (readFileSync(`${dev}/hwmon/${hw}/name`, 'utf-8').trim() === 'amdgpu') { hwmon = `${dev}/hwmon/${hw}`; break; }
+        }
+      } catch { /* no hwmon on this card */ }
+      if (!hwmon) continue; // not the GPU card (e.g. a display-only node)
+      const readInt = (p) => { try { return parseInt(readFileSync(p, 'utf-8').trim()) || 0; } catch { return 0; } };
+      out.temperature = Math.round(readInt(`${hwmon}/temp1_input`) / 100) / 10; // m°C -> °C
+      out.power = Math.round(readInt(`${hwmon}/power1_average`) / 1000000);      // µW -> W
+      out.coreClock = Math.round(readInt(`${hwmon}/freq1_input`) / 1000000);     // Hz -> MHz
+      out.busyPercent = readInt(`${dev}/gpu_busy_percent`);
+      return out;
+    }
+  } catch {
+    // sysfs not available
+  }
+  return out;
+}
+
+// Resolve a GPU usage % from sysfs: prefer the kernel's busy counter when it's moving,
+// otherwise fall back to a package-power proxy (idle ~35W -> 0%, ~130W -> 100%) since
+// power is the signal that reliably tracks compute load on this iGPU.
+function gpuUsageFromSysfs(sysfs) {
+  if (sysfs.busyPercent > 0) return sysfs.busyPercent;
+  if (sysfs.power > 35) return Math.max(0, Math.min(100, Math.round(((sysfs.power - 35) / (130 - 35)) * 100)));
+  return 0;
+}
+
 // System stats collection
 // Previous CPU sample for the app-usage delta (pid -> jiffies, plus total).
 let prevAppCpuSample = null;
@@ -2262,6 +2303,23 @@ async function collectGpuStats() {
       output += data.toString();
     });
 
+    // rocm-smi returns nothing on Strix Halo (kernel 6.18+), so build the GPU compute
+    // stats from amdgpu sysfs for every result branch below. (memClock has no simple
+    // sysfs file, so it stays 0 — the dashboard tolerates it.)
+    const sysfs = getGpuSysfsStats();
+    const gpuFromSysfs = (extra = {}) => ({
+      temperature: sysfs.temperature,
+      usage: gpuUsageFromSysfs(sysfs),
+      usageRaw: sysfs.busyPercent,
+      power: sysfs.power,
+      coreClock: sysfs.coreClock,
+      memClock: 0,
+      vram: { total: 0, used: 0, usage: 0 },
+      gtt: gttStats,
+      isAPU: true,
+      ...extra,
+    });
+
     cmd.on('close', (code) => {
       try {
         // Parse rocm-smi JSON output
@@ -2321,68 +2379,22 @@ async function collectGpuStats() {
             isAPU
           });
         } else {
-          // rocm-smi failed, but we might still have GTT stats
-          if (gttStats.total > 0) {
-            finish({
-              temperature: 0,
-              usage: 0,
-              power: 0,
-              coreClock: 0,
-              memClock: 0,
-              vram: { total: 0, used: 0, usage: 0 },
-              gtt: gttStats,
-              isAPU: true
-            });
-          } else {
-            finish(null);
-          }
+          // rocm-smi returned no card data (normal on Strix Halo) — use amdgpu sysfs.
+          finish(gttStats.total > 0 ? gpuFromSysfs() : null);
         }
       } catch {
-        // Even if parsing fails, return GTT stats if available
-        if (gttStats.total > 0) {
-          finish({
-            temperature: 0,
-            usage: 0,
-            power: 0,
-            coreClock: 0,
-            memClock: 0,
-            vram: { total: 0, used: 0, usage: 0 },
-            gtt: gttStats,
-            isAPU: true
-          });
-        } else {
-          finish(null);
-        }
+        // Even if parsing fails, return amdgpu sysfs stats (+ GTT) if a GPU is present.
+        finish(gttStats.total > 0 ? gpuFromSysfs() : null);
       }
     });
 
     cmd.on('error', () => {
-      if (gttStats.total > 0) {
-        finish({
-          temperature: 0,
-          usage: 0,
-          vram: { total: 0, used: 0, usage: 0 },
-          gtt: gttStats,
-          isAPU: true
-        });
-      } else {
-        finish(null);
-      }
+      finish(gttStats.total > 0 ? gpuFromSysfs() : null);
     });
 
     timeout = setTimeout(() => {
       try { cmd.kill('SIGTERM'); } catch {}
-      finish(gttStats.total > 0 ? {
-        temperature: 0,
-        usage: 0,
-        power: 0,
-        coreClock: 0,
-        memClock: 0,
-        vram: { total: 0, used: 0, usage: 0 },
-        gtt: gttStats,
-        isAPU: true,
-        stale: true
-      } : null);
+      finish(gttStats.total > 0 ? gpuFromSysfs({ stale: true }) : null);
     }, 3000);
   });
 }
