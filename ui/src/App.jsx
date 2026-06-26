@@ -3670,6 +3670,10 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
   // LLM tab structured filters (model + backend dropdowns). Empty = no filter.
   const [llmModelFilter, setLlmModelFilter] = useState('');
   const [llmBackendFilter, setLlmBackendFilter] = useState('');
+  // Endpoint scope for the LLM tab. Embedding requests are recorded as LLM logs but
+  // carry no conversation (no messages/prompt/response), so they read as "non-LLM"
+  // noise — default to conversations only and let the user opt into embeddings/all.
+  const [llmEndpointFilter, setLlmEndpointFilter] = useState('conversations');
   // Drive the active tab off the URL so /logs/llm, /logs/requests, /logs/server
   // each survive page navigation + refresh. Falls back to 'server' if no segment.
   const { tab: urlTab } = useParams();
@@ -3844,6 +3848,10 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
 
   const filteredLlmLogs = React.useMemo(() => {
     return allLlmLogs.filter(log => {
+      // Endpoint scope: embeddings carry no conversation, so hide them unless asked.
+      const isEmbedding = log.endpoint === 'embeddings';
+      if (llmEndpointFilter === 'conversations' && isEmbedding) return false;
+      if (llmEndpointFilter === 'embeddings' && !isEmbedding) return false;
       // Model dropdown filter (exact match on dropdown value)
       if (llmModelFilter && log.model !== llmModelFilter) return false;
       // Backend dropdown filter
@@ -3862,7 +3870,14 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
       }
       return true;
     });
-  }, [allLlmLogs, filter, llmModelFilter, llmBackendFilter]);
+  }, [allLlmLogs, filter, llmModelFilter, llmBackendFilter, llmEndpointFilter]);
+
+  // Count embeddings currently hidden by the conversations-only default, so the
+  // endpoint dropdown can surface them instead of silently dropping entries.
+  const llmEmbeddingCount = React.useMemo(
+    () => allLlmLogs.reduce((n, l) => n + (l.endpoint === 'embeddings' ? 1 : 0), 0),
+    [allLlmLogs]
+  );
 
   const fetchFilters = async () => {
     try {
@@ -4008,6 +4023,16 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
             <>
               <select
                 className="logs-filter-select"
+                value={llmEndpointFilter}
+                onChange={(e) => setLlmEndpointFilter(e.target.value)}
+                title="Filter by request type. Embeddings have no conversation, so they are hidden by default."
+              >
+                <option value="conversations">Conversations</option>
+                <option value="all">All requests</option>
+                <option value="embeddings">Embeddings{llmEmbeddingCount ? ` (${llmEmbeddingCount})` : ''}</option>
+              </select>
+              <select
+                className="logs-filter-select"
                 value={llmModelFilter}
                 onChange={(e) => setLlmModelFilter(e.target.value)}
                 title="Filter by model"
@@ -4028,11 +4053,11 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                   <option key={b} value={b}>{b}</option>
                 ))}
               </select>
-              {(llmModelFilter || llmBackendFilter) && (
+              {(llmModelFilter || llmBackendFilter || llmEndpointFilter !== 'conversations') && (
                 <button
                   className="btn-secondary"
-                  onClick={() => { setLlmModelFilter(''); setLlmBackendFilter(''); }}
-                  title="Clear model/backend filters"
+                  onClick={() => { setLlmModelFilter(''); setLlmBackendFilter(''); setLlmEndpointFilter('conversations'); }}
+                  title="Reset endpoint/model/backend filters"
                 >
                   Clear filters
                 </button>
@@ -4242,8 +4267,20 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
         <div className="logs-container llm-logs-container">
           {filteredLlmLogs.length === 0 ? (
             <div className="logs-empty">
-              <p>No LLM conversation logs yet</p>
-              <p className="hint">Send a request via Chat or any API endpoint to see conversations here</p>
+              {llmEndpointFilter === 'conversations' && llmEmbeddingCount > 0 ? (
+                <>
+                  <p>No conversations to show</p>
+                  <p className="hint">
+                    {llmEmbeddingCount} embedding {llmEmbeddingCount === 1 ? 'request is' : 'requests are'} hidden.
+                    Switch the request-type filter to “Embeddings” or “All requests” to see them.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p>No LLM conversation logs yet</p>
+                  <p className="hint">Send a request via Chat or any API endpoint to see conversations here</p>
+                </>
+              )}
             </div>
           ) : (
             <div className="llm-logs-list">
