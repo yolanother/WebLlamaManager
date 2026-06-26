@@ -716,7 +716,8 @@ function ModelTpsRankChart({ modelBreakdown, window = 'all', height = 200 }) {
         requests: m.windows?.[window]?.requests || 0
       }))
       .filter(d => d.tps > 0)
-      .sort((a, b) => b.tps - a.tps);
+      .sort((a, b) => b.tps - a.tps)
+      .slice(0, 5);  // Top 5 fastest only — keep the widget compact
   }, [modelBreakdown, window]);
 
   if (data.length === 0) {
@@ -1201,6 +1202,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const [modelBreakdown, setModelBreakdown] = useState(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenPage, setFullscreenPage] = useState(0);
+  const [showAllModels, setShowAllModels] = useState(false);
   const fullscreenTimerRef = useRef(null);
   const FULLSCREEN_PAGES = 3;
 
@@ -1367,6 +1369,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     }
   }, [showFullscreen]);
 
+  // Close the "all models" modal on Escape.
+  useEffect(() => {
+    if (!showAllModels) return;
+    const onKey = (e) => { if (e.key === 'Escape') setShowAllModels(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showAllModels]);
+
   const startServer = async () => {
     setLoading(l => ({ ...l, server: true }));
     try {
@@ -1412,6 +1422,17 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const loadedModelCount = serverModelsHaveStatus
     ? serverModels.filter(m => (m.status?.value ?? m.status) === 'loaded').length
     : (stats?.context?.models?.length || 0);
+
+  // Normalize a model entry's loaded state. serverModels carries
+  // status.value ('loaded' | 'unloaded'); the stats.context.models fallback
+  // only ever contains the router's loaded set, so treat those as loaded.
+  const modelStatusValue = (m) => (m?.status?.value ?? m?.status) || 'loaded';
+  // The full available-model list (loaded + unloaded) for the "View all" modal.
+  // Prefer serverModels (carries per-model status); else fall back to the
+  // router's loaded set in stats.context.models.
+  const allModels = serverModels.length > 0 ? serverModels : (stats?.context?.models || []);
+  // Just the loaded models, for inline display in the compact Models card.
+  const loadedModels = allModels.filter(m => modelStatusValue(m) === 'loaded');
 
   // Thermal-guard state — folded into the status strip's right side.
   const guardActive = !!(stats?.guard && stats.guard.state && stats.guard.state !== 'normal');
@@ -2037,9 +2058,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               {loadedModelCount === 0 && (
                 <span className="loaded-model-none">No models loaded</span>
               )}
-              {serverModels.length > 0 && (
+              {loadedModels.length > 0 && (
                 <div className="loaded-models-list">
-                  {serverModels.map((m, i) => {
+                  {loadedModels.map((m, i) => {
                     const modelId = m.id || m.model || '';
                     const isActive = stats?.activeModel && modelId === stats.activeModel;
                     const isLastUsed = !isActive && stats?.lastUsedModel && modelId === stats.lastUsedModel;
@@ -2052,6 +2073,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     );
                   })}
                 </div>
+              )}
+              {allModels.length > loadedModels.length && (
+                <button
+                  type="button"
+                  className="view-all-models-btn"
+                  onClick={() => setShowAllModels(true)}
+                >
+                  View all {allModels.length} models
+                </button>
               )}
             </div>
           </div>
@@ -2066,6 +2096,58 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           )}
         </div>
       </section>
+
+      {/* All-models modal — full list with per-model loaded/unloaded status */}
+      {showAllModels && (
+        <div
+          className="models-modal-overlay"
+          onClick={() => setShowAllModels(false)}
+          role="presentation"
+        >
+          <div
+            className="models-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="All models"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="models-modal-header">
+              <h3>All Models <span className="models-modal-count">{loadedModelCount} / {allModels.length} loaded</span></h3>
+              <button
+                type="button"
+                className="models-modal-close"
+                aria-label="Close"
+                onClick={() => setShowAllModels(false)}
+              >
+                &times;
+              </button>
+            </div>
+            <div className="models-modal-body">
+              {allModels.length === 0 ? (
+                <div className="models-modal-empty">No models available</div>
+              ) : (
+                allModels.map((m, i) => {
+                  const modelId = m.id || m.model || '';
+                  const isLoaded = modelStatusValue(m) === 'loaded';
+                  const isActive = stats?.activeModel && modelId === stats.activeModel;
+                  const isLastUsed = !isActive && stats?.lastUsedModel && modelId === stats.lastUsedModel;
+                  return (
+                    <div key={modelId || i} className={`models-modal-row ${isLoaded ? 'loaded' : 'unloaded'}`}>
+                      <span className={`models-modal-status-dot ${isLoaded ? 'loaded' : 'unloaded'}`} title={isLoaded ? 'Loaded' : 'Unloaded'} />
+                      <span className="models-modal-name" title={modelId}>{formatModelName(m)}</span>
+                      <span className="models-modal-markers">
+                        {isActive && <span className="model-indicator active-indicator" title="Currently processing" />}
+                        {isLastUsed && <span className="model-indicator last-used-indicator" title="Most recently used" />}
+                        <span className={`models-modal-status-label ${isLoaded ? 'loaded' : 'unloaded'}`}>{isLoaded ? 'loaded' : 'unloaded'}</span>
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* System Resources */}
       <section className="dashboard-section">
