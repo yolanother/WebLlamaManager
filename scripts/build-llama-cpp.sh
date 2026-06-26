@@ -75,6 +75,12 @@ echo "[2/4] Configuring + [3/4] building in distrobox '$DISTROBOX_CONTAINER' (th
 distrobox enter "$DISTROBOX_CONTAINER" -- bash -lc "
   set -euo pipefail
   cd '$LLAMA_CPP_DIR'
+  # Auto-detect the ROCm install + HIP compiler so this works across toolbox versions
+  # (rocm-7.0-rc, rocm-7.2.4, ...). Pick the highest-versioned /opt/rocm*.
+  ROCM_DIR=\$(ls -d /opt/rocm* 2>/dev/null | sort -V | tail -1)
+  HIP_CLANG=\"\$ROCM_DIR/llvm/bin/clang++\"
+  echo \"  using ROCM_DIR=\$ROCM_DIR  HIP_CLANG=\$HIP_CLANG\"
+  [ -x \"\$HIP_CLANG\" ] || { echo \"ERROR: no HIP clang++ under \$ROCM_DIR\"; exit 1; }
   cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_HIP=ON \
@@ -86,7 +92,8 @@ distrobox enter "$DISTROBOX_CONTAINER" -- bash -lc "
     -DBUILD_SHARED_LIBS=ON \
     -DLLAMA_BUILD_SERVER=ON \
     -DLLAMA_TOOLS_INSTALL=ON \
-    -DCMAKE_HIP_COMPILER=/opt/rocm-7.0/llvm/bin/clang++
+    -DROCM_PATH=\"\$ROCM_DIR\" \
+    -DCMAKE_HIP_COMPILER=\"\$HIP_CLANG\"
   cmake --build build --target llama-server -j '$JOBS'
 "
 

@@ -76,6 +76,11 @@ AUTO_START="${AUTO_START:-true}"
 STATS_INTERVAL="${STATS_INTERVAL:-1000}"
 LLAMA_UI_URL="${LLAMA_UI_URL:-}"
 HF_TOKEN="${HF_TOKEN:-}"
+# Distrobox toolbox + llama-server binary. Default to the ROCm 7.2.4 toolbox and its
+# prebuilt binary — the ROCm-7.0-RC toolchain emitted gfx1151-incompatible kernels
+# ("Illegal opcode in command stream") that hard-froze the box under gpt-oss-120b.
+DISTROBOX_CONTAINER="${DISTROBOX_CONTAINER:-llama-rocm-7.2.4}"
+LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/usr/local/bin/llama-server}"
 
 echo "=== Llama Manager Installation ==="
 echo
@@ -231,6 +236,10 @@ Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$USER_ID/bus
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin
 Environment=HOME=$HOME
+# Pin the ROCm 7.2.4 toolbox + its prebuilt binary in the service env (the systemd
+# user environment may otherwise pin an older container, and dotenv won't override it).
+Environment=DISTROBOX_CONTAINER=$DISTROBOX_CONTAINER
+Environment=LLAMA_SERVER_BIN=$LLAMA_SERVER_BIN
 
 [Install]
 WantedBy=default.target
