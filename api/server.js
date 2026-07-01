@@ -2207,24 +2207,32 @@ let statsBroadcastInFlight = false;
 
 // Get CPU temperature from thermal zones
 function getCpuTemperature() {
+  // Prefer the AMD APU die sensor (k10temp "Tctl") — the authoritative CPU/APU thermal
+  // signal the governor should act on. The generic /sys/class/thermal thermal_zone0 is
+  // 'acpitz' on this board (a chassis sensor) which reads several degrees hotter than the
+  // die; using it made the governor pause too early and, worse, HOLD the pause after
+  // cooling (acpitz stayed above the resume threshold while the die was already cool),
+  // so local dispatch never resumed.
   try {
-    // Try to read from thermal_zone0 (usually CPU on most systems)
-    const tempFiles = readdirSync('/sys/class/thermal/')
-      .filter(f => f.startsWith('thermal_zone'))
-      .map(f => `/sys/class/thermal/${f}/temp`);
-
-    for (const tempFile of tempFiles) {
+    for (const h of readdirSync('/sys/class/hwmon')) {
       try {
-        const temp = parseInt(readFileSync(tempFile, 'utf-8').trim());
-        if (temp > 0) {
-          return Math.round(temp / 100) / 10; // Convert millidegrees to degrees with 1 decimal
-        }
-      } catch {
-        continue;
-      }
+        if (readFileSync(`/sys/class/hwmon/${h}/name`, 'utf-8').trim() !== 'k10temp') continue;
+        const milli = parseInt(readFileSync(`/sys/class/hwmon/${h}/temp1_input`, 'utf-8').trim());
+        if (milli > 0) return Math.round(milli / 100) / 10;
+      } catch { continue; }
+    }
+  } catch { /* fall through to thermal zones */ }
+  // Fallback: first /sys/class/thermal zone with a reading (non-AMD hosts).
+  try {
+    for (const f of readdirSync('/sys/class/thermal/')) {
+      if (!f.startsWith('thermal_zone')) continue;
+      try {
+        const temp = parseInt(readFileSync(`/sys/class/thermal/${f}/temp`, 'utf-8').trim());
+        if (temp > 0) return Math.round(temp / 100) / 10;
+      } catch { continue; }
     }
   } catch {
-    // Thermal zones not available
+    // Thermal sensors not available
   }
   return null;
 }
