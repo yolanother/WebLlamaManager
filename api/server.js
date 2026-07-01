@@ -39,6 +39,7 @@ import { resolveDefaultModel, defaultModelListEntries } from './default-models.j
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
+import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
@@ -296,6 +297,13 @@ class RequestQueue {
 }
 
 const llamaQueue = new RequestQueue(1); // default: 1 concurrent request
+
+// Timestamp of the most recent LOCAL request completion (slot release). Used by the
+// queue-admission policy to tell a deep-but-DRAINING queue (completions still happening)
+// from a STALLED/wedged model (nothing completing while the backlog grows). Seeded to the
+// process start time so a first request that wedges before anything ever completes still
+// trips the stall guard once the queue is deep.
+let lastLocalCompletionAt = Date.now();
 
 // Stall watchdog defaults: if a local request gets no token for this long, abort it.
 // `localStallMs` in config.json overrides the default; 0 disables the watchdog.
@@ -706,6 +714,29 @@ function resolveBackend(requestedModel, endpoint, body) {
         offloadCounter = (offloadCounter + 1) % 100;
         shouldOffload = offloadCounter < pct;
       }
+    }
+  }
+
+  // Queue-overflow offload: if the local queue has reached its soft capacity and a viable
+  // remote can serve this request, offload rather than piling onto a deep local queue (or
+  // failing later with QUEUE_FULL in acquireLocalSlot). This mirrors the queue-admission
+  // decision so an overflowing request that CAN go remote never has to wait behind a deep
+  // local backlog. Models with no viable remote (e.g. gpt-oss-120b) fall through and queue
+  // locally, where acquireLocalSlot keeps them queued (deeper) unless the model is stalled.
+  if (!shouldOffload && hasViableRemote) {
+    const _gc = guardCfg();
+    const admission = queueAdmissionDecision({
+      pending: llamaQueue.pending,
+      active: llamaQueue.active,
+      hasViableRemote: true,
+      maxQueueDepth: _gc.maxQueueDepth,
+      hardMax: _gc.maxQueueHardCeiling,
+      msSinceLastCompletion: Date.now() - lastLocalCompletionAt,
+      stallMs: _gc.queueStallMs,
+    });
+    if (admission.action === 'offload') {
+      shouldOffload = true;
+      console.log(`[routing] Queue-overflow offload: local queue pending=${llamaQueue.pending} >= ${_gc.maxQueueDepth}, offloading "${requestedModel}" to remote`);
     }
   }
 
@@ -1913,7 +1944,16 @@ function guardCfg() {
     overheadBytes: g.overheadBytes ?? GUARD_DEFAULTS.overheadBytes,
     minContext: g.minContext ?? GUARD_DEFAULTS.minContext,
     memThresholdPct: g.memThresholdPct ?? 90,
-    maxQueueDepth: g.maxQueueDepth ?? 8,
+    // Soft local-queue cap. Raised well above the old fixed 8: at/over this we offload to a
+    // remote (if one can serve the request) or — for models with no remote (e.g. gpt-oss-120b)
+    // — keep queuing DEEPER instead of failing. Requests are only rejected when the model is
+    // genuinely stalled (queueStallMs below) or the hard ceiling is hit. See queue-admission.js.
+    maxQueueDepth: g.maxQueueDepth ?? DEFAULT_MAX_QUEUE_DEPTH,
+    // Absolute runaway backstop for the local queue — reject beyond this no matter what.
+    maxQueueHardCeiling: g.maxQueueHardCeiling ?? DEFAULT_HARD_MAX,
+    // "Not draining" window: if nothing completes locally within this long while the queue is
+    // deep, the model is treated as stalled/wedged and new requests are rejected.
+    queueStallMs: g.queueStallMs ?? DEFAULT_STALL_MS,
     // Memory-recovery knobs: when a model would be refused for lack of free RAM
     // but the RAM is reclaimable (held by other loaded models / a stale stack),
     // free it and retry instead of returning 507. recoveryEnabled gates the
@@ -6181,13 +6221,33 @@ async function waitForModelReady(model, { maxWait = MODEL_LOAD_WAIT_MS, pollInte
 async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait } = {}) {
   const queueStart = Date.now();
 
-  // Guard: bounded queue — reject when the backlog is already too deep so a
-  // stuck/overloaded model can't accumulate a huge pile-up (incident: 13+).
+  // Guard: smart queue admission. We must NOT fail requests just because the queue is busy.
+  // A deep-but-draining queue is allowed to grow (requests wait); we only reject as a LAST
+  // RESORT when the model is genuinely STALLED (deep AND no local completion within stallMs)
+  // or a runaway hard ceiling is hit. Requests that COULD offload to a remote were already
+  // re-routed in resolveBackend, so by the time we reach acquireLocalSlot there is no viable
+  // remote for this request (hasViableRemote: false → the decision is accept/reject only).
+  // This preserves the original anti-pile-up-on-a-wedged-model protection via stall detection
+  // instead of the crude fixed count that also failed healthy busy traffic.
   const _gc = guardCfg();
-  if (_gc.enabled && llamaQueue.pending >= _gc.maxQueueDepth) {
-    const e = new Error(`Server busy: ${llamaQueue.pending} requests already queued (max ${_gc.maxQueueDepth}). Try again shortly.`);
-    e.code = 'QUEUE_FULL'; e.statusCode = 503;
-    throw e;
+  if (_gc.enabled) {
+    const admission = queueAdmissionDecision({
+      pending: llamaQueue.pending,
+      active: llamaQueue.active,
+      hasViableRemote: false,
+      maxQueueDepth: _gc.maxQueueDepth,
+      hardMax: _gc.maxQueueHardCeiling,
+      msSinceLastCompletion: Date.now() - lastLocalCompletionAt,
+      stallMs: _gc.queueStallMs,
+    });
+    if (admission.action === 'reject') {
+      const detail = admission.reason === 'stalled'
+        ? `model appears stalled (no completion in ${Math.round(_gc.queueStallMs / 1000)}s)`
+        : `hard queue ceiling ${_gc.maxQueueHardCeiling} reached`;
+      const e = new Error(`Server busy: ${llamaQueue.pending} requests queued — ${detail}. Try again shortly.`);
+      e.code = 'QUEUE_FULL'; e.statusCode = 503;
+      throw e;
+    }
   }
 
   // Guard: thermal throttle — hold new dispatch while the governor has paused us
@@ -6244,6 +6304,9 @@ async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait
   const release = () => {
     if (released) return;
     released = true;
+    // Record the completion so the queue-admission stall detector can tell a draining
+    // queue (completions happening) from a wedged model (nothing completing).
+    lastLocalCompletionAt = Date.now();
     llamaQueue.release(slotId);
   };
   // Release when the HTTP response ends for any reason: clean finish, client disconnect,
