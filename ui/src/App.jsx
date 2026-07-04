@@ -569,9 +569,58 @@ function StatCard({ label, value, subValue, status, icon }) {
 }
 
 // Progress Ring Component
-function ProgressRing({ value, size = 80, strokeWidth = 8, color = 'var(--accent)' }) {
+function ProgressRing({ value, size = 80, strokeWidth = 8, color = 'var(--accent)', segments = null, centerValue = null }) {
   const radius = (size - strokeWidth) / 2;
   const circumference = radius * 2 * Math.PI;
+
+  // Multi-segment mode: stack several arcs on one ring (e.g. the CPU gauge
+  // showing llama/app load vs the remaining external/system load). Each
+  // segment { value (0-100), color } is drawn clockwise from where the
+  // previous one ended, so the ring fills to the total of all segments.
+  if (segments && segments.length) {
+    let cumPct = 0;
+    const total = centerValue != null
+      ? centerValue
+      : segments.reduce((sum, seg) => sum + (seg.value || 0), 0);
+    return (
+      <svg width={size} height={size} className="progress-ring">
+        <circle
+          className="progress-ring-bg"
+          strokeWidth={strokeWidth}
+          fill="transparent"
+          r={radius}
+          cx={size / 2}
+          cy={size / 2}
+        />
+        {segments.map((seg, i) => {
+          const v = Math.max(0, Math.min(100, seg.value || 0));
+          const len = (v / 100) * circumference;
+          const dashoffset = -(cumPct / 100) * circumference;
+          cumPct += v;
+          return (
+            <circle
+              key={i}
+              className="progress-ring-fill progress-ring-segment"
+              strokeWidth={strokeWidth}
+              fill="transparent"
+              r={radius}
+              cx={size / 2}
+              cy={size / 2}
+              style={{
+                strokeDasharray: `${len} ${circumference}`,
+                strokeDashoffset: dashoffset,
+                stroke: seg.color
+              }}
+            />
+          );
+        })}
+        <text x="50%" y="50%" textAnchor="middle" dy=".3em" className="progress-ring-text">
+          {Math.round(total)}%
+        </text>
+      </svg>
+    );
+  }
+
   const offset = circumference - (value / 100) * circumference;
 
   return (
@@ -2225,12 +2274,25 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
         <div className="resources-grid">
           <div className="resource-card">
             <ProgressRing
-              value={stats?.cpu?.usage || 0}
-              color={stats?.cpu?.usage > 80 ? 'var(--error)' : 'var(--accent)'}
+              centerValue={stats?.cpu?.usage || 0}
+              segments={[
+                { value: stats?.cpu?.appUsage || 0, color: 'var(--accent)' },
+                { value: Math.max(0, (stats?.cpu?.usage || 0) - (stats?.cpu?.appUsage || 0)), color: 'var(--info)' },
+              ]}
             />
             <div className="resource-info">
               <span className="resource-label">CPU</span>
               <span className="resource-detail">{stats?.cpu?.cores || 0} cores @ {stats?.cpu?.loadAvg?.[0]?.toFixed(1) || '0.0'} load</span>
+              <div className="resource-legend">
+                <span className="resource-legend-item">
+                  <span className="resource-legend-dot" style={{ background: 'var(--accent)' }} />
+                  app {Math.round(stats?.cpu?.appUsage || 0)}%
+                </span>
+                <span className="resource-legend-item">
+                  <span className="resource-legend-dot" style={{ background: 'var(--info)' }} />
+                  system {Math.round(Math.max(0, (stats?.cpu?.usage || 0) - (stats?.cpu?.appUsage || 0)))}%
+                </span>
+              </div>
               {stats?.cpu?.temperature && (
                 <span
                   className="resource-detail"
