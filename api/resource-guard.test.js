@@ -60,11 +60,11 @@ test('thermalDecision: warn -> throttle (pause, no unload)', () => {
   assert.equal(d.unload, false);
 });
 
-test('thermalDecision: critical -> unload', () => {
+test('thermalDecision: critical -> pause/offload but NEVER unload (idle model is not a heat source)', () => {
   const d = thermalDecision({ tempC: 97, prevState: 'throttled', warnC: 90, resumeC: 80, criticalC: 96 });
   assert.equal(d.state, 'critical');
   assert.equal(d.pauseDispatch, true);
-  assert.equal(d.unload, true);
+  assert.equal(d.unload, false);
 });
 
 test('thermalDecision: hysteresis — stays throttled between resume and warn', () => {
@@ -83,6 +83,85 @@ test('DEFAULTS present and sane', () => {
   assert.ok(DEFAULTS.warnC < DEFAULTS.criticalC);
   assert.ok(DEFAULTS.resumeC < DEFAULTS.warnC);
   assert.ok(DEFAULTS.headroomFrac > 0 && DEFAULTS.headroomFrac < 1);
+  // Heat-attribution knobs present and ordered sanely.
+  assert.ok(DEFAULTS.criticalC < DEFAULTS.hardCriticalC, 'hard ceiling above the throttle-critical');
+  assert.ok(DEFAULTS.gpuWarnC > 0 && DEFAULTS.gpuWarnC < DEFAULTS.hardCriticalC);
+  assert.ok(DEFAULTS.appCpuHeatPct > 0 && DEFAULTS.appCpuHeatPct <= 100);
+});
+
+// ── thermalDecision heat attribution: don't throttle llama for EXTERNAL heat ──
+
+test('thermalDecision: die hot but iGPU cool + llama-CPU low => EXTERNAL heat, do NOT pause/unload', () => {
+  // The observed incident: external CPU load drives the die (cpuC) to 98C while
+  // llama's iGPU is idle (41C) and llama's own CPU share is tiny.
+  const d = thermalDecision({
+    tempC: 98, prevState: 'normal',
+    warnC: 90, resumeC: 80, criticalC: 96,
+    gpuC: 41, appCpuPct: 3, gpuWarnC: 85, appCpuHeatPct: 25, hardCriticalC: 105
+  });
+  assert.equal(d.state, 'normal');
+  assert.equal(d.pauseDispatch, false);
+  assert.equal(d.unload, false);
+});
+
+test('thermalDecision: external heat holding => still normal even if we were throttled before', () => {
+  const d = thermalDecision({
+    tempC: 97, prevState: 'throttled',
+    warnC: 90, resumeC: 80, criticalC: 96,
+    gpuC: 40, appCpuPct: 2, gpuWarnC: 85, appCpuHeatPct: 25, hardCriticalC: 105
+  });
+  assert.equal(d.state, 'normal');
+  assert.equal(d.pauseDispatch, false);
+  assert.equal(d.unload, false);
+});
+
+test("thermalDecision: die hot AND iGPU hot (llama's own compute) => pause/offload, NEVER unload", () => {
+  const d = thermalDecision({
+    tempC: 97, prevState: 'normal',
+    warnC: 90, resumeC: 80, criticalC: 96,
+    gpuC: 92, appCpuPct: 5, gpuWarnC: 85, appCpuHeatPct: 25, hardCriticalC: 105
+  });
+  assert.equal(d.state, 'critical');
+  assert.equal(d.pauseDispatch, true);
+  assert.equal(d.unload, false);
+});
+
+test('thermalDecision: high llama CPU share alone attributes the heat to llama => throttle', () => {
+  // iGPU cool but llama is the one pegging the CPU (its own workload).
+  const d = thermalDecision({
+    tempC: 91, prevState: 'normal',
+    warnC: 90, resumeC: 80, criticalC: 96,
+    gpuC: 60, appCpuPct: 70, gpuWarnC: 85, appCpuHeatPct: 25, hardCriticalC: 105
+  });
+  assert.equal(d.state, 'throttled');
+  assert.equal(d.pauseDispatch, true);
+  assert.equal(d.unload, false);
+});
+
+test('thermalDecision: at hardCriticalC => pause REGARDLESS of source, still NEVER unload', () => {
+  // Even though the heat is external (iGPU cool, llama CPU low), the absolute die
+  // ceiling forces a pause to protect the shared hardware — but keep the model loaded.
+  const d = thermalDecision({
+    tempC: 106, prevState: 'normal',
+    warnC: 90, resumeC: 80, criticalC: 96,
+    gpuC: 40, appCpuPct: 2, gpuWarnC: 85, appCpuHeatPct: 25, hardCriticalC: 105
+  });
+  assert.equal(d.state, 'critical');
+  assert.equal(d.pauseDispatch, true);
+  assert.equal(d.unload, false);
+});
+
+test('thermalDecision: no attribution inputs => backward-compatible threshold behavior (no unload)', () => {
+  // Old callers pass only tempC — assume llama could be the source and throttle,
+  // but the thermal path no longer unloads.
+  const warn = thermalDecision({ tempC: 91, prevState: 'normal', warnC: 90, resumeC: 80, criticalC: 96 });
+  assert.equal(warn.state, 'throttled');
+  assert.equal(warn.pauseDispatch, true);
+  assert.equal(warn.unload, false);
+  const crit = thermalDecision({ tempC: 97, prevState: 'normal', warnC: 90, resumeC: 80, criticalC: 96 });
+  assert.equal(crit.state, 'critical');
+  assert.equal(crit.pauseDispatch, true);
+  assert.equal(crit.unload, false);
 });
 
 // ── planMemoryRecovery: decide serve / reclaim / refuse ─────────────────────

@@ -1939,6 +1939,10 @@ function guardCfg() {
     warnC: g.warnC ?? GUARD_DEFAULTS.warnC,
     resumeC: g.resumeC ?? GUARD_DEFAULTS.resumeC,
     criticalC: g.criticalC ?? GUARD_DEFAULTS.criticalC,
+    // Heat-attribution + hard-safety knobs (shared CPU/iGPU die). See thermalDecision.
+    gpuWarnC: g.gpuWarnC ?? GUARD_DEFAULTS.gpuWarnC,
+    appCpuHeatPct: g.appCpuHeatPct ?? GUARD_DEFAULTS.appCpuHeatPct,
+    hardCriticalC: g.hardCriticalC ?? GUARD_DEFAULTS.hardCriticalC,
     headroomFrac: g.headroomFrac ?? GUARD_DEFAULTS.headroomFrac,
     kvBytesPerToken: g.kvBytesPerToken ?? GUARD_DEFAULTS.kvBytesPerToken,
     overheadBytes: g.overheadBytes ?? GUARD_DEFAULTS.overheadBytes,
@@ -8679,11 +8683,20 @@ setInterval(() => {
 }, MEM_WATCHDOG_INTERVAL);
 
 // ── Thermal governor ─────────────────────────────────────────────────────────
-// Polls APU temperature (max of GPU edge + CPU) and protects the hardware:
-// above the warn threshold it pauses dispatching new requests (acquireLocalSlot
-// holds the queue); above the critical threshold it unloads the model to force a
-// cooldown. Added after the incident where the APU sat at 98-99 C. Governs on the
-// hotter of GPU/CPU and ignores all-zero readings (telemetry dark).
+// Polls the shared-die APU temperature and protects the hardware WITHOUT harming
+// service. This APU shares one die between the CPU cores and the iGPU, so the die
+// temp (k10temp Tctl, the hotter of GPU/CPU) can be driven to redline by EXTERNAL
+// CPU workloads while llama's iGPU is idle. Before throttling, the governor
+// attributes the heat: it passes the iGPU temp (gpuC) and llama's own CPU share
+// (appCpuPct) so thermalDecision can tell whether LLAMA is actually the heat
+// source. If the heat is external, llama keeps serving (throttling can't cool a
+// die llama isn't heating). If llama IS the source, it pauses new dispatch (warn)
+// and offloads (critical) — but NEVER unloads: an idle loaded model generates ~no
+// heat, so unloading it would not cool the die and would only destroy inference.
+// An absolute die ceiling (hardCriticalC) pauses regardless of source to protect
+// the hardware, still without unloading. Memory-pressure unloads are a SEPARATE
+// path (planMemoryRecovery / unloadOtherModels) and are unaffected. Ignores
+// all-zero readings (telemetry dark). Added after the APU sat at 98-99 C.
 const THERMAL_INTERVAL = 5_000;
 let thermalPollInFlight = false;
 setInterval(async () => {
@@ -8696,31 +8709,44 @@ setInterval(async () => {
     try { const g = await getGpuStats(); gpuC = Number(g?.temperature) || 0; } catch { /* telemetry dark */ }
     const cpuC = Number(getCpuTemperature()) || 0;
     const maxTempC = Math.max(gpuC, cpuC);
+    // llama-stack CPU share (% of total capacity) — used to attribute the heat.
+    let appCpuPct = 0;
+    try { appCpuPct = Number(getAppUsage(totalmem() / 1024)?.cpuUsage) || 0; } catch { /* usage dark */ }
 
     const prev = guardThermalState;
     const decision = thermalDecision({
       tempC: maxTempC, prevState: prev,
-      warnC: cfg.warnC, resumeC: cfg.resumeC, criticalC: cfg.criticalC
+      warnC: cfg.warnC, resumeC: cfg.resumeC, criticalC: cfg.criticalC,
+      // Heat attribution: iGPU temp is llama's direct thermal contribution; appCpuPct
+      // is llama's CPU share. Only present when telemetry is live (else null => the
+      // decision falls back to threshold-only, backward-compatible behavior).
+      gpuC: gpuC > 0 ? gpuC : null,
+      appCpuPct,
+      gpuWarnC: cfg.gpuWarnC, appCpuHeatPct: cfg.appCpuHeatPct, hardCriticalC: cfg.hardCriticalC
     });
     guardThermalState = decision.state;
     guardDispatchPaused = decision.pauseDispatch && maxTempC > 0;
-    guardLast = { state: decision.state, maxTempC, gpuC, cpuC, paused: guardDispatchPaused, at: Date.now() };
+    guardLast = { state: decision.state, maxTempC, gpuC, cpuC, appCpuPct, paused: guardDispatchPaused, at: Date.now() };
 
     // Log only on transitions to avoid spamming every interval.
     if (decision.state !== prev) {
       if (decision.state === 'critical') {
-        addLog('system', `[thermal] CRITICAL ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}) >= ${cfg.criticalC}C — unloading model to cool down`);
+        const hard = maxTempC >= cfg.hardCriticalC;
+        addLog('system', `[thermal] CRITICAL ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}, llamaCpu=${appCpuPct}%) ${hard ? `>= hard ceiling ${cfg.hardCriticalC}C` : `>= ${cfg.criticalC}C`} — pausing new requests and offloading (model stays loaded) until <= ${cfg.resumeC}C`);
       } else if (decision.state === 'throttled') {
-        addLog('system', `[thermal] throttling: ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}) >= ${cfg.warnC}C — pausing new requests until <= ${cfg.resumeC}C`);
+        addLog('system', `[thermal] throttling: ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}, llamaCpu=${appCpuPct}%) >= ${cfg.warnC}C — pausing new requests until <= ${cfg.resumeC}C`);
       } else if (decision.state === 'normal') {
-        addLog('system', `[thermal] recovered: ${maxTempC.toFixed(1)}C <= ${cfg.resumeC}C — resuming normal dispatch`);
+        // Coming down from a throttle, or heat that was attributed to external load.
+        const external = maxTempC >= cfg.warnC;
+        addLog('system', external
+          ? `[thermal] die ${maxTempC.toFixed(1)}C but heat is EXTERNAL (gpu=${gpuC} < ${cfg.gpuWarnC}C, llamaCpu=${appCpuPct}% < ${cfg.appCpuHeatPct}%) — not throttling llama`
+          : `[thermal] recovered: ${maxTempC.toFixed(1)}C <= ${cfg.resumeC}C — resuming normal dispatch`);
       }
     }
-
-    if (decision.unload && maxTempC > 0 && llamaProcess && !llamaProcess.killed && !restartInProgress) {
-      intentionalStop = true;
-      try { await stopLlamaServer(); } finally { intentionalStop = false; }
-    }
+    // NOTE: the thermal path deliberately performs NO unload. Models stay loaded so
+    // inference resumes instantly once the die cools; heat shedding is via the
+    // dispatch pause + remote offload (dispatchPreference). Memory-pressure unloads
+    // live in the separate planMemoryRecovery / unloadOtherModels path.
   } finally {
     thermalPollInFlight = false;
   }

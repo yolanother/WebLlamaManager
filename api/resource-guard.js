@@ -14,10 +14,21 @@ export const DEFAULTS = {
   overheadBytes: 3 * (2 ** 30), // ~3 GiB for compute buffers / runtime
   headroomFrac: 0.12,        // keep 12% of available RAM free
   minContext: 4096,          // smallest context worth serving
-  // Thermal thresholds (deg C), governed on max(GPU, CPU).
+  // Thermal thresholds (deg C), governed on the die temperature (k10temp Tctl,
+  // the hotter of GPU/CPU on this shared-die APU).
   warnC: 90,                 // pause dispatching new requests at/above this
   resumeC: 80,               // resume dispatch when cooled to/below this
-  criticalC: 96              // unload the model at/above this
+  criticalC: 96,             // pause + offload at/above this (never unloads — see thermalDecision)
+  // Heat-attribution knobs. On a shared CPU+iGPU die the die can be driven hot by
+  // EXTERNAL processes while llama's own workload is idle; throttling llama then
+  // does nothing but destroy service. These let thermalDecision tell whether
+  // LLAMA is actually the heat source before it throttles.
+  gpuWarnC: 85,              // iGPU at/above this => llama's own compute is heating the die
+  appCpuHeatPct: 25,         // llama-stack CPU share (% of total) at/above this => llama is heating the die
+  // Absolute die-temperature ceiling. Because it is a shared die, at/above this we
+  // pause dispatch REGARDLESS of the heat source to protect the hardware — but even
+  // then we only pause/offload, we never unload (an idle model is not a heat source).
+  hardCriticalC: 105
 };
 
 /**
@@ -173,22 +184,78 @@ export function dispatchPreference({ preferLocal = true, thermalPaused = false }
 }
 
 /**
- * Hysteresis thermal state machine. Governs on a single temperature (the caller
- * passes max(GPU, CPU)). Once throttled, stays throttled until cooled to resumeC.
+ * Hysteresis thermal state machine with heat-source attribution.
+ *
+ * This APU shares ONE die between the CPU cores and the iGPU, so the die
+ * temperature (`tempC`, the k10temp Tctl / hotter of GPU+CPU) can be driven to
+ * redline by EXTERNAL processes (a busy CPU workload that has nothing to do with
+ * llama) while llama's own iGPU sits idle. Throttling or unloading llama in that
+ * case is pure harm: an idle loaded model generates ~no heat, so unloading it
+ * does not cool the die, and pausing dispatch cannot cool a die that llama is not
+ * heating — it only destroys service. So before throttling we ATTRIBUTE the heat:
+ *
+ *   - If the caller passes attribution inputs (`gpuC` and/or `appCpuPct`) and BOTH
+ *     say llama is cool (iGPU below `gpuWarnC` AND llama's CPU share below
+ *     `appCpuHeatPct`), the heat is external => stay 'normal', never pause, never
+ *     unload. Inference keeps running; it will not make the die hotter.
+ *   - Otherwise llama is (or may be) the heat source, so the normal hysteresis
+ *     thresholds apply: pause new dispatch at `warnC`, and at `criticalC`
+ *     pause + offload (the caller routes offloadable work to a remote to shed the
+ *     iGPU load). Even here we NEVER unload for thermal reasons — the model stays
+ *     loaded so inference resumes instantly once the die cools. Memory-pressure
+ *     unloads are a SEPARATE path (see planMemoryRecovery) and are unaffected.
+ *
+ * Hard-safety backstop: at/above `hardCriticalC` (an absolute die ceiling) we
+ * pause dispatch REGARDLESS of the heat source to protect the shared hardware —
+ * but still only pause/offload, never unload.
+ *
+ * `unload` is retained in the return shape for backward compatibility but is now
+ * ALWAYS false; thermal actions are limited to pausing/offloading.
+ *
  * @param {object} a
- * @param {number} a.tempC Current temperature (max of GPU/CPU).
+ * @param {number} a.tempC Current die temperature (hotter of GPU/CPU, k10temp Tctl).
  * @param {string} a.prevState 'normal' | 'throttled' | 'critical'
  * @param {number} [a.warnC]
  * @param {number} [a.resumeC]
  * @param {number} [a.criticalC]
+ * @param {number|null} [a.gpuC] iGPU temperature (llama's direct thermal contribution). null => unknown.
+ * @param {number|null} [a.appCpuPct] llama-stack CPU share (% of total). null => unknown.
+ * @param {number} [a.gpuWarnC] iGPU temp at/above which llama's own compute counts as heating the die.
+ * @param {number} [a.appCpuHeatPct] llama CPU share at/above which llama counts as heating the die.
+ * @param {number} [a.hardCriticalC] Absolute die ceiling: pause regardless of source.
  * @returns {{state:string, pauseDispatch:boolean, unload:boolean}}
  */
 export function thermalDecision({
   tempC, prevState = 'normal',
-  warnC = DEFAULTS.warnC, resumeC = DEFAULTS.resumeC, criticalC = DEFAULTS.criticalC
+  warnC = DEFAULTS.warnC, resumeC = DEFAULTS.resumeC, criticalC = DEFAULTS.criticalC,
+  gpuC = null, appCpuPct = null,
+  gpuWarnC = DEFAULTS.gpuWarnC, appCpuHeatPct = DEFAULTS.appCpuHeatPct,
+  hardCriticalC = DEFAULTS.hardCriticalC
 }) {
+  // Hard-safety backstop first: at the absolute die ceiling we pause regardless of
+  // who is heating the die (shared hardware) — but never unload; offload instead.
+  if (tempC >= hardCriticalC) {
+    return { state: 'critical', pauseDispatch: true, unload: false };
+  }
+
+  // Heat attribution: is llama actually the source of the heat? Only decide
+  // "external" when we have at least one attribution signal AND every signal we
+  // have says llama is cool. With no signals we conservatively assume llama could
+  // be the source and fall through to the normal thresholds (backward compatible).
+  const haveAttribution = gpuC !== null || appCpuPct !== null;
+  const gpuHot = gpuC !== null && gpuC >= gpuWarnC;
+  const appCpuHot = appCpuPct !== null && appCpuPct >= appCpuHeatPct;
+  const llamaIsHeatSource = gpuHot || appCpuHot;
+
+  if (haveAttribution && !llamaIsHeatSource) {
+    // Die is hot but the heat is EXTERNAL (iGPU cool + llama CPU low). Throttling
+    // llama cannot cool an externally-heated die, so keep serving.
+    return { state: 'normal', pauseDispatch: false, unload: false };
+  }
+
+  // llama is (or may be) the heat source — apply the hysteresis thresholds.
   if (tempC >= criticalC) {
-    return { state: 'critical', pauseDispatch: true, unload: true };
+    return { state: 'critical', pauseDispatch: true, unload: false };
   }
   if (tempC >= warnC) {
     return { state: 'throttled', pauseDispatch: true, unload: false };
