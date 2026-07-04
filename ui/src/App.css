@@ -281,7 +281,10 @@ input::placeholder {
 .stats-header-temp {
   font-size: 14px;
   font-weight: 600;
-  color: var(--warning);
+  /* Color is set inline from the thermal guard severity (see App.jsx) so this
+     compact gauge always agrees with the guard's Normal/Throttled/Critical
+     state. This is only a neutral fallback if no severity is provided. */
+  color: var(--text-primary);
   font-family: monospace;
 }
 

@@ -624,6 +624,73 @@ const CHART_COLORS = {
   offloaded: '#8b5cf6'
 };
 
+// --- Thermal status helpers -------------------------------------------------
+// The API thermal guard (stats.guard) is the SINGLE SOURCE OF TRUTH for the
+// box's thermal state. Every temperature/thermal indicator on the dashboard
+// derives its severity from here so widgets can never contradict each other
+// (e.g. a "good"/green gauge showing while the guard reports Critical).
+//
+// Thresholds are kept in sync with the API guard so that raw-sensor readouts
+// (which have no direct guard context) color themselves the same way the guard
+// would: warn ~90°C, critical ~95°C.
+const TEMP_WARN_C = 90;
+const TEMP_CRIT_C = 95;
+
+const SEVERITY_RANK = { normal: 0, throttled: 1, critical: 2 };
+
+/**
+ * Overall thermal severity for the whole box, taken from the guard state.
+ * @param {object} [guard] stats.guard — { state, maxTempC, gpuC, cpuC, paused }.
+ * @returns {'normal'|'throttled'|'critical'} severity level.
+ */
+function guardSeverity(guard) {
+  const state = guard?.state;
+  if (state === 'critical') return 'critical';
+  if (state === 'throttled') return 'throttled';
+  if (state === 'normal') return 'normal';
+  // No guard state available — fall back to the hottest reported sensor.
+  const t = guard?.maxTempC;
+  if (t == null) return 'normal';
+  if (t >= TEMP_CRIT_C) return 'critical';
+  if (t >= TEMP_WARN_C) return 'throttled';
+  return 'normal';
+}
+
+/**
+ * Thermal severity for a single sensor readout (e.g. the CPU or GPU temp).
+ * Uses the sensor's own value against the guard-aligned thresholds, but is
+ * floored by the guard state whenever this sensor is (near) the guard's
+ * hottest reading — so the sensor driving a Critical guard can never render
+ * as "good"/green.
+ * @param {number} [sensorC] the sensor temperature in °C.
+ * @param {object} [guard] stats.guard for context.
+ * @returns {'normal'|'throttled'|'critical'} severity level.
+ */
+function sensorSeverity(sensorC, guard) {
+  let sev = 'normal';
+  if (sensorC != null) {
+    if (sensorC >= TEMP_CRIT_C) sev = 'critical';
+    else if (sensorC >= TEMP_WARN_C) sev = 'throttled';
+  }
+  // If this reading is the one driving the guard, inherit the guard's severity.
+  if (guard?.maxTempC != null && sensorC != null && sensorC >= guard.maxTempC - 0.5) {
+    const g = guardSeverity(guard);
+    if (SEVERITY_RANK[g] > SEVERITY_RANK[sev]) sev = g;
+  }
+  return sev;
+}
+
+/**
+ * Maps a thermal severity to its dashboard CSS color variable.
+ * @param {'normal'|'throttled'|'critical'} severity
+ * @returns {string} a CSS color value.
+ */
+function severityColor(severity) {
+  if (severity === 'critical') return 'var(--error)';
+  if (severity === 'throttled') return 'var(--warning)';
+  return 'var(--success)';
+}
+
 // Custom tooltip for charts
 function ChartTooltip({ active, payload, label, unit = '' }) {
   if (!active || !payload || !payload.length) return null;
@@ -1705,7 +1772,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
           <div className="fullscreen-charts-grid">
             <div className="chart-card">
-              <h4>Temperature <span className="chart-value">GPU: {stats?.gpu?.temperature?.toFixed(0) || 0}°C{stats?.cpu?.temperature ? ` / CPU: ${stats.cpu.temperature}°C` : ''}</span></h4>
+              <h4>Temperature <span className="chart-value">
+                <span style={{ color: severityColor(sensorSeverity(stats?.gpu?.temperature, stats?.guard)) }}>GPU: {stats?.gpu?.temperature?.toFixed(0) || 0}°C</span>
+                {stats?.cpu?.temperature ? <> / <span style={{ color: severityColor(sensorSeverity(stats.cpu.temperature, stats?.guard)) }}>CPU: {stats.cpu.temperature}°C</span></> : ''}
+              </span></h4>
               <TemperatureChart data={analytics?.temperature || []} height={200} />
             </div>
             <div className="chart-card">
@@ -2162,7 +2232,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               <span className="resource-label">CPU</span>
               <span className="resource-detail">{stats?.cpu?.cores || 0} cores @ {stats?.cpu?.loadAvg?.[0]?.toFixed(1) || '0.0'} load</span>
               {stats?.cpu?.temperature && (
-                <span className="resource-detail">Temp: {stats.cpu.temperature}°C</span>
+                <span
+                  className="resource-detail"
+                  style={{ color: severityColor(sensorSeverity(stats.cpu.temperature, stats?.guard)) }}
+                >Temp: {stats.cpu.temperature}°C</span>
               )}
             </div>
           </div>
@@ -2221,7 +2294,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   {stats.gpu.usage?.toFixed(0) || 0}% @ {stats.gpu.coreClock || 0} MHz
                 </span>
                 {stats.gpu.temperature > 0 && (
-                  <span className="resource-detail">Temp: {stats.gpu.temperature}°C</span>
+                  <span
+                    className="resource-detail"
+                    style={{ color: severityColor(sensorSeverity(stats.gpu.temperature, stats?.guard)) }}
+                  >Temp: {stats.gpu.temperature}°C</span>
                 )}
               </div>
             </div>
@@ -2309,8 +2385,8 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             <h4>
               Temperature
               <span className="chart-value">
-                GPU: {stats?.gpu?.temperature?.toFixed(0) || 0}°C
-                {stats?.cpu?.temperature && ` / CPU: ${stats.cpu.temperature}°C`}
+                <span style={{ color: severityColor(sensorSeverity(stats?.gpu?.temperature, stats?.guard)) }}>GPU: {stats?.gpu?.temperature?.toFixed(0) || 0}°C</span>
+                {stats?.cpu?.temperature ? <> / <span style={{ color: severityColor(sensorSeverity(stats.cpu.temperature, stats?.guard)) }}>CPU: {stats.cpu.temperature}°C</span></> : ''}
               </span>
             </h4>
             <TemperatureChart data={analytics?.temperature || []} />
@@ -6802,12 +6878,23 @@ function StatsHeader({ stats }) {
               <span className="stats-header-label">GPU</span>
             </div>
 
-            {stats.gpu.temperature > 0 && (
-              <div className="stats-header-item temp" title="GPU Temperature">
-                <span className="stats-header-temp">{stats.gpu.temperature}°</span>
-                <span className="stats-header-label">Temp</span>
-              </div>
-            )}
+            {(stats.guard || stats.gpu.temperature > 0) && (() => {
+              // Reflect the guard's whole-box thermal state (hottest sensor),
+              // NOT just the GPU reading — otherwise a cool GPU makes this gauge
+              // read "fine" while the guard reports Critical from the CPU.
+              const guard = stats.guard;
+              const sev = guard ? guardSeverity(guard) : sensorSeverity(stats.gpu.temperature, null);
+              const displayC = guard?.maxTempC != null ? guard.maxTempC : stats.gpu.temperature;
+              const title = guard
+                ? `Thermal: ${sev} — ${Math.round(displayC)}°C (gpu ${Math.round(guard.gpuC ?? stats.gpu.temperature)} / cpu ${Math.round(guard.cpuC ?? 0)})`
+                : 'GPU Temperature';
+              return (
+                <div className="stats-header-item temp" title={title}>
+                  <span className="stats-header-temp" style={{ color: severityColor(sev) }}>{Math.round(displayC)}°</span>
+                  <span className="stats-header-label">Temp</span>
+                </div>
+              );
+            })()}
           </>
         )}
 
