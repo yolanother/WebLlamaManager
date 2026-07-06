@@ -37,6 +37,7 @@ import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent
 import { findLeakedSlots } from './slot-reaper.js';
 import { resolveDefaultModel, defaultModelListEntries } from './default-models.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
+import { shouldDeferMemRestart } from './mem-watchdog.js';
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
@@ -8346,6 +8347,7 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
 
 // Memory watchdog — restart llama-server if system memory >= 95% and it's the heaviest process
 const MEM_WATCHDOG_INTERVAL = 30_000; // check every 30s
+let _memWatchdogLastDeferLogAt = 0; // throttles deferral log lines to one per minute
 const MEM_WATCHDOG_THRESHOLD = 95; // percent
 let memWatchdogCooldown = false;
 
@@ -8660,6 +8662,24 @@ setInterval(() => {
   const memPercent = getSystemMemoryPercent();
   if (memPercent >= guardCfg().memThresholdPct) {
     if (isLlamaServerHeaviestProcess()) {
+      // A restart tears down in-flight generations ("Stream error: terminated"
+      // client-side), so defer while any request is actively progressing and
+      // memory is still below the hard ceiling. See api/mem-watchdog.js.
+      const deferral = shouldDeferMemRestart({
+        memPercent,
+        thresholdPct: guardCfg().memThresholdPct,
+        activeEntries: activeRequests.values(),
+        nowMs: Date.now(),
+      });
+      if (deferral.defer) {
+        if (Date.now() - _memWatchdogLastDeferLogAt > 60_000) {
+          _memWatchdogLastDeferLogAt = Date.now();
+          const deferMsg = `Memory watchdog: ${memPercent.toFixed(1)}% ≥ ${guardCfg().memThresholdPct}% but ${deferral.progressing} request(s) actively streaming — deferring restart (hard ceiling ${deferral.hardCeilingPct}%)`;
+          console.warn(`[mem-watchdog] ${deferMsg}`);
+          addLog('system', deferMsg);
+        }
+        return;
+      }
       memWatchdogCooldown = true;
       const msg = `Memory watchdog triggered: system at ${memPercent.toFixed(1)}% and llama-server is heaviest process. Restarting...`;
       console.warn(`[mem-watchdog] ${msg}`);
