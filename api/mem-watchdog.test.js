@@ -29,11 +29,37 @@ test('does not defer when no requests are active', () => {
   assert.equal(r.progressing, 0);
 });
 
-test('does not defer when all active requests are idle past the window', () => {
+test('does not defer when token-emitting requests go idle past the window', () => {
   const r = shouldDeferMemRestart({
     memPercent: 91,
     thresholdPct: 90,
-    activeEntries: [{ lastActivityAt: NOW - 31_000 }, { startTime: NOW - 120_000 }],
+    activeEntries: [
+      { lastActivityAt: NOW - 31_000, startTime: NOW - 700_000, tokens: 12 },
+      { startTime: NOW - 700_000, tokens: 40 },
+    ],
+    nowMs: NOW,
+  });
+  assert.equal(r.defer, false);
+});
+
+test('defers for a zero-token request within the prompt-processing grace', () => {
+  // 57s into prompt processing of a 27k-token context: no tokens emitted yet,
+  // lastActivityAt stale — the exact case that killed session J_h_Br50.
+  const r = shouldDeferMemRestart({
+    memPercent: 92.5,
+    thresholdPct: 90,
+    activeEntries: [{ startTime: NOW - 57_000, lastActivityAt: NOW - 57_000, tokens: 0 }],
+    nowMs: NOW,
+  });
+  assert.equal(r.defer, true);
+  assert.equal(r.progressing, 1);
+});
+
+test('does not defer for a zero-token request older than the prompt grace', () => {
+  const r = shouldDeferMemRestart({
+    memPercent: 92.5,
+    thresholdPct: 90,
+    activeEntries: [{ startTime: NOW - 601_000, lastActivityAt: NOW - 601_000, tokens: 0 }],
     nowMs: NOW,
   });
   assert.equal(r.defer, false);

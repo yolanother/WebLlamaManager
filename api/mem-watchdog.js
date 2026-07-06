@@ -21,6 +21,11 @@
  * @param {number} opts.nowMs - Current epoch millis.
  * @param {number} [opts.activityWindowMs=30000] - How recent activity must be for a
  *   request to count as "actively progressing".
+ * @param {number} [opts.promptGraceMs=600000] - Age below which a request that has
+ *   emitted ZERO tokens still counts as progressing. During prompt processing of a
+ *   large context llama.cpp emits nothing for minutes, so lastActivityAt goes stale
+ *   even though the upstream is actively crunching (same pathology the stall
+ *   watchdog handles via its prompt-processing extension).
  * @param {number} [opts.hardCeilingMarginPct=6] - Margin above the soft threshold at
  *   which restarts are no longer deferred (capped at 98%).
  * @returns {{defer: boolean, hardCeilingPct: number, progressing: number}}
@@ -33,6 +38,7 @@ export function shouldDeferMemRestart({
   activeEntries,
   nowMs,
   activityWindowMs = 30_000,
+  promptGraceMs = 600_000,
   hardCeilingMarginPct = 6,
 }) {
   const hardCeilingPct = Math.min(98, thresholdPct + hardCeilingMarginPct);
@@ -40,7 +46,13 @@ export function shouldDeferMemRestart({
   for (const entry of activeEntries) {
     if (!entry || entry._watchdogKilled) continue;
     const lastActivity = entry.lastActivityAt || entry.startTime || 0;
-    if (nowMs - lastActivity < activityWindowMs) progressing++;
+    if (nowMs - lastActivity < activityWindowMs) {
+      progressing++;
+      continue;
+    }
+    const inPromptProcessing = !(entry.tokens > 0);
+    const age = nowMs - (entry.startTime || lastActivity);
+    if (inPromptProcessing && age < promptGraceMs) progressing++;
   }
   const defer = progressing > 0 && memPercent < hardCeilingPct;
   return { defer, hardCeilingPct, progressing };
