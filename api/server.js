@@ -45,6 +45,11 @@ import {
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl
 } from './engines.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
+import { resolveDs4ModelPath } from './engines.js';
+import {
+  ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
+  shouldKeepEmbedServer, ds4Exclusive503Body
+} from './ds4-exclusive.js';
 import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
@@ -206,6 +211,11 @@ let currentPreset = null;
 // the default) or 'ds4' (ds4-server, DeepSeek V4 Flash). Set by preset activation.
 // While 'ds4', llama-server is stopped and the ds4 supervisor owns the box.
 let currentEngine = ENGINE_TYPES.LLAMA;
+// In-flight ds4 engine swap (activation or deactivation). While set, incoming
+// OpenAI requests await it so mid-swap traffic is held and served after readiness
+// rather than 404'd or mis-routed (established queue-during-swap operator rule).
+// Cleared back to null once the swap settles. Resolves (never rejects) for awaiters.
+let ds4SwapPromise = null;
 let lastUsedModel = null;   // most recently used model name
 let lastUsedModelTime = 0;  // timestamp of last use
 let activeLocalModel = null; // model currently being processed/loaded on local backend
@@ -1992,6 +2002,14 @@ function memAvailableBytes() {
   try {
     const m = readFileSync('/proc/meminfo', 'utf8');
     return (parseInt(m.match(/MemAvailable:\s+(\d+)/)?.[1] || '0', 10)) * 1024;
+  } catch { return 0; }
+}
+
+/** Total system memory in bytes (MemTotal), 0 if unreadable. */
+function memTotalBytes() {
+  try {
+    const m = readFileSync('/proc/meminfo', 'utf8');
+    return (parseInt(m.match(/MemTotal:\s+(\d+)/)?.[1] || '0', 10)) * 1024;
   } catch { return 0; }
 }
 
@@ -4843,9 +4861,168 @@ async function restartDs4Server(preset) { return getDs4Supervisor().restart(pres
 /** Fetch ds4 server health (probe GET /v1/models; ds4 has no /health). */
 async function getDs4Health() { return getDs4Supervisor().health(); }
 
+// ── Exclusive-DS4-mode orchestration ─────────────────────────────────────────
+// Verified pre-eviction on activation, verified reclaim on deactivation, and a
+// swap gate so mid-swap requests are held (not 404'd). Pure decisions live in
+// ds4-exclusive.js; here we wire them to the real stop/reclaim/spawn side effects.
+
+/** Reclaim poll knobs. The 81GB ds4 model needs the kernel to actually free the
+ *  pages the evicted llama model held before we spawn ds4 (which sets
+ *  oom_score_adj=1000 and would be OOM-killed if we over-commit). */
+const DS4_RECLAIM_TIMEOUT_MS = parseInt(process.env.DS4_RECLAIM_TIMEOUT_MS) || 180_000;
+const DS4_RECLAIM_INTERVAL_MS = parseInt(process.env.DS4_RECLAIM_INTERVAL_MS) || 2000;
+/** How long to wait for ds4 /v1/models readiness before releasing the swap gate. */
+const DS4_READY_TIMEOUT_MS = parseInt(process.env.DS4_READY_TIMEOUT_MS) || 600_000;
+const DS4_READY_INTERVAL_MS = parseInt(process.env.DS4_READY_INTERVAL_MS) || 3000;
+/** Approx resident footprint of the embed server, counted in the eviction budget. */
+const DS4_EMBED_APPROX_BYTES = 5 * 1024 * 1024 * 1024;
+/** Fallback ds4 weight size when the GGUF can't be stat'd (DeepSeek V4 Flash q2 ~81GB). */
+const DS4_MODEL_FALLBACK_BYTES = 81 * 1024 * 1024 * 1024;
+
+/** Model names (normalized-compared) that route to the local ds4 engine. */
+function ds4ModelIdsForPreset(presetId) {
+  const preset = config.presets?.[presetId];
+  if (!preset) return presetId ? [presetId] : [];
+  const ids = [presetId, preset.name].filter(Boolean);
+  const mp = preset.modelPath ? String(preset.modelPath).split('/').pop().replace(/\.gguf$/i, '') : '';
+  if (mp) ids.push(mp);
+  return ids;
+}
+
+/** Guard headroom in bytes (fraction of MemTotal the guard keeps free). */
+function ds4HeadroomBytes() {
+  const gc = guardCfg();
+  const total = memTotalBytes();
+  const frac = gc.headroomFrac ?? 0.06;
+  return total ? Math.round(total * frac) : 8 * 1024 * 1024 * 1024;
+}
+
+/** Poll ds4 /v1/models until ready or timeout; resolves regardless (best-effort gate). */
+async function waitForDs4Ready() {
+  const start = Date.now();
+  while (Date.now() - start < DS4_READY_TIMEOUT_MS) {
+    try { const h = await getDs4Health(); if (h?.status === 'ok') return true; } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, DS4_READY_INTERVAL_MS));
+  }
+  return false;
+}
+
+/**
+ * Activate a ds4 preset in TRUE exclusive mode: flip the engine so no new local
+ * llama load can start, stop llama-server (and the embed server unless it fits the
+ * budget), VERIFY MemAvailable actually reclaimed to (model + headroom) BEFORE
+ * spawning ds4, then spawn and (in the background) wait for readiness. The HTTP
+ * caller returns once reclaim+spawn succeed; requests await ds4SwapPromise until
+ * readiness. On reclaim timeout ds4 is NOT spawned and the box rolls back to llama.
+ * @returns {Promise<{ok:true}|{ok:false,status:number,error:string}>}
+ */
+async function activateDs4Exclusive(presetId, preset) {
+  const ds4cfg = resolveDs4Config(config, process.env);
+  const modelAbs = resolveDs4ModelPath(preset.modelPath || '', ds4cfg.ggufDir);
+  const ds4ModelBytes = ggufFileSizeBytes(modelAbs) || DS4_MODEL_FALLBACK_BYTES;
+  const headroomBytes = ds4HeadroomBytes();
+  const totalBytes = memTotalBytes();
+  const keepEmbed = shouldKeepEmbedServer({
+    allowEmbedServer: ds4cfg.allowEmbedServer,
+    ds4ModelBytes, embedServerBytes: DS4_EMBED_APPROX_BYTES, totalBytes, headroomBytes,
+  });
+
+  // Flip engine + mode immediately so ensureModelServed early-returns and no new
+  // local llama load can race the eviction. Traffic is gated on ds4SwapPromise below.
+  currentMode = 'single';
+  currentPreset = presetId;
+  currentEngine = ENGINE_TYPES.DS4;
+
+  let releaseGate;
+  ds4SwapPromise = new Promise((resolve) => { releaseGate = resolve; });
+
+  try {
+    addLog('presets', `Activating ds4 EXCLUSIVE mode: ${preset.name} (pre-evicting local models, verifying reclaim before spawn)`);
+    await stopLlamaServer();
+    if (!keepEmbed) {
+      addLog('presets', 'ds4: stopping embed server — does not fit the exclusive-DS4 memory budget');
+      await stopEmbedServer();
+    } else {
+      addLog('presets', 'ds4: keeping embed server resident (fits the memory budget)');
+    }
+
+    const targetBytes = reclaimTargetBytes({ ds4ModelBytes, headroomBytes });
+    addLog('presets', `ds4: waiting for memory reclaim — need MemAvailable ≥ ${gibStr(targetBytes)} GiB before spawn`);
+    const poll = await pollForReclaim({
+      readMemAvailable: memAvailableBytes,
+      targetBytes,
+      timeoutMs: DS4_RECLAIM_TIMEOUT_MS,
+      intervalMs: DS4_RECLAIM_INTERVAL_MS,
+    });
+    if (!poll.ok) {
+      const e = new Error(`ds4 pre-eviction FAILED: MemAvailable ${gibStr(poll.memAvailableBytes)} GiB < required ${gibStr(targetBytes)} GiB after ${Math.round(poll.waitedMs / 1000)}s; refusing to spawn ds4 to avoid OOM/swap.`);
+      e.code = 'DS4_RECLAIM_TIMEOUT';
+      throw e;
+    }
+    addLog('presets', `ds4: reclaim verified (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB ≥ ${gibStr(targetBytes)} GiB); spawning ds4-server`);
+    startDs4Server(preset);
+  } catch (err) {
+    // Roll back so the box isn't left engine-less: restore llama router.
+    currentEngine = ENGINE_TYPES.LLAMA;
+    currentMode = 'router';
+    currentPreset = null;
+    try { await stopDs4Server(); } catch { /* ignore */ }
+    if (releaseGate) releaseGate();
+    ds4SwapPromise = null;
+    addLog('presets', `ds4 activation rolled back to llama router: ${err.message}`);
+    return { ok: false, status: err.code === 'DS4_RECLAIM_TIMEOUT' ? 503 : 500, error: err.message };
+  }
+
+  // Background: hold the swap gate until ds4 answers /v1/models, then release it so
+  // queued mid-swap requests proceed against a ready ds4-server.
+  (async () => {
+    try { await waitForDs4Ready(); }
+    finally {
+      if (releaseGate) releaseGate();
+      ds4SwapPromise = null;
+    }
+  })();
+
+  return { ok: true };
+}
+
+/**
+ * Deactivate exclusive DS4 mode: stop ds4-server, free its port, flip the engine
+ * back to llama, and VERIFY ds4's ~81GB actually reclaimed (to a headroom target)
+ * before the caller starts llama-server. Gated on ds4SwapPromise so mid-swap
+ * requests wait. Best-effort reclaim wait — llama's own preflight guard re-checks
+ * per-model on the next request.
+ */
+async function deactivateDs4Exclusive() {
+  let releaseGate;
+  ds4SwapPromise = new Promise((resolve) => { releaseGate = resolve; });
+  try {
+    addLog('presets', 'ds4: deactivating exclusive mode — stopping ds4-server and verifying reclaim');
+    await stopDs4Server();
+    currentEngine = ENGINE_TYPES.LLAMA;
+    const targetBytes = ds4HeadroomBytes();
+    const poll = await pollForReclaim({
+      readMemAvailable: memAvailableBytes,
+      targetBytes,
+      timeoutMs: DS4_RECLAIM_TIMEOUT_MS,
+      intervalMs: DS4_RECLAIM_INTERVAL_MS,
+    });
+    if (poll.ok) addLog('presets', `ds4: reclaim after deactivation verified (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB)`);
+    else addLog('presets', `ds4: reclaim after deactivation still short (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB); llama preflight guard will gate the next load`);
+  } finally {
+    if (releaseGate) releaseGate();
+    ds4SwapPromise = null;
+  }
+}
+
 // Start llama server in router mode (multi-model)
 app.post('/api/server/start', async (req, res) => {
   idleShutdown = false;
+  // Switching to router while ds4 owns the box reverses exclusive mode first
+  // (stop ds4, verify its 81GB reclaimed) so llama and ds4 never over-commit RAM.
+  if (currentEngine === ENGINE_TYPES.DS4) {
+    await deactivateDs4Exclusive();
+  }
   await stopLlamaServer();
 
   try {
@@ -4900,18 +5077,14 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
   }
 
   // ── ds4 engine preset ──────────────────────────────────────────────────────
-  // Activating a ds4 preset stops llama-server entirely and hands the box to the
-  // ds4 supervisor. (Full exclusive/pre-eviction + offload semantics land in a
-  // later task; here we just start/stop the right process.)
+  // TRUE exclusive mode: pre-evict all local llama models with VERIFIED memory
+  // reclaim before spawning ds4 (its 81GB model + gpt-oss-120b cannot coexist in
+  // 124GB), keep/drop the embed server per the budget, and hold mid-swap traffic
+  // on ds4SwapPromise until ds4 is ready. See activateDs4Exclusive().
   if (isDs4Preset(preset)) {
-    try {
-      await stopLlamaServer();
-      currentMode = 'single';
-      currentPreset = presetId;
-      currentEngine = ENGINE_TYPES.DS4;
-      console.log(`[presets] Activating ds4 preset: ${presetId} with model ${preset.modelPath}`);
-      addLog('presets', `Activating ds4 preset: ${preset.name}`);
-      startDs4Server(preset);
+    console.log(`[presets] Activating ds4 preset (exclusive): ${presetId} with model ${preset.modelPath}`);
+    const result = await activateDs4Exclusive(presetId, preset);
+    if (result.ok) {
       return res.json({
         success: true,
         mode: 'single',
@@ -4919,19 +5092,16 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
         preset,
         pid: getDs4Supervisor().getPid()
       });
-    } catch (error) {
-      currentEngine = ENGINE_TYPES.LLAMA;
-      currentMode = 'router';
-      currentPreset = null;
-      return res.status(500).json({ error: error.message });
     }
+    return res.status(result.status || 500).json({ error: result.error });
   }
 
   // ── llama engine preset ────────────────────────────────────────────────────
-  // If we were serving ds4, stop it first so the two engines never co-reside.
+  // If we were serving ds4, reverse exclusive mode with the same verified-reclaim
+  // discipline (stop ds4, free port, confirm ds4's 81GB is released) before we
+  // start a llama model, so the two engines never co-reside / over-commit RAM.
   if (currentEngine === ENGINE_TYPES.DS4) {
-    await stopDs4Server();
-    currentEngine = ENGINE_TYPES.LLAMA;
+    await deactivateDs4Exclusive();
   }
 
   await stopLlamaServer();
@@ -6843,6 +7013,70 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
   }
 }
 
+/**
+ * Forward a legacy /v1/completions request to the local ds4-server while ds4 owns
+ * the box. Compact passthrough (stream = raw SSE relay, else JSON) — ds4-server is
+ * OpenAI-compatible, so the body/response shapes match. Logged with backend='ds4'.
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {{requestedModel:string, isStreaming:boolean, startTime:number}} ctx
+ */
+async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, startTime }) {
+  const ds4 = resolveDs4Config(config, process.env);
+  const url = ds4TargetUrl(ds4.port, '/v1/completions');
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'completions', messages: null, backend: 'ds4' });
+  const controller = new AbortController();
+  res.on('close', () => { try { controller.abort(); } catch { /* ignore */ } });
+  try {
+    const upstream = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body), signal: controller.signal,
+    });
+    if (!upstream.ok) {
+      const errText = await upstream.text().catch(() => '');
+      addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error: errText, backend: 'ds4', requestBody: req.body });
+      endActiveRequest(activeReqId, { status: 'error' });
+      if (!res.headersSent) return res.status(upstream.status).send(errText);
+      try { res.end(); } catch { /* ignore */ }
+      return;
+    }
+    if (isStreaming) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let responseText = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value);
+        for (const line of chunk.split('\n')) {
+          if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+            try { const d = JSON.parse(line.slice(6)); const t = d.choices?.[0]?.text || ''; if (t) { responseText += t; updateActiveRequest(activeReqId, t); } } catch { /* keepalive */ }
+          }
+        }
+        res.write(chunk);
+      }
+      try { res.end(); } catch { /* ignore */ }
+      addLlmLog({ endpoint: 'completions', model: requestedModel, stream: true, status: 200, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
+      endActiveRequest(activeReqId, { status: 'complete' });
+      return;
+    }
+    const data = await upstream.json();
+    if (data.model) data.model = requestedModel;
+    addLlmLog({ endpoint: 'completions', model: requestedModel, stream: false, status: 200, duration: Date.now() - startTime, promptTokens: data.usage?.prompt_tokens || 0, completionTokens: data.usage?.completion_tokens || 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: data.choices?.[0]?.text || null, error: null, backend: 'ds4', requestBody: req.body });
+    endActiveRequest(activeReqId, { status: 'complete' });
+    return res.json(data);
+  } catch (err) {
+    endActiveRequest(activeReqId, { status: 'error' });
+    addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error: err.message, backend: 'ds4', requestBody: req.body });
+    if (!res.headersSent) return res.status(502).json({ error: { message: `ds4-server request failed: ${err.message}`, type: 'ds4_backend_error' } });
+    try { res.end(); } catch { /* ignore */ }
+  }
+}
+
 // OpenAI-compatible chat completions (streaming and non-streaming)
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
@@ -6867,21 +7101,44 @@ app.post('/api/v1/chat/completions', async (req, res) => {
     return res.status(400).json({ error: { message: 'messages must be an array', type: 'invalid_request_error' } });
   }
 
-  // ── ds4 engine active: forward straight to ds4-server ────────────────────────
-  // ds4 is a single-model OpenAI-compatible server with NO slots / router / KV
-  // proxy, so we bypass ALL of the llama machinery below (slot assignment, prefix
-  // cache, tokenize, fetchWithRetry error-sniffing, resolveBackend). Offload
-  // routing of non-ds4 requests while ds4 is active is a LATER task (task 3);
-  // here we simply serve every request from ds4 while it owns the box.
-  if (currentEngine === ENGINE_TYPES.DS4) {
-    return proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime });
-  }
+  // ── Hold mid-swap traffic ────────────────────────────────────────────────────
+  // If a ds4 engine swap (activation/deactivation) is in flight, await it so this
+  // request is served after readiness rather than 404'd or routed to a half-up
+  // engine. The promise resolves (never rejects) for awaiters.
+  if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
 
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
-  // Resolve backend routing (local vs remote)
-  const routing = resolveBackend(requestedModel, 'chat/completions', req.body);
+  // ── ds4 engine active (EXCLUSIVE mode) ───────────────────────────────────────
+  // ds4 owns the box: a request for the ds4 model is served locally on ds4-server
+  // (single-model, no slots/router — bypasses all llama machinery below); a request
+  // for ANY other model is OFFLOADED to a configured remote backend (never loaded
+  // locally beside ds4's 81GB); if no backend can serve it, 503 (never queue forever).
+  let routing;
+  if (currentEngine === ENGINE_TYPES.DS4) {
+    const decision = ds4RequestTarget({
+      requestedModel,
+      ds4ModelIds: ds4ModelIdsForPreset(currentPreset),
+      hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'chat/completions'),
+    });
+    if (decision.target === 'local-ds4') {
+      return proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime });
+    }
+    if (decision.target === 'reject') {
+      const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
+      addLog('backends', `ds4 exclusive: no offload backend for '${requestedModel}' — returning 503`);
+      return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
+    }
+    // Force remote (never local): build routing from the fastest viable backend.
+    const backend = findFastestAvailableBackend(requestedModel, 'chat/completions');
+    const remoteModel = resolveModelMapping(backend.modelMapping, requestedModel);
+    routing = buildRemoteRouting(backend, remoteModel, 'chat/completions');
+    console.log(`[chat/completions] ds4 exclusive: offloading non-ds4 model '${requestedModel}' to ${backend.name} (${remoteModel})`);
+  } else {
+    // Resolve backend routing (local vs remote) the normal way.
+    routing = resolveBackend(requestedModel, 'chat/completions', req.body);
+  }
 
   // Prefix-cache routing (local only): pin same-conversation requests to the
   // same llama.cpp slot so its per-slot KV cache auto-matches the prefix and
@@ -7731,8 +7988,33 @@ app.post('/api/v1/completions', async (req, res) => {
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
   const isStreaming = req.body.stream === true;
 
-  // Route to remote backend if applicable
-  const routing = resolveBackend(requestedModel, 'completions', req.body);
+  // Hold mid-swap traffic until any ds4 engine swap settles (see chat/completions).
+  if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
+
+  // ── ds4 engine active (EXCLUSIVE mode) ───────────────────────────────────────
+  // ds4 model → local ds4-server; other model → remote offload (never local beside
+  // ds4's 81GB); no viable backend → clean 503. Never fall through to a stopped llama.
+  let routing;
+  if (currentEngine === ENGINE_TYPES.DS4) {
+    const decision = ds4RequestTarget({
+      requestedModel,
+      ds4ModelIds: ds4ModelIdsForPreset(currentPreset),
+      hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'completions'),
+    });
+    if (decision.target === 'local-ds4') {
+      return proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, startTime });
+    }
+    if (decision.target === 'reject') {
+      const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
+      return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
+    }
+    const backend = findFastestAvailableBackend(requestedModel, 'completions');
+    routing = buildRemoteRouting(backend, resolveModelMapping(backend.modelMapping, requestedModel), 'completions');
+    console.log(`[completions] ds4 exclusive: offloading non-ds4 model '${requestedModel}' to ${backend.name}`);
+  } else {
+    // Route to remote backend if applicable
+    routing = resolveBackend(requestedModel, 'completions', req.body);
+  }
   if (routing.remote) {
     req._backend = routing.backend.id;
     const remoteBody = { ...req.body, model: routing.targetModel };
