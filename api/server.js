@@ -40,6 +40,11 @@ import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart } from './mem-watchdog.js';
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
+import {
+  ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
+  validatePresetEngineFields, ds4ModelsList, ds4TargetUrl
+} from './engines.js';
+import { createDs4Supervisor } from './ds4-supervisor.js';
 import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
@@ -197,6 +202,10 @@ let embedIntentionalStop = false;
 let downloadProcesses = new Map();
 let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
+// Which inference engine is currently serving: 'llama' (llama.cpp router/preset,
+// the default) or 'ds4' (ds4-server, DeepSeek V4 Flash). Set by preset activation.
+// While 'ds4', llama-server is stopped and the ds4 supervisor owns the box.
+let currentEngine = ENGINE_TYPES.LLAMA;
 let lastUsedModel = null;   // most recently used model name
 let lastUsedModelTime = 0;  // timestamp of last use
 let activeLocalModel = null; // model currently being processed/loaded on local backend
@@ -1923,6 +1932,15 @@ function saveConfig(config) {
 
 let config = loadConfig();
 
+// Seed the top-level `ds4` engine block (ds4-server / DeepSeek V4 Flash) with
+// resolved defaults so it is visible/editable in config.json. resolveDs4Config
+// still applies defaults + DS4_* env at read time, so this is purely for
+// discoverability and persistence — non-destructive to any operator overrides.
+if (!config.ds4) {
+  config.ds4 = resolveDs4Config(config, process.env);
+  try { saveConfig(config); } catch { /* best-effort seed */ }
+}
+
 // ── Resource guard (memory fit + thermal governor) ───────────────────────────
 // Added after the gpt-oss-120b incident (system RAM 99.9%, APU 98-99C, crash
 // loop). Runtime protections: thermal throttle/unload, bounded queue, earlier
@@ -2366,6 +2384,11 @@ async function getSystemStats() {
   let embedStats = null;
   try { embedStats = await getEmbedHealth(); } catch { /* embed down */ }
 
+  let ds4Stats = null;
+  if (currentEngine === ENGINE_TYPES.DS4) {
+    try { ds4Stats = await getDs4Health(); } catch { /* ds4 down */ }
+  }
+
   return {
     timestamp: Date.now(),
     cpu: {
@@ -2385,6 +2408,8 @@ async function getSystemStats() {
     gpu: gpuStats,
     llama: llamaStats,
     embed: embedStats,
+    ds4: ds4Stats,
+    engine: currentEngine,
     guard: guardLast,
     context: contextStats,
     queue: {
@@ -4044,14 +4069,21 @@ app.get('/api/models', async (req, res) => {
   try {
     // Get models from llama-server
     let serverModels = [];
-    try {
-      const response = await fetch(`http://localhost:${LLAMA_PORT}/models`);
-      if (response.ok) {
-        const data = await response.json();
-        serverModels = data.data || data || [];
+    // When ds4 is the active engine, llama-server is stopped — the served model is
+    // the ds4 preset's model, not llama's /models shape.
+    const ds4List = ds4ModelsList(config, { currentEngine, currentPreset, created: Math.floor(Date.now() / 1000) });
+    if (ds4List) {
+      serverModels = ds4List;
+    } else {
+      try {
+        const response = await fetch(`http://localhost:${LLAMA_PORT}/models`);
+        if (response.ok) {
+          const data = await response.json();
+          serverModels = data.data || data || [];
+        }
+      } catch {
+        // Server not running, that's ok
       }
-    } catch {
-      // Server not running, that's ok
     }
 
     // Get local models from filesystem
@@ -4194,6 +4226,45 @@ app.post('/api/presets', (req, res) => {
     return res.status(409).json({ error: `Preset with ID '${id}' already exists. Use PUT to update or choose a different ID.` });
   }
 
+  // Validate the engine field (+ ds4-specific fields). Defaults to 'llama'.
+  const engineCheck = validatePresetEngineFields(req.body);
+  if (!engineCheck.ok) {
+    return res.status(400).json({ error: engineCheck.error });
+  }
+
+  // ── ds4 engine preset ──────────────────────────────────────────────────────
+  // ds4 models live under the dedicated ds4 ggufDir (NEVER ~/models). Store the
+  // absolute path + ds4 launch knobs under config so the ds4 supervisor can run it.
+  if (engineCheck.engine === ENGINE_TYPES.DS4) {
+    const ds4 = resolveDs4Config(config, process.env);
+    const d = engineCheck.ds4;
+    const ds4ModelPath = d.modelPath.startsWith('/') ? d.modelPath : `${ds4.ggufDir}/${d.modelPath}`;
+    if (!existsSync(ds4ModelPath)) {
+      return res.status(404).json({ error: `ds4 model file not found: ${ds4ModelPath}` });
+    }
+    const preset = {
+      id,
+      name,
+      engine: ENGINE_TYPES.DS4,
+      description: description || `Preset for ${name}`,
+      modelPath: ds4ModelPath,
+      hfRepo: null,
+      context: d.context ?? (context || 0),
+      config: {
+        power: d.power,
+        kvDiskDir: d.kvDiskDir,
+        kvDiskSpaceMb: d.kvDiskSpaceMb,
+        extraSwitches: d.extraSwitches || '--rocm --cors'
+      }
+    };
+    if (!config.presets) config.presets = {};
+    config.presets[id] = preset;
+    saveConfig(config);
+    console.log(`[presets] Created ds4 preset: ${id} for model ${ds4ModelPath}`);
+    addLog('presets', `Created ds4 preset: ${name}`);
+    return res.json({ success: true, preset });
+  }
+
   let fullModelPath = null;
 
   // If using local file path, validate it exists
@@ -4211,6 +4282,7 @@ app.post('/api/presets', (req, res) => {
   const preset = {
     id,
     name,
+    engine: ENGINE_TYPES.LLAMA,
     description: description || `Preset for ${name}`,
     modelPath: fullModelPath,
     hfRepo: hfRepo || null, // e.g., "unsloth/Qwen3-Coder-Next-GGUF:Q5_K_M"
@@ -4247,6 +4319,17 @@ app.put('/api/presets/:presetId', (req, res) => {
 
   if (!config.presets || !config.presets[presetId]) {
     return res.status(404).json({ error: `Preset '${presetId}' not found` });
+  }
+
+  // If the engine field is being set/changed, validate it (+ ds4 fields). Merge
+  // the effective body so a ds4-field-only update still validates against the
+  // stored engine.
+  if ('engine' in updates || presetEngine(config.presets[presetId]) === ENGINE_TYPES.DS4) {
+    const merged = { ...config.presets[presetId], ...updates };
+    const engineCheck = validatePresetEngineFields(merged);
+    if (!engineCheck.ok) {
+      return res.status(400).json({ error: engineCheck.error });
+    }
   }
 
   // Update the preset
@@ -4473,6 +4556,17 @@ async function ensureModelServed(modelName) {
 }
 
 async function restartLlamaServer({ governed = true } = {}) {
+  // When the active engine is ds4, "restart the local server" means restart the
+  // ds4 supervisor's process, NOT llama-server (which is stopped). The ds4
+  // supervisor runs its own governor, so we bypass the llama governor here.
+  if (currentEngine === ENGINE_TYPES.DS4) {
+    const preset = config.presets?.[currentPreset];
+    if (preset && isDs4Preset(preset)) {
+      await restartDs4Server(preset);
+      return;
+    }
+  }
+
   if (restartInProgress) {
     console.log('[restart] Restart already in progress, waiting for it to complete...');
     // Wait for the in-progress restart to finish
@@ -4694,6 +4788,54 @@ async function getEmbedHealth() {
   }
 }
 
+// ── ds4-server supervisor (DeepSeek V4 Flash engine) ─────────────────────────
+// A second supervised process alongside llama-server/embed. ds4-server is a
+// single-model OpenAI-compatible engine with its own flag set and NO
+// /health//slots//props — readiness is GET /v1/models. The state machine lives
+// in ds4-supervisor.js (unit-tested); here we wire it to the real spawn/fetch,
+// the shared restart governor, and a host-side kill that frees the ds4 port
+// WITHOUT ever matching the llama-server process pattern.
+
+/** Host-side reap of any ds4-server process + free the ds4 port. Never matches "llama-server". */
+async function ds4RunKill() {
+  const ds4 = resolveDs4Config(config, process.env);
+  await runKillCommand({ label: 'ds4 host pkill', command: 'pkill -9 -f "ds4-server" || true', useContainer: false });
+  await runKillCommand({ label: 'ds4 host fuser', command: `fuser -k ${ds4.port}/tcp 2>/dev/null || true`, useContainer: false });
+  if (containerExecWedged < CONTAINER_EXEC_WEDGED_LIMIT) {
+    await runKillCommand({ label: 'ds4 container pkill', command: 'pkill -9 -f "ds4-server" || true', useContainer: true });
+  }
+}
+
+let ds4Supervisor = null;
+/** Lazily construct the singleton ds4 supervisor (deps are defined by now). */
+function getDs4Supervisor() {
+  if (!ds4Supervisor) {
+    ds4Supervisor = createDs4Supervisor({
+      spawn,
+      fetchFn: fetch,
+      getConfig: () => config,
+      env: process.env,
+      projectRoot: PROJECT_ROOT,
+      restartDecision,
+      restartDefaults: RESTART_DEFAULTS,
+      log: (m) => console.log(m),
+      addLog,
+      runKill: ds4RunKill,
+      now: () => Date.now(),
+    });
+  }
+  return ds4Supervisor;
+}
+
+/** Spawn the ds4 server for a ds4 preset (idempotent). */
+function startDs4Server(preset) { return getDs4Supervisor().start(preset); }
+/** Stop the ds4 server (no auto-restart) and free its port. */
+async function stopDs4Server() { return getDs4Supervisor().stop(); }
+/** Restart the ds4 server in place (governed by the ds4 supervisor). */
+async function restartDs4Server(preset) { return getDs4Supervisor().restart(preset); }
+/** Fetch ds4 server health (probe GET /v1/models; ds4 has no /health). */
+async function getDs4Health() { return getDs4Supervisor().health(); }
+
 // Start llama server in router mode (multi-model)
 app.post('/api/server/start', async (req, res) => {
   idleShutdown = false;
@@ -4750,11 +4892,47 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
     return res.status(404).json({ error: `Preset '${presetId}' not found` });
   }
 
+  // ── ds4 engine preset ──────────────────────────────────────────────────────
+  // Activating a ds4 preset stops llama-server entirely and hands the box to the
+  // ds4 supervisor. (Full exclusive/pre-eviction + offload semantics land in a
+  // later task; here we just start/stop the right process.)
+  if (isDs4Preset(preset)) {
+    try {
+      await stopLlamaServer();
+      currentMode = 'single';
+      currentPreset = presetId;
+      currentEngine = ENGINE_TYPES.DS4;
+      console.log(`[presets] Activating ds4 preset: ${presetId} with model ${preset.modelPath}`);
+      addLog('presets', `Activating ds4 preset: ${preset.name}`);
+      startDs4Server(preset);
+      return res.json({
+        success: true,
+        mode: 'single',
+        engine: ENGINE_TYPES.DS4,
+        preset,
+        pid: getDs4Supervisor().getPid()
+      });
+    } catch (error) {
+      currentEngine = ENGINE_TYPES.LLAMA;
+      currentMode = 'router';
+      currentPreset = null;
+      return res.status(500).json({ error: error.message });
+    }
+  }
+
+  // ── llama engine preset ────────────────────────────────────────────────────
+  // If we were serving ds4, stop it first so the two engines never co-reside.
+  if (currentEngine === ENGINE_TYPES.DS4) {
+    await stopDs4Server();
+    currentEngine = ENGINE_TYPES.LLAMA;
+  }
+
   await stopLlamaServer();
 
   try {
     currentMode = 'single';
     currentPreset = presetId;
+    currentEngine = ENGINE_TYPES.LLAMA;
 
     // All presets use the same script with environment variables
     const startScript = join(PROJECT_ROOT, 'start-preset.sh');
@@ -6033,6 +6211,18 @@ app.get('/api/analytics/crashes', (req, res) => {
 // OpenAI-compatible models endpoint - returns models from llama.cpp that can be loaded
 app.get('/api/v1/models', async (req, res) => {
   try {
+    // ds4 engine active: llama-server is stopped and serves nothing. Advertise the
+    // single ds4 model (owned_by 'ds4') plus any configured default aliases, and
+    // skip the llama /models + disk-scan shape entirely.
+    const ds4List = ds4ModelsList(config, { currentEngine, currentPreset, created: Math.floor(Date.now() / 1000) });
+    if (ds4List) {
+      const out = { object: 'list', data: [...ds4List] };
+      for (const entry of defaultModelListEntries(config, Math.floor(Date.now() / 1000))) {
+        out.data.push(entry);
+      }
+      return res.json(out);
+    }
+
     // Aliases from config
     const aliases = config.modelAliases || {};
 
@@ -6558,6 +6748,94 @@ function injectModelSamplingDefaults(body) {
   return body;
 }
 
+/**
+ * Forward an OpenAI chat-completions request straight to the ds4-server, bypassing
+ * ALL llama.cpp machinery (slot assignment, prefix cache, tokenize, resolveBackend,
+ * fetchWithRetry error-sniffing). ds4 is a single-model OpenAI-compatible server, so
+ * the request body (including its model field) is passed through unchanged. Handles
+ * both streaming (SSE passthrough) and non-streaming responses and records an LLM log
+ * entry with backend='ds4'.
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @param {{requestedModel:string, isStreaming:boolean, startTime:number}} ctx
+ */
+async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime }) {
+  const ds4 = resolveDs4Config(config, process.env);
+  const url = ds4TargetUrl(ds4.port, '/v1/chat/completions');
+  console.log(`[chat/completions] ds4 engine active — forwarding to ${url}`);
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: 'ds4' });
+  const controller = new AbortController();
+  res.on('close', () => { try { controller.abort(); } catch { /* ignore */ } });
+
+  try {
+    // LIVE VERIFICATION PENDING: exercises a real ds4-server round-trip, which needs
+    // the 81GB DeepSeek V4 Flash model loaded in an operator memory window (ds4 and
+    // gpt-oss-120b cannot coexist in 124GB RAM). Mechanics below are unit-tested via
+    // the routing helpers; the network hop itself is verified manually after merge.
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+      signal: controller.signal
+    });
+
+    if (!upstream.ok) {
+      const errText = await upstream.text().catch(() => '');
+      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: errText, backend: 'ds4', requestBody: req.body });
+      endActiveRequest(activeReqId, { status: 'error' });
+      if (!res.headersSent) return res.status(upstream.status).send(errText);
+      try { res.end(); } catch { /* ignore */ }
+      return;
+    }
+
+    if (isStreaming) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let responseText = '';
+      let completionTokens = 0;
+      let promptTokens = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value);
+        for (const line of chunk.split('\n')) {
+          if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+            try {
+              const d = JSON.parse(line.slice(6));
+              const t = d.choices?.[0]?.delta?.content || '';
+              if (t) { completionTokens++; responseText += t; updateActiveRequest(activeReqId, t); }
+              if (d.usage) { promptTokens = d.usage.prompt_tokens || promptTokens; completionTokens = d.usage.completion_tokens || completionTokens; }
+            } catch { /* non-JSON keepalive line */ }
+          }
+        }
+        res.write(chunk);
+      }
+      try { res.end(); } catch { /* ignore */ }
+      const dur = Date.now() - startTime;
+      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: 200, duration: dur, promptTokens, completionTokens, tokensPerSecond: completionTokens / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
+      endActiveRequest(activeReqId, { status: 'complete' });
+      return;
+    }
+
+    // Non-streaming.
+    const data = await upstream.json();
+    const dur = Date.now() - startTime;
+    const usage = data.usage || {};
+    addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: 200, duration: dur, promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0, tokensPerSecond: (usage.completion_tokens || 0) / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: data.choices?.[0]?.message?.content || null, error: null, backend: 'ds4', requestBody: req.body });
+    endActiveRequest(activeReqId, { status: 'complete' });
+    return res.json(data);
+  } catch (err) {
+    endActiveRequest(activeReqId, { status: 'error' });
+    addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: err.message, backend: 'ds4', requestBody: req.body });
+    if (!res.headersSent) return res.status(502).json({ error: { message: `ds4-server request failed: ${err.message}`, type: 'ds4_backend_error' } });
+    try { res.end(); } catch { /* ignore */ }
+  }
+}
+
 // OpenAI-compatible chat completions (streaming and non-streaming)
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
@@ -6580,6 +6858,16 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   }
   if (!Array.isArray(req.body.messages)) {
     return res.status(400).json({ error: { message: 'messages must be an array', type: 'invalid_request_error' } });
+  }
+
+  // ── ds4 engine active: forward straight to ds4-server ────────────────────────
+  // ds4 is a single-model OpenAI-compatible server with NO slots / router / KV
+  // proxy, so we bypass ALL of the llama machinery below (slot assignment, prefix
+  // cache, tokenize, fetchWithRetry error-sniffing, resolveBackend). Offload
+  // routing of non-ds4 requests while ds4 is active is a LATER task (task 3);
+  // here we simply serve every request from ds4 while it owns the box.
+  if (currentEngine === ENGINE_TYPES.DS4) {
+    return proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime });
   }
 
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
@@ -8801,7 +9089,7 @@ function shutdownWithTimeout(signal) {
     process.exit(1);
   }, 10000);
   forceExit.unref();
-  Promise.allSettled([stopLlamaServer(), stopEmbedServer()]).finally(() => process.exit(0));
+  Promise.allSettled([stopLlamaServer(), stopEmbedServer(), stopDs4Server()]).finally(() => process.exit(0));
 }
 
 process.on('SIGTERM', () => shutdownWithTimeout('SIGTERM'));

@@ -21,7 +21,10 @@ const DS4_DEFAULTS = {
   binPath: '/home/yolan/.local/bin/ds4-server',
   port: 5253,
   ggufDir: '/home/yolan/models-ds4/deepseek-v4-gguf',
-  container: 'llama-rocm-7rc-rocwmma',
+  // ds4-server must run in the SAME container the live llama.cpp uses. The 7rc
+  // container's HSA runtime segfaults on gfx1151 queue creation; 7.2.4 works
+  // (the ds4 binary was built against ROCm 7.0 but the 7.2.4 sonames match).
+  container: 'llama-rocm-7.2.4',
   runInDistrobox: true,
 };
 

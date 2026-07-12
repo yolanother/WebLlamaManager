@@ -36,7 +36,7 @@ test('resolveDs4Config: defaults when nothing set', () => {
   assert.equal(c.binPath, '/home/yolan/.local/bin/ds4-server');
   assert.equal(c.port, 5253);
   assert.equal(c.ggufDir, '/home/yolan/models-ds4/deepseek-v4-gguf');
-  assert.equal(c.container, 'llama-rocm-7rc-rocwmma');
+  assert.equal(c.container, 'llama-rocm-7.2.4');
   assert.equal(c.runInDistrobox, true);
 });
 
