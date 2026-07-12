@@ -4504,6 +4504,13 @@ function presetServesModel(preset, modelName) {
 // + acquireLocalSlot path serializes new requests during the window.
 let modeSwitchPromise = null;
 async function ensureModelServed(modelName) {
+  // While the ds4 engine owns the box, do NOT run any llama mode-switch/restart:
+  // starting llama-server alongside ds4 would OOM (ds4's 81GB model + a llama
+  // model can't coexist in 124GB RAM). ds4 chat requests are served upstream in
+  // the chat handler; other llama-only endpoints simply don't serve while ds4 is
+  // active (full offload routing for non-ds4 requests lands in a later task).
+  if (currentEngine === ENGINE_TYPES.DS4) return;
+
   // Pre-flight memory guard with graceful recovery: if the model doesn't fit the
   // current free RAM but the shortfall is reclaimable, free memory (unload other
   // models, then restart llama-server) and retry; only refuse (MODEL_TOO_LARGE)
