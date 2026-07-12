@@ -38,6 +38,13 @@ test('resolveDs4Config: defaults when nothing set', () => {
   assert.equal(c.ggufDir, '/home/yolan/models-ds4/deepseek-v4-gguf');
   assert.equal(c.container, 'llama-rocm-7.2.4');
   assert.equal(c.runInDistrobox, true);
+  assert.equal(c.allowEmbedServer, true);
+});
+
+test('resolveDs4Config: allowEmbedServer honored from config and env', () => {
+  assert.equal(resolveDs4Config({ ds4: { allowEmbedServer: false } }, {}).allowEmbedServer, false);
+  assert.equal(resolveDs4Config({ ds4: { allowEmbedServer: false } }, { DS4_ALLOW_EMBED_SERVER: '1' }).allowEmbedServer, true);
+  assert.equal(resolveDs4Config({}, { DS4_ALLOW_EMBED_SERVER: '0' }).allowEmbedServer, false);
 });
 
 test('resolveDs4Config: config block honored', () => {

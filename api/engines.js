@@ -26,6 +26,9 @@ const DS4_DEFAULTS = {
   // (the ds4 binary was built against ROCm 7.0 but the 7.2.4 sonames match).
   container: 'llama-rocm-7.2.4',
   runInDistrobox: true,
+  // The small embedding server (~5GB) may stay resident alongside ds4 when RAM
+  // headroom allows. Exclusive-DS4 activation counts it in the eviction budget.
+  allowEmbedServer: true,
 };
 
 /** Coerce a value to a finite number, falling back to `d` for empty/NaN input. */
@@ -63,7 +66,7 @@ export function isDs4Preset(preset) {
  * Env (DS4_*) overrides the config.ds4 block; both fall back to defaults.
  * @param {object} config Parsed config.json (may lack a `ds4` block).
  * @param {object} env Environment object (e.g. process.env).
- * @returns {{binPath:string, port:number, ggufDir:string, container:string, runInDistrobox:boolean}}
+ * @returns {{binPath:string, port:number, ggufDir:string, container:string, runInDistrobox:boolean, allowEmbedServer:boolean}}
  */
 export function resolveDs4Config(config = {}, env = {}) {
   const d = config.ds4 || {};
@@ -75,6 +78,9 @@ export function resolveDs4Config(config = {}, env = {}) {
     runInDistrobox: env.DS4_IN_DISTROBOX !== undefined
       ? boolFlag(env.DS4_IN_DISTROBOX, DS4_DEFAULTS.runInDistrobox)
       : boolFlag(d.runInDistrobox, DS4_DEFAULTS.runInDistrobox),
+    allowEmbedServer: env.DS4_ALLOW_EMBED_SERVER !== undefined
+      ? boolFlag(env.DS4_ALLOW_EMBED_SERVER, DS4_DEFAULTS.allowEmbedServer)
+      : boolFlag(d.allowEmbedServer, DS4_DEFAULTS.allowEmbedServer),
   };
 }
 
