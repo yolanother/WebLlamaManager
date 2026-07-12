@@ -13,9 +13,11 @@ entirely and hands the box to the ds4 supervisor; activating a llama preset (or
 router) stops ds4-server first. The two never co-reside — the 81GB DeepSeek V4
 model cannot coexist with the llama models in 124GB RAM.
 
-> Full exclusive-mode pre-eviction + offload routing of non-ds4 requests while
-> ds4 is active is a **later task** (epic task 3). This layer only makes preset
-> activation start/stop the correct process and route ds4 requests to ds4.
+Activation runs in **true exclusive mode**: local llama models are pre-evicted
+with **verified memory reclamation** before ds4-server is spawned, and while ds4
+is active every non-ds4 request is offloaded to a remote backend (or cleanly
+503'd) instead of loading a second model locally. See
+[Exclusive DS4 mode](#exclusive-ds4-mode-pre-eviction--offload-routing).
 
 ## Why ds4 needs its own engine
 
@@ -95,10 +97,15 @@ overrides at read time):
     "port": 5253,
     "ggufDir": "/home/yolan/models-ds4/deepseek-v4-gguf",
     "container": "llama-rocm-7.2.4",
-    "runInDistrobox": true
+    "runInDistrobox": true,
+    "allowEmbedServer": true
   }
 }
 ```
+
+`allowEmbedServer` (default `true`, `DS4_ALLOW_EMBED_SERVER` override): whether the
+small embedding server (~5GB) may stay resident alongside ds4. Exclusive-DS4
+activation counts it in the eviction budget and stops it if it would not fit.
 
 Port allocation: API 5250, LLAMA 5251, EMBED 5252, **DS4 5253**.
 
@@ -132,11 +139,74 @@ preset** stores:
 - `GET /api/models` and `GET /api/v1/models` list only the ds4 model
   (`owned_by: 'ds4'`) plus configured default aliases — the llama `/models` shape
   and disk scan are skipped.
-- `POST /api/v1/chat/completions` is forwarded straight to the ds4 port via
-  `proxyChatToDs4`, bypassing slot assignment, prefix cache, `/tokenize`,
-  `resolveBackend`, and `fetchWithRetry` error-sniffing. Streaming and
-  non-streaming are both supported; the llama path is unchanged.
+- `POST /api/v1/chat/completions` and `POST /api/v1/completions` apply the
+  exclusive routing table below. A request for the **ds4 model** is forwarded
+  straight to the ds4 port (`proxyChatToDs4` / `proxyCompletionsToDs4`), bypassing
+  slot assignment, prefix cache, `/tokenize`, and `fetchWithRetry`
+  error-sniffing. A request for **any other model** is offloaded to a remote
+  backend (never loaded locally beside ds4's 81GB). Streaming and non-streaming
+  are both supported; the llama path is unchanged.
 - The status/stats endpoint reports `engine` and (when ds4 active) `ds4` health.
+
+## Exclusive DS4 mode (pre-eviction + offload routing)
+
+The 81GB DeepSeek V4 model plus gpt-oss-120b (~61GB) cannot coexist in 124GB
+unified RAM, and ds4-server sets its own `oom_score_adj=1000` (it is the first
+thing the kernel OOM-kills). So activation must **pre-evict and verify** before
+spawning ds4 — never load-then-OOM. The decision logic is a pure, GPU-free module
+`api/ds4-exclusive.js` (unit-tested in `ds4-exclusive.test.js`); `server.js` wires
+it to the real side effects.
+
+### `api/ds4-exclusive.js` (pure, unit-tested)
+
+| Export | Purpose |
+|---|---|
+| `ds4ModelMatches(model, ids)` | Normalized (case/punctuation-insensitive, substring) match of a request's model to the ds4 engine |
+| `ds4RequestTarget({requestedModel, ds4ModelIds, hasViableRemote})` | Routing table → `{target:'local-ds4'\|'remote'\|'reject'}` |
+| `reclaimTargetBytes({ds4ModelBytes, headroomBytes})` | MemAvailable that must be free before spawn (model + headroom) |
+| `reclaimSatisfied({memAvailableBytes, targetBytes})` | Whether enough RAM is reclaimed |
+| `pollForReclaim({readMemAvailable, targetBytes, timeoutMs, intervalMs, sleep, now})` | Poll MemAvailable until reclaimed or timeout (injectable clock; never spawns ds4 itself) |
+| `shouldKeepEmbedServer({allowEmbedServer, ds4ModelBytes, embedServerBytes, totalBytes, headroomBytes})` | Embed-server residency within the budget |
+| `ds4Exclusive503Body(requestedModel, ds4ModelName)` | OpenAI-style 503 error body (`type/code: exclusive_ds4_mode`) |
+
+### Activation sequence (`activateDs4Exclusive` in server.js)
+
+1. Flip `currentEngine = 'ds4'` immediately so `ensureModelServed` early-returns
+   and no new local llama load can race the eviction.
+2. Set `ds4SwapPromise` — a swap gate that incoming chat/completions & completions
+   requests `await` so mid-swap traffic is **held and served after readiness**,
+   never 404'd.
+3. `stopLlamaServer()`; stop the embed server unless `shouldKeepEmbedServer` says
+   it fits the budget.
+4. **Verify reclaim**: `pollForReclaim` on `/proc/meminfo` MemAvailable until it
+   reaches `reclaimTargetBytes` (ds4 weights + guard headroom), with a timeout
+   (`DS4_RECLAIM_TIMEOUT_MS`, default 180s). **On timeout ds4 is NOT spawned** —
+   the box rolls back to the llama router and the activate call returns 503. This
+   is the fix for the load-then-OOM pre-eviction bug.
+5. Spawn ds4-server. Readiness (`GET /v1/models`) is awaited in the **background**;
+   the HTTP activate returns after spawn, and the swap gate releases on readiness.
+
+### Routing table while ds4 active
+
+| Requested model | Action |
+|---|---|
+| The ds4 model (or alias) | Serve locally on ds4-server |
+| Any other model, a remote backend can serve it | **Offload** to the fastest viable remote (`findFastestAvailableBackend` + `buildRemoteRouting`) — never loaded locally |
+| Any other model, no viable backend | **503** `exclusive_ds4_mode` (never queue forever, never load locally) |
+
+### Deactivation (`deactivateDs4Exclusive` in server.js)
+
+Activating a llama preset or router mode while ds4 is active reverses the sequence
+with the **same verified-reclaim discipline**: stop ds4-server, free its port,
+flip `currentEngine = 'llama'`, and verify ds4's ~81GB is released (poll
+MemAvailable to a headroom target) before llama-server starts. Gated on
+`ds4SwapPromise` so mid-swap requests wait.
+
+### Tuning knobs (env)
+
+`DS4_RECLAIM_TIMEOUT_MS` (180000), `DS4_RECLAIM_INTERVAL_MS` (2000),
+`DS4_READY_TIMEOUT_MS` (600000), `DS4_READY_INTERVAL_MS` (3000),
+`DS4_ALLOW_EMBED_SERVER` (from `config.ds4.allowEmbedServer`, default true).
 
 ## State variables (`api/server.js`)
 
@@ -148,8 +218,23 @@ let currentEngine = 'llama';  // 'llama' | 'ds4'
 
 ## Live verification (pending)
 
-The ds4 supervisor mechanics and routing helpers are unit-tested with the
-process/HTTP mocked. A real ds4-server round-trip requires the 81GB model loaded
-in an operator memory window (ds4 + gpt-oss-120b cannot coexist), so end-to-end
-verification is performed manually after merge — activate a ds4 preset, confirm
-`/api/v1/models` shows the ds4 model, and round-trip a chat completion.
+The ds4 supervisor mechanics, routing helpers, and exclusive-mode decision logic
+(reclaim budget/poll, routing table, embed budget, 503 body) are unit-tested with
+the process/HTTP/clock/meminfo mocked. A real ds4-server round-trip requires the
+81GB model loaded in an operator memory window (ds4 + gpt-oss-120b cannot
+coexist), so end-to-end verification is performed manually after merge:
+
+1. With gpt-oss-120b resident, watch `free -m -s1` (or `watch -n1 free -m`) and
+   activate the ds4 preset. Confirm MemAvailable never drops below the guard
+   headroom and **swap never grows** during the swap — the reclaim poll gates the
+   spawn.
+2. Confirm `GET /api/v1/models` lists the ds4 model and a chat completion for it
+   round-trips through ds4-server.
+3. While ds4 is active, send a chat/completions for a **non-ds4** model: it must
+   land on a configured offload backend, or return a clean 503
+   (`type: exclusive_ds4_mode`) if no backend maps it — it must **never** load a
+   second model locally.
+4. Send a chat request **during** the activation window: it must be held and
+   answered after ds4 readiness, not errored.
+5. Deactivate (activate a llama preset / router): confirm ds4 stops, its ~81GB is
+   released, and llama routing resumes.
