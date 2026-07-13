@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join, basename } from 'path';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { cpus, totalmem, freemem, loadavg } from 'os';
+import { cpus, totalmem, freemem, loadavg, homedir } from 'os';
 import { EventEmitter } from 'events';
 import { createHash } from 'crypto';
 import pty from 'node-pty';
@@ -47,6 +47,7 @@ import {
   listDs4GgufFiles, validateDs4DownloadRequest
 } from './engines.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
+import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
 import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
@@ -4933,6 +4934,108 @@ async function restartDs4Server(preset) { return getDs4Supervisor().restart(pres
 /** Fetch ds4 server health (probe GET /v1/models; ds4 has no /health). */
 async function getDs4Health() { return getDs4Supervisor().health(); }
 
+// ── ds4 auto-updater (track upstream, rebuild, smoke, atomic swap) ───────────
+// Keeps the local antirez/ds4 build current with github.com/antirez/ds4 without
+// ever serving a broken binary. The pure state machine lives in ds4-updater.js
+// (unit-tested); here we wire the real shell exec, a supervised ds4 restart, an
+// idle probe (so the memory-hungry smoke+swap only runs with no in-flight
+// requests — the 81GB model can't coexist with a resident big model), and a
+// prominent alert sink. Versioned builds live under ~/.local/share/ds4/builds/
+// with a `current` symlink that start-ds4.sh resolves for the binary path.
+
+/** Absolute state dir for the ds4 updater (versioned builds + current symlink + state.json). */
+const DS4_STATE_DIR = process.env.DS4_STATE_DIR || join(homedir(), '.local/share/ds4');
+
+/** Promisified shell exec returning {code,stdout,stderr}; never rejects (build/git steps
+ *  report failure via a nonzero code the updater state machine handles). */
+function ds4UpdaterExec(cmd, { timeoutMs = 120_000 } = {}) {
+  return new Promise((resolve) => {
+    exec(cmd, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: stdout || '', stderr: stderr || '' });
+    });
+  });
+}
+
+/** Prominent alert sink for ds4 update failures (louder than a routine log line). */
+function ds4UpdaterAlert(msg, meta) {
+  console.error(`[ds4-update][ALERT] ${msg}`, meta || '');
+  addLog('system', `⚠️ ds4 auto-update: ${msg}`);
+}
+
+let ds4Updater = null;
+let ds4UpdateInFlight = false;
+/** Lazily construct the singleton ds4 updater (config + deps are defined by now). */
+function getDs4Updater() {
+  if (!ds4Updater) {
+    const ds4cfg = resolveDs4Config(config, process.env);
+    // Model for the smoke test: env override, else any configured ds4 preset's model,
+    // else the documented DeepSeek V4 Flash GGUF under the ds4 gguf dir.
+    let smokeModel = process.env.DS4_MODEL || '';
+    if (!smokeModel) {
+      const dp = Object.values(config.presets || {}).find((p) => isDs4Preset(p));
+      if (dp?.modelPath) smokeModel = resolveDs4ModelPath(dp.modelPath, ds4cfg.ggufDir);
+    }
+    if (!smokeModel) {
+      smokeModel = `${ds4cfg.ggufDir}/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`;
+    }
+    ds4Updater = createDs4Updater({
+      exec: ds4UpdaterExec,
+      isIdle: () => activeRequests.size === 0 && llamaQueue.active === 0 && llamaQueue.pending === 0,
+      // Only restart ds4 if it is the running engine; otherwise the symlink flip
+      // alone suffices and the next ds4 activation picks up `current`.
+      restartDs4: async () => {
+        if (currentEngine === ENGINE_TYPES.DS4 && getDs4Supervisor().isRunning()) {
+          await restartDs4Server(getDs4Supervisor().getActivePreset());
+        }
+      },
+      alert: ds4UpdaterAlert,
+      log: (m) => console.log(m),
+      addLog,
+      paths: {
+        repoDir: process.env.DS4_REPO_DIR || '/home/yolan/workspace/ai/ds4',
+        stateDir: DS4_STATE_DIR,
+        buildsDir: join(DS4_STATE_DIR, 'builds'),
+        currentLink: join(DS4_STATE_DIR, 'current'),
+        statePath: join(DS4_STATE_DIR, 'state.json'),
+        modelPath: smokeModel,
+      },
+      buildContainer: process.env.DS4_BUILD_CONTAINER || 'llama-rocm-7rc-rocwmma',
+      runContainer: ds4cfg.container,
+    });
+  }
+  return ds4Updater;
+}
+
+// Status: current/upstream commit, last check, last result, history.
+app.get('/api/ds4/update/status', (req, res) => {
+  try { res.json(getDs4Updater().getStatus()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Manual "check now": git fetch + compare, no build. Cheap; runs synchronously.
+app.post('/api/ds4/update/check', async (req, res) => {
+  try {
+    const r = await getDs4Updater().check();
+    res.json({ ...r, status: getDs4Updater().getStatus() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Manual "update now": kick off build/smoke/swap in the BACKGROUND (a build can
+// take minutes) and return 202 immediately; poll /status for progress. `force`
+// rebuilds+swaps even when already up to date.
+app.post('/api/ds4/update/apply', (req, res) => {
+  const up = getDs4Updater();
+  if (ds4UpdateInFlight) {
+    return res.status(409).json({ error: 'ds4 update already in progress', status: up.getStatus() });
+  }
+  const force = req.body?.force === true;
+  ds4UpdateInFlight = true;
+  up.apply({ force })
+    .catch((e) => console.error('[ds4-update] apply failed', e))
+    .finally(() => { ds4UpdateInFlight = false; });
+  res.status(202).json({ started: true, force, status: up.getStatus() });
+});
+
 // ── Exclusive-DS4-mode orchestration ─────────────────────────────────────────
 // Verified pre-eviction on activation, verified reclaim on deactivation, and a
 // swap gate so mid-swap requests are held (not 404'd). Pure decisions live in
@@ -9566,6 +9669,31 @@ setInterval(async () => {
     intentionalStop = false;
   }
 }, IDLE_CHECK_INTERVAL);
+
+// ds4 auto-update scheduler. Evaluates every 30 min but only runs a check/cycle
+// once the configured interval (config.ds4.update.intervalHours, default 6h) has
+// elapsed since the last check. Disabled via config.ds4.update.enabled === false;
+// auto-apply (build+smoke+swap on a new commit) via config.ds4.update.autoApply
+// (default on). Smoke+swap are idle-gated inside the updater, so a busy box only
+// builds (memory-light) and defers the memory-hungry swap. Never runs two updates
+// at once (shares the ds4UpdateInFlight guard with the manual apply endpoint).
+const DS4_UPDATE_TICK_MS = 30 * 60_000;
+setInterval(async () => {
+  const u = config?.ds4?.update || {};
+  if (u.enabled === false) return;
+  if (ds4UpdateInFlight) return;
+  const intervalMs = (Number(u.intervalHours) > 0 ? Number(u.intervalHours) : 6) * 3_600_000;
+  const lastCheck = getDs4Updater().getStatus().lastCheck || 0;
+  if (Date.now() - lastCheck < intervalMs) return;
+  ds4UpdateInFlight = true;
+  try {
+    await getDs4Updater().runCycle({ autoApply: u.autoApply !== false });
+  } catch (e) {
+    console.error('[ds4-update] scheduled cycle failed', e);
+  } finally {
+    ds4UpdateInFlight = false;
+  }
+}, DS4_UPDATE_TICK_MS).unref?.();
 
 // Graceful shutdown with forced exit timeout
 function shutdownWithTimeout(signal) {

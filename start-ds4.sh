@@ -11,7 +11,10 @@
 # scans it).
 #
 # Env: DS4_MODEL (gguf path or bare name under DS4_GGUF_DIR, required),
-#      DS4_SERVER_BIN (default ~/.local/bin/ds4-server), DS4_PORT (default 5253),
+#      DS4_SERVER_BIN (override; default resolves the auto-updater's managed
+#        binary at DS4_STATE_DIR/current/ds4-server, else ~/.local/bin/ds4-server),
+#      DS4_STATE_DIR (default ~/.local/share/ds4 — holds the updater's versioned
+#        builds/<commit>/ dirs + the `current` symlink), DS4_PORT (default 5253),
 #      DS4_CTX (0 = model default), DS4_GGUF_DIR
 #      (default /home/yolan/models-ds4/deepseek-v4-gguf), DS4_POWER (1-100, opt),
 #      DS4_KV_DISK_DIR (opt), DS4_KV_DISK_SPACE_MB (opt),
@@ -25,7 +28,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/.env" ]; then set -a; . "$SCRIPT_DIR/.env"; set +a; fi
 
-DS4_SERVER_BIN="${DS4_SERVER_BIN:-$HOME/.local/bin/ds4-server}"
+# Resolve the ds4-server binary. The auto-updater (api/ds4-updater.js) installs
+# versioned builds under DS4_STATE_DIR/builds/<commit>/ and atomically flips a
+# `current` symlink to the active one; prefer that managed binary so a swap takes
+# effect on the next (re)start. config.ds4.binPath (passed through as
+# DS4_SERVER_BIN) remains an explicit override/fallback: if it is set to a value
+# OTHER than the legacy default path, it wins (operator pinned a specific binary).
+DS4_STATE_DIR="${DS4_STATE_DIR:-$HOME/.local/share/ds4}"
+DS4_CURRENT_BIN="$DS4_STATE_DIR/current/ds4-server"
+DS4_LEGACY_DEFAULT="$HOME/.local/bin/ds4-server"
+if [ -x "$DS4_CURRENT_BIN" ] && { [ -z "${DS4_SERVER_BIN:-}" ] || [ "${DS4_SERVER_BIN}" = "$DS4_LEGACY_DEFAULT" ]; }; then
+  DS4_SERVER_BIN="$DS4_CURRENT_BIN"
+fi
+DS4_SERVER_BIN="${DS4_SERVER_BIN:-$DS4_LEGACY_DEFAULT}"
 DS4_PORT="${DS4_PORT:-5253}"
 DS4_CTX="${DS4_CTX:-0}"
 DS4_GGUF_DIR="${DS4_GGUF_DIR:-/home/yolan/models-ds4/deepseek-v4-gguf}"
