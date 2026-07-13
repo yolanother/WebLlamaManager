@@ -202,6 +202,39 @@ flip `currentEngine = 'llama'`, and verify ds4's ~81GB is released (poll
 MemAvailable to a headroom target) before llama-server starts. Gated on
 `ds4SwapPromise` so mid-swap requests wait.
 
+### Preferred big model: `default-big` → a ds4 preset
+
+The `default-big` / `default-small` request aliases (see
+[default-model aliases](../superpowers/specs/2026-06-22-default-model-aliases-design.md))
+can point at a **ds4 preset id** so every client pinned to `default-big` is served
+DeepSeek V4 Flash with no architecture thrash. Because a ds4 model's OpenAI id **is**
+its preset id, the raw ds4 model name and the `default-big` alias resolve to the same
+target and hit one resident ds4-server (no double activation).
+
+Pure helpers (`api/default-models.js`):
+
+| Helper | Purpose |
+| --- | --- |
+| `ds4PresetForModel(config, name)` | Returns `{ presetId, preset }` when `name` is an existing ds4 preset id, else `null`. |
+| `validateDefaultModelTarget(config, target)` | Config-API validator. Accepts a ds4 preset id (`engine:'ds4'`) or a plain llama model name (`engine:'llama'`, even if not yet downloaded); clears on null/blank; rejects a non-string or an existing **non-ds4 (llama) preset id** (`default-big` maps to a model name or a ds4 preset id, never a llama preset id). |
+| `defaultModelListEntries(config, now)` | Now tags each alias entry with `engine` (`'ds4'` when the target names a ds4 preset) so `GET /api/v1/models` surfaces a ds4-backed `default-big`. |
+
+Server wiring (`ensureDs4ForModel(rawModel, resolvedModel)` in `server.js`), called at
+the top of `/api/v1/chat/completions` and `/api/v1/completions` before the mid-swap gate:
+
+- Resolved model names a ds4 preset and ds4 is **not** active → `activateDs4Exclusive`
+  (the engine-level equivalent of `ensureModelServed`'s llama load). On activation
+  failure the request returns the activation's status/error, never falling through to a
+  stopped llama. No-op when ds4 already serves that preset (no double spawn).
+- Request used the `default-big`/`default-small` **alias**, that alias now points at a
+  llama target, and ds4 **is** active → `deactivateDs4Exclusive`, then the normal llama
+  path serves it. Gated to the alias: a non-alias request for some other model while ds4
+  is active still **offloads to a remote backend** (task-3 exclusivity), it does not tear
+  ds4 down.
+
+Config PUT (`PUT /api/config`) validates `defaultBigModel`/`defaultSmallModel` through
+`validateDefaultModelTarget`.
+
 ### Tuning knobs (env)
 
 `DS4_RECLAIM_TIMEOUT_MS` (180000), `DS4_RECLAIM_INTERVAL_MS` (2000),
@@ -294,3 +327,10 @@ coexist), so end-to-end verification is performed manually after merge:
    answered after ds4 readiness, not errored.
 5. Deactivate (activate a llama preset / router): confirm ds4 stops, its ~81GB is
    released, and llama routing resumes.
+6. `default-big` → ds4 preset: `PUT /api/config { "defaultBigModel": "<ds4-preset-id>" }`,
+   then a chat completion for model `default-big` must (a) trigger exclusive activation
+   if ds4 isn't already active, (b) return a DeepSeek V4 Flash completion, and (c) show
+   `default-big` → the ds4 preset id with `engine:"ds4"` in `GET /api/v1/models`. A raw
+   request for the ds4 preset id must hit the same resident ds4-server (no second spawn).
+7. Flip back: `PUT /api/config { "defaultBigModel": "<llama-model-name>" }`, then a
+   `default-big` request while ds4 is active must deactivate ds4 and serve the llama model.
