@@ -37,12 +37,13 @@ import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent
 import { findLeakedSlots } from './slot-reaper.js';
 import { resolveDefaultModel, defaultModelListEntries } from './default-models.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
-import { shouldDeferMemRestart } from './mem-watchdog.js';
+import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
-  validatePresetEngineFields, ds4ModelsList, ds4TargetUrl
+  validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
+  isEngineProcessComm, engineSupportsSlots
 } from './engines.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { resolveDs4ModelPath } from './engines.js';
@@ -1977,6 +1978,12 @@ function guardCfg() {
     overheadBytes: g.overheadBytes ?? GUARD_DEFAULTS.overheadBytes,
     minContext: g.minContext ?? GUARD_DEFAULTS.minContext,
     memThresholdPct: g.memThresholdPct ?? 90,
+    // ds4-server memory watchdog: ds4 holds ~81GB resident by design, so a system
+    // memory threshold breach at its baseline is NOT a leak (a restart reloads the
+    // same 81GB). The watchdog only restarts ds4 when its RSS exceeds its expected
+    // baseline (ds4ExpectedResidentGb) by ds4MemLeakMarginFrac — a genuine leak.
+    ds4ExpectedResidentGb: g.ds4ExpectedResidentGb ?? 85,
+    ds4MemLeakMarginFrac: g.ds4MemLeakMarginFrac ?? 0.15,
     // Soft local-queue cap. Raised well above the old fixed 8: at/over this we offload to a
     // remote (if one can serve the request) or — for models with no remote (e.g. gpt-oss-120b)
     // — keep queuing DEEPER instead of failing. Requests are only rejected when the model is
@@ -2107,13 +2114,27 @@ refreshLoadedModelsSnapshot();
 
 /** Total resident memory (bytes) held by all running llama-server processes. */
 function llamaServerRssBytes() {
+  return commRssBytes('llama-server');
+}
+
+/**
+ * Total resident memory (bytes) held by all running ds4-server processes. Used by
+ * the memory watchdog to measure ds4's residency against its expected 81GB
+ * baseline (a restart only reclaims memory when ds4 has leaked ABOVE baseline).
+ */
+function ds4ServerRssBytes() {
+  return commRssBytes('ds4-server');
+}
+
+/** Sum VmRSS (bytes) across all /proc processes whose comm matches `name`. */
+function commRssBytes(name) {
   let kb = 0;
   try {
     for (const pid of readdirSync('/proc')) {
       if (!/^\d+$/.test(pid)) continue;
       let comm;
       try { comm = readFileSync(`/proc/${pid}/comm`, 'utf-8').trim(); } catch { continue; }
-      if (comm !== 'llama-server') continue;
+      if (comm !== name) continue;
       try { kb += parseRssKb(readFileSync(`/proc/${pid}/status`, 'utf-8')); } catch {}
     }
   } catch {}
@@ -2324,10 +2345,13 @@ function gpuUsageFromSysfs(sysfs) {
 let prevAppCpuSample = null;
 
 /**
- * Measure the llama.cpp inference stack's own memory and CPU footprint by
- * scanning /proc for processes whose comm is "llama-server" (the model router,
- * its per-model child processes, and the embedding server — all host-visible
- * since distrobox shares the host PID namespace). CPU is a delta between
+ * Measure the local inference stack's own memory and CPU footprint by scanning
+ * /proc for the engine processes — comm "llama-server" (the model router, its
+ * per-model child processes, and the embedding server) AND comm "ds4-server"
+ * (the DeepSeek V4 Flash engine), all host-visible since distrobox shares the
+ * host PID namespace. Counting ds4-server here is what lets the thermal governor
+ * attribute ds4's iGPU/CPU heat to "the llama stack" (app load) rather than
+ * mis-reading it as external heat it must not throttle. CPU is a delta between
  * broadcasts, so the first call returns 0% for CPU. Pure parsing/math lives in
  * app-usage.js; this only does the /proc reads.
  * @param {number} totalMemKb Total system memory in kB.
@@ -2341,7 +2365,7 @@ function getAppUsage(totalMemKb) {
       if (!/^\d+$/.test(pid)) continue;
       let comm;
       try { comm = readFileSync(`/proc/${pid}/comm`, 'utf-8').trim(); } catch { continue; }
-      if (comm !== 'llama-server') continue;
+      if (!isEngineProcessComm(comm)) continue;
       try { rssKbList.push(parseRssKb(readFileSync(`/proc/${pid}/status`, 'utf-8'))); } catch {}
       try { curProc[pid] = parseProcCpuJiffies(readFileSync(`/proc/${pid}/stat`, 'utf-8')); } catch {}
     }
@@ -4846,6 +4870,10 @@ function getDs4Supervisor() {
       log: (m) => console.log(m),
       addLog,
       runKill: ds4RunKill,
+      // Same wedged-GPU signal the llama restart path uses: hold ds4 restarts for
+      // the long wedgedCooldownMs when the exec/GPU layer is wedged (commit e960d04).
+      getWedged: () => containerExecWedged >= CONTAINER_EXEC_WEDGED_LIMIT
+        || consecutiveFailedRestarts >= FAILED_RESTART_LIMIT,
       now: () => Date.now(),
     });
   }
@@ -8940,7 +8968,13 @@ function getSystemMemoryPercent() {
   }
 }
 
-function isLlamaServerHeaviestProcess() {
+/**
+ * Whether the single heaviest-RSS process on the box has `name` in its comm.
+ * The memory watchdog uses this to confirm the local engine (not some unrelated
+ * process) is the memory hog before it restarts it.
+ * @param {string} name comm substring to match (e.g. 'llama-server' | 'ds4-server').
+ */
+function isProcessHeaviest(name) {
   try {
     // Get top process by RSS, excluding kernel threads (pid 0) and this node process
     const output = execSync('ps -eo pid,rss,comm --sort=-rss --no-headers', { encoding: 'utf8', timeout: 5000 });
@@ -8949,10 +8983,15 @@ function isLlamaServerHeaviestProcess() {
     const top = lines[0].trim().split(/\s+/);
     // top = [pid, rss_kb, command]
     const topComm = top.slice(2).join(' ');
-    return topComm.includes('llama-server');
+    return topComm.includes(name);
   } catch {
     return false;
   }
+}
+
+/** True when a llama-server process is the heaviest-RSS process on the box. */
+function isLlamaServerHeaviestProcess() {
+  return isProcessHeaviest('llama-server');
 }
 
 // Check llama-cpp's slots for the given model. Returns true if any slot is
@@ -8988,6 +9027,10 @@ async function fetchSlots(model) {
 // active requests share it).
 const UPSTREAM_PROBE_INTERVAL_MS = 3000;
 setInterval(async () => {
+  // ds4-server has no llama.cpp /slots endpoint — the per-slot proof-of-life probe
+  // is llama-only, so no-op cleanly while ds4 is the active engine (no /slots
+  // fetches, no log spam). ds4 request liveness is surfaced via ds4 health.
+  if (!engineSupportsSlots(currentEngine)) return;
   // Collect distinct models that have at least one active local slot holder
   const slotHolders = new Set();
   for (const item of llamaQueue.activeItems.values()) {
@@ -9110,24 +9153,30 @@ setInterval(async () => {
   // needlessly starves local serving. Non-chat slots (activeReqId null) can't be
   // told apart from legit long prompt-processing, so they only reap at hardCapMs.
   const LEAK_REAP_GRACE_MS = Math.min(stallMs, 10_000);
-  const liveReqIds = new Set(activeRequests.keys());
-  const leakedSlotIds = findLeakedSlots({
-    items: [...llamaQueue.activeItems.values()], liveReqIds, now,
-    graceMs: LEAK_REAP_GRACE_MS, hardCapMs
-  });
-  for (const slotId of leakedSlotIds) {
-    const item = llamaQueue.activeItems.get(slotId);
-    if (!item) continue;
-    const heldFor = now - (item.startedAt || item.enqueuedAt || now);
-    const msg = `Stall watchdog: force-releasing leaked llamaQueue slot ${item.id} (model=${item.model}, endpoint=${item.endpoint}, held ${Math.round(heldFor / 1000)}s, activeReqId=${item.activeReqId})`;
-    console.warn(`[watchdog] ${msg}`);
-    addLog('system', msg);
-    requestStatsAccum.watchdogKills++;
-    watchdogStats.totalKills++;
-    watchdogStats.lastKillAt = now;
-    watchdogStats.lastKillModel = item.model;
-    watchdogStats.lastKillStallMs = heldFor;
-    llamaQueue.release(item.id);
+  // The leaked-slot reaper is llama-only (the llamaQueue serializes llama.cpp
+  // dispatch). ds4 requests never take a llamaQueue slot (proxied directly, backend
+  // 'ds4'), so it is a no-op under ds4 — skip it explicitly. Remote/ds4 request
+  // stall handling below still runs.
+  if (engineSupportsSlots(currentEngine)) {
+    const liveReqIds = new Set(activeRequests.keys());
+    const leakedSlotIds = findLeakedSlots({
+      items: [...llamaQueue.activeItems.values()], liveReqIds, now,
+      graceMs: LEAK_REAP_GRACE_MS, hardCapMs
+    });
+    for (const slotId of leakedSlotIds) {
+      const item = llamaQueue.activeItems.get(slotId);
+      if (!item) continue;
+      const heldFor = now - (item.startedAt || item.enqueuedAt || now);
+      const msg = `Stall watchdog: force-releasing leaked llamaQueue slot ${item.id} (model=${item.model}, endpoint=${item.endpoint}, held ${Math.round(heldFor / 1000)}s, activeReqId=${item.activeReqId})`;
+      console.warn(`[watchdog] ${msg}`);
+      addLog('system', msg);
+      requestStatsAccum.watchdogKills++;
+      watchdogStats.totalKills++;
+      watchdogStats.lastKillAt = now;
+      watchdogStats.lastKillModel = item.model;
+      watchdogStats.lastKillStallMs = heldFor;
+      llamaQueue.release(item.id);
+    }
   }
   for (const [id, entry] of activeRequests) {
     if (entry._watchdogKilled) continue;
@@ -9234,49 +9283,86 @@ setInterval(async () => {
 }, STALL_WATCHDOG_INTERVAL);
 
 setInterval(() => {
-  if (!llamaProcess || memWatchdogCooldown || restartInProgress) return;
+  if (memWatchdogCooldown || restartInProgress) return;
 
+  const cfg = guardCfg();
   const memPercent = getSystemMemoryPercent();
-  if (memPercent >= guardCfg().memThresholdPct) {
-    if (isLlamaServerHeaviestProcess()) {
-      // A restart tears down in-flight generations ("Stream error: terminated"
-      // client-side), so defer while any request is actively progressing and
-      // memory is still below the hard ceiling. See api/mem-watchdog.js.
-      const deferral = shouldDeferMemRestart({
-        memPercent,
-        thresholdPct: guardCfg().memThresholdPct,
-        activeEntries: activeRequests.values(),
-        nowMs: Date.now(),
-      });
-      if (deferral.defer) {
-        if (Date.now() - _memWatchdogLastDeferLogAt > 60_000) {
-          _memWatchdogLastDeferLogAt = Date.now();
-          const deferMsg = `Memory watchdog: ${memPercent.toFixed(1)}% ≥ ${guardCfg().memThresholdPct}% but ${deferral.progressing} request(s) actively streaming — deferring restart (hard ceiling ${deferral.hardCeilingPct}%)`;
-          console.warn(`[mem-watchdog] ${deferMsg}`);
-          addLog('system', deferMsg);
-        }
-        return;
-      }
-      memWatchdogCooldown = true;
-      const msg = `Memory watchdog triggered: system at ${memPercent.toFixed(1)}% and llama-server is heaviest process. Restarting...`;
-      console.warn(`[mem-watchdog] ${msg}`);
-      addLog('system', msg);
-      recordCrashEvent({ exitCode: null, trigger: 'memory_watchdog' });
+  if (memPercent < cfg.memThresholdPct) return;
 
-      restartLlamaServer({ governed: false })
-        .then(() => {
-          addLog('system', 'Memory watchdog restart completed successfully');
-        })
-        .catch(err => {
-          console.error('[mem-watchdog] Restart failed:', err.message);
-          addLog('system', `Memory watchdog restart failed: ${err.message}`);
-        })
-        .finally(() => {
-          // Cooldown for 60s to avoid rapid-fire restarts
-          setTimeout(() => { memWatchdogCooldown = false; }, 60_000);
-        });
+  // Identify the active local engine's process and confirm it is the memory hog
+  // before restarting it. In ds4 mode llamaProcess is null (llama is stopped) and
+  // ds4-server holds ~81GB by design, so the llama-only gate would leave ds4
+  // unmonitored — branch on the active engine instead.
+  const ds4Active = currentEngine === ENGINE_TYPES.DS4;
+  let engineLabel;
+  if (ds4Active) {
+    // ds4's 81GB baseline means a threshold breach alone is NOT a leak: restarting
+    // reloads the same weights and reclaims nothing. Only restart when ds4's RSS
+    // has grown past its expected baseline (a genuine leak). See mem-watchdog.js.
+    if (!getDs4Supervisor().isRunning()) return;
+    if (!isProcessHeaviest('ds4-server')) return;
+    const leak = shouldRestartForResidentLeak({
+      memPercent,
+      thresholdPct: cfg.memThresholdPct,
+      residentBytes: ds4ServerRssBytes(),
+      expectedResidentBytes: cfg.ds4ExpectedResidentGb * (2 ** 30),
+      leakMarginFrac: cfg.ds4MemLeakMarginFrac,
+    });
+    if (!leak.restart) {
+      if (Date.now() - _memWatchdogLastDeferLogAt > 60_000) {
+        _memWatchdogLastDeferLogAt = Date.now();
+        const msg = `Memory watchdog (ds4): ${memPercent.toFixed(1)}% ≥ ${cfg.memThresholdPct}% but ds4-server RSS is at baseline (≤ ${(leak.leakThresholdBytes / (2 ** 30)).toFixed(1)} GiB) — not a leak, holding (a restart would reload the same 81GB)`;
+        console.warn(`[mem-watchdog] ${msg}`);
+        addLog('system', msg);
+      }
+      return;
     }
+    engineLabel = 'ds4-server';
+  } else {
+    if (!llamaProcess) return;
+    if (!isLlamaServerHeaviestProcess()) return;
+    engineLabel = 'llama-server';
   }
+
+  // A restart tears down in-flight generations ("Stream error: terminated"
+  // client-side), so defer while any request is actively progressing and memory
+  // is still below the hard ceiling. Applies to both engines: ds4 requests share
+  // the activeRequests map (backend 'ds4'). See api/mem-watchdog.js.
+  const deferral = shouldDeferMemRestart({
+    memPercent,
+    thresholdPct: cfg.memThresholdPct,
+    activeEntries: activeRequests.values(),
+    nowMs: Date.now(),
+  });
+  if (deferral.defer) {
+    if (Date.now() - _memWatchdogLastDeferLogAt > 60_000) {
+      _memWatchdogLastDeferLogAt = Date.now();
+      const deferMsg = `Memory watchdog: ${memPercent.toFixed(1)}% ≥ ${cfg.memThresholdPct}% but ${deferral.progressing} request(s) actively streaming — deferring restart (hard ceiling ${deferral.hardCeilingPct}%)`;
+      console.warn(`[mem-watchdog] ${deferMsg}`);
+      addLog('system', deferMsg);
+    }
+    return;
+  }
+  memWatchdogCooldown = true;
+  const msg = `Memory watchdog triggered: system at ${memPercent.toFixed(1)}% and ${engineLabel} is heaviest process. Restarting...`;
+  console.warn(`[mem-watchdog] ${msg}`);
+  addLog('system', msg);
+  recordCrashEvent({ exitCode: null, trigger: 'memory_watchdog' });
+
+  // restartLlamaServer delegates to the ds4 supervisor when ds4 is the active
+  // engine (see restartLlamaServer), so this one call restarts the right engine.
+  restartLlamaServer({ governed: false })
+    .then(() => {
+      addLog('system', 'Memory watchdog restart completed successfully');
+    })
+    .catch(err => {
+      console.error('[mem-watchdog] Restart failed:', err.message);
+      addLog('system', `Memory watchdog restart failed: ${err.message}`);
+    })
+    .finally(() => {
+      // Cooldown for 60s to avoid rapid-fire restarts
+      setTimeout(() => { memWatchdogCooldown = false; }, 60_000);
+    });
 }, MEM_WATCHDOG_INTERVAL);
 
 // ── Thermal governor ─────────────────────────────────────────────────────────

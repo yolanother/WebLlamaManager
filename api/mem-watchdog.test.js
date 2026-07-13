@@ -2,9 +2,10 @@
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { shouldDeferMemRestart } from './mem-watchdog.js';
+import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
 
 const NOW = 1_000_000;
+const GiB = 2 ** 30;
 
 test('defers when a request is actively progressing below the hard ceiling', () => {
   const r = shouldDeferMemRestart({
@@ -106,4 +107,63 @@ test('falls back to startTime when lastActivityAt is missing', () => {
     nowMs: NOW,
   });
   assert.equal(r.defer, true);
+});
+
+// ── shouldRestartForResidentLeak (ds4 high-baseline engine) ──────────────────
+// ds4-server sits at ~81GB resident by design; a system-memory threshold breach
+// alone is NOT a leak (a restart reloads the same 81GB and does not help). Only
+// restart when the resident set has grown a margin BEYOND its expected baseline.
+
+test('does NOT restart ds4 at its 81GB baseline even under memory pressure', () => {
+  const r = shouldRestartForResidentLeak({
+    memPercent: 93,                       // above threshold — pressure present
+    thresholdPct: 90,
+    residentBytes: 81 * GiB,              // sitting at baseline (no leak)
+    expectedResidentBytes: 85 * GiB,      // configured baseline
+  });
+  assert.equal(r.restart, false);
+  assert.equal(r.leaked, false);
+});
+
+test('restarts ds4 when resident grows past the leak margin AND memory is pressured', () => {
+  const r = shouldRestartForResidentLeak({
+    memPercent: 93,
+    thresholdPct: 90,
+    residentBytes: 105 * GiB,             // grown well past 85 * 1.15 = ~97.75
+    expectedResidentBytes: 85 * GiB,
+    leakMarginFrac: 0.15,
+  });
+  assert.equal(r.restart, true);
+  assert.equal(r.leaked, true);
+});
+
+test('does NOT restart ds4 on leak alone when memory is below threshold', () => {
+  const r = shouldRestartForResidentLeak({
+    memPercent: 70,                       // no pressure yet
+    thresholdPct: 90,
+    residentBytes: 105 * GiB,             // leaked, but the box is not pressured
+    expectedResidentBytes: 85 * GiB,
+  });
+  assert.equal(r.leaked, true);
+  assert.equal(r.restart, false);
+});
+
+test('leak threshold sits at expectedResident * (1 + margin)', () => {
+  const r = shouldRestartForResidentLeak({
+    memPercent: 95, thresholdPct: 90,
+    residentBytes: 90 * GiB, expectedResidentBytes: 85 * GiB, leakMarginFrac: 0.15,
+  });
+  // 85 * 1.15 = 97.75 GiB; 90 GiB is below it -> not a leak
+  assert.equal(Math.round(r.leakThresholdBytes / GiB * 100) / 100, 97.75);
+  assert.equal(r.leaked, false);
+  assert.equal(r.restart, false);
+});
+
+test('unknown baseline fails SAFE: no ds4 restart on pressure alone', () => {
+  const r = shouldRestartForResidentLeak({
+    memPercent: 99, thresholdPct: 90,
+    residentBytes: 120 * GiB, expectedResidentBytes: 0,
+  });
+  assert.equal(r.restart, false);
+  assert.equal(r.leaked, false);
 });

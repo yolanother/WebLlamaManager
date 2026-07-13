@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createDs4Supervisor } from './ds4-supervisor.js';
+import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 
 /** A fake child process good enough for the supervisor's exit/kill/stdio wiring. */
 function fakeProc(pid = 1234) {
@@ -39,6 +40,7 @@ function makeSup(overrides = {}) {
     log: () => {},
     addLog: () => {},
     runKill: async () => { calls.runKill++; },
+    getWedged: overrides.getWedged,
     now: overrides.now || (() => 1000),
     sleep: async () => {},
     setTimeoutFn: (cb) => { calls.scheduled.push(cb); return 0; },
@@ -115,6 +117,51 @@ test('exit: governor can suppress auto-restart', () => {
   procs[0].emit('exit', 1);
   assert.equal(calls.scheduled.length, 0);
   assert.equal(calls.spawn.length, 1);
+});
+
+test('exit: passes the wedged signal through to the restart governor', () => {
+  const seen = [];
+  const { sup, procs } = makeSup({
+    getWedged: () => true,
+    restartDecision: (a) => { seen.push(a); return { allow: true, reason: 'ok', history: [...(a.history || []), a.now], retryAfterMs: 0 }; },
+  });
+  sup.start(PRESET);
+  procs[0].emit('exit', 1);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].wedged, true);
+});
+
+test('exit: wedged-hold suppresses ds4 auto-restart via the shared governor', () => {
+  // Seed a prior restart, then a crash while the exec/GPU layer is wedged: the
+  // real governor must hold (wedged-hold), not schedule another probe onto the
+  // locked GPU. Mirrors the llama wedged-hold (commit e960d04) for ds4.
+  let clock = 1_000_000;
+  const { sup, calls, procs } = makeSup({
+    getWedged: () => true,
+    restartDecision,
+    restartDefaults: RESTART_DEFAULTS,
+    now: () => clock,
+  });
+  sup.start(PRESET);
+  // First crash proceeds (no prior attempt to hold against) and reschedules.
+  procs[0].emit('exit', 1);
+  assert.equal(calls.scheduled.length, 1);
+  calls.scheduled[0](); // spawns a fresh proc, recording the attempt in history
+  assert.equal(calls.spawn.length, 2);
+  // Second crash 30s later, still wedged: within wedgedCooldownMs -> HELD.
+  clock += 30_000;
+  procs[1].emit('exit', 1);
+  assert.equal(calls.scheduled.length, 1, 'no new restart scheduled while wedged-held');
+  assert.equal(calls.spawn.length, 2, 'no fresh ds4 process spawned during wedged-hold');
+});
+
+test('exit: not wedged still debounces/allows per the governor', () => {
+  const { sup, procs } = makeSup({
+    getWedged: () => false,
+    restartDecision: (a) => { assert.equal(a.wedged, false); return { allow: true, reason: 'ok', history: [a.now], retryAfterMs: 0 }; },
+  });
+  sup.start(PRESET);
+  procs[0].emit('exit', 1);
 });
 
 test('restart: stops then starts a fresh process', async () => {

@@ -29,6 +29,9 @@ import { resolveDs4Config, resolveDs4ModelPath } from './engines.js';
  * @param {Function} [deps.log] console-style logger.
  * @param {Function} [deps.addLog] UI log sink (channel, msg).
  * @param {Function} [deps.runKill] async () => void — host-side pkill of ds4-server + free the port.
+ * @param {Function} [deps.getWedged] () => boolean — true when the exec/GPU layer is wedged
+ *   (un-killable D-state). Forwarded to the shared restart governor so ds4 auto-restarts honor
+ *   the wedged-GPU hold (probing a locked GPU with a fresh 81GB load would freeze the host).
  * @param {Function} [deps.now] () => ms clock (Date.now).
  * @param {Function} [deps.sleep] async (ms) => void — grace delay between SIGTERM and SIGKILL.
  * @param {Function} [deps.setTimeoutFn] setTimeout (or a fake) for scheduling auto-restart.
@@ -46,6 +49,7 @@ export function createDs4Supervisor({
   log = () => {},
   addLog = () => {},
   runKill = async () => {},
+  getWedged = () => false,
   now = () => Date.now(),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   setTimeoutFn = setTimeout,
@@ -101,7 +105,10 @@ export function createDs4Supervisor({
   /** Schedule a governed auto-restart after an unexpected exit. */
   function scheduleAutoRestart() {
     const knobs = { ...restartDefaults, ...(getConfig()?.guard?.restart || {}) };
-    const decision = restartDecision({ history: restartHistory, now: now(), ...knobs });
+    // Forward the wedged-GPU signal so a locked exec/GPU layer holds ds4 restarts
+    // for the long wedgedCooldownMs (15m) instead of probing a fresh 81GB load
+    // onto the locked GPU every cooldown — the same protection llama-server gets.
+    const decision = restartDecision({ history: restartHistory, now: now(), wedged: !!getWedged(), ...knobs });
     if (!decision.allow) {
       log(`[ds4] auto-restart suppressed by governor (${decision.reason})`);
       addLog('system', `ds4-server restart suppressed (${decision.reason}); backing off`);

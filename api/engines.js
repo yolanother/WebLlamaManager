@@ -16,6 +16,38 @@
 /** Canonical engine type identifiers. */
 export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4' };
 
+/**
+ * `comm` values (as reported by /proc/<pid>/comm) of the local inference-engine
+ * processes this manager supervises: the llama.cpp router/children/embed server
+ * (all comm 'llama-server') and the ds4-server (DeepSeek V4 Flash). Used by the
+ * guards to attribute memory + heat to "the llama stack" regardless of which
+ * engine is active, so an 81GB ds4-server is not mistaken for external load.
+ */
+export const ENGINE_PROCESS_COMMS = ['llama-server', 'ds4-server'];
+
+/**
+ * True when a /proc comm belongs to a supervised inference-engine process
+ * (llama-server or ds4-server). Trims the trailing newline comm files carry.
+ * @param {string} comm
+ * @returns {boolean}
+ */
+export function isEngineProcessComm(comm) {
+  return ENGINE_PROCESS_COMMS.includes(String(comm || '').trim());
+}
+
+/**
+ * True when the given engine type exposes llama.cpp-style per-slot `/slots`
+ * (llama does; ds4-server does not). The slot-cache / slot-reaper / per-slot
+ * proof-of-life machinery is llama-only and must no-op cleanly under ds4.
+ * Unknown/empty engine defaults to slot-capable (the llama default) so a missing
+ * engine flag never silently disables the llama slot guards.
+ * @param {string} engineType
+ * @returns {boolean}
+ */
+export function engineSupportsSlots(engineType) {
+  return String(engineType || '').toLowerCase() !== ENGINE_TYPES.DS4;
+}
+
 /** Default ds4 configuration when neither config.ds4 nor DS4_* env is present. */
 const DS4_DEFAULTS = {
   binPath: '/home/yolan/.local/bin/ds4-server',

@@ -12,7 +12,40 @@ import {
   ds4ModelEntry,
   ds4ModelsList,
   ds4TargetUrl,
+  ENGINE_PROCESS_COMMS,
+  isEngineProcessComm,
+  engineSupportsSlots,
 } from './engines.js';
+
+// ── isEngineProcessComm (heat/RSS attribution) ───────────────────────────────
+test('isEngineProcessComm: matches both llama-server and ds4-server', () => {
+  assert.equal(isEngineProcessComm('llama-server'), true);
+  assert.equal(isEngineProcessComm('ds4-server'), true);
+  // whitespace-trimmed (comm files carry a trailing newline)
+  assert.equal(isEngineProcessComm('ds4-server\n'), true);
+});
+test('isEngineProcessComm: rejects unrelated processes and junk', () => {
+  assert.equal(isEngineProcessComm('node'), false);
+  assert.equal(isEngineProcessComm('bash'), false);
+  assert.equal(isEngineProcessComm(''), false);
+  assert.equal(isEngineProcessComm(null), false);
+  assert.equal(isEngineProcessComm(undefined), false);
+});
+test('ENGINE_PROCESS_COMMS lists exactly the two engine binaries', () => {
+  assert.deepEqual([...ENGINE_PROCESS_COMMS].sort(), ['ds4-server', 'llama-server']);
+});
+
+// ── engineSupportsSlots (slot machinery no-op gate) ──────────────────────────
+test('engineSupportsSlots: llama has /slots, ds4 does not', () => {
+  assert.equal(engineSupportsSlots(ENGINE_TYPES.LLAMA), true);
+  assert.equal(engineSupportsSlots('llama'), true);
+  assert.equal(engineSupportsSlots(ENGINE_TYPES.DS4), false);
+  assert.equal(engineSupportsSlots('DS4'), false);
+});
+test('engineSupportsSlots: unknown/empty engine defaults to slot-capable (llama)', () => {
+  assert.equal(engineSupportsSlots(undefined), true);
+  assert.equal(engineSupportsSlots(''), true);
+});
 
 // ── presetEngine ────────────────────────────────────────────────────────────
 test('presetEngine: defaults to llama when unset', () => {
