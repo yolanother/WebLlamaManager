@@ -51,8 +51,9 @@ import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
 import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
-  shouldKeepEmbedServer, ds4Exclusive503Body
+  shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision
 } from './ds4-exclusive.js';
+import { killEngineByComm, enginePids } from './engine-kill.js';
 import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
@@ -4417,6 +4418,51 @@ app.delete('/api/presets/:presetId', (req, res) => {
 let containerExecWedged = 0;
 const CONTAINER_EXEC_WEDGED_LIMIT = 2;
 
+// Robust host-PID engine kill (see engine-kill.js). A host `kill -9` reaches the
+// container's llama-server/ds4-server workers (distrobox shares the host PID
+// namespace) WITHOUT a container exec that can wedge in D-state under load, so this
+// is the PRIMARY reclaim path; the in-container pkill is only a secondary fallback.
+// The wait window is long enough to actually see a 60GB model unmap rather than
+// "timing out and giving up" while it is still resident.
+const ENGINE_KILL_TIMEOUT_MS = parseInt(process.env.ENGINE_KILL_TIMEOUT_MS) || 20_000;
+const ENGINE_KILL_INTERVAL_MS = parseInt(process.env.ENGINE_KILL_INTERVAL_MS) || 250;
+
+/** Snapshot the host /proc table as [{pid, comm}] rows (distrobox procs are host-visible). */
+function hostEngineProcTable() {
+  const rows = [];
+  try {
+    for (const pid of readdirSync('/proc')) {
+      if (!/^\d+$/.test(pid)) continue;
+      let comm;
+      try { comm = readFileSync(`/proc/${pid}/comm`, 'utf-8').trim(); } catch { continue; }
+      rows.push({ pid: Number(pid), comm });
+    }
+  } catch {}
+  return rows;
+}
+
+/** Host PIDs currently resident for an engine comm (exact match; never cross-engine). */
+function residentEnginePids(comm) {
+  return enginePids(hostEngineProcTable(), comm);
+}
+
+/**
+ * Robustly reclaim an engine ('llama-server' | 'ds4-server') by host PID: SIGKILL the
+ * matching pids and poll /proc until they are gone (bounded). Returns { ok, remainingPids }
+ * — ok:false means a pid persisted (likely D-state / wedged GPU), so the caller must NOT
+ * stack a second engine on top of it.
+ */
+async function killEnginePidsRobust(comm, { timeoutMs = ENGINE_KILL_TIMEOUT_MS } = {}) {
+  return killEngineByComm({
+    comm,
+    readProcTable: hostEngineProcTable,
+    kill: (pid, sig) => process.kill(pid, sig),
+    timeoutMs,
+    intervalMs: ENGINE_KILL_INTERVAL_MS,
+    log: (m) => console.log(m),
+  });
+}
+
 /**
  * Run a kill command with a hard timeout. On timeout the spawned process GROUP is
  * SIGKILLed so a hung exec is never leaked. Container execs that time out bump the
@@ -4468,27 +4514,31 @@ async function stopLlamaServer() {
   }
   llamaProcess = null;
 
-  // Primary kill — host side only. distrobox shares the host PID namespace, so a
-  // host pkill also kills the container's (dynamic-port) llama-server workers, and
-  // the port is on the host network so host fuser frees it. Neither touches the
-  // podman layer, so neither can hang in D-state.
-  console.log('[stop] Killing all llama-server processes (host)...');
-  await runKillCommand({ label: 'host pkill', command: 'pkill -9 -f "llama-server" || true', useContainer: false });
+  // Primary kill — robust host-PID reap. distrobox shares the host PID namespace, so
+  // a host `kill -9` reaches the container's (dynamic-port) llama-server workers, and
+  // it polls /proc until they are actually GONE (up to ENGINE_KILL_TIMEOUT_MS) instead
+  // of firing a fire-and-forget pkill that can "succeed" while a 60GB model is still
+  // unmapping. Never touches the podman exec layer, so it can't hang in D-state.
+  console.log('[stop] Killing all llama-server processes (host, by PID)...');
+  const kill = await killEnginePidsRobust('llama-server');
+  // Free the port on the host network (best-effort; host fuser can't wedge).
   await runKillCommand({ label: 'host fuser', command: `fuser -k ${LLAMA_PORT}/tcp 2>/dev/null || true`, useContainer: false });
 
-  // Best-effort container-side cleanup, but ONLY while the container exec layer is
-  // healthy. If it has wedged recently, skip it — issuing more container execs is
-  // exactly what piled up D-state processes and locked the host; the host kills
-  // above already cover it.
-  if (containerExecWedged < CONTAINER_EXEC_WEDGED_LIMIT) {
-    await runKillCommand({ label: 'container pkill', command: 'pkill -9 -f "llama-server" || true', useContainer: true });
-  } else {
-    console.warn(`[stop] Skipping container kill — exec wedged (x${containerExecWedged}); relying on host kills`);
+  // Secondary fallback ONLY if a pid survived the host SIGKILL wait and the container
+  // exec layer is still healthy. If it has wedged recently, skip it — issuing more
+  // container execs is exactly what piled up D-state processes and locked the host.
+  if (!kill.ok) {
+    if (containerExecWedged < CONTAINER_EXEC_WEDGED_LIMIT) {
+      console.warn(`[stop] llama-server pids [${kill.remainingPids.join(', ')}] survived host SIGKILL — trying container pkill fallback`);
+      await runKillCommand({ label: 'container pkill', command: 'pkill -9 -f "llama-server" || true', useContainer: true });
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } else {
+      console.warn(`[stop] llama-server pids [${kill.remainingPids.join(', ')}] survived and exec wedged (x${containerExecWedged}); relying on host kills — may be D-state/wedged GPU`);
+    }
   }
 
-  // Give processes time to fully terminate
-  await new Promise(resolve => setTimeout(resolve, 500));
-  console.log('[stop] Llama server stopped');
+  console.log(kill.ok ? '[stop] Llama server stopped' : '[stop] Llama server stop incomplete (pids may persist)');
+  return { ok: kill.ok, remainingPids: residentEnginePids('llama-server') };
 }
 
 // Restart llama server in its current mode (router or preset)
@@ -4893,11 +4943,16 @@ async function getEmbedHealth() {
 /** Host-side reap of any ds4-server process + free the ds4 port. Never matches "llama-server". */
 async function ds4RunKill() {
   const ds4 = resolveDs4Config(config, process.env);
-  await runKillCommand({ label: 'ds4 host pkill', command: 'pkill -9 -f "ds4-server" || true', useContainer: false });
+  // Primary: robust host-PID reap that waits until the ds4-server pids are gone (an 81GB
+  // model takes real time to unmap). Exact comm match — never touches llama-server.
+  const kill = await killEnginePidsRobust('ds4-server');
   await runKillCommand({ label: 'ds4 host fuser', command: `fuser -k ${ds4.port}/tcp 2>/dev/null || true`, useContainer: false });
-  if (containerExecWedged < CONTAINER_EXEC_WEDGED_LIMIT) {
+  // Secondary container fallback only if a pid survived and the exec layer is healthy.
+  if (!kill.ok && containerExecWedged < CONTAINER_EXEC_WEDGED_LIMIT) {
+    console.warn(`[stop] ds4-server pids [${kill.remainingPids.join(', ')}] survived host SIGKILL — trying container pkill fallback`);
     await runKillCommand({ label: 'ds4 container pkill', command: 'pkill -9 -f "ds4-server" || true', useContainer: true });
   }
+  return { ok: kill.ok, remainingPids: residentEnginePids('ds4-server') };
 }
 
 let ds4Supervisor = null;
@@ -5083,13 +5138,25 @@ async function waitForDs4Ready() {
 }
 
 /**
- * Activate a ds4 preset in TRUE exclusive mode: flip the engine so no new local
- * llama load can start, stop llama-server (and the embed server unless it fits the
- * budget), VERIFY MemAvailable actually reclaimed to (model + headroom) BEFORE
- * spawning ds4, then spawn and (in the background) wait for readiness. The HTTP
- * caller returns once reclaim+spawn succeed; requests await ds4SwapPromise until
- * readiness. On reclaim timeout ds4 is NOT spawned and the box rolls back to llama.
- * @returns {Promise<{ok:true}|{ok:false,status:number,error:string}>}
+ * Activate a ds4 preset in TRUE exclusive mode, hardened against the live-traffic
+ * activation race (see task 7IPwBy3JqbPfBkDaf4LfL). Flip the engine to ds4 IMMEDIATELY
+ * (so ensureModelServed early-returns and the request flood offloads instead of starting
+ * a competing local llama load), robustly EVICT llama-server by host PID (waiting until
+ * the model actually unmaps), verify no llama model is still resident AND that
+ * MemAvailable reclaimed to (model + headroom) BEFORE spawning ds4, then spawn and (in
+ * the background) wait for readiness.
+ *
+ * Crucially, the rollback semantics are driven by ds4ActivationDecision():
+ *   - A kill/reclaim HICCUP (a llama model that won't die → possible wedged GPU, or RAM
+ *     that won't free in time) does NOT roll the box back to the llama router. Rolling
+ *     back re-admits local loads and is exactly what OOM-killed ds4 in the field. Instead
+ *     the box STAYS in exclusive-DS4 mode (engine=ds4, flood offloads) and the activation
+ *     reports a 503; nothing reloads a llama model on top of the in-progress state.
+ *   - Only a genuine ds4-SPAWN failure — after eviction TRULY succeeded (RAM free, no
+ *     resident model) — rolls back to llama. That is safe because there is nothing to race.
+ *     The half-started ds4 is stopped FIRST so the two engines never co-reside.
+ *
+ * @returns {Promise<{ok:true}|{ok:false,status:number,error:string,stayedExclusive?:boolean}>}
  */
 async function activateDs4Exclusive(presetId, preset) {
   const ds4cfg = resolveDs4Config(config, process.env);
@@ -5103,25 +5170,41 @@ async function activateDs4Exclusive(presetId, preset) {
   });
 
   // Flip engine + mode immediately so ensureModelServed early-returns and no new
-  // local llama load can race the eviction. Traffic is gated on ds4SwapPromise below.
+  // local llama load can race the eviction. Held for the ENTIRE load window below.
+  // Traffic is gated on ds4SwapPromise.
   currentMode = 'single';
   currentPreset = presetId;
   currentEngine = ENGINE_TYPES.DS4;
 
   let releaseGate;
   ds4SwapPromise = new Promise((resolve) => { releaseGate = resolve; });
+  const settleGate = () => { if (releaseGate) releaseGate(); ds4SwapPromise = null; };
 
-  try {
-    addLog('presets', `Activating ds4 EXCLUSIVE mode: ${preset.name} (pre-evicting local models, verifying reclaim before spawn)`);
-    await stopLlamaServer();
-    if (!keepEmbed) {
-      addLog('presets', 'ds4: stopping embed server — does not fit the exclusive-DS4 memory budget');
-      await stopEmbedServer();
-    } else {
-      addLog('presets', 'ds4: keeping embed server resident (fits the memory budget)');
-    }
+  addLog('presets', `Activating ds4 EXCLUSIVE mode: ${preset.name} (evicting local models by host PID, verifying reclaim before spawn)`);
 
-    const targetBytes = reclaimTargetBytes({ ds4ModelBytes, headroomBytes });
+  // ── Eviction phase ──────────────────────────────────────────────────────────
+  // Robust host-PID kill of llama-server (waits until gone), then a bounded retry
+  // if a model survives the first SIGKILL window. A hiccup here NEVER rolls back.
+  await stopLlamaServer();
+  if (!keepEmbed) {
+    addLog('presets', 'ds4: stopping embed server — does not fit the exclusive-DS4 memory budget');
+    await stopEmbedServer();
+  } else {
+    addLog('presets', 'ds4: keeping embed server resident (fits the memory budget)');
+  }
+
+  let resident = residentEnginePids('llama-server');
+  if (resident.length) {
+    addLog('presets', `ds4: llama-server pids [${resident.join(', ')}] still resident after eviction — retrying robust host kill (staying exclusive, not resuming llama)`);
+    await killEnginePidsRobust('llama-server');
+    resident = residentEnginePids('llama-server');
+  }
+  const residentAfterEvict = resident.length > 0;
+
+  // Only measure reclaim once the model process is actually gone.
+  const targetBytes = reclaimTargetBytes({ ds4ModelBytes, headroomBytes });
+  let reclaimOk = false;
+  if (!residentAfterEvict) {
     addLog('presets', `ds4: waiting for memory reclaim — need MemAvailable ≥ ${gibStr(targetBytes)} GiB before spawn`);
     const poll = await pollForReclaim({
       readMemAvailable: memAvailableBytes,
@@ -5129,33 +5212,55 @@ async function activateDs4Exclusive(presetId, preset) {
       timeoutMs: DS4_RECLAIM_TIMEOUT_MS,
       intervalMs: DS4_RECLAIM_INTERVAL_MS,
     });
-    if (!poll.ok) {
-      const e = new Error(`ds4 pre-eviction FAILED: MemAvailable ${gibStr(poll.memAvailableBytes)} GiB < required ${gibStr(targetBytes)} GiB after ${Math.round(poll.waitedMs / 1000)}s; refusing to spawn ds4 to avoid OOM/swap.`);
-      e.code = 'DS4_RECLAIM_TIMEOUT';
-      throw e;
-    }
-    addLog('presets', `ds4: reclaim verified (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB ≥ ${gibStr(targetBytes)} GiB); spawning ds4-server`);
-    startDs4Server(preset);
+    reclaimOk = poll.ok;
+    if (reclaimOk) addLog('presets', `ds4: reclaim verified (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB ≥ ${gibStr(targetBytes)} GiB); spawning ds4-server`);
+    else addLog('presets', `ds4: reclaim short (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB < ${gibStr(targetBytes)} GiB after ${Math.round(poll.waitedMs / 1000)}s)`);
+  }
+
+  // ── Decide whether eviction cleared the way to spawn ──────────────────────────
+  const evict = ds4ActivationDecision({ residentAfterEvict, reclaimOk, spawnOk: undefined });
+  if (evict.action === 'abort-stay-exclusive') {
+    // STAY exclusive (engine remains ds4): the flood offloads to remotes and NOTHING
+    // reloads a local llama model. Do NOT spawn ds4 (would OOM on top of the resident
+    // model / short RAM). This is the anti-rollback that fixes the field OOM.
+    settleGate();
+    const msg = evict.reason === 'llama-wedged-resident'
+      ? `ds4 activation blocked: llama-server pids [${resident.join(', ')}] would not die after SIGKILL (possible D-state / wedged GPU). NOT spawning ds4 on top; box stays in exclusive-DS4 offload mode. Manual recovery may be needed (restart llama-manager / SIGKILL gpu-manager).`
+      : `ds4 activation deferred: memory did not reclaim to ${gibStr(targetBytes)} GiB before spawn; NOT spawning ds4 to avoid OOM/swap. Box stays in exclusive-DS4 offload mode; retry once RAM frees.`;
+    addLog('presets', msg);
+    return { ok: false, status: 503, error: msg, stayedExclusive: true };
+  }
+
+  // ── Spawn phase (eviction truly succeeded: no resident model + RAM free) ──────
+  let spawnOk = true;
+  try {
+    const child = startDs4Server(preset);
+    if (!child) spawnOk = false;
   } catch (err) {
-    // Roll back so the box isn't left engine-less: restore llama router.
+    spawnOk = false;
+    addLog('presets', `ds4: spawn threw: ${err.message}`);
+  }
+
+  const spawnDecision = ds4ActivationDecision({ residentAfterEvict: false, reclaimOk: true, spawnOk });
+  if (spawnDecision.action === 'rollback-to-llama') {
+    // ds4 failed to spawn but eviction succeeded, so RAM is free and restoring llama
+    // cannot race a competing load. Stop the half-started ds4 FIRST, then restore llama.
+    if (spawnDecision.stopDs4) { try { await stopDs4Server(); } catch { /* ignore */ } }
     currentEngine = ENGINE_TYPES.LLAMA;
     currentMode = 'router';
     currentPreset = null;
-    try { await stopDs4Server(); } catch { /* ignore */ }
-    if (releaseGate) releaseGate();
-    ds4SwapPromise = null;
-    addLog('presets', `ds4 activation rolled back to llama router: ${err.message}`);
-    return { ok: false, status: err.code === 'DS4_RECLAIM_TIMEOUT' ? 503 : 500, error: err.message };
+    settleGate();
+    const msg = 'ds4 activation rolled back to llama router: ds4-server failed to spawn after eviction succeeded.';
+    addLog('presets', msg);
+    return { ok: false, status: 500, error: msg };
   }
 
   // Background: hold the swap gate until ds4 answers /v1/models, then release it so
-  // queued mid-swap requests proceed against a ready ds4-server.
+  // queued mid-swap requests proceed against a ready ds4-server. currentEngine stays
+  // ds4 for the whole readiness window, so the flood keeps offloading throughout.
   (async () => {
     try { await waitForDs4Ready(); }
-    finally {
-      if (releaseGate) releaseGate();
-      ds4SwapPromise = null;
-    }
+    finally { settleGate(); }
   })();
 
   return { ok: true };
