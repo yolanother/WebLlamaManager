@@ -145,6 +145,41 @@ export function shouldKeepEmbedServer({
 }
 
 /**
+ * Decide the engine-state transition for an exclusive-DS4 activation attempt, given how
+ * eviction and (if reached) ds4 spawn went. This encodes the fix for the live activation
+ * race: once the box is committed to ds4, a kill/reclaim HICCUP must NEVER roll it back to
+ * the llama router — doing so re-admits a competing local model load during the ~1-2 min ds4
+ * load window and OOM-kills ds4. So:
+ *   - a llama model still resident after the robust host kill (wedged / D-state)   → abort, but
+ *     STAY exclusive (engine stays ds4 so the request flood offloads); do NOT spawn ds4 on top.
+ *   - reclaim never reached target (no resident, RAM just didn't free in time)      → abort, STAY
+ *     exclusive (retry/offload); do NOT spawn.
+ *   - eviction TRULY succeeded (no resident + reclaim ok) but ds4 failed to spawn    → roll back to
+ *     llama. Safe here only because RAM is already free, so restoring llama cannot race a load; the
+ *     half-started ds4 is stopped FIRST (stopDs4) so the two engines never co-reside.
+ *   - eviction succeeded and ds4 spawned                                            → proceed exclusive.
+ * A resident llama always wins over an optimistic spawn signal (never spawn on a wedged llama).
+ *
+ * @param {object} params
+ * @param {boolean} params.residentAfterEvict A llama-server model is still resident after the robust kill.
+ * @param {boolean} params.reclaimOk MemAvailable reached the pre-spawn target.
+ * @param {boolean|undefined} [params.spawnOk] Whether ds4-server spawned/verified (undefined until reached).
+ * @returns {{action:'abort-stay-exclusive'|'rollback-to-llama'|'spawn', engine:'ds4'|'llama', spawn:boolean, stopDs4:boolean, ok:boolean, reason:string}}
+ */
+export function ds4ActivationDecision({ residentAfterEvict, reclaimOk, spawnOk } = {}) {
+  if (residentAfterEvict) {
+    return { action: 'abort-stay-exclusive', engine: 'ds4', spawn: false, stopDs4: false, ok: false, reason: 'llama-wedged-resident' };
+  }
+  if (!reclaimOk) {
+    return { action: 'abort-stay-exclusive', engine: 'ds4', spawn: false, stopDs4: false, ok: false, reason: 'reclaim-timeout' };
+  }
+  if (spawnOk === false) {
+    return { action: 'rollback-to-llama', engine: 'llama', spawn: false, stopDs4: true, ok: false, reason: 'ds4-spawn-failed' };
+  }
+  return { action: 'spawn', engine: 'ds4', spawn: true, stopDs4: false, ok: true, reason: 'ok' };
+}
+
+/**
  * OpenAI-style error body for a request rejected because the box is in exclusive DS4 mode
  * and no offload backend can serve the requested model. Returned with HTTP 503.
  * @param {string} requestedModel The model the client asked for.

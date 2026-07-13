@@ -18,6 +18,7 @@ import {
   pollForReclaim,
   shouldKeepEmbedServer,
   ds4Exclusive503Body,
+  ds4ActivationDecision,
 } from './ds4-exclusive.js';
 
 const GB = 1024 * 1024 * 1024;
@@ -147,4 +148,73 @@ test('ds4Exclusive503Body: OpenAI-style error naming both models', () => {
   assert.match(b.error.message, /gpt-oss-120b/);
   assert.match(b.error.message, /deepseek-v4-flash/);
   assert.match(b.error.message, /exclusive DS4 mode/i);
+});
+
+// ── ds4ActivationDecision ─────────────────────────────────────────────────────
+// The rollback rule that fixes the live activation race: once committed to ds4,
+// a kill/reclaim hiccup must NEVER roll the box back to llama-router (which would
+// re-admit a competing local model load during the ds4 load window). Only a genuine
+// ds4-spawn failure — AFTER eviction truly succeeded — rolls back, and it stops the
+// half-started ds4 before restoring llama so the two engines never co-reside.
+test('ds4ActivationDecision: llama still resident after robust kill → abort but STAY exclusive (no llama resume)', () => {
+  const d = ds4ActivationDecision({ residentAfterEvict: true, reclaimOk: false, spawnOk: undefined });
+  assert.equal(d.action, 'abort-stay-exclusive');
+  assert.equal(d.engine, 'ds4');   // engine stays ds4 — flood offloads, no local reload
+  assert.equal(d.spawn, false);    // never spawn ds4 on top of a wedged llama
+  assert.equal(d.stopDs4, false);  // nothing to stop; ds4 never started
+  assert.equal(d.ok, false);
+  assert.equal(d.reason, 'llama-wedged-resident');
+});
+
+test('ds4ActivationDecision: reclaim timeout (no resident, RAM never freed) → abort but STAY exclusive', () => {
+  const d = ds4ActivationDecision({ residentAfterEvict: false, reclaimOk: false, spawnOk: undefined });
+  assert.equal(d.action, 'abort-stay-exclusive');
+  assert.equal(d.engine, 'ds4');
+  assert.equal(d.spawn, false);
+  assert.equal(d.ok, false);
+  assert.equal(d.reason, 'reclaim-timeout');
+});
+
+test('ds4ActivationDecision: eviction succeeded but ds4 spawn failed → rollback to llama, stopping ds4 first', () => {
+  const d = ds4ActivationDecision({ residentAfterEvict: false, reclaimOk: true, spawnOk: false });
+  assert.equal(d.action, 'rollback-to-llama');
+  assert.equal(d.engine, 'llama'); // only here do we resume llama — RAM is free, no race
+  assert.equal(d.spawn, false);
+  assert.equal(d.stopDs4, true);   // fully stop the half-started ds4 BEFORE restoring llama
+  assert.equal(d.ok, false);
+  assert.equal(d.reason, 'ds4-spawn-failed');
+});
+
+test('ds4ActivationDecision: eviction succeeded and ds4 spawned → proceed exclusive', () => {
+  const d = ds4ActivationDecision({ residentAfterEvict: false, reclaimOk: true, spawnOk: true });
+  assert.equal(d.action, 'spawn');
+  assert.equal(d.engine, 'ds4');
+  assert.equal(d.spawn, true);
+  assert.equal(d.stopDs4, false);
+  assert.equal(d.ok, true);
+  assert.equal(d.reason, 'ok');
+});
+
+test('ds4ActivationDecision: resident wins over spawnOk (never spawn on a wedged llama)', () => {
+  // Even if a spawn probe were optimistic, a resident llama forces abort-stay-exclusive.
+  const d = ds4ActivationDecision({ residentAfterEvict: true, reclaimOk: true, spawnOk: true });
+  assert.equal(d.action, 'abort-stay-exclusive');
+  assert.equal(d.engine, 'ds4');
+  assert.equal(d.spawn, false);
+});
+
+// ── ds4RequestTarget during the ds4 load window ───────────────────────────────
+// While ds4 is loading (currentEngine=ds4, gate held), a NON-ds4 request must never
+// resolve to a local llama load — it offloads to a remote or is rejected. This is
+// what keeps a competing 60GB llama model off the box during the ~1-2 min ds4 load.
+test('ds4RequestTarget: non-ds4 request during load window never targets local llama', () => {
+  const ds4Ids = ['deepseek-v4-flash'];
+  // With a viable remote → offload.
+  assert.equal(ds4RequestTarget({ requestedModel: 'gpt-oss-120b', ds4ModelIds: ds4Ids, hasViableRemote: true }).target, 'remote');
+  // Without a viable remote → reject (never load locally).
+  const rej = ds4RequestTarget({ requestedModel: 'gpt-oss-120b', ds4ModelIds: ds4Ids, hasViableRemote: false });
+  assert.equal(rej.target, 'reject');
+  // The only local target this function can EVER return is the ds4 engine itself.
+  const local = ds4RequestTarget({ requestedModel: 'deepseek-v4-flash', ds4ModelIds: ds4Ids, hasViableRemote: false });
+  assert.equal(local.target, 'local-ds4');
 });
