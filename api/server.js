@@ -35,7 +35,7 @@ import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference,
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots } from './slot-reaper.js';
-import { resolveDefaultModel, defaultModelListEntries } from './default-models.js';
+import { resolveDefaultModel, defaultModelListEntries, ds4PresetForModel, validateDefaultModelTarget, BIG_ALIAS, SMALL_ALIAS } from './default-models.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
@@ -3196,23 +3196,21 @@ app.post('/api/settings', (req, res) => {
     }
   }
 
-  // Targets for the default-big / default-small aliases. Accept any string (we do not
-  // reject an unknown/not-yet-loaded name, matching direct requests to such a model);
-  // an empty/blank string clears the alias (stored as null).
+  // Targets for the default-big / default-small aliases. Accept a plain (possibly
+  // not-yet-loaded) llama model name — matching direct requests to such a model —
+  // OR a ds4-engine preset id (which migrates default clients onto DeepSeek V4
+  // Flash); an empty/blank string clears the alias (stored as null). Reject only a
+  // non-string or an existing non-ds4 (llama) preset id. See validateDefaultModelTarget.
   if (defaultBigModel !== undefined) {
-    if (defaultBigModel !== null && typeof defaultBigModel !== 'string') {
-      return res.status(400).json({ error: 'defaultBigModel must be a string or null' });
-    }
-    const v = typeof defaultBigModel === 'string' ? defaultBigModel.trim() : '';
-    config.defaultBigModel = v.length ? v : null;
+    const r = validateDefaultModelTarget(config, defaultBigModel);
+    if (!r.ok) return res.status(400).json({ error: `defaultBigModel: ${r.error}` });
+    config.defaultBigModel = r.value;
   }
 
   if (defaultSmallModel !== undefined) {
-    if (defaultSmallModel !== null && typeof defaultSmallModel !== 'string') {
-      return res.status(400).json({ error: 'defaultSmallModel must be a string or null' });
-    }
-    const v = typeof defaultSmallModel === 'string' ? defaultSmallModel.trim() : '';
-    config.defaultSmallModel = v.length ? v : null;
+    const r = validateDefaultModelTarget(config, defaultSmallModel);
+    if (!r.ok) return res.status(400).json({ error: `defaultSmallModel: ${r.error}` });
+    config.defaultSmallModel = r.value;
   }
 
   // HuggingFace token: store in config (preferred over the HF_TOKEN env var).
@@ -4545,6 +4543,51 @@ function presetServesModel(preset, modelName) {
 // promise so we don't kick off multiple restarts; the existing llamaQueue
 // + acquireLocalSlot path serializes new requests during the window.
 let modeSwitchPromise = null;
+/**
+ * Ensure the correct ENGINE is active for a request, following the configured
+ * default-big/default-small target, so the "preferred big model" alias drives the
+ * box across the llama↔ds4 seam. Two symmetric directions:
+ *
+ *  - The (alias-resolved) model names a ds4-engine preset and ds4 is not already
+ *    active → trigger the exclusive DS4 activation from task 3 (activateDs4Exclusive)
+ *    — the engine-level equivalent of how a normal request triggers ensureModelServed.
+ *  - The request used the `default-big`/`default-small` ALIAS, that alias now points
+ *    at a llama target (not a ds4 preset), and ds4 IS active → reverse exclusive mode
+ *    (deactivateDs4Exclusive from task 3) so llama serves it. Gated to the ALIAS only:
+ *    a non-alias request for some other model while ds4 is active still offloads to a
+ *    remote backend (task-3 exclusivity), it does NOT tear ds4 down.
+ *
+ * Idempotent: a no-op when ds4 already serves the requested ds4 preset, or when a
+ * non-alias request resolves to a llama model (the normal llama path handles it).
+ *
+ * LIVE VERIFICATION PENDING: exercises activateDs4Exclusive/deactivateDs4Exclusive
+ * (GPU + 81GB model), so the side-effect wiring is verified via the pure helpers'
+ * unit tests plus a live smoke on the box (see task report), not in `node --test`.
+ *
+ * @param {string} rawModel the ORIGINAL request model (pre-alias-resolution).
+ * @param {string} resolvedModel the alias-resolved model name.
+ * @returns {Promise<null|{ok:true}|{ok:false,status:number,error:string}>} the
+ *   activation result when a ds4 activation was attempted, else null.
+ */
+async function ensureDs4ForModel(rawModel, resolvedModel) {
+  const ref = ds4PresetForModel(config, resolvedModel);
+  if (ref) {
+    if (currentEngine === ENGINE_TYPES.DS4) return null; // ds4 already active → served downstream
+    console.log(`[ds4] default-model request for ds4 preset '${ref.presetId}' — activating exclusive ds4 mode`);
+    addLog('presets', `Request for ds4 preset '${ref.presetId}' (via default-model alias or name) — activating exclusive ds4 mode`);
+    return activateDs4Exclusive(ref.presetId, ref.preset);
+  }
+  // Resolved target is a llama model. Reverse exclusive ds4 ONLY for an alias request
+  // whose target has been re-pointed at llama — the alias follows the operator's
+  // preferred-big choice. Arbitrary non-alias models keep offloading (task-3).
+  if (currentEngine === ENGINE_TYPES.DS4 && (rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS)) {
+    console.log(`[ds4] default-model alias '${rawModel}' now points at llama target '${resolvedModel}' — deactivating exclusive ds4 mode`);
+    addLog('presets', `default-model alias '${rawModel}' re-pointed at llama target '${resolvedModel}' — reversing exclusive ds4 mode`);
+    await deactivateDs4Exclusive();
+  }
+  return null;
+}
+
 async function ensureModelServed(modelName) {
   // While the ds4 engine owns the box, do NOT run any llama mode-switch/restart:
   // starting llama-server alongside ds4 would OOM (ds4's 81GB model + a llama
@@ -7111,8 +7154,10 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   const isStreaming = req.body.stream === true;
   // Resolve default-big/default-small aliases to the configured real target before
   // routing, and forward the resolved name to the backend so the alias never reaches
-  // llama.cpp as an unknown model name.
-  const requestedModel = resolveDefaultModel(req.body.model || 'default', config);
+  // llama.cpp as an unknown model name. rawModel keeps the pre-resolution name so the
+  // engine seam can tell an alias request from a direct model request.
+  const rawModel = req.body.model || 'default';
+  const requestedModel = resolveDefaultModel(rawModel, config);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
@@ -7127,6 +7172,16 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   }
   if (!Array.isArray(req.body.messages)) {
     return res.status(400).json({ error: { message: 'messages must be an array', type: 'invalid_request_error' } });
+  }
+
+  // ── Engine activation for a ds4-backed default-big ───────────────────────────
+  // If the alias-resolved model names a ds4 preset and ds4 isn't already active,
+  // trigger exclusive DS4 activation before routing (the engine-level equivalent
+  // of ensureModelServed). On activation failure, fail cleanly rather than falling
+  // through to a stopped llama.
+  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel);
+  if (ds4Activation && !ds4Activation.ok) {
+    return res.status(ds4Activation.status || 503).json({ error: { message: ds4Activation.error, type: 'server_error' } });
   }
 
   // ── Hold mid-swap traffic ────────────────────────────────────────────────────
@@ -8012,9 +8067,16 @@ app.post('/api/v1/chat/completions', async (req, res) => {
 app.post('/api/v1/completions', async (req, res) => {
   const startTime = Date.now();
   // Resolve default-big/default-small aliases and forward the resolved name downstream.
-  const requestedModel = resolveDefaultModel(req.body.model || 'unknown', config);
+  const rawModel = req.body.model || 'unknown';
+  const requestedModel = resolveDefaultModel(rawModel, config);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
   const isStreaming = req.body.stream === true;
+
+  // Activate/deactivate exclusive ds4 to follow the default-model target (see chat handler).
+  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel);
+  if (ds4Activation && !ds4Activation.ok) {
+    return res.status(ds4Activation.status || 503).json({ error: { message: ds4Activation.error, type: 'server_error' } });
+  }
 
   // Hold mid-swap traffic until any ds4 engine swap settles (see chat/completions).
   if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
