@@ -1987,6 +1987,13 @@ function guardCfg() {
     // baseline (ds4ExpectedResidentGb) by ds4MemLeakMarginFrac — a genuine leak.
     ds4ExpectedResidentGb: g.ds4ExpectedResidentGb ?? 85,
     ds4MemLeakMarginFrac: g.ds4MemLeakMarginFrac ?? 0.15,
+    // Absolute GiB of free RAM required ABOVE the ds4 model weights before spawning
+    // ds4 (the pre-eviction reclaim gate). Absolute, NOT a fraction of total RAM: the
+    // ds4 model is ~65% of a 124GB box, so a percentage headroom (guard.headroomFrac,
+    // used for llama fitting) demands more free RAM than a shared box can ever reach
+    // and the gate never opens. A small absolute margin suffices — the mem-watchdog
+    // handles runtime growth after load. Default 8 GiB.
+    ds4ReclaimHeadroomGb: g.ds4ReclaimHeadroomGb ?? 8,
     // Soft local-queue cap. Raised well above the old fixed 8: at/over this we offload to a
     // remote (if one can serve the request) or — for models with no remote (e.g. gpt-oss-120b)
     // — keep queuing DEEPER instead of failing. Requests are only rejected when the model is
@@ -5122,9 +5129,13 @@ function ds4ModelIdsForPreset(presetId) {
 /** Guard headroom in bytes (fraction of MemTotal the guard keeps free). */
 function ds4HeadroomBytes() {
   const gc = guardCfg();
-  const total = memTotalBytes();
-  const frac = gc.headroomFrac ?? 0.06;
-  return total ? Math.round(total * frac) : 8 * 1024 * 1024 * 1024;
+  // Small ABSOLUTE margin above the ds4 model's weight footprint that must be free
+  // before spawn — NOT total*headroomFrac. The 80GB model is ~65% of RAM, so a
+  // percentage headroom demands more free RAM than a shared box can provide and the
+  // reclaim gate never opens (observed: target 99.4 GiB vs ~95 GiB achievable). The
+  // mem-watchdog governs runtime growth. See guard.ds4ReclaimHeadroomGb.
+  const gb = gc.ds4ReclaimHeadroomGb ?? 8;
+  return Math.round(gb * 1024 * 1024 * 1024);
 }
 
 /** Poll ds4 /v1/models until ready or timeout; resolves regardless (best-effort gate). */
