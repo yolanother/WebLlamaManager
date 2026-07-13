@@ -208,6 +208,62 @@ MemAvailable to a headroom target) before llama-server starts. Gated on
 `DS4_READY_TIMEOUT_MS` (600000), `DS4_READY_INTERVAL_MS` (3000),
 `DS4_ALLOW_EMBED_SERVER` (from `config.ds4.allowEmbedServer`, default true).
 
+ds4 memory-watchdog knobs live under `config.guard`:
+`ds4ExpectedResidentGb` (85 — ds4's expected resident baseline in GiB) and
+`ds4MemLeakMarginFrac` (0.15 — fractional RSS growth over baseline that counts as
+a leak). Only when ds4's RSS exceeds `ds4ExpectedResidentGb × (1 + margin)` **and**
+system memory is over `guard.memThresholdPct` does the watchdog restart ds4.
+
+## Guards under ds4 (mem-watchdog, restart governor, thermal, slots, kill)
+
+The stability guards were built from real llama incidents (OOM + thermal redline,
+restart thrash, wedged-amdgpu lockup). A ds4-server running 81GB hot on the same
+iGPU with guards blind to it would reintroduce every one of those failure modes,
+so each guard is engine-aware. **Exclusive mode means exactly one local engine is
+ever active**, so a single "local engine" governor/watchdog is correct.
+
+- **Memory watchdog** (`api/mem-watchdog.js` + the `MEM_WATCHDOG_INTERVAL` loop).
+  The loop no longer early-returns when `llamaProcess` is null; it branches on
+  `currentEngine`. Under ds4 it checks the ds4 supervisor is running and that a
+  `ds4-server` process is the heaviest-RSS process, then gates the restart on
+  `shouldRestartForResidentLeak`. ds4 holds ~81GB **by design**, so a system-memory
+  threshold breach at that baseline is **not** a leak and a restart would only
+  reload the same 81GB (minutes of iGPU downtime). The gate therefore requires
+  ds4's RSS (`ds4ServerRssBytes()`) to have grown past
+  `guard.ds4ExpectedResidentGb × (1 + guard.ds4MemLeakMarginFrac)` (defaults 85 GiB
+  and 0.15 → ~97.75 GiB) **and** the system to be under pressure. It fails **safe**
+  on an unknown baseline (never restarts on pressure alone). The streaming-defer
+  (`shouldDeferMemRestart`, commit d77c5f7) and zero-token prompt-processing grace
+  (d6770e6) still apply — ds4 requests share the `activeRequests` map (backend
+  `'ds4'`). The restart itself goes through `restartLlamaServer({governed:false})`,
+  which delegates to the ds4 supervisor when ds4 is active.
+
+- **Restart governor** (`api/restart-governor.js`). The ds4 supervisor already
+  routes auto-restarts through the shared `restartDecision` (debounce +
+  circuit-breaker + sustained-thrash). It now also forwards a `getWedged()` signal
+  (`containerExecWedged`/`consecutiveFailedRestarts`), so the **wedged-GPU 15-min
+  hold** (commit e960d04) applies to ds4 too — a locked GPU won't get a fresh 81GB
+  probe every cooldown.
+
+- **Thermal governor** (`api/resource-guard.js` + the thermal loop). Heat
+  attribution is what decides whether the die heat is "the llama stack" (throttle)
+  or external (leave alone — commit 7c954e3). `getAppUsage` now counts comm
+  `ds4-server` as app load (`engines.isEngineProcessComm`), so ds4's CPU/iGPU heat
+  is attributed to the stack and the governor pauses/offloads correctly under ds4.
+  `thermalDecision` never unloads for heat regardless of engine.
+
+- **Slots** (`api/slot-reaper.js`, the `/slots` proof-of-life probe). ds4-server
+  has no llama.cpp `/slots`. Both the per-slot proof-of-life probe and the
+  leaked-slot reaper explicitly no-op under ds4 (`engines.engineSupportsSlots`) —
+  ds4 requests never take a `llamaQueue` slot, so there is nothing to reap and no
+  `/slots` fetch is issued (no errors, no log spam). Remote/ds4 request stall
+  handling still runs.
+
+- **Kill / emergency paths.** The `llama-server` and `ds4-server` pkill patterns
+  are disjoint (`ds4RunKill` frees the ds4 port and never matches `llama-server`,
+  and vice-versa). Shutdown stops all three (`llama`, `embed`, `ds4`); ds4
+  deactivation and the mem-watchdog restart both reap ds4 via the supervisor.
+
 ## State variables (`api/server.js`)
 
 ```javascript
