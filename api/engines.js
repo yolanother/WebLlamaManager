@@ -61,6 +61,11 @@ const DS4_DEFAULTS = {
   // The small embedding server (~5GB) may stay resident alongside ds4 when RAM
   // headroom allows. Exclusive-DS4 activation counts it in the eviction budget.
   allowEmbedServer: true,
+  // HuggingFace repos the ds4 downloader is permitted to fetch from. ds4 GGUFs
+  // use a custom quantization and only load in ds4-server, so the download path
+  // is hard-restricted to this allowlist (any other repo is rejected) — this
+  // keeps arbitrary GGUFs out of the dedicated ds4 ggufDir.
+  allowedRepos: ['antirez/deepseek-v4-gguf'],
 };
 
 /** Coerce a value to a finite number, falling back to `d` for empty/NaN input. */
@@ -74,6 +79,23 @@ function boolFlag(v, d) {
   if (typeof v === 'boolean') return v;
   const s = String(v).toLowerCase();
   return s === '1' || s === 'true' || s === 'yes';
+}
+
+/**
+ * Resolve the ds4 download repo allowlist. A DS4_ALLOWED_REPOS env value
+ * (comma-separated) wins; otherwise a config array is honored; otherwise the
+ * default. Always returns a fresh array so callers can't mutate the defaults.
+ * @param {string|undefined} envVal Comma-separated env override.
+ * @param {string[]|undefined} cfgVal config.ds4.allowedRepos array.
+ * @param {string[]} dflt Built-in default allowlist.
+ * @returns {string[]}
+ */
+function resolveAllowedRepos(envVal, cfgVal, dflt) {
+  if (envVal !== undefined && envVal !== null && envVal !== '') {
+    return String(envVal).split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  if (Array.isArray(cfgVal)) return cfgVal.slice();
+  return dflt.slice();
 }
 
 /**
@@ -98,7 +120,7 @@ export function isDs4Preset(preset) {
  * Env (DS4_*) overrides the config.ds4 block; both fall back to defaults.
  * @param {object} config Parsed config.json (may lack a `ds4` block).
  * @param {object} env Environment object (e.g. process.env).
- * @returns {{binPath:string, port:number, ggufDir:string, container:string, runInDistrobox:boolean, allowEmbedServer:boolean}}
+ * @returns {{binPath:string, port:number, ggufDir:string, container:string, runInDistrobox:boolean, allowEmbedServer:boolean, allowedRepos:string[]}}
  */
 export function resolveDs4Config(config = {}, env = {}) {
   const d = config.ds4 || {};
@@ -113,6 +135,7 @@ export function resolveDs4Config(config = {}, env = {}) {
     allowEmbedServer: env.DS4_ALLOW_EMBED_SERVER !== undefined
       ? boolFlag(env.DS4_ALLOW_EMBED_SERVER, DS4_DEFAULTS.allowEmbedServer)
       : boolFlag(d.allowEmbedServer, DS4_DEFAULTS.allowEmbedServer),
+    allowedRepos: resolveAllowedRepos(env.DS4_ALLOWED_REPOS, d.allowedRepos, DS4_DEFAULTS.allowedRepos),
   };
 }
 
@@ -264,4 +287,89 @@ export function ds4ModelsList(config, { currentEngine, currentPreset, created } 
 export function ds4TargetUrl(port, path) {
   const p = String(path || '').replace(/^\/+/, '');
   return `http://127.0.0.1:${port}/${p}`;
+}
+
+/**
+ * True when `repo` is present in the ds4 download allowlist. Exact string match
+ * (HF `owner/name`); an empty/missing repo or a non-array allowlist is never
+ * allowed. This is the sole gate that keeps the ds4 downloader restricted to the
+ * approved DeepSeek V4 repo(s).
+ * @param {string} repo HuggingFace repo id.
+ * @param {string[]} allowedRepos Allowlist from resolveDs4Config().
+ * @returns {boolean}
+ */
+export function isDs4RepoAllowed(repo, allowedRepos) {
+  if (!repo || typeof repo !== 'string' || !Array.isArray(allowedRepos)) return false;
+  return allowedRepos.includes(repo);
+}
+
+/**
+ * List the GGUF files present in the ds4 ggufDir. Pure w.r.t. the filesystem
+ * primitives injected via `fsImpl` so it is unit-testable against a temp dir.
+ * Non-existent dir → empty list. Entries are sorted by name and carry a size.
+ * @param {string} ggufDir Absolute ds4 gguf directory.
+ * @param {{existsSync:Function, readdirSync:Function, statSync:Function}} fsImpl
+ * @returns {{name:string, path:string, sizeBytes:(number|null)}[]}
+ */
+export function listDs4GgufFiles(ggufDir, fsImpl = {}) {
+  const { existsSync, readdirSync, statSync } = fsImpl;
+  if (!ggufDir || typeof existsSync !== 'function' || !existsSync(ggufDir)) return [];
+  const base = String(ggufDir).replace(/\/+$/, '');
+  let names = [];
+  try { names = readdirSync(ggufDir); } catch { return []; }
+  return names
+    .filter((n) => /\.gguf$/i.test(n))
+    .map((name) => {
+      const full = `${base}/${name}`;
+      let sizeBytes = null;
+      try { sizeBytes = statSync(full).size; } catch { /* unreadable — leave null */ }
+      return { name, path: full, sizeBytes };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Validate a ds4 download request and resolve its HF include patterns, dedup
+ * downloadId, and target directory. Enforces the repo allowlist (any repo not in
+ * `ds4Config.allowedRepos` is rejected with status 400) and HARD-PINS the target
+ * directory to the ds4 ggufDir so a ds4 download can never write into ~/models.
+ * Pure — no filesystem or process side effects; the server wires the result to the
+ * shared HF download plumbing.
+ * @param {object} body Request body ({ repo, filename?, pattern?, quantization? }).
+ * @param {{ggufDir:string, allowedRepos:string[]}} ds4Config Resolved ds4 config.
+ * @returns {{ok:false, status:number, error:string}
+ *   |{ok:true, repo:string, includePatterns:string[], downloadId:string, targetDir:string}}
+ */
+export function validateDs4DownloadRequest(body = {}, ds4Config = {}) {
+  const repo = body.repo;
+  if (!repo || typeof repo !== 'string') {
+    return { ok: false, status: 400, error: 'Missing repo parameter' };
+  }
+  if (!isDs4RepoAllowed(repo, ds4Config.allowedRepos)) {
+    const allowed = Array.isArray(ds4Config.allowedRepos) ? ds4Config.allowedRepos.join(', ') : '';
+    return {
+      ok: false,
+      status: 400,
+      error: `Repo '${repo}' is not in the ds4 allowlist${allowed ? ` (allowed: ${allowed})` : ''}.`,
+    };
+  }
+
+  let includePatterns;
+  let downloadId;
+  if (body.filename) {
+    includePatterns = [body.filename];
+    downloadId = `${repo}:${body.filename}`;
+  } else if (body.pattern) {
+    includePatterns = [body.pattern];
+    downloadId = `${repo}:${body.pattern}`;
+  } else if (body.quantization) {
+    const q = String(body.quantization);
+    includePatterns = [`*${q.toUpperCase()}*.gguf`, `*${q.toLowerCase()}*.gguf`];
+    downloadId = `${repo}:${q}`;
+  } else {
+    includePatterns = ['*.gguf'];
+    downloadId = `${repo}:all`;
+  }
+
+  return { ok: true, repo, includePatterns, downloadId, targetDir: ds4Config.ggufDir };
 }

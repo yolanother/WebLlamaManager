@@ -43,7 +43,8 @@ import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-re
 import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
-  isEngineProcessComm, engineSupportsSlots
+  isEngineProcessComm, engineSupportsSlots,
+  listDs4GgufFiles, validateDs4DownloadRequest
 } from './engines.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { resolveDs4ModelPath } from './engines.js';
@@ -5397,39 +5398,18 @@ function flattenGgufFiles(targetDir) {
   }
 }
 
-// Download a model from HuggingFace to ~/models
-// Supports: quantization pattern, specific filename, or all GGUF files
-app.post('/api/pull', async (req, res) => {
-  const { repo, quantization, filename, pattern } = req.body;
-
-  if (!repo) {
-    return res.status(400).json({ error: 'Missing repo parameter' });
-  }
-
-  // Determine what to download
-  let includePatterns = [];
-  let downloadId = repo;
-
-  if (filename) {
-    // Download specific file
-    includePatterns = [filename];
-    downloadId = `${repo}:${filename}`;
-  } else if (quantization) {
-    // Download by quantization pattern
-    const quant = quantization.toUpperCase();
-    const quantLower = quantization.toLowerCase();
-    includePatterns = [`*${quant}*.gguf`, `*${quantLower}*.gguf`];
-    downloadId = `${repo}:${quantization}`;
-  } else if (pattern) {
-    // Custom pattern
-    includePatterns = [pattern];
-    downloadId = `${repo}:${pattern}`;
-  } else {
-    // Download all GGUF files
-    includePatterns = ['*.gguf'];
-    downloadId = `${repo}:all`;
-  }
-
+/**
+ * Shared HuggingFace download runner used by /api/pull (→ ~/models) and
+ * /api/ds4/download (→ the dedicated ds4 ggufDir). Dedup-checks an in-flight
+ * download, spawns `hf download` (PTY for live progress bars, plain
+ * child_process fallback), parses progress/completion into the downloadProcesses
+ * map, flattens nested GGUFs on success, and writes the HTTP response. The CALLER
+ * chooses repo/includePatterns/downloadId/targetDir — this function never picks
+ * the directory, so each caller fully controls (and isolates) its write target.
+ * @param {import('express').Response} res
+ * @param {{downloadId:string, repo:string, includePatterns:string[], targetDir:string}} spec
+ */
+function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir }) {
   if (downloadProcesses.has(downloadId)) {
     const existing = downloadProcesses.get(downloadId);
     if (existing.status === 'downloading' || existing.status === 'starting') {
@@ -5446,8 +5426,8 @@ app.post('/api/pull', async (req, res) => {
   downloadProcesses.set(downloadId, downloadInfo);
 
   try {
-    // Downloads to ~/models with repo structure
-    const targetDir = join(MODELS_DIR, repo.replace('/', '_'));
+    // targetDir is chosen by the caller (~/models/<repo> for llama, the ds4
+    // ggufDir for ds4) — this runner never writes outside it.
     mkdirSync(targetDir, { recursive: true });
 
     // Build include arguments for hf download
@@ -5607,6 +5587,75 @@ app.post('/api/pull', async (req, res) => {
     downloadInfo.error = error.message;
     res.status(500).json({ error: error.message });
   }
+}
+
+// Download a model from HuggingFace to ~/models
+// Supports: quantization pattern, specific filename, or all GGUF files
+app.post('/api/pull', (req, res) => {
+  const { repo, quantization, filename, pattern } = req.body;
+
+  if (!repo) {
+    return res.status(400).json({ error: 'Missing repo parameter' });
+  }
+
+  // Determine what to download
+  let includePatterns = [];
+  let downloadId = repo;
+
+  if (filename) {
+    // Download specific file
+    includePatterns = [filename];
+    downloadId = `${repo}:${filename}`;
+  } else if (quantization) {
+    // Download by quantization pattern
+    const quant = quantization.toUpperCase();
+    const quantLower = quantization.toLowerCase();
+    includePatterns = [`*${quant}*.gguf`, `*${quantLower}*.gguf`];
+    downloadId = `${repo}:${quantization}`;
+  } else if (pattern) {
+    // Custom pattern
+    includePatterns = [pattern];
+    downloadId = `${repo}:${pattern}`;
+  } else {
+    // Download all GGUF files
+    includePatterns = ['*.gguf'];
+    downloadId = `${repo}:all`;
+  }
+
+  // Llama downloads land under ~/models/<repo>; they must NEVER touch the ds4
+  // ggufDir (a normal GGUF there would poison the router's mode detection).
+  const targetDir = join(MODELS_DIR, repo.replace('/', '_'));
+  return handleHfDownload(res, { downloadId, repo, includePatterns, targetDir });
+});
+
+// ── DS4 model listing + allowlisted download ─────────────────────────────────
+// ds4 GGUFs use a custom quantization that only loads in ds4-server, so they live
+// in a DEDICATED ggufDir (never ~/models) and download only from an allowlisted
+// HF repo. These two endpoints back the Downloads-tab DS4 section and the ds4
+// preset model picker.
+
+// List the GGUF files currently present in the ds4 ggufDir.
+app.get('/api/ds4/models', (req, res) => {
+  const ds4 = resolveDs4Config(config, process.env);
+  const models = listDs4GgufFiles(ds4.ggufDir, { existsSync, readdirSync, statSync });
+  res.json({ ggufDir: ds4.ggufDir, allowedRepos: ds4.allowedRepos, models });
+});
+
+// Download a ds4 GGUF into the ds4 ggufDir. HARD-RESTRICTED to config.ds4.allowedRepos
+// (default ["antirez/deepseek-v4-gguf"]) — any other repo is rejected with 400 — and
+// the write target is pinned to the ggufDir so a ds4 download can never reach ~/models.
+app.post('/api/ds4/download', (req, res) => {
+  const ds4 = resolveDs4Config(config, process.env);
+  const decision = validateDs4DownloadRequest(req.body, ds4);
+  if (!decision.ok) {
+    return res.status(decision.status).json({ error: decision.error });
+  }
+  return handleHfDownload(res, {
+    downloadId: decision.downloadId,
+    repo: decision.repo,
+    includePatterns: decision.includePatterns,
+    targetDir: decision.targetDir,
+  });
 });
 
 // Get download status
