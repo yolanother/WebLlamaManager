@@ -477,6 +477,11 @@ function Sidebar({ stats }) {
           <span className="status-dot" />
           <span>{isHealthy ? 'Running' : stats?.mode ? 'Starting' : 'Stopped'}</span>
         </div>
+        {stats?.engine === 'ds4' && (
+          <div className="engine-badge ds4 sidebar-engine" title="DeepSeek V4 active — llama models offloaded to backends">
+            DS4 · exclusive
+          </div>
+        )}
       </div>
 
       <div className="sidebar-nav">
@@ -3088,27 +3093,45 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
 }
 
 // Presets Page
+// A fresh, empty preset draft. `engine` selects which field set the create form
+// shows: 'llama' (sampling knobs) vs 'ds4' (ctx / power / KV-disk / switches).
+const EMPTY_PRESET = {
+  id: '',
+  name: '',
+  description: '',
+  engine: 'llama',
+  modelPath: '',
+  context: 0,
+  config: {
+    temp: 0.7,
+    topP: 1.0,
+    topK: 20,
+    minP: 0,
+    chatTemplateKwargs: '',
+    extraSwitches: '--jinja'
+  },
+  // ds4-only launch knobs (flat body fields consumed by validatePresetEngineFields).
+  ds4: {
+    power: 100,
+    kvDiskDir: '',
+    kvDiskSpaceMb: 0,
+    extraSwitches: '--rocm --cors'
+  }
+};
+
 function PresetsPage({ stats }) {
   const [presets, setPresets] = useState([]);
   const [localModels, setLocalModels] = useState([]);
+  const [ds4Models, setDs4Models] = useState([]);
+  const [ds4GgufDir, setDs4GgufDir] = useState('');
   const [loading, setLoading] = useState({});
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [editingPreset, setEditingPreset] = useState(null);
-  const [newPreset, setNewPreset] = useState({
-    id: '',
-    name: '',
-    description: '',
-    modelPath: '',
-    context: 0,
-    config: {
-      temp: 0.7,
-      topP: 1.0,
-      topK: 20,
-      minP: 0,
-      chatTemplateKwargs: '',
-      extraSwitches: '--jinja'
-    }
-  });
+  const [newPreset, setNewPreset] = useState(EMPTY_PRESET);
+
+  // Active engine/preset (from the shared stats poll) for badging.
+  const activeEngine = stats?.engine || 'llama';
+  const activePresetId = stats?.preset?.id || null;
 
   const fetchPresets = useCallback(async () => {
     try {
@@ -3130,10 +3153,23 @@ function PresetsPage({ stats }) {
     }
   }, []);
 
+  // ds4 GGUFs live in a dedicated dir (never ~/models) — separate endpoint.
+  const fetchDs4Models = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/ds4/models`);
+      const data = await res.json();
+      setDs4Models(data.models || []);
+      setDs4GgufDir(data.ggufDir || '');
+    } catch (err) {
+      console.error('Failed to fetch ds4 models:', err);
+    }
+  }, []);
+
   useEffect(() => {
     fetchPresets();
     fetchModels();
-  }, [fetchPresets, fetchModels]);
+    fetchDs4Models();
+  }, [fetchPresets, fetchModels, fetchDs4Models]);
 
   const createPreset = async () => {
     if (!newPreset.id || !newPreset.name || !newPreset.modelPath) {
@@ -3142,18 +3178,32 @@ function PresetsPage({ stats }) {
     }
     setLoading(l => ({ ...l, create: true }));
     try {
+      // ds4 presets POST a FLAT body (engine + ds4 launch knobs) that the
+      // backend's validatePresetEngineFields understands; llama presets keep
+      // their nested config as before.
+      const body = newPreset.engine === 'ds4'
+        ? {
+            id: newPreset.id,
+            name: newPreset.name,
+            description: newPreset.description,
+            engine: 'ds4',
+            modelPath: newPreset.modelPath,
+            context: newPreset.context,
+            power: newPreset.ds4.power,
+            kvDiskDir: newPreset.ds4.kvDiskDir,
+            kvDiskSpaceMb: newPreset.ds4.kvDiskSpaceMb,
+            extraSwitches: newPreset.ds4.extraSwitches
+          }
+        : { ...newPreset, engine: 'llama', ds4: undefined };
       const res = await fetch(`${API_BASE}/presets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newPreset)
+        body: JSON.stringify(body)
       });
       if (res.ok) {
         await fetchPresets();
         setShowCreateForm(false);
-        setNewPreset({
-          id: '', name: '', description: '', modelPath: '', context: 0,
-          config: { temp: 0.7, topP: 1.0, topK: 20, minP: 0, chatTemplateKwargs: '', extraSwitches: '--jinja' }
-        });
+        setNewPreset(EMPTY_PRESET);
       } else {
         const err = await res.json();
         alert(err.error || 'Failed to create preset');
@@ -3222,67 +3272,142 @@ function PresetsPage({ stats }) {
               />
             </div>
             <div className="form-group full-width">
+              <label>Engine</label>
+              <select
+                value={newPreset.engine}
+                onChange={(e) => setNewPreset(p => ({ ...p, engine: e.target.value, modelPath: '' }))}
+              >
+                <option value="llama">llama.cpp (router / presets)</option>
+                <option value="ds4">DS4 · DeepSeek V4 (exclusive)</option>
+              </select>
+              {newPreset.engine === 'ds4' && (
+                <span className="hint">
+                  DS4 runs in exclusive mode — activating it evicts llama models and offloads other
+                  requests to backends. Models load only from the ds4 GGUF dir{ds4GgufDir ? ` (${ds4GgufDir})` : ''}.
+                </span>
+              )}
+            </div>
+            <div className="form-group full-width">
               <label>Model</label>
-              <SearchableSelect
-                value={newPreset.modelPath}
-                onChange={(val) => setNewPreset(p => ({ ...p, modelPath: val }))}
-                options={localModels.map(m => ({ value: m.name, label: formatModelName(m) }))}
-                placeholder="Select a local model..."
-                storageKey="lastPresetModel"
-              />
+              {newPreset.engine === 'ds4' ? (
+                <SearchableSelect
+                  value={newPreset.modelPath}
+                  onChange={(val) => setNewPreset(p => ({ ...p, modelPath: val }))}
+                  options={ds4Models.map(m => ({ value: m.name, label: `${m.name}${m.sizeBytes ? ` — ${formatBytes(m.sizeBytes)}` : ''}` }))}
+                  placeholder={ds4Models.length ? 'Select a ds4 GGUF...' : 'No ds4 GGUFs found — download one from the Download tab'}
+                  storageKey="lastDs4PresetModel"
+                />
+              ) : (
+                <SearchableSelect
+                  value={newPreset.modelPath}
+                  onChange={(val) => setNewPreset(p => ({ ...p, modelPath: val }))}
+                  options={localModels.map(m => ({ value: m.name, label: formatModelName(m) }))}
+                  placeholder="Select a local model..."
+                  storageKey="lastPresetModel"
+                />
+              )}
             </div>
             <div className="form-group">
-              <label>Context Size (0 = default)</label>
+              <label>{newPreset.engine === 'ds4' ? 'Context (--ctx, 0 = default)' : 'Context Size (0 = default)'}</label>
               <input
                 type="number"
                 value={newPreset.context}
                 onChange={(e) => setNewPreset(p => ({ ...p, context: parseInt(e.target.value) || 0 }))}
               />
             </div>
-            <div className="form-group">
-              <label>Temperature</label>
-              <input
-                type="number"
-                step="0.1"
-                value={newPreset.config.temp}
-                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, temp: parseFloat(e.target.value) || 0.7 } }))}
-              />
-            </div>
-            <div className="form-group">
-              <label>Top P</label>
-              <input
-                type="number"
-                step="0.1"
-                value={newPreset.config.topP}
-                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, topP: parseFloat(e.target.value) || 1.0 } }))}
-              />
-            </div>
-            <div className="form-group">
-              <label>Top K</label>
-              <input
-                type="number"
-                value={newPreset.config.topK}
-                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, topK: parseInt(e.target.value) || 0 } }))}
-              />
-            </div>
-            <div className="form-group full-width">
-              <label>Extra Switches</label>
-              <input
-                type="text"
-                placeholder="--jinja"
-                value={newPreset.config.extraSwitches}
-                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, extraSwitches: e.target.value } }))}
-              />
-            </div>
-            <div className="form-group full-width">
-              <label>Chat Template Kwargs (JSON)</label>
-              <input
-                type="text"
-                placeholder='{"reasoning_effort": "high"}'
-                value={newPreset.config.chatTemplateKwargs}
-                onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, chatTemplateKwargs: e.target.value } }))}
-              />
-            </div>
+
+            {/* ── llama-only sampling knobs ─────────────────────────────── */}
+            {newPreset.engine === 'llama' && (
+              <>
+                <div className="form-group">
+                  <label>Temperature</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={newPreset.config.temp}
+                    onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, temp: parseFloat(e.target.value) || 0.7 } }))}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Top P</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={newPreset.config.topP}
+                    onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, topP: parseFloat(e.target.value) || 1.0 } }))}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Top K</label>
+                  <input
+                    type="number"
+                    value={newPreset.config.topK}
+                    onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, topK: parseInt(e.target.value) || 0 } }))}
+                  />
+                </div>
+                <div className="form-group full-width">
+                  <label>Extra Switches</label>
+                  <input
+                    type="text"
+                    placeholder="--jinja"
+                    value={newPreset.config.extraSwitches}
+                    onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, extraSwitches: e.target.value } }))}
+                  />
+                </div>
+                <div className="form-group full-width">
+                  <label>Chat Template Kwargs (JSON)</label>
+                  <input
+                    type="text"
+                    placeholder='{"reasoning_effort": "high"}'
+                    value={newPreset.config.chatTemplateKwargs}
+                    onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, chatTemplateKwargs: e.target.value } }))}
+                  />
+                </div>
+              </>
+            )}
+
+            {/* ── ds4-only launch knobs ─────────────────────────────────── */}
+            {newPreset.engine === 'ds4' && (
+              <>
+                <div className="form-group">
+                  <label>Power (%)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={newPreset.ds4.power}
+                    onChange={(e) => setNewPreset(p => ({ ...p, ds4: { ...p.ds4, power: parseInt(e.target.value) || 100 } }))}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>KV Disk Cache Size (MB, 0 = off)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    value={newPreset.ds4.kvDiskSpaceMb}
+                    onChange={(e) => setNewPreset(p => ({ ...p, ds4: { ...p.ds4, kvDiskSpaceMb: parseInt(e.target.value) || 0 } }))}
+                  />
+                </div>
+                <div className="form-group full-width">
+                  <label>KV Disk Cache Dir</label>
+                  <input
+                    type="text"
+                    placeholder="/path/to/kv-cache (optional)"
+                    value={newPreset.ds4.kvDiskDir}
+                    onChange={(e) => setNewPreset(p => ({ ...p, ds4: { ...p.ds4, kvDiskDir: e.target.value } }))}
+                  />
+                </div>
+                <div className="form-group full-width">
+                  <label>Extra Switches</label>
+                  <input
+                    type="text"
+                    placeholder="--rocm --cors"
+                    value={newPreset.ds4.extraSwitches}
+                    onChange={(e) => setNewPreset(p => ({ ...p, ds4: { ...p.ds4, extraSwitches: e.target.value } }))}
+                  />
+                </div>
+              </>
+            )}
           </div>
           <div className="form-actions">
             <button className="btn-secondary" onClick={() => setShowCreateForm(false)}>Cancel</button>
@@ -3299,16 +3424,29 @@ function PresetsPage({ stats }) {
         <div className="presets-grid">
           {presets.map((preset) => {
             // Determine display values - support both hfRepo format and legacy repo/quantization
-            const modelDisplay = preset.hfRepo || 
+            const modelDisplay = preset.hfRepo ||
               (preset.repo ? `${preset.repo}:${preset.quantization || 'Q5_K_M'}` : null) ||
               preset.modelPath?.split('/').pop() ||
               'Unknown';
-            
+            const isDs4 = preset.engine === 'ds4';
+            const isActiveDs4 = isDs4 && activeEngine === 'ds4' && activePresetId === preset.id;
+
             return (
-              <div key={preset.id} className="preset-card">
+              <div key={preset.id} className={`preset-card${isActiveDs4 ? ' active-ds4' : ''}`}>
                 <div className="preset-header">
                   <h3>{preset.name}</h3>
+                  {isDs4 && (
+                    <span className="engine-badge ds4" title="DeepSeek V4 engine — runs in exclusive mode">
+                      {isActiveDs4 ? 'DS4 · exclusive' : 'DS4'}
+                    </span>
+                  )}
                 </div>
+
+                {isActiveDs4 && (
+                  <p className="preset-active-note">
+                    Active in exclusive mode — llama models are evicted and other requests offload to backends.
+                  </p>
+                )}
 
                 <p className="preset-description">{preset.description}</p>
 
@@ -3612,6 +3750,25 @@ function ModelsPage({ stats }) {
 }
 
 // Download Page
+// The DS4 / DeepSeek V4 download catalog. Only the antirez/deepseek-v4-gguf repo
+// is allowlisted server-side; oversized variants are shown for context but are
+// NOT one-click downloadable on this 128GB Strix Halo (they OOM the box).
+const DS4_REPO = 'antirez/deepseek-v4-gguf';
+// `pattern` is the HF --include glob sent to the allowlisted download endpoint;
+// `match` is the substring that identifies an already-present file in the ds4 dir.
+const DS4_OPTIONS = [
+  { key: 'q2-imatrix', label: 'Q2 (imatrix)', size: '~81GB', pattern: '*imatrix*', match: 'imatrix', fits: true, recommended: true,
+    desc: 'Recommended — the best-fitting DeepSeek V4 Flash quant for this 128GB Strix Halo.' },
+  { key: 'mtp', label: 'MTP (speculative)', size: '~3.5GB', pattern: '*mtp*', match: 'mtp', fits: true, recommended: false,
+    desc: 'Optional multi-token-prediction file for speculative decoding.' },
+  { key: 'q2-q4', label: 'Q2-Q4 mix', size: '~98GB', pattern: null, match: null, fits: false, recommended: false,
+    desc: 'Does not fit this machine — can cause system OOM.' },
+  { key: 'q4', label: 'Q4', size: '~153GB', pattern: null, match: null, fits: false, recommended: false,
+    desc: 'Does not fit this machine — can cause system OOM.' },
+  { key: 'pro', label: 'Pro variants', size: '≥153GB', pattern: null, match: null, fits: false, recommended: false,
+    desc: 'Does not fit this machine — can cause system OOM.' },
+];
+
 function DownloadPage({ stats }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
@@ -3621,6 +3778,52 @@ function DownloadPage({ stats }) {
   const [loadingFiles, setLoadingFiles] = useState(false);
   const [repoError, setRepoError] = useState(null);
   const [customPattern, setCustomPattern] = useState('');
+  const [ds4Models, setDs4Models] = useState([]);
+  const [ds4GgufDir, setDs4GgufDir] = useState('');
+  const [ds4Downloading, setDs4Downloading] = useState(null);
+
+  // Poll which ds4 GGUFs are already present so the section can show them as available.
+  const fetchDs4Models = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/ds4/models`);
+      const data = await res.json();
+      setDs4Models(data.models || []);
+      setDs4GgufDir(data.ggufDir || '');
+    } catch (err) {
+      console.error('Failed to fetch ds4 models:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchDs4Models();
+    const t = setInterval(fetchDs4Models, 10000);
+    return () => clearInterval(t);
+  }, [fetchDs4Models]);
+
+  // LIVE VERIFICATION PENDING: the DS4 preset editor + Downloads-tab DS4 section
+  // compile and are wired to /api/ds4/models and /api/ds4/download; the actual
+  // browser click-through (create a ds4 preset, run the recommended download,
+  // confirm progress + present-file listing) is verified by the operator after
+  // install.sh deploy — the 81GB model download needs a real memory window.
+  // Kick off an allowlisted ds4 download into the dedicated ggufDir (never ~/models).
+  const downloadDs4 = async (opt) => {
+    if (!opt.fits || !opt.pattern) return;
+    setDs4Downloading(opt.key);
+    try {
+      const res = await fetch(`${API_BASE}/ds4/download`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repo: DS4_REPO, pattern: opt.pattern })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(err.error || 'Failed to start ds4 download');
+      }
+    } catch (err) {
+      console.error('Failed to start ds4 download:', err);
+    }
+    setDs4Downloading(null);
+  };
 
   const searchModels = async () => {
     if (!searchQuery.trim()) return;
@@ -3703,11 +3906,81 @@ function DownloadPage({ stats }) {
     { repo: 'BAAI/bge-m3-GGUF', label: 'BGE-M3 (1024-dim, multilingual)' }
   ];
 
+  const ds4Names = ds4Models.map(m => m.name.toLowerCase());
+  const isDs4OptPresent = (opt) => !!opt.match && ds4Names.some(n => n.includes(opt.match));
+  const recommended = DS4_OPTIONS.find(o => o.recommended);
+
   return (
     <div className="page">
       <div className="page-header">
         <h2>Download Models</h2>
       </div>
+
+      {/* ── DS4 / DeepSeek V4 section ──────────────────────────────────────── */}
+      <section className="page-section ds4-download-section">
+        <div className="ds4-section-header">
+          <h3>DS4 / DeepSeek V4</h3>
+          <span className="engine-badge ds4">exclusive engine</span>
+        </div>
+        <p className="page-description">
+          Special ds4-only GGUFs from <code>{DS4_REPO}</code>. These load only in the DS4 engine and
+          download into the dedicated ds4 dir{ds4GgufDir ? ` (${ds4GgufDir})` : ''} — never into <code>~/models</code>.
+        </p>
+        {recommended && (
+          <button
+            className="btn-primary ds4-recommended-btn"
+            onClick={() => downloadDs4(recommended)}
+            disabled={ds4Downloading === recommended.key || isDs4OptPresent(recommended)}
+            title={`Download ${recommended.label} (${recommended.size}) into the ds4 dir`}
+          >
+            {isDs4OptPresent(recommended)
+              ? `Recommended already downloaded — ${recommended.label}`
+              : ds4Downloading === recommended.key
+                ? 'Starting...'
+                : `Download recommended — ${recommended.label} (${recommended.size})`}
+          </button>
+        )}
+        <div className="ds4-options-list">
+          {DS4_OPTIONS.map((opt) => {
+            const present = isDs4OptPresent(opt);
+            return (
+              <div key={opt.key} className={`ds4-option${opt.fits ? '' : ' unfit'}${opt.recommended ? ' recommended' : ''}`}>
+                <div className="ds4-option-info">
+                  <span className="ds4-option-title">
+                    {opt.label} <span className="ds4-option-size">{opt.size}</span>
+                    {opt.recommended && <span className="ds4-tag rec">RECOMMENDED</span>}
+                    {!opt.fits && <span className="ds4-tag unfit">does not fit — can OOM</span>}
+                    {present && <span className="ds4-tag present">downloaded</span>}
+                  </span>
+                  <span className="ds4-option-desc">{opt.desc}</span>
+                </div>
+                {opt.fits && opt.pattern ? (
+                  <button
+                    className="btn-secondary"
+                    onClick={() => downloadDs4(opt)}
+                    disabled={ds4Downloading === opt.key || present}
+                  >
+                    {present ? 'Available' : ds4Downloading === opt.key ? 'Starting...' : 'Download'}
+                  </button>
+                ) : (
+                  <button className="btn-secondary" disabled title="Too large for this machine">Unavailable</button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        {ds4Models.length > 0 && (
+          <div className="ds4-present-list">
+            <h4>Present in ds4 dir</h4>
+            {ds4Models.map(m => (
+              <div key={m.name} className="ds4-present-item">
+                <span>{m.name}</span>
+                <span className="ds4-option-size">{m.sizeBytes ? formatBytes(m.sizeBytes) : ''}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       <div className="search-section">
         <div className="card">
