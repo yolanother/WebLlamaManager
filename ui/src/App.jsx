@@ -464,7 +464,10 @@ function useWebSocket() {
 // Sidebar Navigation
 function Sidebar({ stats }) {
   const location = useLocation();
-  const isHealthy = stats?.llama?.status === 'ok';
+  // Healthy when EITHER the llama server is up OR the ds4 engine is active and
+  // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
+  // is the real signal — otherwise the chat/status would show "not running").
+  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
 
   return (
     <nav className="sidebar">
@@ -1528,7 +1531,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     }
   };
 
-  const isHealthy = stats?.llama?.status === 'ok';
+  // Healthy when EITHER the llama server is up OR the ds4 engine is active and
+  // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
+  // is the real signal — otherwise the chat/status would show "not running").
+  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
   const isSingleMode = stats?.mode === 'single';
   const llamaPort = stats?.llamaPort || 5251;
   const llamaUiUrl = stats?.llamaUiUrl || `http://${window.location.hostname}:${llamaPort}`;
@@ -3605,7 +3611,10 @@ function ModelsPage({ stats }) {
     return localModel?.alias || null;
   };
 
-  const isHealthy = stats?.llama?.status === 'ok';
+  // Healthy when EITHER the llama server is up OR the ds4 engine is active and
+  // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
+  // is the real signal — otherwise the chat/status would show "not running").
+  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
   const isSingleMode = stats?.mode === 'single';
 
   if (isSingleMode) {
@@ -7106,7 +7115,10 @@ function StatsHeader({ stats }) {
   const [expandedDownload, setExpandedDownload] = useState(null);
   const [copiedId, setCopiedId] = useState(null);
   const dropdownRef = useRef(null);
-  const isHealthy = stats?.llama?.status === 'ok';
+  // Healthy when EITHER the llama server is up OR the ds4 engine is active and
+  // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
+  // is the real signal — otherwise the chat/status would show "not running").
+  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
 
   // Get downloads from stats
   const downloads = stats?.downloads ? Object.entries(stats.downloads).map(([id, info]) => ({ id, ...info })) : [];
@@ -7623,7 +7635,10 @@ function QueryPanel({ stats }) {
     setConversationId(null); // Start fresh conversation next time
   };
 
-  const isHealthy = stats?.llama?.status === 'ok';
+  // Healthy when EITHER the llama server is up OR the ds4 engine is active and
+  // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
+  // is the real signal — otherwise the chat/status would show "not running").
+  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
 
   return (
     <div className={`query-panel ${isOpen ? 'open' : ''}`}>
@@ -8481,7 +8496,10 @@ function ChatPage({ stats }) {
     setHoveredMessage(null);
   };
 
-  const isHealthy = stats?.llama?.status === 'ok';
+  // Healthy when EITHER the llama server is up OR the ds4 engine is active and
+  // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
+  // is the real signal — otherwise the chat/status would show "not running").
+  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
 
   const formatTimestamp = (ts) => {
     const date = new Date(ts);
