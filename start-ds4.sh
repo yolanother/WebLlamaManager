@@ -18,6 +18,10 @@
 #      DS4_CTX (0 = model default), DS4_GGUF_DIR
 #      (default /home/yolan/models-ds4/deepseek-v4-gguf), DS4_POWER (1-100, opt),
 #      DS4_KV_DISK_DIR (opt), DS4_KV_DISK_SPACE_MB (opt),
+#      DS4_SSD_STREAMING (0/1 — 1 appends --ssd-streaming to stream MoE experts
+#        off SSD, cutting resident weight RAM ~30G; set per-attempt by the adaptive
+#        controller), DS4_SSD_STREAMING_CACHE_EXPERTS (expert-cache size for
+#        --ssd-streaming-cache-experts, e.g. 32GB; only used when streaming is on),
 #      DS4_EXTRA_SWITCHES (default "--rocm --cors"),
 #      DS4_CONTAINER (default llama-rocm-7.2.4 — the SAME container the live
 #        llama.cpp uses; the 7rc container's HSA runtime segfaults on gfx1151),
@@ -48,6 +52,8 @@ DS4_MODEL="${DS4_MODEL:-}"
 DS4_POWER="${DS4_POWER:-}"
 DS4_KV_DISK_DIR="${DS4_KV_DISK_DIR:-}"
 DS4_KV_DISK_SPACE_MB="${DS4_KV_DISK_SPACE_MB:-}"
+DS4_SSD_STREAMING="${DS4_SSD_STREAMING:-0}"
+DS4_SSD_STREAMING_CACHE_EXPERTS="${DS4_SSD_STREAMING_CACHE_EXPERTS:-}"
 DS4_EXTRA_SWITCHES="${DS4_EXTRA_SWITCHES:---rocm --cors}"
 CONTAINER_NAME="${DS4_CONTAINER:-llama-rocm-7.2.4}"
 DS4_IN_DISTROBOX="${DS4_IN_DISTROBOX:-1}"
@@ -72,6 +78,14 @@ build_args() {
   if [ -n "$DS4_KV_DISK_DIR" ]; then
     DS4_ARGS+=(--kv-disk-dir "$DS4_KV_DISK_DIR")
     [ -n "$DS4_KV_DISK_SPACE_MB" ] && DS4_ARGS+=(--kv-disk-space-mb "$DS4_KV_DISK_SPACE_MB")
+  fi
+  # SSD expert-streaming: stream MoE experts off SSD to cut resident weight RAM
+  # (~30G), letting a higher context fit. The adaptive controller sets these
+  # per-attempt; the cache-experts size defaults to ds4-server's own default when
+  # streaming is on but no size is given.
+  if [ "${DS4_SSD_STREAMING:-0}" = "1" ]; then
+    DS4_ARGS+=(--ssd-streaming)
+    [ -n "$DS4_SSD_STREAMING_CACHE_EXPERTS" ] && DS4_ARGS+=(--ssd-streaming-cache-experts "$DS4_SSD_STREAMING_CACHE_EXPERTS")
   fi
   # Extra switches (e.g. --rocm --cors --quality --mtp <file>) — word-split.
   if [ -n "$DS4_EXTRA_SWITCHES" ]; then
