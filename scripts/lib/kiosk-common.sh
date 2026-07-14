@@ -201,7 +201,13 @@ kiosk_ensure_account() {
     home="$(kiosk_path "$logical_home")"
     managed="$(kiosk_manifest_get installed_kiosk_account)"
     if [ "$KIOSK_ROOT" != "/" ]; then
-        if [ -d "$home" ]; then
+        if [ -L "$home" ]; then
+            kiosk_warn "$logical_home is a symlink; refusing to use it as the kiosk home"
+            return 1
+        elif [ -e "$home" ] && [ ! -d "$home" ]; then
+            kiosk_warn "$logical_home exists but is not a directory"
+            return 1
+        elif [ -d "$home" ]; then
             [ "$managed" = true ] || kiosk_manifest_set installed_kiosk_account false
         else
             kiosk_run mkdir -p "$home"
@@ -215,11 +221,15 @@ kiosk_ensure_account() {
             kiosk_warn "existing account '$user' uses '$existing_home', not required home '$logical_home'; refusing to modify it"
             return 1
         fi
+        if [ -L "$home" ] || [ ! -d "$home" ]; then
+            kiosk_warn "existing account '$user' does not have a real directory at '$logical_home'"
+            return 1
+        fi
         [ "$managed" = true ] || kiosk_manifest_set installed_kiosk_account false
         return 0
     fi
-    if { [ -e "$home" ] || [ -L "$home" ]; } && [ "$managed" != true ]; then
-        kiosk_warn "$logical_home already exists but is not managed by this installer"
+    if [ -e "$home" ] || [ -L "$home" ]; then
+        kiosk_warn "$logical_home already exists while account '$user' is absent; refusing to claim it"
         return 1
     fi
     kiosk_run useradd --system --create-home --home-dir "$logical_home" \

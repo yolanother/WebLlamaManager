@@ -365,6 +365,44 @@ test_production_account_safety_guards() {
       kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
       id() { return 0; }
       getent() { printf 'llama-kiosk:x:900:900::/home/llama-kiosk:/bin/bash\n'; }
+      mkdir -p "$sb/home"
+      ln -s /tmp/replaced-home "$sb/home/llama-kiosk"
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "installer rejects an existing account whose home is a symlink" \
+          1 "$rc"
+      rm -f "$sb/home/llama-kiosk"
+      printf 'not a directory\n' > "$sb/home/llama-kiosk"
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "installer rejects an existing account whose home is not a directory" \
+          1 "$rc"
+      rm -rf "$sb"
+    )
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 1; }
+      useradd() { printf '%s\n' "$*" > "$sb/useradd.txt"; }
+      chown() { printf '%s\n' "$*" > "$sb/chown.txt"; }
+      mkdir -p "$sb/var/backups/llama-kiosk" "$sb/home"
+      printf 'installed_kiosk_account=true\n' \
+          > "$sb/var/backups/llama-kiosk/manifest"
+      ln -s /tmp/replaced-home "$sb/home/llama-kiosk"
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "stale ownership marker cannot claim a symlink after account loss" \
+          1 "$rc"
+      assert_no_file "stale marker never reaches useradd" "$sb/useradd.txt"
+      assert_no_file "stale marker never reaches recursive chown" "$sb/chown.txt"
+      rm -rf "$sb"
+    )
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 0; }
+      getent() { printf 'llama-kiosk:x:900:900::/home/llama-kiosk:/bin/bash\n'; }
       userdel() { printf '%s\n' "$*" > "$sb/userdel.txt"; }
       mkdir -p "$sb/var/backups/llama-kiosk" "$sb/home"
       printf 'installed_kiosk_account=true\nsession_stopped=true\n' \
