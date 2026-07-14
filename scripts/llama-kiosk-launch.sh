@@ -4,9 +4,9 @@
 # root for license terms.
 #
 # Invoked by the "Llama Kiosk" Wayland session (see install-kiosk.sh). Resolves
-# the dashboard URL from .env, waits until it is reachable (so a cold boot does
-# not flash a connection error while the llama-manager service starts), then
-# replaces itself with `cage` running full-screen Chrome in kiosk mode.
+# the dashboard URL from the canonical packaged manager EnvironmentFile, waits
+# until it is reachable, then replaces itself with `cage` running full-screen
+# Chrome in kiosk mode.
 #
 # Starts the separate loopback-only control helper so the local kiosk can switch
 # to GDM without adding a remotely reachable API route.
@@ -16,12 +16,12 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # shellcheck source=scripts/lib/kiosk-common.sh
 source "$SCRIPT_DIR/lib/kiosk-common.sh"
 
-URL="$(kiosk_resolve_url "$REPO_ROOT/.env")"
+MANAGER_ENV_FILE="${LLAMA_MANAGER_ENV_FILE:-/etc/llama-manager/llama-manager.env}"
+URL="$(kiosk_resolve_url "$MANAGER_ENV_FILE")"
 WAIT_BUDGET="${KIOSK_WAIT_BUDGET:-60}"
 PROFILE_DIR="${HOME:-/tmp}/.config/llama-kiosk/chrome"
 CONTROL_HELPER="$SCRIPT_DIR/llama-kiosk-control.py"

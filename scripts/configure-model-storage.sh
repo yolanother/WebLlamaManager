@@ -6,8 +6,9 @@
 # Configures the MODELS_DIR consumed by the packaged manager service for a local
 # directory, an existing filesystem partition, or an NFS export. Mount-backed
 # modes generate portable systemd mount units, activate them, verify the service
-# account can write, and only then publish model-storage.conf. The reset command
-# removes only generated mount metadata and preserves all model data.
+# account can write, and only then atomically update the canonical manager env,
+# root-only state, and service dependency. Reconfiguration preserves the prior
+# active contract until commit; reset preserves all model data.
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
@@ -24,6 +25,11 @@ DEVICE=""
 FS_TYPE=""
 SERVICE_USER="llama-manager"
 SERVICE_GROUP="llama-manager"
+RUNUSER_BIN="${MODEL_STORAGE_RUNUSER:-runuser}"
+CHGRP_BIN="${MODEL_STORAGE_CHGRP:-chgrp}"
+ENV_LOGICAL="/etc/llama-manager/llama-manager.env"
+STATE_LOGICAL="/etc/llama-manager/model-storage.state"
+DROPIN_LOGICAL="/etc/systemd/system/llama-manager.service.d/model-storage.conf"
 
 # Print command usage and the supported storage modes.
 usage() {
@@ -46,6 +52,15 @@ log() { printf '[model-storage] %s\n' "$*"; }
 # Args: logical absolute path. Echoes physical path.
 root_path() { printf '%s/%s\n' "${ROOT%/}" "${1#/}"; }
 
+# Read one literal key from the private root-owned storage state file.
+# Args: key. Echoes the final value or nothing when absent.
+state_get() {
+    local key="$1" state
+    state="$(root_path "$STATE_LOGICAL")"
+    [ -f "$state" ] || return 0
+    grep -E "^${key}=" "$state" 2>/dev/null | tail -n1 | cut -d= -f2- || true
+}
+
 # Run a mutating command unless this is a dry-run preview.
 # Args: command and arguments.
 run() {
@@ -66,6 +81,27 @@ validate_storage_path() {
             return 1
             ;;
     esac
+}
+
+# Resolve symlinks and missing path components, then apply the protected-path
+# policy to the actual target. Relocated roots must remain inside their sandbox.
+# Args: logical absolute path.
+validate_resolved_target() {
+    local logical="$1" physical resolved root_resolved resolved_logical
+    physical="$(root_path "$logical")"
+    [ ! -L "$physical" ] || { echo "Error: model storage path must not be a symlink." >&2; return 1; }
+    resolved="$(realpath -m -- "$physical")"
+    root_resolved="$(realpath -m -- "$(root_path /)")"
+    if [ "$root_resolved" = / ]; then
+        resolved_logical="$resolved"
+    else
+        case "$resolved" in
+            "$root_resolved") resolved_logical=/ ;;
+            "$root_resolved"/*) resolved_logical="/${resolved#"$root_resolved"/}" ;;
+            *) echo "Error: resolved model storage path escapes the configured root." >&2; return 1 ;;
+        esac
+    fi
+    validate_storage_path "$resolved_logical"
 }
 
 # Validate a credential-free DNS name or IPv4 literal for an NFS source.
@@ -132,6 +168,33 @@ ensure_root() {
     [ "$(id -u)" -eq 0 ] || { echo "Error: run with sudo for system configuration." >&2; exit 1; }
 }
 
+# Require the package-created service user/group and group membership before
+# touching storage. Relocated roots use their seeded passwd/group fixtures.
+ensure_service_identity() {
+    local passwd_file group_file user_line group_line user_gid group_gid members
+    if [ "$ROOT" = "/" ]; then
+        getent passwd "$SERVICE_USER" >/dev/null 2>&1 || { echo "Error: service account '$SERVICE_USER' does not exist." >&2; return 1; }
+        getent group "$SERVICE_GROUP" >/dev/null 2>&1 || { echo "Error: service group '$SERVICE_GROUP' does not exist." >&2; return 1; }
+        id -nG "$SERVICE_USER" | tr ' ' '\n' | grep -Fxq "$SERVICE_GROUP" || {
+            echo "Error: '$SERVICE_USER' must belong to '$SERVICE_GROUP'." >&2; return 1;
+        }
+        return 0
+    fi
+    passwd_file="$(root_path /etc/passwd)"
+    group_file="$(root_path /etc/group)"
+    user_line="$(grep -E "^${SERVICE_USER}:" "$passwd_file" 2>/dev/null | tail -n1 || true)"
+    group_line="$(grep -E "^${SERVICE_GROUP}:" "$group_file" 2>/dev/null | tail -n1 || true)"
+    [ -n "$user_line" ] || { echo "Error: service account '$SERVICE_USER' does not exist in relocated root." >&2; return 1; }
+    [ -n "$group_line" ] || { echo "Error: service group '$SERVICE_GROUP' does not exist in relocated root." >&2; return 1; }
+    user_gid="$(printf '%s\n' "$user_line" | cut -d: -f4)"
+    group_gid="$(printf '%s\n' "$group_line" | cut -d: -f3)"
+    members="$(printf '%s\n' "$group_line" | cut -d: -f4)"
+    [ "$user_gid" = "$group_gid" ] || case ",$members," in
+        *",$SERVICE_USER,"*) ;;
+        *) echo "Error: '$SERVICE_USER' must belong to '$SERVICE_GROUP'." >&2; return 1 ;;
+    esac
+}
+
 # Parse options shared by each subcommand and its mode-specific arguments.
 parse_options() {
     while [ $# -gt 0 ]; do
@@ -196,8 +259,25 @@ EOF
 activate_mount() {
     local unit="$1"
     [ "$ROOT" != "/" ] && return 0
-    run systemctl daemon-reload
-    run systemctl enable --now "$unit"
+    run systemctl daemon-reload || return 1
+    run systemctl enable --now "$unit" || return 1
+}
+
+# Stop and remove one generated mount unit without touching its mountpoint data.
+# Args: unit name.
+remove_mount_unit() {
+    local unit="$1" dest
+    [ -n "$unit" ] || return 0
+    dest="$(root_path "/etc/systemd/system/$unit")"
+    if [ ! -f "$dest" ] || ! grep -Fq 'Llama Manager generated model storage mount' "$dest"; then
+        echo "Error: refusing to remove unrecognized mount unit '$unit'." >&2
+        return 1
+    fi
+    if [ "$ROOT" = "/" ]; then
+        run systemctl disable --now "$unit" || return 1
+    fi
+    run rm -f "$dest" || return 1
+    [ "$ROOT" != "/" ] || run systemctl daemon-reload || return 1
 }
 
 # Refuse to mount over existing files, which would hide them until unmount and
@@ -215,21 +295,31 @@ ensure_empty_mountpoint() {
 # mountpoint directory are deliberately preserved.
 # Args: unit name.
 rollback_mount() {
-    local unit="$1" dest
-    dest="$(root_path "/etc/systemd/system/$unit")"
-    if [ ! -f "$dest" ] || ! grep -Fq 'Llama Manager generated model storage mount' "$dest"; then
-        log "Refusing to remove unrecognized mount unit '$unit'."
-        return 1
-    fi
-    if [ "$ROOT" = "/" ]; then
-        run systemctl disable --now "$unit" >/dev/null 2>&1 || true
-    fi
-    run rm -f "$dest"
-    [ "$ROOT" != "/" ] || run systemctl daemon-reload
+    remove_mount_unit "$1" >/dev/null 2>&1 || true
 }
 
-# Verify the target is writable before publishing it to the service. Production
-# checks as the service account; relocated tests perform an actual create/remove.
+# Give the service account and operator group setgid read/write access. NFS and
+# partition exports that refuse ownership/mode changes fail clearly before the
+# manager is pointed at them.
+# Args: logical storage path.
+prepare_operator_access() {
+    local logical="$1" physical
+    physical="$(root_path "$logical")"
+    run "$CHGRP_BIN" "$SERVICE_GROUP" "$physical" || return 1
+    run chmod 2775 "$physical" || return 1
+    if [ "$ROOT" = "/" ] && [ "$DRY_RUN" != true ]; then
+        [ "$(stat -c %G "$physical")" = "$SERVICE_GROUP" ] || {
+            echo "Error: storage root is not owned by group '$SERVICE_GROUP'." >&2; return 1;
+        }
+        [ "$(stat -c %a "$physical")" = 2775 ] || {
+            echo "Error: storage root does not grant setgid group write access." >&2; return 1;
+        }
+    fi
+}
+
+# Verify the target by creating and removing a probe as the service account.
+# The probe is never created as root, preventing a false positive on storage the
+# actual daemon cannot manage.
 # Args: logical storage path.
 verify_writable() {
     local logical="$1" physical probe
@@ -238,41 +328,186 @@ verify_writable() {
         return 1
     }
     physical="$(root_path "$logical")"
-    if [ "$ROOT" = "/" ] && id "$SERVICE_USER" >/dev/null 2>&1; then
-        run runuser -u "$SERVICE_USER" -- test -w "$logical" || {
-            echo "Error: $SERVICE_USER cannot write '$logical'." >&2
-            return 1
-        }
-        return 0
-    fi
     [ "$DRY_RUN" = true ] && return 0
     probe="$physical/.llama-manager-write-test.$$"
-    touch "$probe" 2>/dev/null || { echo "Error: model storage is not writable." >&2; return 1; }
-    rm -f "$probe"
+    "$RUNUSER_BIN" -u "$SERVICE_USER" -- touch "$probe" 2>/dev/null || {
+        echo "Error: $SERVICE_USER cannot create files in '$logical'." >&2
+        return 1
+    }
+    "$RUNUSER_BIN" -u "$SERVICE_USER" -- rm -f "$probe" 2>/dev/null || {
+        echo "Error: $SERVICE_USER cannot remove files in '$logical'." >&2
+        return 1
+    }
 }
 
-# Publish the EnvironmentFile consumed by llama-manager.service only after the
-# selected target has passed activation and writability checks.
-# Args: storage type, logical model path, source description, optional unit.
-write_service_config() {
-    local type="$1" path="$2" source="$3" unit="${4:-}" dir dest state
-    dir="$(root_path /etc/llama-manager)"
-    dest="$dir/model-storage.conf"
-    state="$dir/model-storage.state"
-    [ "$DRY_RUN" = true ] && { log "DRY-RUN would write $dest"; return 0; }
-    mkdir -p "$dir"
-    cat > "$dest" <<EOF
-# Llama Manager model storage environment. See LICENSE in the repository root.
-# Generated by configure-model-storage.sh after the target passed validation.
-MODELS_DIR=$path
-MODEL_STORAGE_TYPE=$type
-MODEL_STORAGE_SOURCE=$source
+# Read MODELS_DIR literally from the canonical manager EnvironmentFile.
+env_models_dir() {
+    local env_file
+    env_file="$(root_path "$ENV_LOGICAL")"
+    [ -f "$env_file" ] || return 0
+    grep '^MODELS_DIR=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- || true
+}
+
+# Render the canonical manager EnvironmentFile with MODELS_DIR set or removed,
+# preserving every unrelated setting without evaluating shell content.
+# Args: output file, mode (set/remove), optional value.
+render_manager_env() {
+    local output="$1" action="$2" value="${3:-}" current
+    current="$(root_path "$ENV_LOGICAL")"
+    if [ -f "$current" ]; then
+        grep -v '^MODELS_DIR=' "$current" > "$output" || true
+    else
+        cat > "$output" <<'EOF'
+# Llama Manager — package service environment overrides.
+# Copyright (c) Llama Manager project. See LICENSE in the repository root.
 EOF
-    cat > "$state" <<EOF
+    fi
+    [ "$action" != set ] || printf 'MODELS_DIR=%s\n' "$value" >> "$output"
+}
+
+# Copy a file into place atomically with a fixed mode.
+# Args: source, destination, numeric mode.
+atomic_install() {
+    local source="$1" destination="$2" mode="$3" temp
+    mkdir -p "$(dirname "$destination")" || return 1
+    temp="$(mktemp "$(dirname "$destination")/.llama-manager-storage.XXXXXX")" || return 1
+    cp "$source" "$temp" || { rm -f "$temp"; return 1; }
+    chmod "$mode" "$temp" || { rm -f "$temp"; return 1; }
+    mv "$temp" "$destination" || { rm -f "$temp"; return 1; }
+}
+
+# Snapshot a file for transaction rollback.
+# Args: logical path, snapshot name, transaction directory.
+snapshot_file() {
+    local logical="$1" name="$2" txn="$3" source
+    source="$(root_path "$logical")"
+    if [ -f "$source" ]; then cp -a "$source" "$txn/$name"; else : > "$txn/$name.missing"; fi
+}
+
+# Restore one snapshotted file exactly, including prior absence.
+# Args: logical path, snapshot name, transaction directory.
+restore_file() {
+    local logical="$1" name="$2" txn="$3" destination
+    destination="$(root_path "$logical")"
+    if [ -f "$txn/$name.missing" ]; then
+        rm -f "$destination"
+    else
+        atomic_install "$txn/$name" "$destination" "$(stat -c %a "$txn/$name")"
+    fi
+}
+
+# Render and atomically commit manager env, state, and service mount dependency.
+# Args: txn, type, path, source, unit.
+commit_metadata() {
+    local txn="$1" type="$2" path="$3" source="$4" unit="$5"
+    local base_present base_value env_dest state_dest dropin_dest
+    base_present="$(state_get BASE_MODELS_DIR_PRESENT)"
+    base_value="$(state_get BASE_MODELS_DIR)"
+    if [ -z "$base_present" ]; then
+        base_value="$(env_models_dir)"
+        [ -n "$base_value" ] && base_present=true || base_present=false
+    fi
+    render_manager_env "$txn/env.new" set "$path" || return 1
+    cat > "$txn/state.new" <<EOF
 TYPE=$type
+PATH=$path
+SOURCE=$source
 UNIT=$unit
+BASE_MODELS_DIR_PRESENT=$base_present
+BASE_MODELS_DIR=$base_value
 EOF
-    chmod 0644 "$dest" "$state"
+    [ -s "$txn/state.new" ] || return 1
+    if [ -n "$unit" ]; then
+        cat > "$txn/dropin.new" <<EOF
+# Llama Manager generated model storage dependency. See LICENSE in the repository root.
+[Unit]
+Requires=$unit
+After=$unit
+EOF
+    else
+        cat > "$txn/dropin.new" <<EOF
+# Llama Manager generated local model storage dependency. See LICENSE in the repository root.
+[Unit]
+RequiresMountsFor=$path
+EOF
+    fi
+    env_dest="$(root_path "$ENV_LOGICAL")"
+    state_dest="$(root_path "$STATE_LOGICAL")"
+    dropin_dest="$(root_path "$DROPIN_LOGICAL")"
+    atomic_install "$txn/dropin.new" "$dropin_dest" 0644 || return 1
+    atomic_install "$txn/env.new" "$env_dest" 0660 || return 1
+    "$CHGRP_BIN" "$SERVICE_GROUP" "$env_dest" || return 1
+    atomic_install "$txn/state.new" "$state_dest" 0600 || return 1
+}
+
+# Reload unit dependencies and restart the manager only when it is already
+# running, so an active process switches storage before an old mount is removed.
+reload_manager() {
+    [ "$ROOT" != "/" ] && return 0
+    run systemctl daemon-reload || return 1
+    run systemctl try-restart llama-manager.service || return 1
+}
+
+# Restore transaction metadata snapshots and reload the prior manager contract.
+# Args: transaction directory.
+restore_metadata() {
+    local txn="$1" env_dest
+    restore_file "$DROPIN_LOGICAL" dropin.old "$txn"
+    restore_file "$ENV_LOGICAL" env.old "$txn"
+    restore_file "$STATE_LOGICAL" state.old "$txn"
+    env_dest="$(root_path "$ENV_LOGICAL")"
+    [ ! -f "$env_dest" ] || "$CHGRP_BIN" "$SERVICE_GROUP" "$env_dest" || return 1
+    reload_manager || true
+}
+
+# Commit a verified storage candidate, restart active manager processes onto it,
+# and only then retire the previous mount. Failures restore prior metadata and
+# leave the prior active unit/state intact.
+# Args: type, logical path, source, new unit, whether new unit was created.
+commit_storage_transaction() {
+    local type="$1" path="$2" source="$3" new_unit="$4" new_created="$5"
+    local old_unit txn config_dir old_unit_path
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN would select $type storage at $path"
+        return 0
+    fi
+    old_unit="$(state_get UNIT)"
+    config_dir="$(root_path /etc/llama-manager)"
+    mkdir -p "$config_dir"
+    txn="$(mktemp -d "$config_dir/.model-storage-txn.XXXXXX")"
+    snapshot_file "$ENV_LOGICAL" env.old "$txn"
+    snapshot_file "$STATE_LOGICAL" state.old "$txn"
+    snapshot_file "$DROPIN_LOGICAL" dropin.old "$txn"
+    if [ -n "$old_unit" ]; then
+        old_unit_path="$(root_path "/etc/systemd/system/$old_unit")"
+        [ -f "$old_unit_path" ] && cp -a "$old_unit_path" "$txn/old-unit"
+    fi
+
+    if ! commit_metadata "$txn" "$type" "$path" "$source" "$new_unit"; then
+        restore_metadata "$txn"
+        [ "$new_created" != true ] || rollback_mount "$new_unit"
+        rm -rf "$txn"
+        return 1
+    fi
+    if ! reload_manager; then
+        restore_metadata "$txn"
+        [ "$new_created" != true ] || rollback_mount "$new_unit"
+        rm -rf "$txn"
+        return 1
+    fi
+    if [ -n "$old_unit" ] && [ "$old_unit" != "$new_unit" ]; then
+        if [ "${MODEL_STORAGE_FORCE_CLEANUP_FAILURE:-0}" = 1 ] || ! remove_mount_unit "$old_unit"; then
+            if [ -f "$txn/old-unit" ]; then
+                atomic_install "$txn/old-unit" "$(root_path "/etc/systemd/system/$old_unit")" 0644
+                activate_mount "$old_unit" || true
+            fi
+            restore_metadata "$txn"
+            [ "$new_created" != true ] || rollback_mount "$new_unit"
+            rm -rf "$txn"
+            return 1
+        fi
+    fi
+    rm -rf "$txn"
 }
 
 # Configure a local directory with setgid group access for manager operators.
@@ -281,13 +516,12 @@ configure_local() {
     validate_storage_path "$PATH_VALUE"
     local physical
     physical="$(root_path "$PATH_VALUE")"
+    validate_resolved_target "$PATH_VALUE"
     run mkdir -p "$physical"
-    if [ "$ROOT" = "/" ] && getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
-        run chgrp "$SERVICE_GROUP" "$physical"
-    fi
-    run chmod 2775 "$physical"
+    validate_resolved_target "$PATH_VALUE"
+    prepare_operator_access "$PATH_VALUE"
     verify_writable "$PATH_VALUE"
-    write_service_config local "$PATH_VALUE" "$PATH_VALUE"
+    commit_storage_transaction local "$PATH_VALUE" "$PATH_VALUE" "" false
 }
 
 # Configure and activate a credential-free NFS model store.
@@ -301,15 +535,30 @@ configure_nfs() {
     OPTIONS="${OPTIONS:-rw}"
     validate_nfs_options "$OPTIONS"
     OPTIONS="$(safe_nfs_options "$OPTIONS")"
-    local unit physical
+    local unit physical source old_unit old_source created=false
     unit="$(mount_unit_name "$MOUNTPOINT")"
+    source="$SERVER:$EXPORT_PATH"
+    old_unit="$(state_get UNIT)"
+    old_source="$(state_get SOURCE)"
+    if [ -n "$old_unit" ] && [ "$unit" = "$old_unit" ] && [ "$source" != "$old_source" ]; then
+        echo "Error: changing a mount source in place is unsafe; select a new mountpoint." >&2
+        return 1
+    fi
     physical="$(root_path "$MOUNTPOINT")"
+    validate_resolved_target "$MOUNTPOINT"
     run mkdir -p "$physical"
-    [ "$DRY_RUN" = true ] || ensure_empty_mountpoint "$physical"
-    write_mount_unit "$unit" "$SERVER:$EXPORT_PATH" "$MOUNTPOINT" nfs "$OPTIONS"
-    if ! activate_mount "$unit"; then rollback_mount "$unit"; return 1; fi
-    if ! verify_writable "$MOUNTPOINT"; then rollback_mount "$unit"; return 1; fi
-    write_service_config nfs "$MOUNTPOINT" "$SERVER:$EXPORT_PATH" "$unit"
+    validate_resolved_target "$MOUNTPOINT"
+    if [ "$unit" != "$old_unit" ]; then
+        [ "$DRY_RUN" = true ] || ensure_empty_mountpoint "$physical"
+        write_mount_unit "$unit" "$source" "$MOUNTPOINT" nfs "$OPTIONS"
+        if ! activate_mount "$unit"; then rollback_mount "$unit"; return 1; fi
+        created=true
+    fi
+    if ! prepare_operator_access "$MOUNTPOINT" || ! verify_writable "$MOUNTPOINT"; then
+        [ "$created" != true ] || rollback_mount "$unit"
+        return 1
+    fi
+    commit_storage_transaction nfs "$MOUNTPOINT" "$source" "$unit" "$created"
 }
 
 # Configure and activate an already-formatted local partition by stable UUID.
@@ -323,32 +572,56 @@ configure_partition() {
     if [ "$ROOT" = "/" ]; then
         [ -b "$DEVICE" ] || { echo "Error: '$DEVICE' is not a block device." >&2; exit 1; }
     fi
-    local uuid unit physical
+    local uuid unit physical source old_unit old_source created=false
     uuid="${MODEL_STORAGE_TEST_UUID:-}"
     [ "$ROOT" = "/" ] && uuid="$(blkid -s UUID -o value "$DEVICE")"
     [[ "$uuid" =~ ^[A-Za-z0-9-]+$ ]] || { echo "Error: device has no safe filesystem UUID." >&2; exit 1; }
     unit="$(mount_unit_name "$MOUNTPOINT")"
+    source="/dev/disk/by-uuid/$uuid"
+    old_unit="$(state_get UNIT)"
+    old_source="$(state_get SOURCE)"
+    if [ -n "$old_unit" ] && [ "$unit" = "$old_unit" ] && [ "$source" != "$old_source" ]; then
+        echo "Error: changing a mount source in place is unsafe; select a new mountpoint." >&2
+        return 1
+    fi
     physical="$(root_path "$MOUNTPOINT")"
+    validate_resolved_target "$MOUNTPOINT"
     run mkdir -p "$physical"
-    [ "$DRY_RUN" = true ] || ensure_empty_mountpoint "$physical"
-    write_mount_unit "$unit" "/dev/disk/by-uuid/$uuid" "$MOUNTPOINT" "$FS_TYPE" "rw,nosuid,nodev,noexec"
-    if ! activate_mount "$unit"; then rollback_mount "$unit"; return 1; fi
-    if ! verify_writable "$MOUNTPOINT"; then rollback_mount "$unit"; return 1; fi
-    write_service_config partition "$MOUNTPOINT" "/dev/disk/by-uuid/$uuid" "$unit"
+    validate_resolved_target "$MOUNTPOINT"
+    if [ "$unit" != "$old_unit" ]; then
+        [ "$DRY_RUN" = true ] || ensure_empty_mountpoint "$physical"
+        write_mount_unit "$unit" "$source" "$MOUNTPOINT" "$FS_TYPE" "rw,nosuid,nodev,noexec"
+        if ! activate_mount "$unit"; then rollback_mount "$unit"; return 1; fi
+        created=true
+    fi
+    if ! prepare_operator_access "$MOUNTPOINT" || ! verify_writable "$MOUNTPOINT"; then
+        [ "$created" != true ] || rollback_mount "$unit"
+        return 1
+    fi
+    commit_storage_transaction partition "$MOUNTPOINT" "$source" "$unit" "$created"
 }
 
 # Remove generated service/mount configuration while preserving model contents.
 reset_storage() {
-    local state unit="" config
-    state="$(root_path /etc/llama-manager/model-storage.state)"
-    config="$(root_path /etc/llama-manager/model-storage.conf)"
-    if [ -f "$state" ]; then
-        unit="$(grep '^UNIT=' "$state" | tail -n1 | cut -d= -f2-)"
+    local unit base_present base_value env_temp
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN would remove generated storage configuration without deleting models"
+        return 0
     fi
-    if [ -n "$unit" ]; then
-        rollback_mount "$unit"
+    unit="$(state_get UNIT)"
+    base_present="$(state_get BASE_MODELS_DIR_PRESENT)"
+    base_value="$(state_get BASE_MODELS_DIR)"
+    env_temp="$(mktemp)"
+    if [ "$base_present" = true ]; then
+        render_manager_env "$env_temp" set "$base_value"
+    else
+        render_manager_env "$env_temp" remove
     fi
-    run rm -f "$config" "$state"
+    atomic_install "$env_temp" "$(root_path "$ENV_LOGICAL")" 0660
+    "$CHGRP_BIN" "$SERVICE_GROUP" "$(root_path "$ENV_LOGICAL")"
+    rm -f "$env_temp" "$(root_path "$STATE_LOGICAL")" "$(root_path "$DROPIN_LOGICAL")"
+    reload_manager
+    [ -z "$unit" ] || remove_mount_unit "$unit"
     log "Configuration removed; model data was not deleted."
 }
 
@@ -360,6 +633,7 @@ esac
 
 parse_options "$@"
 ensure_root
+ensure_service_identity
 case "$MODE" in
     local) configure_local ;;
     nfs) configure_nfs ;;

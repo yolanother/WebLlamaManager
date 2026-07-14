@@ -4,8 +4,8 @@
 # root for license terms.
 #
 # Shared helpers for scripts/install-kiosk.sh and scripts/llama-kiosk-launch.sh.
-# Provides: sandbox-aware path resolution (KIOSK_ROOT), .env-driven KIOSK_URL
-# resolution, dedicated-account lifecycle, install-manifest read/write,
+# Provides: sandbox-aware path resolution (KIOSK_ROOT), canonical manager-env
+# KIOSK_URL resolution, dedicated-account/session lifecycle, manifest read/write,
 # idempotent file backups, and a dry-run-aware command wrapper. This file is
 # meant to be SOURCED, not executed.
 
@@ -26,8 +26,8 @@ kiosk_path() {
 }
 
 # Resolve the dashboard URL the kiosk should display.
-# Precedence: $KIOSK_URL env > KIOSK_URL= in .env > http://localhost:$API_PORT.
-# Arg: $1 = path to a .env file (need not exist).
+# Precedence: $KIOSK_URL env > KIOSK_URL= in manager env > localhost:$API_PORT.
+# Arg: $1 = path to the canonical manager EnvironmentFile (need not exist).
 # Echo: the resolved URL.
 kiosk_resolve_url() {
     local env_file="$1" url="" api_port=""
@@ -210,12 +210,46 @@ kiosk_ensure_account() {
 kiosk_remove_account() {
     local user="$1" home
     [ "$(kiosk_manifest_get installed_kiosk_account)" = "true" ] || return 0
+    kiosk_record_action remove-account
+    [ "$(kiosk_manifest_get session_stopped)" = "true" ] || {
+        kiosk_warn "refusing to remove '$user' before its graphical session is stopped"
+        return 1
+    }
     home="$(kiosk_path /var/lib/llama-kiosk)"
     if [ "$KIOSK_ROOT" != "/" ]; then
         kiosk_run rm -rf "$home"
     elif id "$user" >/dev/null 2>&1; then
         kiosk_run userdel --remove "$user"
     fi
+}
+
+# Append an action to the optional test audit log.
+# Args: action name.
+kiosk_record_action() {
+    [ -z "${KIOSK_TEST_ACTION_LOG:-}" ] || printf '%s\n' "$1" >> "$KIOSK_TEST_ACTION_LOG"
+}
+
+# Terminate the kiosk user's graphical/login session before runtime or account
+# removal. loginctl termination is synchronous; any remaining process prevents
+# user deletion rather than orphaning a helper or compositor under a deleted UID.
+# Args: account name.
+kiosk_stop_session() {
+    local user="$1"
+    kiosk_record_action stop-session
+    if [ "$KIOSK_DRY_RUN" = "true" ]; then
+        kiosk_log "DRY-RUN would terminate login sessions for $user"
+        return 0
+    fi
+    if [ "$KIOSK_ROOT" = "/" ] && id "$user" >/dev/null 2>&1; then
+        if command -v loginctl >/dev/null 2>&1 && loginctl show-user "$user" >/dev/null 2>&1; then
+            loginctl terminate-user "$user"
+        fi
+        if pgrep -u "$user" >/dev/null 2>&1; then
+            kiosk_warn "processes for '$user' remain after session termination"
+            return 1
+        fi
+    fi
+    kiosk_manifest_set session_stopped true
 }
 
 # Install the kiosk launcher, helper, and shared library in a world-traversable
@@ -376,6 +410,8 @@ kiosk_uninstall() {
     user="$(kiosk_manifest_get target_user)"
     [ -z "$user" ] && user="$(kiosk_target_user)"
     session_entry="$(kiosk_path /usr/share/wayland-sessions/llama-kiosk.desktop)"
+
+    kiosk_stop_session "$user"
 
     # Restore the two backed-up system files.
     kiosk_restore_file gdm_custom_conf

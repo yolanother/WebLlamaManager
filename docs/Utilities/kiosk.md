@@ -33,8 +33,9 @@ The installer:
   reboot needed) — unless you pass `--no-start`.
 
 The launcher waits for the dashboard to come up before showing it. Configure the
-target with `KIOSK_URL=` (or `API_PORT=`) in the manager environment; the
-default is `http://localhost:3001/kiosk`.
+target with `KIOSK_URL=` (or `API_PORT=`) in the canonical package environment
+`/etc/llama-manager/llama-manager.env`; the default is
+`http://localhost:3001/kiosk`.
 
 The kiosk page includes **System Login**. It posts to a separate Python helper
 bound only to `127.0.0.1:8798`; the helper accepts only exact localhost browser
@@ -74,8 +75,9 @@ sudo bash scripts/install-kiosk.sh uninstall
 
 Restores the backed-up gdm/session settings and removes the kiosk session entry.
 If the installer created `llama-kiosk`, it removes that account and its private
-home. A pre-existing account with that name is preserved. `cage` is left
-installed (remove with `sudo apt remove cage` if you want).
+home. It first terminates the kiosk login session and refuses account removal if
+processes remain. A pre-existing account with that name is preserved. `cage` is
+left installed (remove with `sudo apt remove cage` if you want).
 
 ## Tests
 

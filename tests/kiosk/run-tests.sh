@@ -247,7 +247,8 @@ test_uninstall_flow() {
 
     # Install then uninstall.
     KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install   --root "$sb" >/dev/null 2>&1
-    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
+    KIOSK_TEST_ACTION_LOG="$sb/actions.log" KIOSK_FAKE_CHROME=1 \
+      bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
     local rc=$?
     assert_eq "uninstall exit 0" "0" "$rc"
 
@@ -263,6 +264,8 @@ test_uninstall_flow() {
       "$([ -e "$sb/usr/local/lib/llama-manager/kiosk" ] && echo yes || echo no)"
     assert_eq "installer-created kiosk home removed" "no" \
       "$([ -e "$sb/var/lib/llama-kiosk" ] && echo yes || echo no)"
+    assert_eq "active kiosk session stopped before account removal" "yes" \
+      "$(awk '/stop-session/{stopped=NR} /remove-account/{removed=NR} END{print (stopped && removed && stopped < removed) ? "yes" : "no"}' "$sb/actions.log")"
 
     # Uninstall again is safe (idempotent, exit 0).
     bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
@@ -301,6 +304,16 @@ EOF
     assert_file "cage was invoked" "$sb/launch.txt"
     assert_eq "chrome kiosk + url passed" "yes" \
       "$(grep -q -- '--kiosk' "$sb/launch.txt" && grep -q 'localhost:3001' "$sb/launch.txt" && echo yes || echo no)"
+
+    # Packaged runtime reads the canonical manager EnvironmentFile rather than
+    # looking for a nonexistent .env beside /usr/local/lib.
+    printf 'API_PORT=4555\n' > "$sb/llama-manager.env"
+    rm -f "$sb/launch.txt"
+    PATH="$sb/bin:$PATH" KIOSK_LAUNCH_ONCE=1 \
+        LLAMA_MANAGER_ENV_FILE="$sb/llama-manager.env" KIOSK_WAIT_BUDGET=2 \
+        bash "$REPO_ROOT/scripts/llama-kiosk-launch.sh" >/dev/null 2>&1
+    assert_eq "launcher reads canonical manager env path" "yes" \
+      "$(grep -q 'localhost:4555/kiosk' "$sb/launch.txt" && echo yes || echo no)"
 
     rm -rf "$sb"
 }
