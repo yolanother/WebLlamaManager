@@ -238,6 +238,28 @@ test_reset_preserves_models() {
     rm -rf "$root"
 }
 
+test_reset_without_state_is_noop() {
+    printf 'test_reset_without_state_is_noop\n'
+    local root env_file dropin
+    root="$(new_root)"
+    seed_identity "$root"
+    env_file="$root/etc/llama-manager/llama-manager.env"
+    dropin="$root/etc/systemd/system/llama-manager.service.d/model-storage.conf"
+    mkdir -p "$(dirname "$env_file")" "$(dirname "$dropin")"
+    printf 'API_PORT=4567\nMODELS_DIR=/srv/unmanaged-models\n' > "$env_file"
+    printf 'UNMANAGED DROPIN\n' > "$dropin"
+
+    storage_cli "$root" reset >/dev/null 2>&1
+    assert_eq "reset without state exits as no-op" 0 "$?"
+    assert_contains "state-less reset preserves model override" \
+        "$env_file" "MODELS_DIR=/srv/unmanaged-models"
+    assert_contains "state-less reset preserves unrelated setting" \
+        "$env_file" "API_PORT=4567"
+    assert_contains "state-less reset preserves unmanaged drop-in" \
+        "$dropin" "UNMANAGED DROPIN"
+    rm -rf "$root"
+}
+
 test_reset_restores_original_override() {
     printf 'test_reset_restores_original_override\n'
     local root
@@ -341,6 +363,7 @@ test_partition_storage
 test_activation_requires_writable_target
 test_dry_run_does_not_mutate
 test_reset_preserves_models
+test_reset_without_state_is_noop
 test_reset_restores_original_override
 test_reset_rolls_back_on_mount_cleanup_failure
 test_missing_service_identity

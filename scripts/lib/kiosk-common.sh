@@ -354,6 +354,7 @@ kiosk_install() {
     # Back up before mutating.
     kiosk_backup_file gdm_custom_conf /etc/gdm3/custom.conf
     kiosk_backup_file "accountsservice_$user" "/var/lib/AccountsService/users/$user"
+    kiosk_backup_file wayland_session /usr/share/wayland-sessions/llama-kiosk.desktop
     kiosk_manifest_set target_user "$user"
 
     # Enable gdm autologin for the user.
@@ -412,23 +413,22 @@ kiosk_restart() {
 # Args: forwarded from the install-kiosk.sh dispatcher (may include --root etc.,
 #       already consumed by the parent; ensure_root re-checks privilege).
 kiosk_uninstall() {
-    local user session_entry
+    local user manifest
+    manifest="$(kiosk_manifest_path)"
+    if [ ! -f "$manifest" ]; then
+        kiosk_log "No recorded kiosk installation found; nothing to uninstall."
+        return 0
+    fi
     ensure_root "$@" || true
     user="$(kiosk_manifest_get target_user)"
     [ -z "$user" ] && user="$(kiosk_target_user)"
-    session_entry="$(kiosk_path /usr/share/wayland-sessions/llama-kiosk.desktop)"
-
     kiosk_stop_session "$user"
 
-    # Restore the two backed-up system files.
+    # Restore every backed-up system file, including a pre-existing session
+    # entry. An unrecorded entry is never removed by uninstall.
     kiosk_restore_file gdm_custom_conf
     kiosk_restore_file "accountsservice_$user"
-
-    # Remove the session entry we generated.
-    if [ -e "$session_entry" ]; then
-        kiosk_run rm -f "$session_entry"
-        kiosk_log "removed session entry: $session_entry"
-    fi
+    kiosk_restore_file wayland_session
 
     kiosk_remove_runtime
     kiosk_remove_account "$user"

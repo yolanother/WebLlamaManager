@@ -94,6 +94,10 @@ the directory and all model files:
 sudo scripts/configure-model-storage.sh reset
 ```
 
+Reset acts only when `/etc/llama-manager/model-storage.state` exists. Without
+that ownership record it exits successfully without changing `MODELS_DIR`,
+other manager settings, service drop-ins, mounts, or service state.
+
 ## Portable recovery data
 
 For a local path, `llama-manager.env` records the logical model directory. NFS

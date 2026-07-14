@@ -28,7 +28,8 @@ The installer:
   its private home,
 - copies the kiosk runtime to `/usr/local/lib/llama-manager/kiosk` so the
   dedicated account never needs access to the administrator's source checkout,
-- backs up `/etc/gdm3/custom.conf` and the kiosk AccountsService record to
+- backs up `/etc/gdm3/custom.conf`, the kiosk AccountsService record, and any
+  pre-existing `llama-kiosk.desktop` session entry to
   `/var/backups/llama-kiosk/`,
 - enables gdm autologin into a new "Llama Kiosk" Wayland session,
 - **brings the kiosk up immediately** by restarting the display manager (no
@@ -81,14 +82,16 @@ kiosk session.
 sudo bash scripts/install-kiosk.sh uninstall
 ```
 
-Restores the backed-up gdm/session settings and removes the kiosk session entry.
-If the installer created `llama-kiosk`, it removes that account and its private
-home. It first terminates the kiosk login session and refuses account removal if
-processes remain. A pre-existing account with that name is preserved. `cage` is
-left installed (remove with `sudo apt remove cage` if you want). Re-running the
-installer preserves its ownership markers, so uninstall still removes an
-installer-created account and reports when the installer originally added
-`cage`.
+Restores the backed-up gdm/session settings. A pre-existing
+`llama-kiosk.desktop` is restored exactly; the entry is removed only when the
+installer created it. Without an installation manifest, uninstall is a complete
+no-op and never touches an unmanaged entry. If the installer created
+`llama-kiosk`, it removes that account and its private home. It first terminates
+the kiosk login session and refuses account removal if processes remain. A
+pre-existing account with that name is preserved. `cage` is left installed
+(remove with `sudo apt remove cage` if you want). Re-running the installer
+preserves its ownership markers, so uninstall still removes installer-created
+resources and reports when the installer originally added `cage`.
 
 ## Tests
 

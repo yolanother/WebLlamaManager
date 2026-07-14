@@ -77,7 +77,7 @@ the autologin session — the kiosk self-heals.
 | `scripts/llama-kiosk-launch.sh` | `/usr/local/lib/llama-manager/kiosk/` | Reads the canonical manager environment, starts the helper, waits for readiness, then launches Firefox or a Chrome-family browser through `cage`. |
 | `scripts/llama-kiosk-control.py` | `/usr/local/lib/llama-manager/kiosk/` | Binds only to `127.0.0.1`, validates exact localhost origins, and invokes `gdmflexiserver`. |
 | `llama-kiosk.desktop` | `/usr/share/wayland-sessions/` (generated) | Registers the kiosk session with an `Exec=` under `/usr/local/lib/llama-manager/kiosk`. |
-| Backups + manifest | `/var/backups/llama-kiosk/` | Original `gdm3/custom.conf`, original AccountsService user file, and a `manifest` recording exactly what install changed. |
+| Backups + manifest | `/var/backups/llama-kiosk/` | Original `gdm3/custom.conf`, AccountsService user file, optional pre-existing Wayland session entry, and a `manifest` recording exactly what install changed. |
 
 ### 4.1 System changes made by `install` (all backed up first)
 
@@ -97,7 +97,10 @@ the autologin session — the kiosk self-heals.
 4. **`/var/lib/AccountsService/users/llama-kiosk`** — back up, then set
    `Session=llama-kiosk` so the autologin uses the kiosk session rather than the
    user's previous session.
-5. **Bring the kiosk up now** (unless `--no-start`): restart the display manager
+5. **`/usr/share/wayland-sessions/llama-kiosk.desktop`** — back up a
+   pre-existing entry or record that the installer created it, then publish the
+   managed session. Repeated installs retain the original ownership record.
+6. **Bring the kiosk up now** (unless `--no-start`): restart the display manager
    so gdm autologin immediately enters the kiosk session — no reboot required for
    first use.
 
@@ -165,7 +168,8 @@ and reverses precisely:
   created it), remove the lines/file we added.
 - Restore `/var/lib/AccountsService/users/<user>` from backup (or remove the
   `Session=` line we added if there was no prior value).
-- Remove `/usr/share/wayland-sessions/llama-kiosk.desktop`.
+- Restore a pre-existing `/usr/share/wayland-sessions/llama-kiosk.desktop`, or
+  remove it only when the manifest records that this installer created it.
 - Terminate the `llama-kiosk` login session before removing runtime files or the
   account; refuse user deletion if processes remain.
 - Remove the installed runtime and dedicated account/home only when the
@@ -177,9 +181,11 @@ and reverses precisely:
 After uninstall, the next boot returns to the normal gdm login prompt and GNOME
 session.
 
-Uninstall is **idempotent** and safe to run even if install never completed: a
-missing manifest or missing backup is treated as "nothing to restore for that
-item" with a warning, not a fatal error.
+Uninstall is **idempotent** and safe to run even if install never completed. A
+missing manifest makes the entire operation a no-op, protecting unmanaged
+accounts, session entries, and configuration. A missing individual backup in a
+valid manifest is treated as "nothing to restore for that item" with a warning,
+not a fatal error.
 
 ## 7. Idempotency & safety
 

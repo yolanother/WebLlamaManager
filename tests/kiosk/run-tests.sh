@@ -318,6 +318,43 @@ test_preexisting_account_is_preserved() {
     rm -rf "$sb"
 }
 
+test_preexisting_session_entry_is_restored() {
+    printf 'test_preexisting_session_entry_is_restored\n'
+    local sb session; sb="$(new_sandbox)"
+    session="$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    mkdir -p "$(dirname "$session")"
+    printf 'ORIGINAL VENDOR SESSION\n' > "$session"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "repeated install keeps pristine session-entry backup" \
+        "ORIGINAL VENDOR SESSION" \
+        "$(cat "$sb/var/backups/llama-kiosk/wayland_session")"
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "repeated install/uninstall restores pre-existing session entry" \
+        "ORIGINAL VENDOR SESSION" "$(cat "$session" 2>/dev/null)"
+    rm -rf "$sb"
+}
+
+test_uninstall_without_install_preserves_session_entry() {
+    printf 'test_uninstall_without_install_preserves_session_entry\n'
+    local sb session; sb="$(new_sandbox)"
+    session="$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    mkdir -p "$(dirname "$session")"
+    printf 'UNMANAGED SESSION\n' > "$session"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "uninstall without install never deletes unmanaged session entry" \
+        "UNMANAGED SESSION" "$(cat "$session")"
+    assert_no_file "uninstall without install creates no ownership manifest" \
+        "$sb/var/backups/llama-kiosk/manifest"
+    rm -rf "$sb"
+}
+
 test_launcher() {
     printf 'test_launcher\n'
     local sb; sb="$(new_sandbox)"
@@ -387,6 +424,8 @@ test_install_flow
 test_dry_run_no_mutation
 test_uninstall_flow
 test_preexisting_account_is_preserved
+test_preexisting_session_entry_is_restored
+test_uninstall_without_install_preserves_session_entry
 test_launcher
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.

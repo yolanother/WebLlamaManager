@@ -603,7 +603,12 @@ configure_partition() {
 
 # Remove generated service/mount configuration while preserving model contents.
 reset_storage() {
-    local unit base_present base_value env_temp txn config_dir unit_path
+    local unit base_present base_value env_temp txn config_dir unit_path state_file
+    state_file="$(root_path "$STATE_LOGICAL")"
+    if [ ! -f "$state_file" ]; then
+        log "No generated model storage state found; nothing to reset."
+        return 0
+    fi
     if [ "$DRY_RUN" = true ]; then
         log "DRY-RUN would remove generated storage configuration without deleting models"
         return 0
