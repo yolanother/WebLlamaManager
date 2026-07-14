@@ -22,7 +22,10 @@ Every manifest is treated as hostile despite that trust boundary. File entries
 must exactly match the compiled category/path allowlist, with no duplicates; NFS
 records accept only their fixed schema and a conservative option allowlist. Bundle
 symlinks, unknown payloads, unsafe path components, and unsupported field types are
-rejected.
+rejected. Backup output and hostname directories are created with fd-relative,
+no-follow traversal so an existing symlink cannot redirect a bundle. Platform
+metadata links are accepted only when their final target remains inside the selected
+backup root (needed for normal sysfs links).
 
 ## Commands
 
@@ -92,7 +95,7 @@ chroot-aware provisioning workflow.
 | `manager` | Packaged manager configuration under `/etc/llama-manager` and `/etc/default/llama-manager`. |
 | `service` | The system service and its allowlisted override file. |
 | `kiosk` | GDM kiosk settings, the `llama-kiosk` AccountsService record, and its Wayland session entry. |
-| `storage` | Model directory plus NFS source, mountpoint, type, and options as a portable manifest. The selected mapped model directory is created setgid `2775`; the mount is reconstructed only from explicit mappings. Protected system paths are rejected. |
+| `storage` | Model directory plus NFS source, mountpoint, type, and options as a portable manifest. The selected mapped model directory is created as the `llama-manager` account/group with setgid `2775`; missing production identities, regular-file collisions, incorrectly owned existing directories, and protected system paths are rejected. The mount is reconstructed only from explicit mappings. |
 | `platform` | Relevant GRUB defaults and `amdxdna` module blacklist, plus OS, kernel, hardware product, selected firmware/kernel/ROCm package versions, and packaged runtime pins. |
 
 The tool writes sanitized files under `files/`, metadata to `manifest.json`, a
@@ -103,7 +106,8 @@ bundles whose checksums do not match.
 Keys whose names resemble tokens, secrets, passwords, credentials, API keys, or
 private keys are replaced with `[REDACTED]`. Strings containing credential
 assignments, URL userinfo, or sensitive URL query parameters are redacted as a
-complete value; safe fragments from that value are not copied. Restore never writes
+complete value even when the URL is embedded in arbitrary text or the secret is a
+quoted multi-word assignment; safe fragments from that value are not copied. Restore never writes
 the marker over a working value: it preserves the target host's complete existing
 value when one exists and otherwise omits the setting. Enter missing credentials
 later through the owning setup tool.
@@ -146,8 +150,11 @@ The rollback manifest and `ROLLBACK.md` are fsynced in `prepared` state before t
 first target mutation. File replacement is atomic. A successful transaction records
 `completed`; a mid-apply failure automatically restores prepared originals in
 reverse order and records `rolled_back` (or `rollback_failed` if operator action is
-still required). This preparation happens for all targets before any configuration
-is changed.
+still required). Restore file access and replacement use fd-relative `O_NOFOLLOW`
+operations, rejecting every symlink ancestor and preventing a checked parent from
+being swapped before the write. Directory creation and rollback deletion fsync their
+parents before the durable transaction state advances. This preparation happens for
+all targets before any configuration is changed.
 
 ## Explicit exclusions
 

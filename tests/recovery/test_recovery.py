@@ -184,6 +184,9 @@ class RecoveryCliTests(unittest.TestCase):
                     "credentialedMirror": "https://operator:password@example.test/models",
                     "queryMirror": "https://example.test/models?token=query-secret&part=1",
                     "publicMirror": "https://example.test/models?part=1",
+                    "prefixed": "fetch from https://operator:password@example.test/models now",
+                    "assignment": "curl=https://operator:password@example.test/models",
+                    "quotedSecret": 'flags token="secret value" safe=true',
                 }
             ),
             encoding="utf-8",
@@ -211,6 +214,9 @@ class RecoveryCliTests(unittest.TestCase):
         )
         self.assertEqual("[REDACTED]", captured["credentialedMirror"])
         self.assertEqual("[REDACTED]", captured["queryMirror"])
+        self.assertEqual("[REDACTED]", captured["prefixed"])
+        self.assertEqual("[REDACTED]", captured["assignment"])
+        self.assertEqual("[REDACTED]", captured["quotedSecret"])
         self.assertEqual("https://example.test/models?part=1", captured["publicMirror"])
         self.assertNotIn("password", json.dumps(captured))
         self.assertNotIn("query-secret", json.dumps(captured))
@@ -454,6 +460,69 @@ class RecoveryCliTests(unittest.TestCase):
                 expected_error = "hostname" if ".." in hostname else "timestamp"
                 self.assertIn(expected_error, result.stderr.lower())
 
+    def test_backup_rejects_symlinked_output_and_platform_escape(self) -> None:
+        """Output parents and platform reads cannot follow attacker-controlled links."""
+        real_output = self.base / "real-output"
+        real_output.mkdir()
+        linked_output = self.base / "linked-output"
+        linked_output.symlink_to(real_output, target_is_directory=True)
+        result = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(linked_output),
+            "--hostname",
+            "source-host",
+            "--timestamp",
+            "20260714T120255Z",
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("symbolic", result.stderr.lower())
+
+        safe_output = self.base / "safe-output"
+        safe_output.mkdir()
+        redirected_host = self.base / "redirected-host"
+        redirected_host.mkdir()
+        (safe_output / "source-host").symlink_to(
+            redirected_host, target_is_directory=True
+        )
+        result = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(safe_output),
+            "--hostname",
+            "source-host",
+            "--timestamp",
+            "20260714T120257Z",
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("symbolic", result.stderr.lower())
+
+        os_release = self.source_root / "etc" / "os-release"
+        os_release.parent.mkdir(parents=True, exist_ok=True)
+        outside = self.base / "outside-os-release"
+        outside.write_text("PRETTY_NAME=escaped\n", encoding="utf-8")
+        os_release.symlink_to(outside)
+        result = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(self.output),
+            "--hostname",
+            "source-host",
+            "--timestamp",
+            "20260714T120256Z",
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("platform", result.stderr.lower())
+
     def test_plan_requires_explicit_replacement_host_storage_mappings(self) -> None:
         """Plan flags host-specific values instead of proposing blind restoration."""
         fstab = self.source_root / "etc" / "fstab"
@@ -553,6 +622,48 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual("[Service]\nExecStart=/old/path\n", target_service.read_text())
         self.assertFalse((target_root / "var" / "backups").exists())
 
+    def test_restore_rejects_symlinked_destination_ancestor_even_inside_root(self) -> None:
+        """A destination ancestor link is rejected even when it resolves inside root."""
+        source_service = (
+            self.source_root
+            / "etc"
+            / "systemd"
+            / "system"
+            / "llama-manager.service"
+        )
+        source_service.parent.mkdir(parents=True)
+        source_service.write_text("[Service]\nExecStart=/new\n")
+        backup = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(self.output),
+            "--hostname",
+            "same-host",
+            "--timestamp",
+            "20260714T120401Z",
+        )
+        target_root = self.base / "target"
+        real_etc = target_root / "real-etc"
+        real_etc.mkdir(parents=True)
+        (target_root / "etc").symlink_to(real_etc, target_is_directory=True)
+        result = self.run_cli(
+            "--root",
+            str(target_root),
+            "restore",
+            backup.stdout.strip(),
+            "--dry-run",
+            "--categories",
+            "service",
+            "--hostname",
+            "same-host",
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("symbolic", result.stderr.lower())
+        self.assertFalse((real_etc / "systemd" / "system" / "llama-manager.service").exists())
+
     def test_storage_only_restore_creates_mapped_model_directory(self) -> None:
         """The required storage.models_dir mapping has an observable storage action."""
         backup = self.run_cli(
@@ -580,6 +691,10 @@ class RecoveryCliTests(unittest.TestCase):
             "same-host",
             "--map",
             "storage.models_dir=/mnt/ai-models",
+            "--manager-uid",
+            str(os.geteuid()),
+            "--manager-gid",
+            str(os.getegid()),
         )
         self.assertIn("/mnt/ai-models", preview.stdout)
         self.assertFalse((target_root / "mnt" / "ai-models").exists())
@@ -595,12 +710,105 @@ class RecoveryCliTests(unittest.TestCase):
             "same-host",
             "--map",
             "storage.models_dir=/mnt/ai-models",
+            "--manager-uid",
+            str(os.geteuid()),
+            "--manager-gid",
+            str(os.getegid()),
             "--timestamp",
             "20260714T120451Z",
         )
         model_dir = target_root / "mnt" / "ai-models"
         self.assertTrue(model_dir.is_dir())
         self.assertEqual(0o2775, stat.S_IMODE(model_dir.stat().st_mode))
+        self.assertEqual(
+            (os.geteuid(), os.getegid()),
+            (model_dir.stat().st_uid, model_dir.stat().st_gid),
+        )
+
+    def test_storage_restore_rejects_regular_file_collision(self) -> None:
+        """A mapped model path that is already a regular file is never accepted."""
+        backup = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(self.output),
+            "--hostname",
+            "same-host",
+            "--timestamp",
+            "20260714T120453Z",
+        )
+        target_root = self.base / "target"
+        collision = target_root / "mnt" / "ai-models"
+        collision.parent.mkdir(parents=True)
+        collision.write_text("not a directory\n")
+        result = self.run_cli(
+            "--root",
+            str(target_root),
+            "restore",
+            backup.stdout.strip(),
+            "--dry-run",
+            "--categories",
+            "storage",
+            "--hostname",
+            "same-host",
+            "--map",
+            "storage.models_dir=/mnt/ai-models",
+            "--manager-uid",
+            str(os.geteuid()),
+            "--manager-gid",
+            str(os.getegid()),
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("regular file", result.stderr.lower())
+
+    def test_storage_creation_failure_removes_new_directory_before_rolled_back_state(self) -> None:
+        """Rollback durably removes a newly created model directory before recording state."""
+        backup = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(self.output),
+            "--hostname",
+            "same-host",
+            "--timestamp",
+            "20260714T120454Z",
+        )
+        target_root = self.base / "target"
+        result = self.run_cli(
+            "--root",
+            str(target_root),
+            "restore",
+            backup.stdout.strip(),
+            "--categories",
+            "storage",
+            "--hostname",
+            "same-host",
+            "--map",
+            "storage.models_dir=/mnt/ai-models",
+            "--manager-uid",
+            str(os.geteuid()),
+            "--manager-gid",
+            str(os.getegid()),
+            "--timestamp",
+            "20260714T120455Z",
+            "--fail-after",
+            "1",
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse((target_root / "mnt" / "ai-models").exists())
+        rollback = (
+            target_root
+            / "var"
+            / "backups"
+            / "llama-manager-recovery"
+            / "20260714T120455Z"
+        )
+        state = json.loads((rollback / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual("rolled_back", state["state"])
 
     def test_restore_rejects_model_storage_under_protected_system_paths(self) -> None:
         """Storage mappings cannot turn model-directory creation into system mutation."""
