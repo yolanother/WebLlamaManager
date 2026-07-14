@@ -31,6 +31,7 @@ hardware-specific gotchas of the AMD Strix Halo (gfx1151) box it targets.
 - [Designs/ChatPage.md](Designs/ChatPage.md) · [Designs/ApiDocs.md](Designs/ApiDocs.md) · [Designs/DocsPage.md](Designs/DocsPage.md) — UI page designs
 - [Designs/OpenCode.md](Designs/OpenCode.md) — OpenCode provider integration
 - [Utilities/kiosk.md](Utilities/kiosk.md) — kiosk / wall-display mode
+- [Utilities/llama-manager-recovery.md](Utilities/llama-manager-recovery.md) — portable, sanitized host backup and replacement-system restore
 
 ## The mental model in one diagram
 

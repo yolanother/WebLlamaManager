@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+# Llama Manager portable host recovery utility.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Creates inspectable, versioned backups of allowlisted Llama Manager and host
+# integration settings, describes safe adaptations for replacement machines,
+# and restores explicitly selected categories with rollback material. It never
+# includes credentials, arbitrary home data, model blobs, or signing keys.
+
+"""Create and safely restore portable Llama Manager host configuration bundles."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import sys
+from typing import Any, Sequence
+
+
+SCHEMA_VERSION = 1
+DEFAULT_OUTPUT_DIR = "/volumes/llama-manager/private/system-backups"
+SENSITIVE_TERM = r"(?:token|secret|password|credential|api[_-]?key|private[_-]?key)"
+SENSITIVE_KEY_NAME = rf"[A-Za-z0-9_.-]*{SENSITIVE_TERM}[A-Za-z0-9_.-]*"
+SENSITIVE_KEY = re.compile(SENSITIVE_TERM, re.IGNORECASE)
+SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?P<key>{SENSITIVE_KEY_NAME})=(?P<value>[^\s\"']+)",
+    re.IGNORECASE,
+)
+ALLOWLIST = {
+    "manager": (
+        "/etc/llama-manager/config.json",
+        "/etc/llama-manager/llama-manager.conf",
+        "/etc/default/llama-manager",
+    ),
+    "service": (
+        "/etc/systemd/system/llama-manager.service",
+        "/etc/systemd/system/llama-manager.service.d/override.conf",
+    ),
+    "kiosk": (
+        "/etc/gdm3/custom.conf",
+        "/var/lib/AccountsService/users/llama-kiosk",
+        "/usr/share/wayland-sessions/llama-kiosk.desktop",
+    ),
+    "platform": (
+        "/etc/default/grub",
+        "/etc/modprobe.d/blacklist-amdxdna.conf",
+    ),
+}
+
+
+def redact_json(value: Any) -> Any:
+    """Return a JSON-compatible value with sensitive keyed values masked.
+
+    Args:
+        value: Parsed JSON value to sanitize recursively.
+
+    Returns:
+        A copy containing ``[REDACTED]`` for credential-like dictionary keys.
+    """
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if SENSITIVE_KEY.search(str(key)) else redact_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_json(item) for item in value]
+    return value
+
+
+def mask_sensitive_assignments(text: str) -> str:
+    """Mask credential-like ``key=value`` fragments embedded in text.
+
+    Args:
+        text: Configuration line that may contain nested assignments.
+
+    Returns:
+        Text with sensitive assignment values replaced by ``[REDACTED]``.
+    """
+    return SENSITIVE_ASSIGNMENT.sub(lambda match: f"{match.group('key')}=[REDACTED]", text)
+
+
+def sanitize_file(source: Path, destination: Path) -> None:
+    """Copy one allowlisted configuration file while masking sensitive values.
+
+    Args:
+        source: Existing configuration file on the source host.
+        destination: Bundle path that will receive sanitized content.
+
+    Raises:
+        ValueError: If a JSON configuration file cannot be parsed.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.suffix == ".json":
+        parsed = json.loads(source.read_text(encoding="utf-8"))
+        destination.write_text(
+            json.dumps(redact_json(parsed), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return
+    sanitized_lines: list[str] = []
+    for line in source.read_text(encoding="utf-8").splitlines():
+        key, separator, _value = line.partition("=")
+        systemd_match = re.match(r'^(Environment=)([A-Za-z_][A-Za-z0-9_]*)(=)(.*?)("?)$', line)
+        if systemd_match and SENSITIVE_KEY.search(systemd_match.group(2)):
+            sanitized_lines.append(
+                f"{systemd_match.group(1)}{systemd_match.group(2)}=[REDACTED]"
+            )
+        elif separator and SENSITIVE_KEY.search(key):
+            sanitized_lines.append(f"{key}=[REDACTED]")
+        else:
+            sanitized_lines.append(mask_sensitive_assignments(line))
+    destination.write_text("\n".join(sanitized_lines) + "\n", encoding="utf-8")
+
+
+def logical_path(root: Path, absolute_path: str) -> Path:
+    """Resolve a logical system path beneath a production or test root.
+
+    Args:
+        root: Filesystem root used for this invocation.
+        absolute_path: Logical absolute host path.
+
+    Returns:
+        The corresponding concrete path beneath ``root``.
+    """
+    return root / absolute_path.lstrip("/")
+
+
+def read_text_if_present(path: Path) -> str | None:
+    """Read a small metadata text file when it exists.
+
+    Args:
+        path: Metadata file to read.
+
+    Returns:
+        Stripped text, or ``None`` when the file is absent.
+    """
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8", errors="replace").strip()
+
+
+def collect_nfs_mounts(root: Path) -> list[dict[str, Any]]:
+    """Parse portable NFS entries from the host fstab.
+
+    Args:
+        root: Filesystem root used for this invocation.
+
+    Returns:
+        Ordered mount records containing source, mountpoint, type, and options.
+    """
+    fstab = logical_path(root, "/etc/fstab")
+    if not fstab.is_file():
+        return []
+    mounts: list[dict[str, Any]] = []
+    for raw_line in fstab.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) < 4 or fields[2] not in {"nfs", "nfs4"}:
+            continue
+        mounts.append(
+            {
+                "source": fields[0],
+                "mountpoint": fields[1],
+                "filesystem": fields[2],
+                "options": fields[3].split(","),
+            }
+        )
+    return mounts
+
+
+def collect_storage(root: Path, nfs_mounts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe model storage without copying model content.
+
+    Args:
+        root: Filesystem root used for this invocation.
+        nfs_mounts: Parsed NFS records to include in the storage manifest.
+
+    Returns:
+        Portable storage configuration.
+    """
+    models_dir: str | None = None
+    config_path = logical_path(root, "/etc/llama-manager/config.json")
+    if config_path.is_file():
+        parsed = json.loads(config_path.read_text(encoding="utf-8"))
+        candidate = parsed.get("modelsDir") or parsed.get("models_dir")
+        if isinstance(candidate, str):
+            models_dir = candidate
+    return {"modelsDir": models_dir, "nfsMounts": nfs_mounts}
+
+
+def collect_platform(root: Path) -> dict[str, Any]:
+    """Collect non-secret host hardware, kernel, firmware, and package metadata.
+
+    Args:
+        root: Filesystem root used for this invocation.
+
+    Returns:
+        Metadata useful when adapting a replacement host.
+    """
+    os_release: dict[str, str] = {}
+    os_release_path = logical_path(root, "/etc/os-release")
+    if os_release_path.is_file():
+        os_release_lines = os_release_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        for line in os_release_lines:
+            key, separator, value = line.partition("=")
+            accepted_keys = {"ID", "VERSION_ID", "VERSION_CODENAME", "PRETTY_NAME"}
+            if separator and key in accepted_keys:
+                os_release[key] = value.strip('"')
+    package_status = logical_path(root, "/var/lib/dpkg/status")
+    packages: list[dict[str, str]] = []
+    if package_status.is_file():
+        current: dict[str, str] = {}
+        status_lines = package_status.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        for line in status_lines + [""]:
+            if not line:
+                name = current.get("Package", "")
+                package_pattern = r"(?:llama-manager|linux-image|linux-firmware|firmware-amd|rocm)"
+                if re.match(package_pattern, name):
+                    packages.append({"name": name, "version": current.get("Version", "unknown")})
+                current = {}
+                continue
+            key, separator, value = line.partition(":")
+            if separator and key in {"Package", "Version"}:
+                current[key] = value.strip()
+    return {
+        "kernel": read_text_if_present(logical_path(root, "/proc/sys/kernel/osrelease")),
+        "product": read_text_if_present(logical_path(root, "/sys/class/dmi/id/product_name")),
+        "osRelease": os_release,
+        "packages": packages,
+    }
+
+
+def collect_runtime(root: Path) -> dict[str, Any]:
+    """Load the packaged runtime pin manifest when available.
+
+    Args:
+        root: Filesystem root used for this invocation.
+
+    Returns:
+        Sanitized runtime metadata, or an empty object.
+    """
+    runtime_path = logical_path(root, "/var/lib/llama-manager/runtime.json")
+    if not runtime_path.is_file():
+        return {}
+    parsed = json.loads(runtime_path.read_text(encoding="utf-8"))
+    sanitized = redact_json(parsed)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def write_reconfiguration_guide(bundle: Path) -> None:
+    """Write replacement-host adaptation instructions into a bundle.
+
+    Args:
+        bundle: Recovery bundle receiving ``RECONFIGURE.md``.
+    """
+    (bundle / "RECONFIGURE.md").write_text(
+        """# Reconfigure a Replacement Llama Manager Host
+
+This bundle is an inspectable configuration reference for a human, Codex or Claude.
+It is not a disk image and intentionally contains no credentials or model blobs.
+
+1. Run `llama-manager-recovery inspect BUNDLE` and review `manifest.json`.
+2. Run `llama-manager-recovery plan BUNDLE` on the replacement host.
+3. Explicitly map NFS source and mount paths, kiosk users, and model storage paths.
+4. Preview selected categories with `restore BUNDLE --dry-run --categories ...`.
+5. Apply only reviewed categories. Preserve the emitted rollback directory and follow
+   its `ROLLBACK.md` if the replacement host does not behave as expected.
+
+Never copy machine-id, SSH keys, browser profiles, tokens, signing keys, or arbitrary
+home data into this bundle. Re-enter required credentials through their owning setup
+tools after restoration.
+""",
+        encoding="utf-8",
+    )
+
+
+def write_checksums(bundle: Path) -> None:
+    """Write SHA-256 checksums for every regular bundle payload file.
+
+    Args:
+        bundle: Recovery bundle whose payload will be checksummed.
+    """
+    lines: list[str] = []
+    for path in sorted(item for item in bundle.rglob("*") if item.is_file()):
+        if path.name == "SHA256SUMS":
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        lines.append(f"{digest}  {path.relative_to(bundle)}")
+    (bundle / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_manifest(bundle: Path) -> dict[str, Any]:
+    """Load and minimally validate a recovery bundle manifest.
+
+    Args:
+        bundle: Existing recovery bundle directory.
+
+    Returns:
+        Parsed manifest object.
+
+    Raises:
+        ValueError: If the manifest shape or schema is unsupported.
+    """
+    parsed = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(parsed, dict) or parsed.get("schemaVersion") != SCHEMA_VERSION:
+        raise ValueError("unsupported or invalid recovery bundle schema")
+    return parsed
+
+
+def verify_checksums(bundle: Path) -> bool:
+    """Verify every checksum listed by a recovery bundle.
+
+    Args:
+        bundle: Recovery bundle directory.
+
+    Returns:
+        ``True`` only when every listed relative payload exists and matches.
+    """
+    checksum_file = bundle / "SHA256SUMS"
+    if not checksum_file.is_file():
+        return False
+    resolved_bundle = bundle.resolve()
+    listed: set[Path] = set()
+    for line in checksum_file.read_text(encoding="utf-8").splitlines():
+        expected, separator, relative = line.partition("  ")
+        if not separator or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            return False
+        candidate = (bundle / relative).resolve()
+        if resolved_bundle not in candidate.parents or not candidate.is_file():
+            return False
+        relative_path = candidate.relative_to(resolved_bundle)
+        if relative_path in listed:
+            return False
+        listed.add(relative_path)
+        if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
+            return False
+    actual: set[Path] = set()
+    for path in bundle.rglob("*"):
+        if not path.is_file() or path.name == "SHA256SUMS":
+            continue
+        if path.is_symlink():
+            return False
+        actual.add(path.resolve().relative_to(resolved_bundle))
+    return listed == actual and Path("manifest.json") in listed
+
+
+def inspect_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    """Summarize a bundle without exposing captured configuration values.
+
+    Args:
+        args: Parsed inspect command arguments.
+
+    Returns:
+        JSON-compatible safe bundle summary.
+    """
+    bundle = Path(args.bundle)
+    manifest = load_manifest(bundle)
+    categories = sorted(
+        {entry["category"] for entry in manifest.get("files", []) if "category" in entry}
+    )
+    if manifest.get("storage", {}).get("nfsMounts"):
+        categories.append("storage")
+    return {
+        "schemaVersion": manifest["schemaVersion"],
+        "sourceHost": manifest.get("sourceHost"),
+        "createdAt": manifest.get("createdAt"),
+        "categories": sorted(set(categories)),
+        "fileCount": len(manifest.get("files", [])),
+        "nfsMountCount": len(manifest.get("storage", {}).get("nfsMounts", [])),
+        "checksumsValid": verify_checksums(bundle),
+        "exclusions": manifest.get("exclusions", []),
+    }
+
+
+def parse_mappings(values: Sequence[str]) -> dict[str, str]:
+    """Parse repeated ``KEY=VALUE`` host adaptation mappings.
+
+    Args:
+        values: Mapping expressions from the command line.
+
+    Returns:
+        Mapping keys to their explicitly reviewed replacement values.
+
+    Raises:
+        ValueError: If an expression lacks a key or separator.
+    """
+    mappings: dict[str, str] = {}
+    for expression in values:
+        key, separator, value = expression.partition("=")
+        if not separator or not key or not value:
+            raise ValueError(f"invalid mapping {expression!r}; expected KEY=VALUE")
+        mappings[key] = value
+    return mappings
+
+
+def validate_mappings(mappings: dict[str, str], target_hostname: str) -> None:
+    """Validate replacement values before they can reach system configuration.
+
+    Args:
+        mappings: Explicit replacement-host mapping values.
+        target_hostname: Hostname detected or supplied for the restore target.
+
+    Raises:
+        ValueError: If a mapping is inconsistent or unsafe for its destination.
+    """
+    acknowledged_host = mappings.get("host.hostname")
+    if acknowledged_host is not None and acknowledged_host != target_hostname:
+        raise ValueError("host.hostname mapping must equal the target hostname")
+    for key, value in mappings.items():
+        if key == "storage.models_dir" or key.endswith(".mountpoint"):
+            path = Path(value)
+            if not path.is_absolute() or ".." in path.parts or any(char.isspace() for char in value):
+                raise ValueError(f"{key} must be an absolute path without whitespace or '..'")
+        elif key.endswith(".source"):
+            if ":" not in value or any(char.isspace() for char in value):
+                raise ValueError(f"{key} must be an NFS host:/export without whitespace")
+        elif key == "kiosk.user" and not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", value):
+            raise ValueError("kiosk.user must be a valid local account name")
+
+
+def kiosk_user(bundle: Path) -> str | None:
+    """Extract the captured kiosk autologin account from sanitized GDM config.
+
+    Args:
+        bundle: Recovery bundle directory.
+
+    Returns:
+        Captured username, or ``None`` when kiosk autologin was not configured.
+    """
+    gdm = bundle / "files" / "etc" / "gdm3" / "custom.conf"
+    if not gdm.is_file():
+        return None
+    for line in gdm.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("AutomaticLogin="):
+            return line.partition("=")[2].strip() or None
+    return None
+
+
+def required_mappings(
+    bundle: Path,
+    manifest: dict[str, Any],
+    target_hostname: str,
+    categories: set[str] | None = None,
+) -> list[str]:
+    """List explicit mappings needed before applying host-specific settings.
+
+    Args:
+        bundle: Recovery bundle directory.
+        manifest: Parsed bundle manifest.
+        target_hostname: Host receiving restored settings.
+        categories: Optional selected categories that limit mapping requirements.
+
+    Returns:
+        Stable, sorted mapping names required for safe restoration.
+    """
+    required: list[str] = []
+    selected = categories or {"manager", "service", "kiosk", "platform", "storage"}
+    if manifest.get("sourceHost") != target_hostname:
+        required.append("host.hostname")
+    storage = manifest.get("storage", {})
+    if storage.get("modelsDir") and selected.intersection({"manager", "storage"}):
+        required.append("storage.models_dir")
+    if "storage" in selected:
+        for index, _mount in enumerate(storage.get("nfsMounts", [])):
+            required.extend((f"nfs.{index}.source", f"nfs.{index}.mountpoint"))
+    if "kiosk" in selected and kiosk_user(bundle):
+        required.append("kiosk.user")
+    return sorted(required)
+
+
+def plan_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    """Compare a bundle with a target root and report non-mutating actions.
+
+    Args:
+        args: Parsed plan command arguments.
+
+    Returns:
+        JSON-compatible change plan and outstanding mapping requirements.
+
+    Raises:
+        ValueError: If bundle checksums fail validation.
+    """
+    bundle = Path(args.bundle)
+    if not verify_checksums(bundle):
+        raise ValueError("bundle checksum validation failed")
+    manifest = load_manifest(bundle)
+    target_hostname = args.hostname or socket.gethostname()
+    mappings = parse_mappings(args.map)
+    validate_mappings(mappings, target_hostname)
+    changes: list[dict[str, str]] = []
+    root = Path(args.root)
+    for entry in manifest.get("files", []):
+        relative = entry["path"].lstrip("/")
+        captured = bundle / "files" / relative
+        target = root / relative
+        if not target.exists():
+            status = "create"
+        elif target.is_file() and target.read_bytes() == captured.read_bytes():
+            status = "unchanged"
+        else:
+            status = "replace"
+        changes.append(
+            {"category": entry["category"], "path": entry["path"], "status": status}
+        )
+    outstanding = [
+        key for key in required_mappings(bundle, manifest, target_hostname) if key not in mappings
+    ]
+    return {
+        "sourceHost": manifest.get("sourceHost"),
+        "targetHost": target_hostname,
+        "checksumsValid": True,
+        "changes": changes,
+        "requiredMappings": outstanding,
+        "readyToRestore": not outstanding,
+    }
+
+
+def parse_categories(value: str) -> set[str]:
+    """Parse and validate a comma-separated restore category list.
+
+    Args:
+        value: Category names supplied to ``restore --categories``.
+
+    Returns:
+        Non-empty set of selected category names.
+
+    Raises:
+        ValueError: If a category is missing or unsupported.
+    """
+    categories = {item.strip() for item in value.split(",") if item.strip()}
+    allowed = {"manager", "service", "kiosk", "platform", "storage"}
+    unsupported = categories - allowed
+    if not categories or unsupported:
+        raise ValueError(
+            "categories must contain only: " + ", ".join(sorted(allowed))
+        )
+    return categories
+
+
+def selected_file_changes(
+    bundle: Path, manifest: dict[str, Any], root: Path, categories: set[str]
+) -> list[dict[str, str]]:
+    """Compute file changes limited to explicitly selected categories.
+
+    Args:
+        bundle: Recovery bundle directory.
+        manifest: Parsed recovery manifest.
+        root: Target filesystem root.
+        categories: Categories authorized for restoration.
+
+    Returns:
+        Ordered observable create/replace/unchanged actions.
+    """
+    changes: list[dict[str, str]] = []
+    for entry in manifest.get("files", []):
+        if entry["category"] not in categories:
+            continue
+        relative = entry["path"].lstrip("/")
+        captured = bundle / "files" / relative
+        target = root / relative
+        if not target.exists():
+            status = "create"
+        elif target.is_file() and target.read_bytes() == captured.read_bytes():
+            status = "unchanged"
+        else:
+            status = "replace"
+        changes.append(
+            {"category": entry["category"], "path": entry["path"], "status": status}
+        )
+    if "storage" in categories and manifest.get("storage", {}).get("nfsMounts"):
+        changes.append({"category": "storage", "path": "/etc/fstab", "status": "review"})
+    return changes
+
+
+def safe_target(root: Path, logical: str) -> Path:
+    """Resolve a logical restore target without permitting path traversal.
+
+    Args:
+        root: Target filesystem root.
+        logical: Logical absolute system path from the signed manifest.
+
+    Returns:
+        Concrete target beneath ``root``.
+
+    Raises:
+        ValueError: If the path is not absolute or escapes the target root.
+    """
+    if not logical.startswith("/") or ".." in Path(logical).parts:
+        raise ValueError(f"unsafe restore path: {logical}")
+    target = root / logical.lstrip("/")
+    resolved_root = root.resolve()
+    resolved_parent = target.parent.resolve()
+    if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+        raise ValueError(f"restore target escapes root: {logical}")
+    if target.is_symlink():
+        raise ValueError(f"restore target is a symbolic link: {logical}")
+    return target
+
+
+def merge_redacted_json(captured: Any, current: Any) -> Any:
+    """Replace redaction markers with current-host values when available.
+
+    Args:
+        captured: Sanitized bundle JSON value.
+        current: Existing target JSON value at the same location.
+
+    Returns:
+        Restorable JSON that never writes the literal redaction marker.
+    """
+    if captured == "[REDACTED]":
+        return current if current is not None else None
+    if isinstance(captured, dict):
+        current_dict = current if isinstance(current, dict) else {}
+        merged: dict[str, Any] = {}
+        for key, value in captured.items():
+            resolved = merge_redacted_json(value, current_dict.get(key))
+            if resolved is not None:
+                merged[key] = resolved
+        return merged
+    if isinstance(captured, list):
+        current_list = current if isinstance(current, list) else []
+        return [
+            merge_redacted_json(value, current_list[index] if index < len(current_list) else None)
+            for index, value in enumerate(captured)
+            if value != "[REDACTED]" or index < len(current_list)
+        ]
+    return captured
+
+
+def merge_redacted_text(captured: str, current: str) -> str:
+    """Resolve embedded redaction markers from existing target text.
+
+    Args:
+        captured: Sanitized bundle text.
+        current: Existing target configuration text.
+
+    Returns:
+        Text with target-host secret assignments preserved and unresolved secret
+        settings omitted rather than written as redaction markers.
+    """
+    current_values: dict[str, str] = {}
+    for match in re.finditer(
+        rf"(?P<key>{SENSITIVE_KEY_NAME})=(?P<value>[^\s\"']+)",
+        current,
+        re.IGNORECASE,
+    ):
+        current_values[match.group("key")] = match.group("value")
+    rendered: list[str] = []
+    marker = re.compile(
+        rf"(?P<key>{SENSITIVE_KEY_NAME})=\[REDACTED\]",
+        re.IGNORECASE,
+    )
+    for line in captured.splitlines():
+        keys = [match.group("key") for match in marker.finditer(line)]
+        if not keys:
+            rendered.append(line)
+            continue
+        if re.match(r"^(?:Environment=)?[A-Za-z0-9_.-]+=\[REDACTED\]$", line):
+            key = keys[0]
+            if key in current_values:
+                prefix = "Environment=" if line.startswith("Environment=") else ""
+                rendered.append(f"{prefix}{key}={current_values[key]}")
+            continue
+        for key in keys:
+            replacement = f"{key}={current_values[key]}" if key in current_values else ""
+            line = re.sub(re.escape(key) + r"=\[REDACTED\]", replacement, line)
+        rendered.append(re.sub(r" {2,}", " ", line))
+    return "\n".join(rendered) + "\n"
+
+
+def rendered_payload(
+    captured: Path,
+    target: Path,
+    logical: str,
+    category: str,
+    mappings: dict[str, str],
+) -> bytes:
+    """Render a captured file with explicit mappings and target secrets preserved.
+
+    Args:
+        captured: Sanitized bundle payload.
+        target: Existing or prospective target path.
+        logical: Logical system path being restored.
+        category: Restore category owning this file.
+        mappings: Explicit replacement-host mappings.
+
+    Returns:
+        Safe bytes to write to the target.
+    """
+    text = captured.read_text(encoding="utf-8")
+    if captured.suffix == ".json":
+        saved = json.loads(text)
+        current: Any = {}
+        if target.is_file():
+            try:
+                current = json.loads(target.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                current = {}
+        merged = merge_redacted_json(saved, current)
+        if category == "manager" and "storage.models_dir" in mappings:
+            if "modelsDir" in merged:
+                merged["modelsDir"] = mappings["storage.models_dir"]
+            elif "models_dir" in merged:
+                merged["models_dir"] = mappings["storage.models_dir"]
+        return (json.dumps(merged, indent=2, sort_keys=True) + "\n").encode()
+    current_text = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else ""
+    text = merge_redacted_text(text, current_text)
+    current_by_key: dict[str, str] = {}
+    current_systemd_environment: dict[str, str] = {}
+    if current_text:
+        for current_line in current_text.splitlines():
+            key, separator, _value = current_line.partition("=")
+            if separator:
+                current_by_key[key] = current_line
+            systemd_match = re.match(
+                r'^Environment=([A-Za-z_][A-Za-z0-9_]*)=.*$', current_line
+            )
+            if systemd_match:
+                current_systemd_environment[systemd_match.group(1)] = current_line
+    rendered: list[str] = []
+    for line in text.splitlines():
+        systemd_redaction = re.match(
+            r'^Environment=([A-Za-z_][A-Za-z0-9_]*)=\[REDACTED\]$', line
+        )
+        if systemd_redaction:
+            preserved = current_systemd_environment.get(systemd_redaction.group(1))
+            if preserved:
+                rendered.append(preserved)
+            continue
+        key, separator, value = line.partition("=")
+        if separator and value == "[REDACTED]":
+            if key in current_by_key:
+                rendered.append(current_by_key[key])
+            continue
+        if category == "kiosk" and key == "AutomaticLogin" and "kiosk.user" in mappings:
+            rendered.append(f"AutomaticLogin={mappings['kiosk.user']}")
+        elif (
+            category == "manager"
+            and key in {"MODELS_DIR", "modelsDir"}
+            and "storage.models_dir" in mappings
+        ):
+            rendered.append(f"{key}={mappings['storage.models_dir']}")
+        else:
+            rendered.append(line)
+    return ("\n".join(rendered) + "\n").encode()
+
+
+def backup_restore_targets(
+    root: Path, rollback: Path, targets: Sequence[tuple[str, Path]]
+) -> list[dict[str, Any]]:
+    """Snapshot every target before any restore write occurs.
+
+    Args:
+        root: Target filesystem root.
+        rollback: Rollback directory receiving originals.
+        targets: Logical paths paired with concrete target paths.
+
+    Returns:
+        Rollback manifest entries recording prior existence.
+    """
+    records: list[dict[str, Any]] = []
+    for logical, target in targets:
+        existed = target.is_file()
+        record: dict[str, Any] = {"path": logical, "existed": existed}
+        if existed:
+            destination = rollback / "original" / logical.lstrip("/")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, destination)
+            record["backup"] = str(destination.relative_to(rollback))
+        records.append(record)
+    return records
+
+
+def write_rollback_guide(rollback: Path, records: Sequence[dict[str, Any]]) -> None:
+    """Write explicit rollback commands for a completed restore.
+
+    Args:
+        rollback: Rollback directory containing prior state.
+        records: Target state records created before restoration.
+    """
+    lines = [
+        "# Llama Manager Recovery Rollback",
+        "",
+        "Restore this directory before retrying or adapting the recovery plan.",
+        "Run these commands as root after reviewing each target:",
+        "",
+    ]
+    for record in records:
+        if record["existed"]:
+            lines.append(f"- Restore `{record['path']}` from `{record['backup']}`.")
+        else:
+            lines.append(f"- Remove `{record['path']}`; it did not exist before restore.")
+    lines.extend(
+        [
+            "",
+            "After restoring systemd or boot files, reload the corresponding manager",
+            "or regenerate boot configuration before restarting the host.",
+        ]
+    )
+    (rollback / "ROLLBACK.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def rendered_fstab(
+    current: str, mounts: Sequence[dict[str, Any]], mappings: dict[str, str]
+) -> str:
+    """Append explicitly mapped NFS mounts while preserving unrelated fstab lines.
+
+    Args:
+        current: Existing target fstab content.
+        mounts: Portable captured NFS mount records.
+        mappings: Explicit NFS source and mountpoint replacements.
+
+    Returns:
+        Updated fstab content with one managed block.
+    """
+    begin = "# BEGIN llama-manager-recovery NFS"
+    end = "# END llama-manager-recovery NFS"
+    kept: list[str] = []
+    in_managed_block = False
+    for line in current.splitlines():
+        if line == begin:
+            in_managed_block = True
+            continue
+        if line == end:
+            in_managed_block = False
+            continue
+        if not in_managed_block:
+            kept.append(line)
+    while kept and not kept[-1]:
+        kept.pop()
+    kept.extend([begin])
+    for index, mount in enumerate(mounts):
+        source = mappings[f"nfs.{index}.source"]
+        mountpoint = mappings[f"nfs.{index}.mountpoint"]
+        options = ",".join(mount["options"])
+        kept.append(f"{source} {mountpoint} {mount['filesystem']} {options} 0 0")
+    kept.append(end)
+    return "\n".join(kept) + "\n"
+
+
+def restore_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    """Preview or apply explicitly selected recovery categories.
+
+    Args:
+        args: Parsed restore command arguments.
+
+    Returns:
+        JSON-compatible restore summary.
+
+    Raises:
+        ValueError: If validation, mapping, or authorization requirements fail.
+    """
+    bundle = Path(args.bundle)
+    if not verify_checksums(bundle):
+        raise ValueError("bundle checksum validation failed")
+    manifest = load_manifest(bundle)
+    categories = parse_categories(args.categories)
+    mappings = parse_mappings(args.map)
+    target_hostname = args.hostname or socket.gethostname()
+    validate_mappings(mappings, target_hostname)
+    outstanding = [
+        key
+        for key in required_mappings(bundle, manifest, target_hostname, categories)
+        if key not in mappings
+    ]
+    if outstanding:
+        raise ValueError("missing required mappings: " + ", ".join(outstanding))
+    changes = selected_file_changes(bundle, manifest, Path(args.root), categories)
+    if args.dry_run:
+        return {
+            "dryRun": True,
+            "categories": sorted(categories),
+            "changes": changes,
+            "requiredMappings": [],
+        }
+    root = Path(args.root)
+    if root.resolve() == Path("/") and os.geteuid() != 0:
+        raise PermissionError("restore must run as root; preview first with --dry-run")
+    timestamp = args.timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rollback = root / "var" / "backups" / "llama-manager-recovery" / timestamp
+    rollback.mkdir(parents=True, exist_ok=False)
+    selected_entries = [
+        entry for entry in manifest.get("files", []) if entry["category"] in categories
+    ]
+    targets: list[tuple[str, Path]] = [
+        (entry["path"], safe_target(root, entry["path"])) for entry in selected_entries
+    ]
+    if "storage" in categories and manifest.get("storage", {}).get("nfsMounts"):
+        targets.append(("/etc/fstab", safe_target(root, "/etc/fstab")))
+    records = backup_restore_targets(root, rollback, targets)
+    for entry in selected_entries:
+        logical = entry["path"]
+        target = safe_target(root, logical)
+        captured = bundle / "files" / logical.lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = rendered_payload(captured, target, logical, entry["category"], mappings)
+        target.write_bytes(payload)
+        shutil.copymode(captured, target)
+    if "storage" in categories and manifest.get("storage", {}).get("nfsMounts"):
+        fstab = safe_target(root, "/etc/fstab")
+        current = fstab.read_text(encoding="utf-8") if fstab.is_file() else ""
+        fstab.parent.mkdir(parents=True, exist_ok=True)
+        fstab.write_text(
+            rendered_fstab(current, manifest["storage"]["nfsMounts"], mappings),
+            encoding="utf-8",
+        )
+    (rollback / "manifest.json").write_text(
+        json.dumps({"createdAt": timestamp, "targets": records}, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    write_rollback_guide(rollback, records)
+    return {
+        "dryRun": False,
+        "categories": sorted(categories),
+        "changes": changes,
+        "rollbackDir": str(rollback),
+    }
+
+
+def create_backup(args: argparse.Namespace) -> Path:
+    """Create an allowlisted, sanitized recovery bundle.
+
+    Args:
+        args: Parsed backup command arguments.
+
+    Returns:
+        Path to the newly created bundle.
+    """
+    root = Path(args.root)
+    hostname = args.hostname or socket.gethostname()
+    timestamp = args.timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_root = Path(args.output_dir)
+    bundle = output_root / hostname / timestamp
+    bundle.mkdir(parents=True, exist_ok=False)
+    copied: list[dict[str, str]] = []
+    for category, paths in ALLOWLIST.items():
+        for path in paths:
+            source = logical_path(root, path)
+            if not source.is_file() or source.is_symlink():
+                continue
+            destination = bundle / "files" / path.lstrip("/")
+            sanitize_file(source, destination)
+            copied.append({"category": category, "path": path})
+    nfs_mounts = collect_nfs_mounts(root)
+    manifest = {
+        "schemaVersion": SCHEMA_VERSION,
+        "createdAt": timestamp,
+        "sourceHost": hostname,
+        "files": copied,
+        "storage": collect_storage(root, nfs_mounts),
+        "platform": collect_platform(root),
+        "runtime": collect_runtime(root),
+        "exclusions": [
+            "credentials and tokens",
+            "signing private keys",
+            "machine-id and SSH keys",
+            "browser profiles and arbitrary home data",
+            "model and container image blobs",
+        ],
+    }
+    (bundle / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    write_reconfiguration_guide(bundle)
+    write_checksums(bundle)
+    return bundle
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the public command-line argument parser.
+
+    Returns:
+        Configured parser for the recovery CLI.
+    """
+    parser = argparse.ArgumentParser(
+        prog="llama-manager-recovery",
+        description="Back up and safely adapt Llama Manager host settings.",
+    )
+    parser.add_argument(
+        "--root",
+        default="/",
+        help="relocate system paths beneath ROOT (primarily for recovery staging/tests)",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    backup = subparsers.add_parser("backup", help="create a sanitized recovery bundle")
+    backup.add_argument(
+        "--output-dir",
+        default=os.environ.get("LLAMA_MANAGER_RECOVERY_DIR", DEFAULT_OUTPUT_DIR),
+        help=f"backup root (default: {DEFAULT_OUTPUT_DIR})",
+    )
+    backup.add_argument("--hostname", help=argparse.SUPPRESS)
+    backup.add_argument("--timestamp", help=argparse.SUPPRESS)
+    backup.set_defaults(handler=create_backup)
+    inspect = subparsers.add_parser("inspect", help="summarize and validate a bundle")
+    inspect.add_argument("bundle", help="recovery bundle directory")
+    inspect.set_defaults(handler=inspect_bundle)
+    plan = subparsers.add_parser("plan", help="compare a bundle with this host")
+    plan.add_argument("bundle", help="recovery bundle directory")
+    plan.add_argument("--hostname", help=argparse.SUPPRESS)
+    plan.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="explicit replacement-host mapping (repeatable)",
+    )
+    plan.set_defaults(handler=plan_bundle)
+    restore = subparsers.add_parser(
+        "restore", help="restore explicitly selected configuration categories"
+    )
+    restore.add_argument("bundle", help="recovery bundle directory")
+    restore.add_argument("--dry-run", action="store_true", help="preview without changes")
+    restore.add_argument(
+        "--categories",
+        required=True,
+        metavar="LIST",
+        help="comma-separated manager,service,kiosk,platform,storage selection",
+    )
+    restore.add_argument("--hostname", help=argparse.SUPPRESS)
+    restore.add_argument("--timestamp", help=argparse.SUPPRESS)
+    restore.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="explicit replacement-host mapping (repeatable)",
+    )
+    restore.set_defaults(handler=restore_bundle)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the recovery command.
+
+    Args:
+        argv: Optional explicit arguments for programmatic invocation.
+
+    Returns:
+        Process exit status.
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = args.handler(args)
+    except (FileNotFoundError, json.JSONDecodeError, PermissionError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
+    if isinstance(result, Path):
+        print(result)
+    elif result is not None:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
