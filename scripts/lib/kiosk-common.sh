@@ -97,8 +97,9 @@ kiosk_backup_dir() { kiosk_path /var/backups/llama-kiosk; }
 
 # Idempotently back up a system file before install modifies it. No-op under
 # dry-run (logs intent only). Only the FIRST backup is kept, so re-running
-# install never clobbers the pristine original. Records backup.<name>.existed
-# (true/false) and backup.<name>.path in the manifest.
+# install never clobbers the pristine original. Symlinks are copied as links,
+# including dangling links whose targets do not exist. Records
+# backup.<name>.existed (true/false) and backup.<name>.path in the manifest.
 # Args: $1 = logical name (manifest/file key), $2 = logical source path.
 kiosk_backup_file() {
     local name="$1" src_logical="$2" src backup
@@ -113,7 +114,7 @@ kiosk_backup_file() {
     if [ -n "$(kiosk_manifest_get "backup.$name.existed")" ]; then
         return 0
     fi
-    if [ -f "$src" ]; then
+    if [ -e "$src" ] || [ -L "$src" ]; then
         cp -a "$src" "$backup"
         kiosk_manifest_set "backup.$name.existed" "true"
     else

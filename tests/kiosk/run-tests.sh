@@ -119,6 +119,18 @@ test_backup() {
       assert_eq "existed=false" "false" "$(kiosk_manifest_get backup.accountsservice.existed)"
       assert_no_file "no backup for missing src" "$(kiosk_path /var/backups/llama-kiosk/accountsservice)"
 
+      # A dangling symlink exists as a filesystem object even though -e/-f are
+      # false; backup must preserve the link itself and its exact target text.
+      mkdir -p "$(dirname "$(kiosk_path /usr/share/wayland-sessions/dangling.desktop)")"
+      ln -s '../missing/vendor-session.desktop' \
+        "$(kiosk_path /usr/share/wayland-sessions/dangling.desktop)"
+      kiosk_backup_file dangling_session /usr/share/wayland-sessions/dangling.desktop
+      assert_eq "dangling symlink recorded as existing" true \
+        "$(kiosk_manifest_get backup.dangling_session.existed)"
+      assert_eq "dangling symlink backup preserves exact target text" \
+        '../missing/vendor-session.desktop' \
+        "$(readlink "$(kiosk_path /var/backups/llama-kiosk/dangling_session)" 2>/dev/null)"
+
       # Dry-run mutating command changes nothing
       export KIOSK_DRY_RUN=true
       kiosk_run touch "$sb/should-not-exist"
@@ -394,6 +406,35 @@ test_session_symlink_target_is_never_overwritten() {
     rm -f "$external"
 }
 
+test_dangling_session_symlink_is_restored_exactly() {
+    printf 'test_dangling_session_symlink_is_restored_exactly\n'
+    local sb session target; sb="$(new_sandbox)"
+    session="$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    target='../missing/vendor-session.desktop'
+    mkdir -p "$(dirname "$session")"
+    ln -s "$target" "$session"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "install replaces dangling session symlink with regular file" yes \
+        "$([ -f "$session" ] && [ ! -L "$session" ] && echo yes || echo no)"
+    assert_eq "backup preserves dangling session link target text" "$target" \
+        "$(readlink "$sb/var/backups/llama-kiosk/wayland_session")"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "reinstall preserves dangling link backup target text" "$target" \
+        "$(readlink "$sb/var/backups/llama-kiosk/wayland_session")"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "uninstall restores dangling session symlink target exactly" \
+        "$target" "$(readlink "$session" 2>/dev/null)"
+    assert_eq "restored session link remains dangling" yes \
+        "$([ -L "$session" ] && [ ! -e "$session" ] && echo yes || echo no)"
+    rm -rf "$sb"
+}
+
 test_launcher() {
     printf 'test_launcher\n'
     local sb; sb="$(new_sandbox)"
@@ -466,6 +507,7 @@ test_preexisting_account_is_preserved
 test_preexisting_session_entry_is_restored
 test_uninstall_without_install_preserves_session_entry
 test_session_symlink_target_is_never_overwritten
+test_dangling_session_symlink_is_restored_exactly
 test_launcher
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.

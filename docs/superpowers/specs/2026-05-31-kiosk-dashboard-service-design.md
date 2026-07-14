@@ -102,7 +102,9 @@ the autologin session — the kiosk self-heals.
    managed session as a mode-`0644` regular temp file followed by an atomic
    same-directory rename. This replaces, rather than follows, a destination
    symlink. Repeated installs retain the original ownership record, including a
-   pristine symlink backup whose external target is never written.
+   pristine symlink backup whose external target is never written. Backup
+   existence uses the directory entry itself, not target existence, so dangling
+   symlinks retain their exact link target text through uninstall.
 6. **Bring the kiosk up now** (unless `--no-start`): restart the display manager
    so gdm autologin immediately enters the kiosk session — no reboot required for
    first use.

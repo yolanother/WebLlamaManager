@@ -30,7 +30,8 @@ The installer:
   dedicated account never needs access to the administrator's source checkout,
 - backs up `/etc/gdm3/custom.conf`, the kiosk AccountsService record, and any
   pre-existing `llama-kiosk.desktop` session entry to
-  `/var/backups/llama-kiosk/`,
+  `/var/backups/llama-kiosk/`; symlinks are preserved as links, including exact
+  target text for dangling links,
 - publishes the managed session entry as a mode-`0644` regular file using an
   atomic same-directory rename, so an existing symlink is replaced rather than
   followed and its target is never overwritten,
