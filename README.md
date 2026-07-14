@@ -4,7 +4,9 @@
 
 <img width="1500" height="1167" alt="image" src="https://github.com/user-attachments/assets/e57cad3c-8d95-45c3-a504-b984249f90aa" />
 
-A comprehensive LLM management, debugging, and performance monitoring platform for llama.cpp. Provides a modern web UI with real-time GPU/CPU/memory telemetry, persistent historical analytics, request tracking with error breakdown, token throughput analysis, full conversation logging, and a hands-free fullscreen dashboard for wall-mounted monitoring. Supports multi-model router mode on AMD GPUs via distrobox with on-demand model loading, LRU eviction, and OpenAI-compatible API proxying.
+A comprehensive LLM management, debugging, and performance monitoring platform for local inference on AMD Strix Halo (gfx1151) GPUs. Provides a modern web UI with real-time GPU/CPU/memory telemetry, persistent historical analytics, request tracking with error breakdown, token throughput analysis, full conversation logging, and a hands-free fullscreen dashboard for wall-mounted monitoring. Runs **multiple inference engines** behind one OpenAI-compatible API — llama.cpp (multi-model router with on-demand loading and LRU eviction) and **DS4 / DeepSeek V4 Flash** (antirez/ds4) — with request-time model aliasing, smart remote offload, and a suite of stability guards tuned for a shared, thermally-constrained CPU+iGPU box.
+
+> **New here?** Read [`docs/features-overview.md`](docs/features-overview.md) for the full feature map and [`docs/ds4-engine.md`](docs/ds4-engine.md) for the DeepSeek V4 Flash engine.
 
 <br clear="left">
 
@@ -24,18 +26,30 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
 - **Process monitoring**: View and manage running llama-server processes with resource usage
 - **Server log streaming**: Real-time log output with configurable noise filters
 
+### Inference Engines & Routing
+- **Multi-engine**: llama.cpp (router or single-preset) and **DS4 / DeepSeek V4 Flash** behind one abstraction — a preset picks its engine ([`docs/features-overview.md`](docs/features-overview.md))
+- **DeepSeek V4 Flash**: an 80 GB model that upstream llama.cpp can't load, run on the iGPU via [antirez/ds4](https://github.com/antirez/ds4) with **adaptive context scaling + SSD expert-streaming** that fits it to the box, exclusive-mode pre-eviction, and a self-updater ([`docs/ds4-engine.md`](docs/ds4-engine.md))
+- **Preferred big/small models**: `default-big` / `default-small` request-time aliases retarget your whole fleet centrally — migrate clients between models (and engines) with no client change
+- **Smart remote offload**: forward requests to remote OpenAI-compatible backends (e.g. Ollama boxes) by queue depth, thermal state, or policy; protect-resident anti-thrash keeps the big model loaded; fastest-backend and backfill-race routing
+
 ### Model Management
 - **Multi-model router**: Load and unload models dynamically without restarting, with LRU eviction
 - **HuggingFace integration**: Search and download GGUF models with progress tracking
-- **Optimized presets**: One-click configurations for specific models (custom sampling, chat templates, reasoning formats)
-- **Model aliases**: Friendly display names for your models
+- **Optimized presets**: One-click configurations for specific models (custom sampling, chat templates, reasoning formats, speculative decoding)
+- **Model aliases**: Friendly display names, plus the `default-big`/`default-small` routing aliases above
+- **Dedicated embeddings server**: OpenAI-compatible `/v1/embeddings` on its own port
+
+### Stability (Strix Halo hardening)
+- **Memory watchdog, thermal governor, restart governor**: pause/offload/restart decisions tuned to the shared CPU+iGPU die and 124 GB unified RAM, each built from a real incident ([`docs/strix-halo-gpu-stability.md`](docs/strix-halo-gpu-stability.md))
+- **Queue admission & slot reaper**: backpressure without dropping requests; leaked-slot recovery
+- **KV-cache persistence**: per-slot prefix cache saved/restored across model reloads
 
 ### Infrastructure
-- **OpenAI-compatible API**: Drop-in replacement proxy with automatic message sanitization for tool-call edge cases
+- **OpenAI-compatible API**: Drop-in replacement proxy (`chat/completions`, `completions`, `embeddings`, `responses`, Anthropic-shaped `messages`, `rerank`) with automatic message sanitization for tool-call edge cases
 - **MCP Server**: Integration with AI agents like Claude Desktop
 - **Full Chat Interface**: Multi-conversation chat with streaming, code highlighting, and image support
 - **systemd service**: Auto-start on boot, runs in background
-- **Models stored in ~/models**: All models in one place, easy to manage
+- **Models stored in ~/models**: All llama.cpp models in one place (DS4 GGUFs live separately in `~/models-ds4`)
 
 ## Screenshots
 
@@ -113,13 +127,36 @@ systemctl --user start llama-manager
 
 ## How It Works
 
-The server runs llama.cpp in **router mode**, which means:
+Llama Manager sits in front of one or more inference engines and exposes a single
+OpenAI-compatible API on port 5250 (`/api/v1`). A request flows:
+
+```
+client → /api/v1/chat/completions
+  → resolve default-big/default-small alias → real model
+  → route: local engine  OR  remote offload backend
+       local llama.cpp (router or preset)  |  local DS4 (exclusive)  |  remote (Ollama, …)
+```
+
+By default the local engine is **llama.cpp in router mode**:
 
 1. Models are auto-discovered from `~/models`
 2. Multiple models can be loaded simultaneously (default: 2)
 3. Models load on-demand when first requested
 4. LRU eviction when hitting the max models limit
 5. No server restart needed to switch models
+
+On top of that:
+
+- **Engines**: a preset can declare `engine: "ds4"` to serve DeepSeek V4 Flash
+  instead of a llama.cpp model. DS4 runs *exclusively* (evicts everything else) and
+  auto-fits itself via adaptive context + SSD-streaming — see
+  [`docs/ds4-engine.md`](docs/ds4-engine.md).
+- **Aliases**: point `default-big` / `default-small` at any model (or a DS4 preset)
+  so clients get retargeted centrally — `POST /api/settings`.
+- **Offload**: when the box is busy, hot, or running DS4, requests for other models
+  are forwarded to configured remote backends (`/api/backends`).
+
+See [`docs/features-overview.md`](docs/features-overview.md) for the full picture.
 
 ### Using Models
 
@@ -372,7 +409,10 @@ sudo ./scripts/gpu-stability-setup.sh all             # apply, then reboot when 
 
 Full background and the engine build process are in
 [`docs/llama-cpp-rocm-build-and-deployment.md`](docs/llama-cpp-rocm-build-and-deployment.md);
-the `system-health-monitor` skill watches these signals proactively.
+the `system-health-monitor` skill watches these signals proactively. The two
+distinct gfx1151 GPU failure modes (illegal-opcode vs. MES suspend wedge), the
+known-good kernel/ROCm/firmware stack, and the watchdog caveat are documented in
+[`docs/strix-halo-gpu-stability.md`](docs/strix-halo-gpu-stability.md).
 
 ## Adding Models
 

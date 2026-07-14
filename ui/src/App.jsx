@@ -7883,18 +7883,33 @@ function DocsPage() {
             <section className="docs-section">
               <h2>Overview</h2>
               <p>
-                Llama Manager is a service for managing llama.cpp in multi-model router mode.
-                It provides a web UI, REST API, and MCP server for AI agent integration.
+                Llama Manager is a control plane for local LLM inference on an AMD Strix Halo (gfx1151)
+                box. It runs <strong>multiple inference engines</strong> behind one OpenAI-compatible API,
+                routes and offloads requests across local and remote backends, and protects a
+                thermally- and memory-constrained shared CPU+iGPU box from the failure modes that
+                actually happen on this hardware. It provides a web UI, REST API, and MCP server for
+                AI agent integration.
               </p>
 
               <h3>Key Features</h3>
               <ul>
-                <li><strong>Multi-model support</strong>: Load and unload models dynamically without restarting</li>
-                <li><strong>Web UI</strong>: Modern React interface for model management and chat</li>
-                <li><strong>OpenAI-compatible API</strong>: Drop-in replacement for OpenAI API clients</li>
-                <li><strong>MCP Server</strong>: Integration with Claude Desktop and other AI agents</li>
-                <li><strong>Real-time monitoring</strong>: GPU stats, logs, and performance analytics</li>
+                <li><strong>Multi-engine</strong>: llama.cpp (multi-model router or single preset) and <strong>DS4 / DeepSeek V4 Flash</strong> — a preset picks its engine</li>
+                <li><strong>DeepSeek V4 Flash</strong>: an 80&nbsp;GB model upstream llama.cpp can't load, run on the iGPU with adaptive context scaling + SSD expert-streaming that fits it to the box</li>
+                <li><strong>Preferred big/small models</strong>: <code>default-big</code> / <code>default-small</code> aliases retarget your whole fleet centrally — migrate clients between models and engines with no client change</li>
+                <li><strong>Smart remote offload</strong>: forward to remote OpenAI-compatible backends by queue depth, thermal state, or policy; protect-resident anti-thrash keeps the big model loaded</li>
+                <li><strong>Stability guards</strong>: memory watchdog, thermal governor, restart governor, queue admission — each tuned to the shared die and 124&nbsp;GB unified RAM</li>
+                <li><strong>OpenAI-compatible API</strong>: drop-in for OpenAI clients (chat/completions, embeddings, responses, Anthropic-shaped messages, rerank)</li>
+                <li><strong>MCP Server</strong>: integration with Claude Desktop and other AI agents</li>
+                <li><strong>Real-time monitoring</strong>: GPU/CPU/RAM/GTT telemetry, per-request logs, and historical analytics</li>
               </ul>
+
+              <div className="docs-info-box">
+                <p>
+                  Deep dives: see the <code>docs/features-overview.md</code> feature map and
+                  <code>docs/ds4-engine.md</code> for the DeepSeek V4 Flash engine in the repo's
+                  <code>/docs</code> folder.
+                </p>
+              </div>
 
               <h3>Quick Start</h3>
               <CodeBlock
@@ -8166,7 +8181,18 @@ print(response.choices[0].message.content)`}
             <section className="docs-section">
               <h2>Features</h2>
 
-              <h3>Router Mode (Default)</h3>
+              <h3>Inference Engines</h3>
+              <p>
+                Two engines run behind one API. A preset declares which one it uses
+                (<code>engine: "llama"</code> or <code>engine: "ds4"</code>); only one serves locally
+                at a time.
+              </p>
+              <ul>
+                <li><strong>llama.cpp</strong> — router (many models, on-demand load/unload) or single tuned preset. Supports slots, KV-cache persistence, speculative decoding, embeddings.</li>
+                <li><strong>DS4 / DeepSeek V4 Flash</strong> — an 80&nbsp;GB model upstream llama.cpp can't load, served via <a href="https://github.com/antirez/ds4" target="_blank" rel="noopener noreferrer">antirez/ds4</a>. Runs <em>exclusively</em> (evicts everything else) and auto-fits the box with adaptive context + SSD expert-streaming.</li>
+              </ul>
+
+              <h3>Router Mode (llama.cpp default)</h3>
               <p>
                 In router mode, multiple models can be loaded simultaneously. The server
                 manages model loading/unloading with LRU eviction when hitting the max models limit.
@@ -8183,10 +8209,41 @@ print(response.choices[0].message.content)`}
                 Use this for maximum performance with a specific model.
               </p>
 
+              <h3>Preferred Big / Small Models (aliases)</h3>
+              <p>
+                Point the <code>default-big</code> and <code>default-small</code> request-time aliases
+                at any model (or a DS4 preset). Clients that always ask for <code>default-big</code>
+                get whatever you've chosen — so you can migrate a whole fleet between models, or between
+                engines, with <strong>no client change</strong>. Set them on the Settings page or via
+                <code>POST /api/settings</code>.
+              </p>
+
+              <h3>Remote Offload</h3>
+              <p>
+                When the box is busy, hot, or running DS4 exclusively, requests for other models are
+                forwarded to configured remote OpenAI-compatible backends (e.g. Ollama boxes) instead of
+                loading locally. Routing considers queue depth, thermal state, an offload policy, and a
+                "protect-resident" rule that keeps the big model loaded rather than evicting it. Manage
+                backends on the Settings page.
+              </p>
+
+              <h3>Stability Guards</h3>
+              <p>
+                Tuned to the shared CPU+iGPU die and 124&nbsp;GB unified RAM, each built from a real
+                incident:
+              </p>
+              <ul>
+                <li><strong>Memory watchdog</strong> — restarts on genuine RAM pressure, but defers while a request is streaming</li>
+                <li><strong>Thermal governor</strong> — pauses dispatch / offloads when the APU is hot (never unloads an idle model)</li>
+                <li><strong>Restart governor</strong> — debounce + circuit breaker + 15-min wedged-GPU hold to prevent restart-thrash</li>
+                <li><strong>Queue admission</strong> — backpressure without dropping requests</li>
+              </ul>
+
               <h3>Presets</h3>
               <p>
                 Presets are pre-configured model settings optimized for specific use cases.
-                They specify the model, quantization, context size, and other parameters.
+                They specify the engine, model, context size, sampling, chat template, and other
+                parameters (including DS4 streaming/context knobs).
               </p>
 
               <h3>Download Management</h3>

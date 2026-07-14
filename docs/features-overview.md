@@ -1,0 +1,210 @@
+# Llama Manager — Feature Overview
+
+Llama Manager is a self-hosted control plane for local LLM inference on an AMD
+Strix Halo (gfx1151) box. It manages one or more inference engines, exposes a
+single OpenAI-compatible API, routes and offloads requests across local and remote
+backends, and protects a thermally- and memory-constrained shared CPU+iGPU box from
+the failure modes that actually happen on this hardware.
+
+This document is the map of what it does and how each piece works. Deep-dives live
+in sibling docs; this is the index + the mental model.
+
+> **Architecture note.** The server is a monolith (`api/server.js`) that wires
+> side-effect-free **decision modules** (`api/*.js`, each with a `*.test.js`) to the
+> real process/GPU/HTTP side effects. Every module header documents the specific
+> failure mode it guards against. When reading the code, the pure module is where
+> the logic lives; `server.js` is where it meets reality.
+
+---
+
+## 1. Engines (llama.cpp + DS4)
+
+Two engines run behind one abstraction (`api/engines.js`):
+
+- **llama.cpp** — the default. Runs either as a **router** (serves many models,
+  loading/unloading on demand) or a **single preset** (one tuned model). Supports
+  `/slots`, KV-cache persistence, speculative decoding, embeddings.
+- **DS4** — [DeepSeek V4 Flash](ds4-engine.md) via `ds4-server`. Single-model,
+  runs **exclusively** (nothing else loads locally), with adaptive context +
+  SSD-streaming to fit an 80 GB model. See [`ds4-engine.md`](ds4-engine.md).
+
+`currentEngine` tracks which is active. A preset declares its engine with an
+`engine: "ds4"` field (default `"llama"`). Only one engine serves locally at a time;
+the guards attribute memory/heat to "the local engine" regardless of which it is.
+
+## 2. Router mode vs single-preset mode (llama.cpp)
+
+- **Router** (`start-llama.sh`): llama.cpp with `--models-dir` serves any model in
+  `~/models`, spawning a child process per model up to `MODELS_MAX`. Best for
+  ad-hoc multi-model use.
+- **Single preset** (`start-preset.sh`): one model with tuned sampling/flags. Best
+  for a pinned production model.
+
+**Auto mode-switch.** An incoming request transparently drives the right mode:
+`ensureModelServed(model)` swaps into a preset that `autoActivate`s the model, or
+back to the router if the current single preset can't serve it. Concurrent callers
+share one in-flight swap; requests are queued during the swap, never 404'd.
+
+## 3. One OpenAI-compatible API
+
+Everything is served under `/api/v1/*` regardless of engine or backend:
+`chat/completions`, `completions`, `embeddings`, `responses`,
+`messages` (+ `count_tokens`, Anthropic-shaped), `rerank`, `models`. Point any
+OpenAI-compatible client (OpenCode, Codex, SDKs) at `http://<host>:5250/api/v1`.
+
+Request enrichment happens transparently:
+- **`reasoning_effort`** — top-level OpenAI field is moved into
+  `chat_template_kwargs`; otherwise per-model (`config.modelReasoningEffort`) or
+  `config.defaultReasoningEffort` is applied.
+- **Sampling defaults** — model-specific recommended `temp/top_p/top_k/min_p`
+  (e.g. Gemma 4, Qwen 3.6) are filled in only when the caller left them unset.
+
+## 4. Model aliasing & preferred big/small models
+
+Two request-time aliases let clients pin a stable name while the operator retargets
+centrally (`api/default-models.js`):
+
+- **`default-big`** → `config.defaultBigModel`
+- **`default-small`** → `config.defaultSmallModel`
+
+A client that always asks for `default-big` gets whatever the operator has chosen —
+gpt-oss-120b today, DeepSeek V4 Flash tomorrow — with **no client change**. This is
+how you migrate a fleet between models (and between engines: a ds4-backed
+`default-big` transparently triggers exclusive DS4 activation). Set them via
+`POST /api/settings` (`defaultBigModel` / `defaultSmallModel`).
+
+Separately, **display aliases** (`config.modelAliases`) rename models in the UI /
+`/v1/models` without changing routing.
+
+## 5. Remote offload & smart routing
+
+Llama Manager can forward requests to remote OpenAI-compatible backends
+(`config.backends`, e.g. Ollama boxes) instead of loading everything locally. The
+decision (`resolveBackend`) layers several triggers:
+
+- **Offload policy** — `overflow` / `threshold` / `percentage` / `manual`, with
+  `preferLocal` vs "spread work to remotes".
+- **Queue overflow** — when the local queue is deep, offload if a remote can serve
+  it (else queue deeper rather than fail).
+- **Protect-resident** (`api/protect-resident.js`) — while a large model (≥ 40 GB)
+  is resident and local slots are full, a request for a *different* model is
+  offloaded rather than evicting the big one (evicting trips the amdgpu MES suspend
+  wedge). This is the anti-thrash policy for the big model.
+- **Thermal** — when the APU is hot, dispatch prefers remotes to cool the die.
+- **Backfill race** — a stalled local request is raced against the fastest remote;
+  first response wins.
+
+Candidates are ranked by priority → measured tokens/sec (EMA) → shared-resource
+weight → queue depth. Backends have per-model `modelMapping` (exact/glob/`*`),
+API-key env vars, cost/concurrency/timeout, and health/circuit-breaker state.
+Managed at `/api/backends*`.
+
+While **DS4 is active** the box is exclusive: the DS4 model serves locally and
+*every other* model offloads (or gets a clean 503) — see [`ds4-engine.md`](ds4-engine.md).
+
+## 6. Presets
+
+A preset is a saved model + launch configuration (`config.presets`). Fields include
+`id`, `name`, `modelPath`/`hfRepo`, `context`, auto-activation rules, and a `config`
+block. For **llama** presets: `temp/topP/topK/minP`, `chatTemplateKwargs`,
+`reasoningFormat`, and `extraSwitches` (e.g. `--jinja`, `--flash-attn on`,
+speculative-decoding `--model-draft ...`). For **DS4** presets: streaming/context
+fields (see [`ds4-engine.md`](ds4-engine.md)). CRUD + activation at `/api/presets*`.
+
+## 7. Stability guards
+
+Each guard exists because of a real incident on this hardware. All are pure,
+unit-tested decision modules wired into `server.js`.
+
+| Guard | Module | Protects against |
+|---|---|---|
+| **Memory watchdog** | `mem-watchdog.js` | RAM-pressure restarts; defers while a request is streaming; DS4-aware (only restarts on a genuine leak above its 80 GB baseline) |
+| **Thermal governor** | `resource-guard.js` | APU overheating on the shared CPU+iGPU die; pauses dispatch / offloads (never unloads); heat-source attribution so external heat doesn't throttle the model |
+| **Restart governor** | `restart-governor.js` | Restart-thrash; debounce + circuit breaker + 15-min **wedged-GPU hold** + sustained-thrash hold |
+| **Queue admission** | `queue-admission.js` | Overload; offload/queue-deeper instead of 503; hard ceiling backstop |
+| **Slot reaper** | `slot-reaper.js` | Leaked local queue slots starving serving |
+| **Engine kill** | `engine-kill.js` | Zombie models eating RAM; robust host-PID SIGKILL, surfaces D-state (wedged GPU) |
+| **Upstream retry** | `upstream-retry.js` | Restarting the router while a child model is merely still loading (proxy-error 500 ≠ server down) |
+
+Knobs live under `config.guard.*` (temps, `headroomFrac`, `memThresholdPct`, queue
+caps, restart-governor timings, DS4 thresholds). See
+[`strix-halo-gpu-stability.md`](strix-halo-gpu-stability.md) and
+[`GOTCHAS.md`](GOTCHAS.md).
+
+## 8. Slot / KV-cache persistence (llama.cpp)
+
+For llama.cpp, conversations are pinned to a per-slot prefix cache so
+same-conversation requests reuse the warmed KV cache, and slot KV state is
+**saved/restored across model reloads** (`api/slot-cache.js`, `--slot-save-path`) so
+a swapped-out model's conversations aren't re-prefilled cold. Prefix-cache hit/miss
+stats surface in the stats stream. (DS4 has no `/slots`; this cleanly no-ops.)
+
+## 9. Embeddings
+
+A **dedicated** embeddings llama-server runs on its own port (5252) because
+llama.cpp can't do embeddings and generation in one process
+(`start-embed.sh`, `api/embeddings.js`, `config.embed`). Served OpenAI-compatibly at
+`/api/v1/embeddings` (+ `/api/v1/rerank`). It may be evicted when DS4 needs the RAM.
+
+## 10. Model download & HuggingFace
+
+Download GGUFs from HuggingFace via the UI or `/api/pull` (progress tracked, gated
+models surface a token prompt). HF token handling (`api/hf-token.js`) masks/redacts
+the token in all API output. A **DS4-scoped** download endpoint (`/api/ds4/download`)
+is repo-allowlisted (`config.ds4.allowedRepos`) and hard-pinned to the ds4 model
+dir so ds4 GGUFs can never pollute `~/models`.
+
+## 11. Monitoring, logs & analytics
+
+- **Live stats** (`/api/system/stats`, WebSocket `/ws`): CPU/RAM/GTT/GPU
+  temperature/power/clock/busy, the llama stack's own CPU/RAM share, active engine,
+  `ds4Runtime`, thermal guard state, queue depth, per-slot context, prefix-cache
+  hit rate, downloads.
+- **LLM request log** — every request's model/status/latency/tokens/tok-s/backend,
+  streamed live (`/api/llm-logs`).
+- **Crash & performance analytics** — time-series ring buffers and crash events
+  (`/api/analytics*`), plus process monitoring (`/api/processes*`).
+- **Server logs** with configurable filters (`/api/logs`).
+
+## 12. Kiosk mode (optional)
+
+Turn the host into a full-screen dashboard appliance (gdm autologin → a Wayland
+`cage` session running Chrome on the dashboard). Standalone installer
+`scripts/install-kiosk.sh`; target via `KIOSK_URL` in `.env`. See
+[`Utilities/kiosk.md`](Utilities/kiosk.md).
+
+---
+
+## Ports
+
+| Service | Env | Default | This deployment |
+|---|---|---|---|
+| API + Web UI | `API_PORT` | 3001 | **5250** |
+| llama.cpp (OpenAI API) | `LLAMA_PORT` | 8080 | **5251** |
+| Embeddings | `EMBED_PORT` | 5252 | 5252 |
+| DS4 | `DS4_PORT` | 5253 | 5253 |
+
+## Where things live
+
+| Concern | File(s) |
+|---|---|
+| Server monolith / all endpoints | `api/server.js` |
+| Engine abstraction, DS4 config/validation | `api/engines.js` |
+| default-big/small aliases | `api/default-models.js` |
+| Offload / protect-resident | `api/protect-resident.js` |
+| DS4 engine | `api/ds4-supervisor.js`, `api/ds4-exclusive.js`, `api/ds4-adaptive.js`, `api/ds4-updater.js`, `start-ds4.sh` |
+| Guards | `api/mem-watchdog.js`, `resource-guard.js`, `restart-governor.js`, `queue-admission.js`, `slot-reaper.js`, `engine-kill.js`, `upstream-retry.js` |
+| Slot KV cache | `api/slot-cache.js` |
+| Embeddings / HF token / app usage | `api/embeddings.js`, `api/hf-token.js`, `api/app-usage.js` |
+| Launchers | `start-llama.sh`, `start-preset.sh`, `container-start.sh`, `start-ds4.sh`, `start-embed.sh` |
+| UI | `ui/src/App.jsx` |
+| Config | `config.json`, `.env` |
+
+## Related docs
+
+- [`ds4-engine.md`](ds4-engine.md) — DeepSeek V4 Flash engine (this feature set's centerpiece)
+- [`ds4-build.md`](ds4-build.md) / [`ds4-auto-update.md`](ds4-auto-update.md) — build + self-updater
+- [`Designs/EngineAbstraction.md`](Designs/EngineAbstraction.md) — engine-seam design
+- [`Designs/ModelManagement.md`](Designs/ModelManagement.md) — model lifecycle
+- [`llama-cpp-rocm-build-and-deployment.md`](llama-cpp-rocm-build-and-deployment.md) — the llama.cpp engine build
+- [`strix-halo-gpu-stability.md`](strix-halo-gpu-stability.md) / [`GOTCHAS.md`](GOTCHAS.md) — hardware stability

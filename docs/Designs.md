@@ -1,16 +1,21 @@
 # Architecture and Design Documentation
 
-This directory contains design documents for Llama Manager features and architecture decisions.
+This directory contains design documents for Llama Manager features and architecture
+decisions. For the full feature map see [features-overview.md](features-overview.md);
+for the docs index see [README.md](README.md).
 
 ## Overview
 
-Llama Manager is a service for managing llama.cpp in multi-model router mode. It provides:
+Llama Manager is a control plane for local LLM inference on an AMD Strix Halo
+(gfx1151) box. It runs **multiple inference engines** behind one OpenAI-compatible
+API and routes/offloads requests across local and remote backends. It provides:
 
-- **Web UI**: React-based interface for model management, monitoring, and chat
-- **REST API**: Full API for programmatic control
-- **OpenAI-Compatible API**: Drop-in replacement for OpenAI API clients
-- **MCP Server**: Model Context Protocol server for AI agent integration
-- **Real-time Monitoring**: WebSocket-based stats and log streaming
+- **Multi-engine**: llama.cpp (router / single preset) and DS4 / DeepSeek V4 Flash
+- **Web UI**: React interface for model management, monitoring, and chat
+- **REST + OpenAI-Compatible API**: drop-in for OpenAI clients + full management API
+- **Model aliasing & remote offload**: `default-big`/`default-small`, backend routing
+- **Stability guards**: memory/thermal/restart governors for the shared CPU+iGPU die
+- **MCP Server** + **real-time WebSocket monitoring**
 
 ## Architecture
 
@@ -22,22 +27,22 @@ Llama Manager is a service for managing llama.cpp in multi-model router mode. It
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Llama Manager API                         │
-│  Express Server (port 3001)                                  │
-│  - Model management                                          │
-│  - Settings & presets                                        │
-│  - Download management                                       │
-│  - Analytics & logging                                       │
-│  - OpenAI API wrapper                                        │
+│                Llama Manager API  (Express, :5250)           │
+│  default-big/small aliasing · routing & offload · presets    │
+│  guards (memory · thermal · restart · queue · protect-res.)  │
+│  download · analytics · logging · OpenAI/Anthropic wrappers  │
 └─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    llama.cpp Server                          │
-│  (Running in distrobox container)                            │
-│  - Router mode: Multiple models, dynamic loading             │
-│  - Single mode: Optimized preset configurations              │
-└─────────────────────────────────────────────────────────────┘
+        │                    │                     │
+        ▼                    ▼                     ▼
+┌───────────────┐   ┌────────────────┐   ┌──────────────────┐
+│  llama.cpp    │   │  DS4-server    │   │  remote backends │
+│  :5251        │   │  DeepSeek V4   │   │  (Ollama, …)     │
+│  router /     │   │  Flash :5253   │   │  offload target  │
+│  single preset│   │  (exclusive)   │   └──────────────────┘
+│  + embeddings │   │  adaptive ctx  │
+│  :5252        │   │  + SSD stream  │
+└───────────────┘   └────────────────┘
+   (in distrobox ROCm container on the gfx1151 iGPU)
 ```
 
 ## Design Documents
