@@ -183,8 +183,53 @@ it to the real side effects.
    (`DS4_RECLAIM_TIMEOUT_MS`, default 180s). **On timeout ds4 is NOT spawned** —
    the box rolls back to the llama router and the activate call returns 503. This
    is the fix for the load-then-OOM pre-eviction bug.
-5. Spawn ds4-server. Readiness (`GET /v1/models`) is awaited in the **background**;
-   the HTTP activate returns after spawn, and the swap gate releases on readiness.
+5. Run the **adaptive load ladder** (see below) in the **background**; the HTTP
+   activate returns immediately and the swap gate releases once the ladder settles
+   on a serving ds4-server (or exhausts).
+
+### Adaptive memory/context management (`api/ds4-adaptive.js`)
+
+The ~80GB ds4 weights fit at full context on a dedicated box but OOM at the load
+tail on a shared/contended box even at modest context. Rather than pin one static
+context, activation computes an **ordered ladder of load attempts** and walks it
+until one serves. Pure logic lives in `api/ds4-adaptive.js` (unit-tested in
+`ds4-adaptive.test.js`); `server.js` wires the real spawn/health/stop I/O.
+
+| Function | Purpose |
+|---|---|
+| `planDs4Attempts({configuredContext, minContext, availBytes, weightBytes, kvBytesPerToken, safetyBytes, ssdStreamingMode, streamingWeightBytes, ssdStreamingCacheExperts, adaptiveContext})` | Build the ordered `[{context, ssdStreaming, cacheExperts}]` plan |
+| `runDs4AdaptivePlan({attempts, startAttempt, waitForOutcome, stopAttempt, onAttempt})` | Walk the plan: advance on load-failure, stop on ready recording the settled attempt, abort on exhaustion |
+
+**Planner:** estimate the largest context that fits **non-streaming**
+(`fit = floor((availBytes − weightBytes − safetyBytes) / kvBytesPerToken)`, capped
+at `configuredContext`), build a descending halving ladder down to `minContext`
+(default 8192), then — when SSD expert-streaming is allowed — append a **streaming
+ladder** (streaming frees ~30G of resident weight RAM, so context re-raises to the
+configured max). Modes: `ssdStreaming` `'off'` never streams (may exhaust to a
+clean failure), `'on'` streams from the first attempt, `'auto'` (default) streams
+only after the non-streaming ladder bottoms out or when the weights don't fit at
+all. `adaptiveContext:false` collapses the plan to a single attempt at the
+configured context. The KV/safety/streaming-weight numbers are **estimates** — the
+plan is a fallback ladder; it always steps down on an **actual** OOM and never
+trusts the estimate alone. Defaults (`config.ds4` / `DS4_*` env overridable):
+`kvBytesPerToken` 128 KiB, `safetyBytes` 5 GiB, `streamingWeightBytes` 50 GiB.
+
+**Controller:** for each attempt the supervisor spawns ds4 with that context +
+streaming override (`DS4_CTX` + `DS4_SSD_STREAMING`/`DS4_SSD_STREAMING_CACHE_EXPERTS`
+via `start-ds4.sh`), and `waitDs4AttemptOutcome` resolves `ready` (health 200) or
+`load-failure` (process exited before serving) reusing the supervisor's
+`sawReady`/exit signal. While the plan runs the supervisor's own auto-restart
+circuit breaker is **suppressed** (`planMode`) — the controller drives the retries;
+`endPlan({settled})` locks the settled config in so a later post-settle auto-restart
+reuses what worked. On exhaustion the box **stays exclusive** (clean 503 for local
+ds4 requests) — it never rolls back to a competing local llama load. The settled
+runtime (`target` vs `effective` context/streaming + `status` of
+`loading`/`ready`/`exhausted`) is exposed at `/api/system/stats` as `ds4Runtime`.
+
+Per-preset overrides (`minContext`, `ssdStreaming`, `ssdStreamingCacheExperts`,
+`adaptiveContext`) are validated by `validatePresetEngineFields` and stored under
+the ds4 preset's `config`; global defaults live in `config.ds4` via
+`resolveDs4Config`.
 
 ### Routing table while ds4 active
 
