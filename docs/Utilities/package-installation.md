@@ -35,15 +35,19 @@ llama-managerctl restart
 ```
 
 Reads of keys whose names look sensitive are masked. The configuration file is
-`/etc/llama-manager/config.json` by default. Allowlisted service path settings
-live in `/etc/llama-manager/llama-manager.env`; do not put private signing keys
-there.
+`/etc/llama-manager/config.json` by default. Allowlisted service path and scalar
+settings live in `/etc/llama-manager/llama-manager.env`; do not put private
+signing keys there. Supported scalars are `API_PORT`, `LLAMA_PORT`, `EMBED_PORT`,
+`MODELS_MAX`, `CONTEXT_SIZE`, `AUTO_START`, and `STATS_INTERVAL`; invalid ports,
+numbers, or booleans fall back to package defaults.
 
 The service does not source that file or load it as a systemd environment file.
 A root-owned launcher reads literal values for documented path keys only and
 starts Node from an empty environment. Entries such as `NODE_OPTIONS`,
 `LD_PRELOAD`, `PATH`, `LLAMA_MANAGER_PACKAGED`, `LLAMA_MANAGER_NODE_BIN`, and
-`DS4_SERVER_BIN` are ignored and cannot change the package runtime.
+`DS4_SERVER_BIN` are ignored and cannot change the package runtime. The ROCm
+Distrobox is fixed at `llama-rocm-7.2.4`, and its llama binary is fixed at
+`/usr/local/bin/llama-server`.
 
 ## Select model storage
 
@@ -108,11 +112,17 @@ package/ISO repository must consume `packaging/runtime-contract.env`, stage all
 declared files as root-owned/non-group-writable content, and cache the runtime
 artifact during the release build so installation works offline.
 
+The contract names `start-llama.sh`, `container-start.sh`, and `start-ds4.sh`
+explicitly so the package builder can fail when a required launcher is missing.
+Inside Distrobox, host `/usr/lib` content is addressed through `/run/host`; the
+contract exports both host and container-visible paths for validation.
+
 ## Path overrides
 
 Advanced deployments can override `LLAMA_MANAGER_CONFIG_DIR`,
 `LLAMA_MANAGER_DATA_DIR`, `LLAMA_MANAGER_CACHE_DIR`, `MODELS_DIR`,
 `DS4_GGUF_DIR`, `DS4_STATE_DIR`, and `SLOT_SAVE_PATH` in the package environment
-file. See [Package-safe runtime architecture](../Designs/PackageSafeRuntime.md)
-for precedence, defaults, and the complete trust-boundary rationale. Unknown
-keys and executable/runtime settings in that file are deliberately ignored.
+file, along with the validated scalar settings listed above. See
+[Package-safe runtime architecture](../Designs/PackageSafeRuntime.md) for
+precedence, defaults, and the complete trust-boundary rationale. Unknown keys
+and executable/runtime settings in that file are deliberately ignored.

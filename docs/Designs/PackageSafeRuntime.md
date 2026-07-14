@@ -40,10 +40,21 @@ undersized runtime.
 
 The same manifest fixes the signed DS4 executable at
 `/usr/lib/llama-manager-ds4/bin/ds4-server` plus the package locations of the
-runtime and model-storage validators. Everything named by the manifest is
-root-owned and non-group-writable. The package/ISO build must acquire these
-artifacts while building the release so installation and first boot need no
-network access.
+runtime and model-storage validators. It also enumerates the actual required
+launch files: `start-llama.sh`, its inner `container-start.sh`, and
+`start-ds4.sh` (there is no package `start.sh`). Everything named by the
+manifest is root-owned and non-group-writable. The package/ISO build must
+acquire these artifacts while building the release so installation and first
+boot need no network access.
+
+Distrobox exposes the host root under `/run/host`. Package launchers therefore
+translate only package-owned `/usr/lib` artifacts at the boundary:
+`container-start.sh` runs as
+`/run/host/usr/lib/llama-manager/container-start.sh`, and the DS4 binary runs as
+`/run/host/usr/lib/llama-manager-ds4/bin/ds4-server`. Source installations keep
+their checkout and managed-state paths. The ROCm container
+`llama-rocm-7.2.4` and its `/usr/local/bin/llama-server` are immutable package
+runtime selections rather than group-managed configuration.
 
 ## DS4 update boundary
 
@@ -84,13 +95,17 @@ directly would let an application operator set `LLAMA_MANAGER_PACKAGED=0`,
 
 Instead, systemd starts the root-owned `run-packaged-service` launcher through
 `/usr/bin/env -i`. The launcher reads the mutable file as literal data, accepts
-only the documented configuration/data/model/cache path keys, and then creates
-a second empty environment containing those paths plus immutable package mode,
-Node, DS4, `PATH`, and home values. It never sources the file. Executable
-selectors, language runtime options, dynamic-loader settings, and unknown keys
-are discarded. This preserves group-managed model and configuration paths
-without converting service restart permission into service-account code
-execution.
+only the documented configuration/data/model/cache paths and validated scalar
+settings (`API_PORT`, `LLAMA_PORT`, `EMBED_PORT`, `MODELS_MAX`, `CONTEXT_SIZE`,
+`AUTO_START`, and `STATS_INTERVAL`), and then creates a second empty environment
+containing those settings plus immutable package mode, Node, DS4, Distrobox,
+llama-server, `PATH`, and home values. Port ranges, positive numeric limits, and
+the boolean flag are validated before use; invalid values retain package
+defaults. The launcher never sources the file. Executable selectors, language
+runtime options, dynamic-loader settings, and unknown keys are discarded. This
+preserves group-managed model and configuration paths—including a non-default
+dashboard/API port—without converting service restart permission into
+service-account code execution.
 
 ## Service hardening
 

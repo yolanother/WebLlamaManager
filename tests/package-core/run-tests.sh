@@ -177,7 +177,7 @@ test_canonical_service_assets_are_package_safe() {
 
 test_packaged_ds4_uses_root_owned_binary() {
   printf 'test_packaged_ds4_uses_root_owned_binary\n'
-  local sandbox output
+  local sandbox output container_binary host_output host_binary
   sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-ds4-package.XXXXXX")"
   mkdir -p "$sandbox/current"
   printf '#!/bin/sh\n' > "$sandbox/current/ds4-server"
@@ -185,12 +185,27 @@ test_packaged_ds4_uses_root_owned_binary() {
 
   output="$(LLAMA_MANAGER_PACKAGED=1 DS4_STATE_DIR="$sandbox" DS4_MODEL=model.gguf \
     bash "$REPO_ROOT/start-ds4.sh" --print-cmd)"
-  assert_contains "packaged launcher selects package binary" "$output" "/usr/lib/llama-manager-ds4/bin/ds4-server"
+  container_binary="${output%% *}"
+  if [ "$container_binary" = "/run/host/usr/lib/llama-manager-ds4/bin/ds4-server" ]; then
+    printf '  ok   packaged distrobox launcher maps the package binary through host root\n'
+  else
+    printf '  FAIL packaged distrobox binary path is %s\n' "$container_binary"
+    failures=$((failures + 1))
+  fi
   if [[ "$output" == *"$sandbox/current/ds4-server"* ]]; then
     printf '  FAIL packaged launcher selected writable DS4 state binary\n'
     failures=$((failures + 1))
   else
     printf '  ok   packaged launcher ignores writable DS4 state binary\n'
+  fi
+  host_output="$(LLAMA_MANAGER_PACKAGED=1 DS4_IN_DISTROBOX=0 DS4_STATE_DIR="$sandbox" \
+    DS4_MODEL=model.gguf bash "$REPO_ROOT/start-ds4.sh" --print-cmd)"
+  host_binary="${host_output%% *}"
+  if [ "$host_binary" = "/usr/lib/llama-manager-ds4/bin/ds4-server" ]; then
+    printf '  ok   packaged host launcher retains the host package path\n'
+  else
+    printf '  FAIL packaged host binary path is %s\n' "$host_binary"
+    failures=$((failures + 1))
   fi
   rm -rf "$sandbox"
 }
@@ -207,6 +222,27 @@ test_source_ds4_keeps_managed_state_binary() {
   rm -rf "$sandbox"
 }
 
+test_llama_launcher_maps_package_scripts_into_distrobox() {
+  printf 'test_llama_launcher_maps_package_scripts_into_distrobox\n'
+  local sandbox output source_output
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-container-paths.XXXXXX")"
+  output="$(LLAMA_MANAGER_PACKAGED=1 DISTROBOX_CONTAINER=operator-container \
+    LLAMA_SERVER_BIN=/tmp/operator-llama MODELS_DIR="$sandbox/models" \
+    bash "$REPO_ROOT/start-llama.sh" --print-cmd 2>&1)"
+  assert_contains "packaged llama uses fixed ROCm container" "$output" "container=llama-rocm-7.2.4"
+  assert_contains "packaged llama maps container launcher through host root" "$output" \
+    "launcher=/run/host/usr/lib/llama-manager/container-start.sh"
+  assert_contains "packaged llama selects container-owned server" "$output" \
+    "llama_server=/usr/local/bin/llama-server"
+
+  source_output="$(DISTROBOX_CONTAINER=source-container LLAMA_SERVER_BIN=/source/llama-server \
+    MODELS_DIR="$sandbox/models" bash "$REPO_ROOT/start-llama.sh" --print-cmd 2>&1)"
+  assert_contains "source llama preserves configured container" "$source_output" "container=source-container"
+  assert_contains "source llama preserves checkout launcher" "$source_output" "launcher=$REPO_ROOT/container-start.sh"
+  assert_contains "source llama preserves configured server" "$source_output" "llama_server=/source/llama-server"
+  rm -rf "$sandbox"
+}
+
 test_packaged_service_uses_declared_offline_node_runtime() {
   printf 'test_packaged_service_uses_declared_offline_node_runtime\n'
   local service contract
@@ -217,7 +253,14 @@ test_packaged_service_uses_declared_offline_node_runtime() {
   assert_contains "manifest declares minimum Node" "$contract" "LLAMA_MANAGER_NODE_VERSION_MIN=20.18.1"
   assert_contains "manifest declares bundled Node path" "$contract" "LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node"
   assert_contains "manifest declares sanitized launcher" "$contract" "LLAMA_MANAGER_SERVICE_LAUNCHER=/usr/lib/llama-manager/scripts/run-packaged-service"
+  assert_contains "manifest declares the real llama launcher" "$contract" "LLAMA_MANAGER_LLAMA_LAUNCHER=/usr/lib/llama-manager/start-llama.sh"
+  assert_contains "manifest requires the inner container launcher" "$contract" "LLAMA_MANAGER_CONTAINER_START=/usr/lib/llama-manager/container-start.sh"
+  assert_contains "manifest declares the DS4 launcher" "$contract" "LLAMA_MANAGER_DS4_LAUNCHER=/usr/lib/llama-manager/start-ds4.sh"
+  assert_contains "manifest declares container-visible app root" "$contract" "LLAMA_MANAGER_CONTAINER_APP_ROOT=/run/host/usr/lib/llama-manager"
   assert_contains "manifest declares DS4 package path" "$contract" "LLAMA_MANAGER_DS4_BIN=/usr/lib/llama-manager-ds4/bin/ds4-server"
+  assert_contains "manifest declares container-visible DS4 path" "$contract" "LLAMA_MANAGER_CONTAINER_DS4_BIN=/run/host/usr/lib/llama-manager-ds4/bin/ds4-server"
+  assert_contains "manifest pins the ROCm distrobox" "$contract" "LLAMA_MANAGER_DISTROBOX_CONTAINER=llama-rocm-7.2.4"
+  assert_contains "manifest pins the container llama binary" "$contract" "LLAMA_MANAGER_LLAMA_SERVER_BIN=/usr/local/bin/llama-server"
   assert_contains "manifest declares storage validator path" "$contract" "LLAMA_MANAGER_STORAGE_CHECK=/usr/lib/llama-manager/scripts/check-model-storage.mjs"
   if [[ "$service" == *"ExecStart=/usr/bin/node"* ]]; then
     printf '  FAIL service depends on Ubuntu system Node\n'
@@ -235,9 +278,12 @@ test_packaged_service_rejects_group_config_runtime_injection() {
 LLAMA_MANAGER_PACKAGED=0
 LLAMA_MANAGER_NODE_BIN=/tmp/operator-node
 DS4_SERVER_BIN=/tmp/operator-ds4
+DISTROBOX_CONTAINER=operator-container
+LLAMA_SERVER_BIN=/tmp/operator-llama
 NODE_OPTIONS=--require=/tmp/operator-code.js
 LD_PRELOAD=/tmp/operator-code.so
 MODELS_DIR=/mnt/shared/models
+API_PORT=4311
 EOF
 
   output="$(bash "$REPO_ROOT/scripts/run-packaged-service" --print-env "$sandbox/llama-manager.env" 2>&1)"
@@ -246,8 +292,12 @@ EOF
   assert_contains "packaged mode remains immutable" "$output" "LLAMA_MANAGER_PACKAGED=1"
   assert_contains "Node path remains package owned" "$output" "LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node"
   assert_contains "DS4 path remains package owned" "$output" "DS4_SERVER_BIN=/usr/lib/llama-manager-ds4/bin/ds4-server"
+  assert_contains "ROCm container remains package selected" "$output" "DISTROBOX_CONTAINER=llama-rocm-7.2.4"
+  assert_contains "llama binary remains container owned" "$output" "LLAMA_SERVER_BIN=/usr/local/bin/llama-server"
   assert_contains "ordinary model storage remains configurable" "$output" "MODELS_DIR=/mnt/shared/models"
+  assert_contains "validated API port remains configurable" "$output" "API_PORT=4311"
   if [[ "$output" == *"operator-node"* || "$output" == *"operator-ds4"* ||
+        "$output" == *"operator-container"* || "$output" == *"operator-llama"* ||
         "$output" == *"NODE_OPTIONS"* || "$output" == *"LD_PRELOAD"* ]]; then
     printf '  FAIL writable configuration injected executable runtime state\n'
     failures=$((failures + 1))
@@ -265,6 +315,30 @@ EOF
   rm -rf "$sandbox"
 }
 
+test_packaged_service_rejects_invalid_scalar_configuration() {
+  printf 'test_packaged_service_rejects_invalid_scalar_configuration\n'
+  local sandbox output
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-invalid-scalars.XXXXXX")"
+  cat > "$sandbox/llama-manager.env" <<'EOF'
+API_PORT=not-a-port
+LLAMA_PORT=70000
+EMBED_PORT=0
+MODELS_MAX=-1
+CONTEXT_SIZE=lots
+AUTO_START=maybe
+STATS_INTERVAL=none
+EOF
+  output="$(bash "$REPO_ROOT/scripts/run-packaged-service" --print-env "$sandbox/llama-manager.env")"
+  assert_contains "invalid API port falls back safely" "$output" "API_PORT=3001"
+  assert_contains "invalid llama port falls back safely" "$output" "LLAMA_PORT=8080"
+  assert_contains "invalid embedding port falls back safely" "$output" "EMBED_PORT=5252"
+  assert_contains "invalid model limit falls back safely" "$output" "MODELS_MAX=2"
+  assert_contains "invalid context falls back safely" "$output" "CONTEXT_SIZE=8192"
+  assert_contains "invalid autostart falls back safely" "$output" "AUTO_START=true"
+  assert_contains "invalid stats interval falls back safely" "$output" "STATS_INTERVAL=1000"
+  rm -rf "$sandbox"
+}
+
 test_packaged_install_helper_is_sourceable
 test_packaged_install_exits_with_apt_guidance
 test_ctl_reports_overridden_runtime_paths
@@ -276,8 +350,10 @@ test_ctl_rejects_model_storage_unusable_by_service_identity
 test_canonical_service_assets_are_package_safe
 test_packaged_ds4_uses_root_owned_binary
 test_source_ds4_keeps_managed_state_binary
+test_llama_launcher_maps_package_scripts_into_distrobox
 test_packaged_service_uses_declared_offline_node_runtime
 test_packaged_service_rejects_group_config_runtime_injection
+test_packaged_service_rejects_invalid_scalar_configuration
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%d failed\n' "$failures"

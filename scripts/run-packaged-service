@@ -15,6 +15,8 @@ readonly CONFIG_FILE_DEFAULT=/etc/llama-manager/llama-manager.env
 readonly NODE_BIN=/usr/lib/llama-manager/node/bin/node
 readonly SERVER_ENTRY=/usr/lib/llama-manager/api/server.js
 readonly DS4_BIN=/usr/lib/llama-manager-ds4/bin/ds4-server
+readonly ROCM_CONTAINER=llama-rocm-7.2.4
+readonly LLAMA_BIN=/usr/local/bin/llama-server
 
 declare -A SERVICE_ENV=(
   [NODE_ENV]=production
@@ -28,9 +30,18 @@ declare -A SERVICE_ENV=(
   [DS4_GGUF_DIR]=/var/lib/llama-manager/models/ds4
   [DS4_STATE_DIR]=/var/lib/llama-manager/ds4
   [DS4_SERVER_BIN]="$DS4_BIN"
+  [DISTROBOX_CONTAINER]="$ROCM_CONTAINER"
+  [LLAMA_SERVER_BIN]="$LLAMA_BIN"
   [SLOT_SAVE_PATH]=/var/cache/llama-manager/slots
   [XDG_RUNTIME_DIR]=/run/llama-manager
   [PATH]=/usr/local/bin:/usr/bin:/bin
+  [API_PORT]=3001
+  [LLAMA_PORT]=8080
+  [EMBED_PORT]=5252
+  [MODELS_MAX]=2
+  [CONTEXT_SIZE]=8192
+  [AUTO_START]=true
+  [STATS_INTERVAL]=1000
 )
 
 # Return success only for mutable path settings that the package service may
@@ -38,8 +49,36 @@ declare -A SERVICE_ENV=(
 is_mutable_setting() {
   case "$1" in
     LLAMA_MANAGER_CONFIG_DIR|CONFIG_PATH|LLAMA_MANAGER_DATA_DIR|LLAMA_MANAGER_CACHE_DIR|\
-      MODELS_DIR|DS4_GGUF_DIR|DS4_STATE_DIR|SLOT_SAVE_PATH) return 0 ;;
+      MODELS_DIR|DS4_GGUF_DIR|DS4_STATE_DIR|SLOT_SAVE_PATH|API_PORT|LLAMA_PORT|\
+      EMBED_PORT|MODELS_MAX|CONTEXT_SIZE|AUTO_START|STATS_INTERVAL) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+# Validate the documented scalar settings before copying them into the service
+# environment. Path settings remain literal strings and are constrained by the
+# service account and systemd filesystem policy.
+is_valid_setting_value() {
+  local key="$1" value="$2" number
+  case "$key" in
+    API_PORT|LLAMA_PORT|EMBED_PORT)
+      [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+      number=$((10#$value))
+      [ "$number" -ge 1 ] && [ "$number" -le 65535 ]
+      ;;
+    MODELS_MAX)
+      [[ "$value" =~ ^[0-9]{1,4}$ ]] || return 1
+      number=$((10#$value))
+      [ "$number" -ge 1 ] && [ "$number" -le 1024 ]
+      ;;
+    CONTEXT_SIZE)
+      [[ "$value" =~ ^[0-9]{1,10}$ ]] && [ "$((10#$value))" -ge 1 ]
+      ;;
+    STATS_INTERVAL)
+      [[ "$value" =~ ^[0-9]{1,9}$ ]] && [ "$((10#$value))" -ge 1 ]
+      ;;
+    AUTO_START) [[ "$value" =~ ^(true|false|1|0)$ ]] ;;
+    *) return 0 ;;
   esac
 }
 
@@ -59,6 +98,7 @@ load_mutable_settings() {
       \"*\") value="${value#\"}"; value="${value%\"}" ;;
     esac
     case "$value" in *$'\r'*|*$'\n'*) continue ;; esac
+    is_valid_setting_value "$key" "$value" || continue
     SERVICE_ENV["$key"]="$value"
   done < "$config_file"
 }

@@ -486,8 +486,10 @@ Check logs: `journalctl --user -u llama-manager -f`
 ### distrobox errors
 Ensure the container exists: `distrobox list`
 If not running, initialize it: `distrobox enter llama-rocm-7.2.4` (or set
-`DISTROBOX_CONTAINER` in the `llama-manager.service` env to use a different
-container — note `.env` alone does not override the systemd user environment; see
+For source installs, set `DISTROBOX_CONTAINER` in the user
+`llama-manager.service` environment to use a different container. Debian
+packages intentionally pin `llama-rocm-7.2.4`; note `.env` alone does not
+override the systemd user environment; see
 [`docs/llama-cpp-rocm-build-and-deployment.md`](docs/llama-cpp-rocm-build-and-deployment.md)).
 To create it: `distrobox create --name llama-rocm-7.2.4 --image docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4 --yes`
 
