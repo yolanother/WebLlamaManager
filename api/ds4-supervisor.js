@@ -59,6 +59,14 @@ export function createDs4Supervisor({
   let intentionalStop = false;
   let restartInProgress = false;
   let restartHistory = [];
+  // Load-failure circuit breaker: ds4 OOMing at the ~80GB weight-load tail exits
+  // non-zero WITHOUT ever serving /v1/models. Re-loading the same 80GB with the same
+  // config just OOMs again (slow restart-thrash). `sawReady` flips true once health
+  // reports ok; a non-zero exit while still !sawReady counts a load failure, and we
+  // stop auto-restarting after `ds4MaxLoadFailures` consecutive ones. Reset on a
+  // fresh (non-auto) activation and on a successful serve.
+  let sawReady = false;
+  let consecutiveLoadFailures = 0;
 
   /** @returns {boolean} whether the ds4 child is currently alive. */
   function isRunning() {
@@ -116,7 +124,7 @@ export function createDs4Supervisor({
     }
     restartHistory = decision.history;
     setTimeoutFn(() => {
-      if (!isRunning() && !intentionalStop) start(activePreset);
+      if (!isRunning() && !intentionalStop) start(activePreset, { isAutoRestart: true });
     }, 3000);
   }
 
@@ -125,7 +133,7 @@ export function createDs4Supervisor({
    * @param {object} [preset] Defaults to the last active preset (used by auto-restart).
    * @returns {object|undefined} the spawned child, or undefined when skipped.
    */
-  function start(preset = activePreset) {
+  function start(preset = activePreset, { isAutoRestart = false } = {}) {
     if (!preset) {
       log('[ds4] start called with no preset; ignoring');
       return;
@@ -133,6 +141,10 @@ export function createDs4Supervisor({
     activePreset = preset;
     if (isRunning()) return proc;
     intentionalStop = false;
+    // A fresh (operator/user) activation gets a clean slate of load attempts; only
+    // auto-restarts accumulate toward the circuit breaker.
+    if (!isAutoRestart) consecutiveLoadFailures = 0;
+    sawReady = false;
 
     const startScript = `${projectRoot}/start-ds4.sh`;
     const child = spawn('bash', [startScript], {
@@ -152,7 +164,20 @@ export function createDs4Supervisor({
       log(`[ds4] ds4-server exited (code ${code})`);
       const wasIntentional = intentionalStop;
       proc = null;
-      if (!wasIntentional) scheduleAutoRestart();
+      if (wasIntentional) return;
+      // Load-failure circuit breaker: exited non-zero before ever serving = an OOM/
+      // crash during the ~80GB load. Retrying the same config just thrashes, so stop
+      // after ds4MaxLoadFailures consecutive load failures and surface the cause.
+      if (!sawReady && code !== 0) {
+        consecutiveLoadFailures++;
+        const max = getConfig()?.guard?.ds4MaxLoadFailures ?? 2;
+        if (consecutiveLoadFailures >= max) {
+          log(`[ds4] ds4-server failed to load ${consecutiveLoadFailures}x without serving (exit ${code}, likely OOM at the weight-load tail); NOT auto-restarting. Lower ds4 context, free RAM, or drop the embed server, then re-activate.`);
+          addLog('system', `ds4-server failed to load ${consecutiveLoadFailures}x (likely OOM before ready); auto-restart stopped. Lower ctx / free memory and re-activate.`);
+          return;
+        }
+      }
+      scheduleAutoRestart();
     });
     return child;
   }
@@ -200,6 +225,7 @@ export function createDs4Supervisor({
     if (!isRunning()) return { status: 'stopped', port: ds4.port, model };
     try {
       const r = await fetchFn(`http://127.0.0.1:${ds4.port}/v1/models`, { signal: AbortSignal.timeout(3000) });
+      if (r.ok) { sawReady = true; consecutiveLoadFailures = 0; }
       return { status: r.ok ? 'ok' : 'error', port: ds4.port, model };
     } catch {
       return { status: 'unavailable', port: ds4.port, model };
