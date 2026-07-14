@@ -1,0 +1,2216 @@
+#!/usr/bin/env python3
+# Llama Manager portable host recovery utility.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Creates inspectable, versioned backups of allowlisted Llama Manager and host
+# integration settings, describes safe adaptations for replacement machines,
+# and restores explicitly selected categories with rollback material. It never
+# includes credentials, arbitrary home data, model blobs, or signing keys.
+
+"""Create and safely restore portable Llama Manager host configuration bundles."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import errno
+import grp
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import socket
+import stat
+import sys
+import tempfile
+from typing import Any, Sequence
+from urllib.parse import parse_qsl, urlsplit
+
+
+SCHEMA_VERSION = 1
+DEFAULT_OUTPUT_DIR = "/volumes/llama-manager/private/system-backups"
+SENSITIVE_TERM = r"(?:token|secret|password|credential|api[_-]?key|private[_-]?key)"
+SENSITIVE_KEY_NAME = rf"[A-Za-z0-9_.-]*{SENSITIVE_TERM}[A-Za-z0-9_.-]*"
+SENSITIVE_KEY = re.compile(SENSITIVE_TERM, re.IGNORECASE)
+SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?P<key>{SENSITIVE_KEY_NAME})\s*=\s*"
+    rf"(?P<value>\"[^\"]*\"|'[^']*'|[^\s\"']+)",
+    re.IGNORECASE,
+)
+URL_CANDIDATE = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
+ALLOWLIST = {
+    "manager": (
+        "/etc/llama-manager/config.json",
+        "/etc/llama-manager/llama-manager.conf",
+        "/etc/default/llama-manager",
+    ),
+    "service": (
+        "/etc/systemd/system/llama-manager.service",
+        "/etc/systemd/system/llama-manager.service.d/override.conf",
+    ),
+    "kiosk": (
+        "/etc/gdm3/custom.conf",
+        "/var/lib/AccountsService/users/llama-kiosk",
+        "/usr/share/wayland-sessions/llama-kiosk.desktop",
+    ),
+    "platform": (
+        "/etc/default/grub",
+        "/etc/modprobe.d/blacklist-amdxdna.conf",
+    ),
+}
+ALLOWED_FILE_PAIRS = {
+    (category, path) for category, paths in ALLOWLIST.items() for path in paths
+}
+NFS_OPTION = re.compile(
+    r"^(?:defaults|rw|ro|hard|soft|intr|nointr|sync|async|noauto|auto|_netdev|"
+    r"nofail|bg|fg|cto|nocto|ac|noac|lock|nolock|"
+    r"local_lock=(?:all|none|flock|posix)|"
+    r"x-systemd\.(?:automount|(?:idle|mount|device)-timeout=\d+[smh]?|"
+    r"requires=[A-Za-z0-9_.@/-]+)|"
+    r"(?:vers|nfsvers)=(?:3|4(?:\.\d)?)|proto=(?:tcp|udp|rdma)|port=\d+|"
+    r"timeo=\d+|retrans=\d+|rsize=\d+|wsize=\d+|"
+    r"sec=(?:sys|krb5|krb5i|krb5p)|actimeo=\d+|"
+    r"lookupcache=(?:all|none|positive)|clientaddr=[0-9a-fA-F:.]+)$"
+)
+SAFE_NEW_FILE_MODES = {
+    "/etc/llama-manager/config.json": 0o640,
+    "/etc/llama-manager/llama-manager.conf": 0o640,
+    "/etc/default/llama-manager": 0o640,
+    "/var/lib/AccountsService/users/llama-kiosk": 0o600,
+}
+
+
+def redact_json(value: Any) -> Any:
+    """Return a JSON-compatible value with sensitive keyed values masked.
+
+    Args:
+        value: Parsed JSON value to sanitize recursively.
+
+    Returns:
+        A copy containing ``[REDACTED]`` for credential-like dictionary keys.
+    """
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if SENSITIVE_KEY.search(str(key)) else redact_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_json(item) for item in value]
+    if isinstance(value, str) and sensitive_complete_value(value):
+        return "[REDACTED]"
+    return value
+
+
+def sensitive_complete_value(value: str) -> bool:
+    """Return whether a full string value must be redacted conservatively.
+
+    Args:
+        value: Untrusted configuration value.
+
+    Returns:
+        ``True`` for embedded sensitive assignments or URL userinfo/query secrets.
+    """
+    if SENSITIVE_ASSIGNMENT.search(value):
+        return True
+    for candidate in URL_CANDIDATE.findall(value):
+        try:
+            parsed = urlsplit(candidate.rstrip(".,;:)"))
+        except ValueError:
+            return True
+        if parsed.username is not None or parsed.password is not None:
+            return True
+        if any(SENSITIVE_KEY.search(key) for key, _item in parse_qsl(parsed.query)):
+            return True
+    return False
+
+
+def mask_sensitive_assignments(text: str) -> str:
+    """Mask credential-like ``key=value`` fragments embedded in text.
+
+    Args:
+        text: Configuration line that may contain nested assignments.
+
+    Returns:
+        Text with sensitive assignment values replaced by ``[REDACTED]``.
+    """
+    return SENSITIVE_ASSIGNMENT.sub(lambda match: f"{match.group('key')}=[REDACTED]", text)
+
+
+def sanitize_file(source: bytes, logical: str) -> bytes:
+    """Sanitize one already-open allowlisted configuration payload.
+
+    Args:
+        source: Stable bytes read from the source host through a descriptor.
+        logical: Logical source path used to select JSON handling.
+
+    Returns:
+        Sanitized bytes ready for an fd-relative bundle write.
+
+    Raises:
+        ValueError: If a JSON configuration file cannot be parsed.
+    """
+    text = source.decode("utf-8")
+    if Path(logical).suffix == ".json":
+        parsed = json.loads(text)
+        return (
+            json.dumps(redact_json(parsed), indent=2, sort_keys=True) + "\n"
+        ).encode()
+    sanitized_lines: list[str] = []
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        systemd_match = re.match(r'^(Environment=)([A-Za-z_][A-Za-z0-9_]*)(=)(.*?)("?)$', line)
+        if systemd_match and (
+            SENSITIVE_KEY.search(systemd_match.group(2))
+            or sensitive_complete_value(systemd_match.group(4))
+        ):
+            sanitized_lines.append(
+                f"{systemd_match.group(1)}{systemd_match.group(2)}=[REDACTED]"
+            )
+        elif separator and (SENSITIVE_KEY.search(key) or sensitive_complete_value(value)):
+            sanitized_lines.append(f"{key}=[REDACTED]")
+        else:
+            sanitized_lines.append(mask_sensitive_assignments(line))
+    return ("\n".join(sanitized_lines) + "\n").encode()
+
+
+def logical_path(root: Path, absolute_path: str) -> Path:
+    """Resolve a logical system path beneath a production or test root.
+
+    Args:
+        root: Filesystem root used for this invocation.
+        absolute_path: Logical absolute host path.
+
+    Returns:
+        The corresponding concrete path beneath ``root``.
+    """
+    return root / absolute_path.lstrip("/")
+
+
+def read_source_file(root: Path, absolute_path: str) -> bytes | None:
+    """Read a logical regular file through no-follow ancestor descriptors.
+
+    Args:
+        root: Filesystem root used for this invocation.
+        absolute_path: Logical absolute source path.
+
+    Returns:
+        Stable file bytes, or ``None`` when the file is absent or not regular.
+
+    Raises:
+        ValueError: If any existing component is a symbolic link or escapes root.
+    """
+    if not absolute_path.startswith("/") or ".." in Path(absolute_path).parts:
+        raise ValueError(f"unsafe source path: {absolute_path}")
+    resolved_root = root.resolve()
+    parts = Path(absolute_path).parts[1:]
+    descriptor = os.open(
+        resolved_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        f"symbolic link is forbidden in backup source: {absolute_path}"
+                    ) from error
+                raise
+            os.close(descriptor)
+            descriptor = child
+        inject_source_parent_swap(resolved_root, absolute_path)
+        try:
+            source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError(
+                    f"symbolic link is forbidden in backup source: {absolute_path}"
+                ) from error
+            raise
+        try:
+            metadata = os.fstat(source)
+            if not stat.S_ISREG(metadata.st_mode):
+                return None
+            with os.fdopen(source, "rb") as stream:
+                source = -1
+                return stream.read()
+        finally:
+            if source >= 0:
+                os.close(source)
+    finally:
+        os.close(descriptor)
+
+
+def inject_source_parent_swap(root: Path, absolute_path: str) -> None:
+    """Inject a deterministic source race for integration tests only.
+
+    Args:
+        root: Resolved non-production source root.
+        absolute_path: Logical path currently being read.
+    """
+    requested = os.environ.get("LLAMA_RECOVERY_TEST_SOURCE_SWAP")
+    target = os.environ.get("LLAMA_RECOVERY_TEST_SOURCE_SWAP_TARGET")
+    if root == Path("/") or requested != absolute_path or not target:
+        return
+    parent = logical_path(root, absolute_path).parent
+    stable = parent.with_name(f"{parent.name}.stable")
+    if stable.exists():
+        return
+    parent.rename(stable)
+    parent.symlink_to(Path(target), target_is_directory=True)
+
+
+def safe_source_file(root: Path, absolute_path: str) -> bytes | None:
+    """Read an allowlisted source without following symbolic links.
+
+    Args:
+        root: Filesystem root used for this invocation.
+        absolute_path: Logical absolute source path.
+
+    Returns:
+        Stable regular-file bytes, or ``None`` when absent.
+    """
+    return read_source_file(root, absolute_path)
+
+
+def root_bounded_source_file(
+    root: Path, absolute_path: str, description: str
+) -> bytes | None:
+    """Read metadata through stable fds while allowing root-internal links.
+
+    Args:
+        root: Filesystem root used for this invocation.
+        absolute_path: Logical absolute metadata path.
+        description: Human-readable source class for safe error messages.
+
+    Returns:
+        Stable regular-file bytes, or ``None`` when absent.
+
+    Raises:
+        ValueError: If resolution escapes the supplied filesystem root.
+    """
+    candidate = logical_path(root, absolute_path)
+    if not candidate.exists() and not candidate.is_symlink():
+        return None
+    resolved_root = root.resolve()
+    resolved = candidate.resolve()
+    if resolved_root != resolved and resolved_root not in resolved.parents:
+        raise ValueError(f"{description} source escapes the backup root")
+    if not resolved.is_file():
+        return None
+    canonical = "/" + str(resolved.relative_to(resolved_root))
+    return read_source_file(resolved_root, canonical)
+
+
+def reject_symlink_components(path: Path) -> None:
+    """Reject any existing symbolic-link component of a path.
+
+    Args:
+        path: Absolute or working-directory-relative path to inspect.
+
+    Raises:
+        ValueError: If the path or any existing ancestor is a symbolic link.
+    """
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"symbolic link is forbidden in path: {cursor}")
+
+
+def secure_create_directory(path: Path, mode: int, exist_ok: bool) -> tuple[Path, int]:
+    """Create and retain an absolute directory through no-follow traversal.
+
+    Args:
+        path: Directory path to create.
+        mode: Permission mode for a newly created leaf.
+        exist_ok: Whether an existing leaf directory is acceptable.
+
+    Returns:
+        Absolute lexical directory path and its open directory descriptor.
+
+    Raises:
+        FileExistsError: If the leaf exists and ``exist_ok`` is false.
+        ValueError: If any component is a symlink or non-directory.
+    """
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    parts = absolute.parts[1:]
+    descriptor = os.open(absolute.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for index, part in enumerate(parts):
+            final = index == len(parts) - 1
+            created = False
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, mode if final else 0o755, dir_fd=descriptor)
+                fsync_directory_fd(descriptor)
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                created = True
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        f"symbolic link or non-directory in output path: {part}"
+                    ) from error
+                raise
+            if final and not created and not exist_ok:
+                os.close(child)
+                raise FileExistsError(f"directory already exists: {absolute}")
+            if final and created:
+                os.fchmod(child, mode)
+                os.fsync(child)
+            os.close(descriptor)
+            descriptor = child
+        return absolute, descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def create_child_directory(
+    parent: int, name: str, mode: int, exist_ok: bool
+) -> int:
+    """Create one child directory and return a stable open descriptor.
+
+    Args:
+        parent: Open trusted parent directory descriptor.
+        name: Validated single child name.
+        mode: Permission mode for a newly created child.
+        exist_ok: Whether an existing directory is acceptable.
+
+    Returns:
+        Open no-follow child directory descriptor.
+    """
+    if name in {"", ".", ".."} or "/" in name:
+        raise ValueError("unsafe output directory name")
+    created = False
+    try:
+        child = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+        )
+    except FileNotFoundError:
+        os.mkdir(name, mode, dir_fd=parent)
+        fsync_directory_fd(parent)
+        child = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+        )
+        created = True
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError(
+                f"symbolic link or non-directory in output path: {name}"
+            ) from error
+        raise
+    if not created and not exist_ok:
+        os.close(child)
+        raise FileExistsError(f"directory already exists: {name}")
+    if created:
+        os.fchmod(child, mode)
+        os.fsync(child)
+    return child
+
+
+def read_text_if_present(payload: bytes | None) -> str | None:
+    """Decode small metadata bytes when present.
+
+    Args:
+        payload: Metadata bytes already read through a stable descriptor.
+
+    Returns:
+        Stripped text, or ``None`` when the file is absent.
+    """
+    if payload is None:
+        return None
+    return payload.decode("utf-8", errors="replace").strip()
+
+
+def collect_nfs_mounts(root: Path) -> list[dict[str, Any]]:
+    """Parse portable NFS entries from the host fstab.
+
+    Args:
+        root: Filesystem root used for this invocation.
+
+    Returns:
+        Ordered mount records containing source, mountpoint, type, and options.
+    """
+    fstab = safe_source_file(root, "/etc/fstab")
+    if fstab is None:
+        return []
+    mounts: list[dict[str, Any]] = []
+    for raw_line in fstab.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) < 4 or fields[2] not in {"nfs", "nfs4"}:
+            continue
+        mount = {
+            "source": fields[0],
+            "mountpoint": fields[1],
+            "filesystem": fields[2],
+            "options": fields[3].split(","),
+        }
+        validate_nfs_mount(mount)
+        mounts.append(mount)
+    return mounts
+
+
+def collect_storage(root: Path, nfs_mounts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe model storage without copying model content.
+
+    Args:
+        root: Filesystem root used for this invocation.
+        nfs_mounts: Parsed NFS records to include in the storage manifest.
+
+    Returns:
+        Portable storage configuration.
+    """
+    models_dir: str | None = None
+    config_path = safe_source_file(root, "/etc/llama-manager/config.json")
+    if config_path is not None:
+        parsed = json.loads(config_path.decode("utf-8"))
+        candidate = parsed.get("modelsDir") or parsed.get("models_dir")
+        if isinstance(candidate, str):
+            models_dir = candidate
+    return {"modelsDir": models_dir, "nfsMounts": nfs_mounts}
+
+
+def collect_platform(root: Path) -> dict[str, Any]:
+    """Collect non-secret host hardware, kernel, firmware, and package metadata.
+
+    Args:
+        root: Filesystem root used for this invocation.
+
+    Returns:
+        Metadata useful when adapting a replacement host.
+    """
+    os_release: dict[str, str] = {}
+    os_release_path = root_bounded_source_file(root, "/etc/os-release", "platform")
+    if os_release_path is not None:
+        os_release_lines = os_release_path.decode(
+            "utf-8", errors="replace"
+        ).splitlines()
+        for line in os_release_lines:
+            key, separator, value = line.partition("=")
+            accepted_keys = {"ID", "VERSION_ID", "VERSION_CODENAME", "PRETTY_NAME"}
+            if separator and key in accepted_keys:
+                os_release[key] = value.strip('"')
+    package_status = root_bounded_source_file(
+        root, "/var/lib/dpkg/status", "platform"
+    )
+    packages: list[dict[str, str]] = []
+    if package_status is not None:
+        current: dict[str, str] = {}
+        status_lines = package_status.decode("utf-8", errors="replace").splitlines()
+        for line in status_lines + [""]:
+            if not line:
+                name = current.get("Package", "")
+                package_pattern = r"(?:llama-manager|linux-image|linux-firmware|firmware-amd|rocm)"
+                if re.match(package_pattern, name):
+                    packages.append({"name": name, "version": current.get("Version", "unknown")})
+                current = {}
+                continue
+            key, separator, value = line.partition(":")
+            if separator and key in {"Package", "Version"}:
+                current[key] = value.strip()
+    kernel_path = root_bounded_source_file(
+        root, "/proc/sys/kernel/osrelease", "platform"
+    )
+    product_path = root_bounded_source_file(
+        root, "/sys/class/dmi/id/product_name", "platform"
+    )
+    return {
+        "kernel": read_text_if_present(kernel_path),
+        "product": read_text_if_present(product_path),
+        "osRelease": os_release,
+        "packages": packages,
+    }
+
+
+def collect_runtime(root: Path) -> dict[str, Any]:
+    """Load the packaged runtime pin manifest when available.
+
+    Args:
+        root: Filesystem root used for this invocation.
+
+    Returns:
+        Sanitized runtime metadata, or an empty object.
+    """
+    runtime_path = safe_source_file(root, "/var/lib/llama-manager/runtime.json")
+    if runtime_path is None:
+        return {}
+    parsed = json.loads(runtime_path.decode("utf-8"))
+    sanitized = redact_json(parsed)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def reconfiguration_guide() -> bytes:
+    """Return replacement-host adaptation instructions for a bundle."""
+    return b"""# Reconfigure a Replacement Llama Manager Host
+
+This bundle is an inspectable configuration reference for a human, Codex or Claude.
+It is not a disk image and intentionally contains no credentials or model blobs.
+SHA-256 checksums detect accidental changes but do not authenticate the bundle.
+Use bundles only from the access-controlled private NAS or another trusted channel.
+
+1. Run `llama-manager-recovery inspect BUNDLE` and review `manifest.json`.
+2. Run `llama-manager-recovery plan BUNDLE` on the replacement host.
+3. Explicitly map NFS source and mount paths, kiosk users, and model storage paths.
+4. Preview selected categories with `restore BUNDLE --dry-run --categories ...`.
+5. Apply only reviewed categories. Preserve the emitted rollback directory and follow
+   its `ROLLBACK.md` if the replacement host does not behave as expected.
+
+Never copy machine-id, SSH keys, browser profiles, tokens, signing keys, or arbitrary
+home data into this bundle. Re-enter required credentials through their owning setup
+tools after restoration.
+"""
+
+
+def write_bundle_file(bundle: int, relative: str, payload: bytes) -> None:
+    """Atomically write one payload beneath an open bundle descriptor.
+
+    Args:
+        bundle: Open trusted bundle directory descriptor.
+        relative: Validated bundle-relative payload path.
+        payload: Complete file content.
+    """
+    path = Path(relative)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise ValueError(f"unsafe bundle payload path: {relative}")
+    parent = os.dup(bundle)
+    temporary = f".llama-manager-recovery-{secrets.token_hex(12)}"
+    descriptor = -1
+    try:
+        for part in path.parts[:-1]:
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, 0o700, dir_fd=parent)
+                fsync_directory_fd(parent)
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent,
+                )
+            os.close(parent)
+            parent = child
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o600)
+            os.fsync(stream.fileno())
+        os.replace(temporary, path.parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+        fsync_directory_fd(parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        os.close(parent)
+
+
+def validate_nfs_mount(mount: Any) -> None:
+    """Validate one portable NFS record before planning or restoration.
+
+    Args:
+        mount: Untrusted manifest value expected to describe one NFS mount.
+
+    Raises:
+        ValueError: If fields, types, paths, source, or options are unsafe.
+    """
+    expected = {"source", "mountpoint", "filesystem", "options"}
+    if not isinstance(mount, dict) or set(mount) != expected:
+        raise ValueError("manifest NFS mount has invalid fields")
+    source = mount["source"]
+    mountpoint = mount["mountpoint"]
+    filesystem = mount["filesystem"]
+    options = mount["options"]
+    if (
+        not isinstance(source, str)
+        or not re.fullmatch(r"[^\s#:]+(?:\.[^\s#:]+)*:/[^\s#]*", source)
+    ):
+        raise ValueError("manifest NFS source must be host:/export")
+    if (
+        not isinstance(mountpoint, str)
+        or not Path(mountpoint).is_absolute()
+        or ".." in Path(mountpoint).parts
+        or any(character.isspace() for character in mountpoint)
+    ):
+        raise ValueError("manifest NFS mountpoint is unsafe")
+    if filesystem not in {"nfs", "nfs4"}:
+        raise ValueError("manifest NFS filesystem is unsupported")
+    if (
+        not isinstance(options, list)
+        or not options
+        or any(
+            not isinstance(option, str) or not NFS_OPTION.fullmatch(option)
+            for option in options
+        )
+    ):
+        raise ValueError("manifest NFS options are unsupported or unsafe")
+
+
+def validate_manifest(bundle: Path, manifest: Any) -> dict[str, Any]:
+    """Validate the complete untrusted manifest against the recovery schema.
+
+    Args:
+        bundle: Bundle directory containing captured payload files.
+        manifest: Parsed JSON value to validate.
+
+    Returns:
+        The validated manifest object.
+
+    Raises:
+        ValueError: If any field could expand restore scope or has an unsafe type.
+    """
+    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != SCHEMA_VERSION:
+        raise ValueError("unsupported or invalid recovery bundle schema")
+    if not isinstance(manifest.get("sourceHost"), str) or not isinstance(
+        manifest.get("createdAt"), str
+    ):
+        raise ValueError("manifest source metadata has invalid types")
+    validate_hostname(manifest["sourceHost"])
+    validate_timestamp(manifest["createdAt"])
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise ValueError("manifest files must be a list")
+    seen: set[tuple[str, str]] = set()
+    expected_payloads: set[Path] = set()
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {"category", "path"}:
+            raise ValueError("manifest file entry has invalid fields")
+        category = entry["category"]
+        path = entry["path"]
+        if not isinstance(category, str) or not isinstance(path, str):
+            raise ValueError("manifest file entry has invalid types")
+        pair = (category, path)
+        if pair not in ALLOWED_FILE_PAIRS or pair in seen:
+            raise ValueError("manifest file entry is duplicate or outside the exact allowlist")
+        captured = bundle / "files" / path.lstrip("/")
+        if not captured.is_file() or captured.is_symlink():
+            raise ValueError("manifest allowlisted payload is missing or unsafe")
+        seen.add(pair)
+        expected_payloads.add(Path(path.lstrip("/")))
+    files_root = bundle / "files"
+    actual_payloads = {
+        payload.relative_to(files_root)
+        for payload in files_root.rglob("*")
+        if payload.is_file()
+    } if files_root.is_dir() else set()
+    if actual_payloads != expected_payloads:
+        raise ValueError("manifest payload set does not exactly match allowlisted entries")
+    storage = manifest.get("storage")
+    if not isinstance(storage, dict) or set(storage) != {"modelsDir", "nfsMounts"}:
+        raise ValueError("manifest storage has invalid fields")
+    models_dir = storage["modelsDir"]
+    if models_dir is not None and (
+        not isinstance(models_dir, str)
+        or not Path(models_dir).is_absolute()
+        or ".." in Path(models_dir).parts
+    ):
+        raise ValueError("manifest model storage path is unsafe")
+    mounts = storage["nfsMounts"]
+    if not isinstance(mounts, list):
+        raise ValueError("manifest NFS mounts must be a list")
+    for mount in mounts:
+        validate_nfs_mount(mount)
+    if not isinstance(manifest.get("platform"), dict) or not isinstance(
+        manifest.get("runtime"), dict
+    ):
+        raise ValueError("manifest platform/runtime metadata has invalid types")
+    if not isinstance(manifest.get("exclusions"), list) or any(
+        not isinstance(item, str) for item in manifest["exclusions"]
+    ):
+        raise ValueError("manifest exclusions have invalid types")
+    return manifest
+
+
+def load_manifest(bundle: Path) -> dict[str, Any]:
+    """Load and minimally validate a recovery bundle manifest.
+
+    Args:
+        bundle: Existing recovery bundle directory.
+
+    Returns:
+        Parsed manifest object.
+
+    Raises:
+        ValueError: If the manifest shape or schema is unsupported.
+    """
+    manifest_path = bundle / "manifest.json"
+    if manifest_path.is_symlink():
+        raise ValueError("bundle manifest must not be a symbolic link")
+    parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return validate_manifest(bundle, parsed)
+
+
+def verify_checksums(bundle: Path) -> bool:
+    """Verify every checksum listed by a recovery bundle.
+
+    Args:
+        bundle: Recovery bundle directory.
+
+    Returns:
+        ``True`` only when every listed relative payload exists and matches.
+    """
+    checksum_file = bundle / "SHA256SUMS"
+    if not checksum_file.is_file() or checksum_file.is_symlink():
+        return False
+    resolved_bundle = bundle.resolve()
+    listed: set[Path] = set()
+    for line in checksum_file.read_text(encoding="utf-8").splitlines():
+        expected, separator, relative = line.partition("  ")
+        if not separator or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            return False
+        candidate = (bundle / relative).resolve()
+        if resolved_bundle not in candidate.parents or not candidate.is_file():
+            return False
+        relative_path = candidate.relative_to(resolved_bundle)
+        if relative_path in listed:
+            return False
+        listed.add(relative_path)
+        if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected:
+            return False
+    actual: set[Path] = set()
+    for path in bundle.rglob("*"):
+        if not path.is_file() or path.name == "SHA256SUMS":
+            continue
+        if path.is_symlink():
+            return False
+        actual.add(path.resolve().relative_to(resolved_bundle))
+    return listed == actual and Path("manifest.json") in listed
+
+
+def inspect_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    """Summarize a bundle without exposing captured configuration values.
+
+    Args:
+        args: Parsed inspect command arguments.
+
+    Returns:
+        JSON-compatible safe bundle summary.
+    """
+    bundle = Path(args.bundle)
+    manifest = load_manifest(bundle)
+    categories = sorted(
+        {entry["category"] for entry in manifest.get("files", []) if "category" in entry}
+    )
+    if manifest.get("storage", {}).get("nfsMounts"):
+        categories.append("storage")
+    return {
+        "schemaVersion": manifest["schemaVersion"],
+        "sourceHost": manifest.get("sourceHost"),
+        "createdAt": manifest.get("createdAt"),
+        "categories": sorted(set(categories)),
+        "fileCount": len(manifest.get("files", [])),
+        "nfsMountCount": len(manifest.get("storage", {}).get("nfsMounts", [])),
+        "checksumsValid": verify_checksums(bundle),
+        "exclusions": manifest.get("exclusions", []),
+    }
+
+
+def parse_mappings(values: Sequence[str]) -> dict[str, str]:
+    """Parse repeated ``KEY=VALUE`` host adaptation mappings.
+
+    Args:
+        values: Mapping expressions from the command line.
+
+    Returns:
+        Mapping keys to their explicitly reviewed replacement values.
+
+    Raises:
+        ValueError: If an expression lacks a key or separator.
+    """
+    mappings: dict[str, str] = {}
+    for expression in values:
+        key, separator, value = expression.partition("=")
+        if not separator or not key or not value:
+            raise ValueError(f"invalid mapping {expression!r}; expected KEY=VALUE")
+        mappings[key] = value
+    return mappings
+
+
+def validate_mappings(mappings: dict[str, str], target_hostname: str) -> None:
+    """Validate replacement values before they can reach system configuration.
+
+    Args:
+        mappings: Explicit replacement-host mapping values.
+        target_hostname: Hostname detected or supplied for the restore target.
+
+    Raises:
+        ValueError: If a mapping is inconsistent or unsafe for its destination.
+    """
+    validate_hostname(target_hostname)
+    acknowledged_host = mappings.get("host.hostname")
+    if acknowledged_host is not None and acknowledged_host != target_hostname:
+        raise ValueError("host.hostname mapping must equal the target hostname")
+    for key, value in mappings.items():
+        if key == "storage.models_dir" or key.endswith(".mountpoint"):
+            path = Path(value)
+            if (
+                not path.is_absolute()
+                or ".." in path.parts
+                or any(char.isspace() for char in value)
+            ):
+                raise ValueError(f"{key} must be an absolute path without whitespace or '..'")
+            forbidden_roots = {
+                "/etc",
+                "/usr",
+                "/bin",
+                "/sbin",
+                "/lib",
+                "/lib64",
+                "/boot",
+                "/dev",
+                "/proc",
+                "/sys",
+                "/run",
+                "/var/backups",
+                "/var/lib/AccountsService",
+            }
+            normalized = str(path)
+            if normalized == "/" or any(
+                normalized == root or normalized.startswith(root + "/")
+                for root in forbidden_roots
+            ):
+                raise ValueError(f"{key} targets a protected system path")
+        elif key.endswith(".source"):
+            if not re.fullmatch(r"[^\s#:]+(?:\.[^\s#:]+)*:/[^\s#]*", value):
+                raise ValueError(f"{key} must be an NFS host:/export without whitespace")
+        elif key == "kiosk.user" and not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", value):
+            raise ValueError("kiosk.user must be a valid local account name")
+
+
+def resolve_manager_identity(
+    root: Path, manager_uid: int | None, manager_gid: int | None, required: bool
+) -> tuple[int, int] | None:
+    """Resolve the service account/group that must manage model storage.
+
+    Args:
+        root: Target filesystem root.
+        manager_uid: Test-root uid override, paired with ``manager_gid``.
+        manager_gid: Test-root gid override, paired with ``manager_uid``.
+        required: Whether this restore includes a model storage directory.
+
+    Returns:
+        Manager uid/gid pair, or ``None`` when storage identity is unnecessary.
+
+    Raises:
+        ValueError: If overrides are incomplete or the production identity is missing.
+    """
+    if not required:
+        return None
+    if (manager_uid is None) != (manager_gid is None):
+        raise ValueError("manager uid and gid overrides must be provided together")
+    if root.resolve() == Path("/"):
+        if manager_uid is not None:
+            raise ValueError("manager uid/gid overrides are forbidden for the real root")
+        try:
+            account = pwd.getpwnam("llama-manager")
+            group = grp.getgrnam("llama-manager")
+        except KeyError as error:
+            raise ValueError(
+                "llama-manager account and group must exist before storage restore"
+            ) from error
+        if account.pw_gid != group.gr_gid and account.pw_name not in group.gr_mem:
+            raise ValueError("llama-manager account is not a member of the llama-manager group")
+        return account.pw_uid, group.gr_gid
+    if manager_uid is None:
+        return os.geteuid(), os.getegid()
+    if manager_uid < 0 or manager_gid is None or manager_gid < 0:
+        raise ValueError("manager uid/gid overrides must be non-negative")
+    return manager_uid, manager_gid
+
+
+def kiosk_user(bundle: Path) -> str | None:
+    """Extract the captured kiosk autologin account from sanitized GDM config.
+
+    Args:
+        bundle: Recovery bundle directory.
+
+    Returns:
+        Captured username, or ``None`` when kiosk autologin was not configured.
+    """
+    gdm = bundle / "files" / "etc" / "gdm3" / "custom.conf"
+    if not gdm.is_file():
+        return None
+    for line in gdm.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("AutomaticLogin="):
+            return line.partition("=")[2].strip() or None
+    return None
+
+
+def required_mappings(
+    bundle: Path,
+    manifest: dict[str, Any],
+    target_hostname: str,
+    categories: set[str] | None = None,
+) -> list[str]:
+    """List explicit mappings needed before applying host-specific settings.
+
+    Args:
+        bundle: Recovery bundle directory.
+        manifest: Parsed bundle manifest.
+        target_hostname: Host receiving restored settings.
+        categories: Optional selected categories that limit mapping requirements.
+
+    Returns:
+        Stable, sorted mapping names required for safe restoration.
+    """
+    required: list[str] = []
+    selected = categories or {"manager", "service", "kiosk", "platform", "storage"}
+    if manifest.get("sourceHost") != target_hostname:
+        required.append("host.hostname")
+    storage = manifest.get("storage", {})
+    if storage.get("modelsDir") and selected.intersection({"manager", "storage"}):
+        required.append("storage.models_dir")
+    if "storage" in selected:
+        for index, _mount in enumerate(storage.get("nfsMounts", [])):
+            required.extend((f"nfs.{index}.source", f"nfs.{index}.mountpoint"))
+    has_account_record = any(
+        entry.get("path", "").startswith("/var/lib/AccountsService/users/")
+        for entry in manifest.get("files", [])
+    )
+    if "kiosk" in selected and (kiosk_user(bundle) or has_account_record):
+        required.append("kiosk.user")
+    return sorted(required)
+
+
+def plan_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    """Compare a bundle with a target root and report non-mutating actions.
+
+    Args:
+        args: Parsed plan command arguments.
+
+    Returns:
+        JSON-compatible change plan and outstanding mapping requirements.
+
+    Raises:
+        ValueError: If bundle checksums fail validation.
+    """
+    bundle = Path(args.bundle)
+    if not verify_checksums(bundle):
+        raise ValueError("bundle checksum validation failed")
+    manifest = load_manifest(bundle)
+    target_hostname = args.hostname or socket.gethostname()
+    mappings = parse_mappings(args.map)
+    validate_mappings(mappings, target_hostname)
+    changes: list[dict[str, str]] = []
+    root = Path(args.root)
+    for entry in manifest.get("files", []):
+        relative = entry["path"].lstrip("/")
+        captured = bundle / "files" / relative
+        target = root / relative
+        if not target.exists():
+            status = "create"
+        elif target.is_file() and target.read_bytes() == captured.read_bytes():
+            status = "unchanged"
+        else:
+            status = "replace"
+        changes.append(
+            {"category": entry["category"], "path": entry["path"], "status": status}
+        )
+    outstanding = [
+        key for key in required_mappings(bundle, manifest, target_hostname) if key not in mappings
+    ]
+    return {
+        "sourceHost": manifest.get("sourceHost"),
+        "targetHost": target_hostname,
+        "checksumsValid": True,
+        "changes": changes,
+        "requiredMappings": outstanding,
+        "readyToRestore": not outstanding,
+    }
+
+
+def parse_categories(value: str) -> set[str]:
+    """Parse and validate a comma-separated restore category list.
+
+    Args:
+        value: Category names supplied to ``restore --categories``.
+
+    Returns:
+        Non-empty set of selected category names.
+
+    Raises:
+        ValueError: If a category is missing or unsupported.
+    """
+    categories = {item.strip() for item in value.split(",") if item.strip()}
+    allowed = {"manager", "service", "kiosk", "platform", "storage"}
+    unsupported = categories - allowed
+    if not categories or unsupported:
+        raise ValueError(
+            "categories must contain only: " + ", ".join(sorted(allowed))
+        )
+    return categories
+
+
+def selected_file_changes(
+    bundle: Path,
+    manifest: dict[str, Any],
+    root: Path,
+    categories: set[str],
+    mappings: dict[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """Compute file changes limited to explicitly selected categories.
+
+    Args:
+        bundle: Recovery bundle directory.
+        manifest: Parsed recovery manifest.
+        root: Target filesystem root.
+        categories: Categories authorized for restoration.
+        mappings: Optional replacement-host mappings that affect target paths.
+
+    Returns:
+        Ordered observable create/replace/unchanged actions.
+    """
+    changes: list[dict[str, str]] = []
+    resolved_mappings = mappings or {}
+    for entry in manifest.get("files", []):
+        if entry["category"] not in categories:
+            continue
+        source_relative = entry["path"].lstrip("/")
+        logical = restore_logical_path(entry, resolved_mappings)
+        captured = bundle / "files" / source_relative
+        kind, current_payload, _metadata = snapshot_restore_target(root, logical)
+        if kind == "absent":
+            status = "create"
+        elif kind == "file" and current_payload == captured.read_bytes():
+            status = "unchanged"
+        else:
+            status = "replace"
+        changes.append(
+            {"category": entry["category"], "path": logical, "status": status}
+        )
+    if "storage" in categories and manifest.get("storage", {}).get("nfsMounts"):
+        changes.append({"category": "storage", "path": "/etc/fstab", "status": "review"})
+    if "storage" in categories and manifest.get("storage", {}).get("modelsDir"):
+        mapped_dir = resolved_mappings.get("storage.models_dir")
+        if mapped_dir is not None:
+            kind, _payload, _metadata = snapshot_restore_target(root, mapped_dir)
+            if kind == "file":
+                raise ValueError("model storage target is an existing regular file")
+            status = "unchanged-directory" if kind == "directory" else "create-directory"
+            changes.append({"category": "storage", "path": mapped_dir, "status": status})
+    return changes
+
+
+def restore_logical_path(entry: dict[str, str], mappings: dict[str, str]) -> str:
+    """Resolve the reviewed target path for one captured manifest entry.
+
+    Args:
+        entry: Validated manifest file entry.
+        mappings: Explicit replacement-host mappings.
+
+    Returns:
+        Logical target path, including a remapped AccountsService username.
+    """
+    path = entry["path"]
+    account_prefix = "/var/lib/AccountsService/users/"
+    if path.startswith(account_prefix):
+        user = mappings.get("kiosk.user")
+        if user is None:
+            raise ValueError("kiosk.user mapping is required for AccountsService restore")
+        return account_prefix + user
+    return path
+
+
+def safe_target(root: Path, logical: str) -> Path:
+    """Resolve a logical restore target without permitting path traversal.
+
+    Args:
+        root: Target filesystem root.
+        logical: Logical absolute system path from the signed manifest.
+
+    Returns:
+        Concrete target beneath ``root``.
+
+    Raises:
+        ValueError: If the path is not absolute or escapes the target root.
+    """
+    if not logical.startswith("/") or ".." in Path(logical).parts:
+        raise ValueError(f"unsafe restore path: {logical}")
+    reject_symlink_components(root)
+    target = root / logical.lstrip("/")
+    reject_symlink_components(target)
+    resolved_root = root.resolve()
+    resolved_parent = target.parent.resolve()
+    if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
+        raise ValueError(f"restore target escapes root: {logical}")
+    if target.is_symlink():
+        raise ValueError(f"restore target is a symbolic link: {logical}")
+    return target
+
+
+def open_restore_parent(root: Path, logical: str, create: bool) -> tuple[int, str]:
+    """Open a restore parent by descriptor without following path links.
+
+    Args:
+        root: Trusted restore filesystem root.
+        logical: Validated logical absolute target path.
+        create: Whether missing parent directories may be created.
+
+    Returns:
+        Open parent directory descriptor and leaf filename. The caller owns the fd.
+
+    Raises:
+        ValueError: If a component is a symlink or non-directory.
+    """
+    safe_target(root, logical)
+    parts = Path(logical).parts[1:]
+    if not parts:
+        raise ValueError("restore target cannot be the filesystem root")
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o755, dir_fd=descriptor)
+                fsync_directory_fd(descriptor)
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                os.fsync(child)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        f"symbolic link or non-directory in restore target: {logical}"
+                    ) from error
+                raise
+            os.close(descriptor)
+            descriptor = child
+        return descriptor, parts[-1]
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def snapshot_restore_target(
+    root: Path, logical: str
+) -> tuple[str, bytes | None, os.stat_result | None]:
+    """Read target state through no-follow descriptors for planning/rollback.
+
+    Args:
+        root: Trusted restore filesystem root.
+        logical: Validated logical absolute target path.
+
+    Returns:
+        Tuple of kind (``file``, ``directory``, or ``absent``), bytes, and stat.
+    """
+    if not root.exists():
+        reject_symlink_components(root)
+        return "absent", None, None
+    try:
+        parent, leaf = open_restore_parent(root, logical, create=False)
+    except FileNotFoundError:
+        return "absent", None, None
+    try:
+        try:
+            metadata = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return "absent", None, None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"restore target is a symbolic link: {logical}")
+        if stat.S_ISDIR(metadata.st_mode):
+            return "directory", None, metadata
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"restore target is not a regular file: {logical}")
+        descriptor = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise ValueError(f"restore target changed while being inspected: {logical}")
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                payload = stream.read()
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return "file", payload, metadata
+    finally:
+        os.close(parent)
+
+
+def atomic_write_destination(
+    root: Path,
+    logical: str,
+    payload: bytes,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> None:
+    """Atomically write a restore target using no-follow directory descriptors.
+
+    Args:
+        root: Trusted restore filesystem root.
+        logical: Validated logical absolute target path.
+        payload: Complete new file bytes.
+        uid: Replacement owner.
+        gid: Replacement group.
+        mode: Replacement permission bits.
+    """
+    parent, leaf = open_restore_parent(root, logical, create=True)
+    temporary = f".llama-manager-recovery-{secrets.token_hex(12)}"
+    descriptor = -1
+    try:
+        try:
+            existing = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(existing.st_mode):
+                raise ValueError(f"restore target became a symbolic link: {logical}")
+        except FileNotFoundError:
+            pass
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode,
+            dir_fd=parent,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fchown(stream.fileno(), uid, gid)
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+        os.replace(temporary, leaf, src_dir_fd=parent, dst_dir_fd=parent)
+        fsync_directory_fd(parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        os.close(parent)
+
+
+def remove_restore_destination(root: Path, logical: str) -> None:
+    """Durably remove a newly created restore target without following links.
+
+    Args:
+        root: Trusted restore filesystem root.
+        logical: Validated logical absolute target path.
+    """
+    try:
+        parent, leaf = open_restore_parent(root, logical, create=False)
+    except FileNotFoundError:
+        return
+    try:
+        try:
+            metadata = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"restore target became a symbolic link: {logical}")
+        if stat.S_ISDIR(metadata.st_mode):
+            os.rmdir(leaf, dir_fd=parent)
+        else:
+            os.unlink(leaf, dir_fd=parent)
+        fsync_directory_fd(parent)
+    finally:
+        os.close(parent)
+
+
+def create_managed_directory(root: Path, logical: str, uid: int, gid: int) -> bool:
+    """Create a durable setgid manager-owned directory without following links.
+
+    Args:
+        root: Trusted restore filesystem root.
+        logical: Validated logical model directory path.
+        uid: Llama Manager service account uid.
+        gid: Llama Manager group gid.
+
+    Returns:
+        ``True`` when the directory was created, otherwise ``False``.
+
+    Raises:
+        ValueError: If the target exists as a non-directory or has unsafe metadata.
+    """
+    parent, leaf = open_restore_parent(root, logical, create=True)
+    try:
+        try:
+            metadata = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            os.mkdir(leaf, 0o2775, dir_fd=parent)
+            child = os.open(
+                leaf,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+            try:
+                os.fchown(child, uid, gid)
+                os.fchmod(child, 0o2775)
+                os.fsync(child)
+            finally:
+                os.close(child)
+            fsync_directory_fd(parent)
+            return True
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("model storage target is an existing regular file")
+        mode = metadata.st_mode & 0o7777
+        if metadata.st_gid != gid or mode & 0o2070 != 0o2070:
+            raise ValueError(
+                "existing model storage directory is not setgid and group-manageable"
+            )
+        return False
+    finally:
+        os.close(parent)
+
+
+def merge_redacted_json(captured: Any, current: Any) -> Any:
+    """Replace redaction markers with current-host values when available.
+
+    Args:
+        captured: Sanitized bundle JSON value.
+        current: Existing target JSON value at the same location.
+
+    Returns:
+        Restorable JSON that never writes the literal redaction marker.
+    """
+    if captured == "[REDACTED]":
+        return current if current is not None else None
+    if isinstance(captured, dict):
+        current_dict = current if isinstance(current, dict) else {}
+        merged: dict[str, Any] = {}
+        for key, value in captured.items():
+            resolved = merge_redacted_json(value, current_dict.get(key))
+            if resolved is not None:
+                merged[key] = resolved
+        return merged
+    if isinstance(captured, list):
+        current_list = current if isinstance(current, list) else []
+        return [
+            merge_redacted_json(value, current_list[index] if index < len(current_list) else None)
+            for index, value in enumerate(captured)
+            if value != "[REDACTED]" or index < len(current_list)
+        ]
+    return captured
+
+
+def merge_redacted_text(captured: str, current: str) -> str:
+    """Resolve embedded redaction markers from existing target text.
+
+    Args:
+        captured: Sanitized bundle text.
+        current: Existing target configuration text.
+
+    Returns:
+        Text with target-host secret assignments preserved and unresolved secret
+        settings omitted rather than written as redaction markers.
+    """
+    current_values: dict[str, str] = {}
+    for match in re.finditer(
+        rf"(?P<key>{SENSITIVE_KEY_NAME})=(?P<value>[^\s\"']+)",
+        current,
+        re.IGNORECASE,
+    ):
+        current_values[match.group("key")] = match.group("value")
+    rendered: list[str] = []
+    marker = re.compile(
+        rf"(?P<key>{SENSITIVE_KEY_NAME})=\[REDACTED\]",
+        re.IGNORECASE,
+    )
+    for line in captured.splitlines():
+        keys = [match.group("key") for match in marker.finditer(line)]
+        if not keys:
+            rendered.append(line)
+            continue
+        if re.match(r"^(?:Environment=)?[A-Za-z0-9_.-]+=\[REDACTED\]$", line):
+            key = keys[0]
+            if key in current_values:
+                prefix = "Environment=" if line.startswith("Environment=") else ""
+                rendered.append(f"{prefix}{key}={current_values[key]}")
+            continue
+        for key in keys:
+            replacement = f"{key}={current_values[key]}" if key in current_values else ""
+            line = re.sub(re.escape(key) + r"=\[REDACTED\]", replacement, line)
+        rendered.append(re.sub(r" {2,}", " ", line))
+    return "\n".join(rendered) + "\n"
+
+
+def rendered_payload(
+    captured: Path,
+    current_payload: bytes | None,
+    logical: str,
+    category: str,
+    mappings: dict[str, str],
+) -> bytes:
+    """Render a captured file with explicit mappings and target secrets preserved.
+
+    Args:
+        captured: Sanitized bundle payload.
+        current_payload: Existing target bytes captured through a no-follow snapshot.
+        logical: Logical system path being restored.
+        category: Restore category owning this file.
+        mappings: Explicit replacement-host mappings.
+
+    Returns:
+        Safe bytes to write to the target.
+    """
+    text = captured.read_text(encoding="utf-8")
+    if captured.suffix == ".json":
+        saved = json.loads(text)
+        current: Any = {}
+        if current_payload is not None:
+            try:
+                current = json.loads(current_payload.decode())
+            except json.JSONDecodeError:
+                current = {}
+        merged = merge_redacted_json(saved, current)
+        if category == "manager" and "storage.models_dir" in mappings:
+            if "modelsDir" in merged:
+                merged["modelsDir"] = mappings["storage.models_dir"]
+            elif "models_dir" in merged:
+                merged["models_dir"] = mappings["storage.models_dir"]
+        return (json.dumps(merged, indent=2, sort_keys=True) + "\n").encode()
+    current_text = current_payload.decode(errors="replace") if current_payload else ""
+    text = merge_redacted_text(text, current_text)
+    current_by_key: dict[str, str] = {}
+    current_systemd_environment: dict[str, str] = {}
+    if current_text:
+        for current_line in current_text.splitlines():
+            key, separator, _value = current_line.partition("=")
+            if separator:
+                current_by_key[key] = current_line
+            systemd_match = re.match(
+                r'^Environment=([A-Za-z_][A-Za-z0-9_]*)=.*$', current_line
+            )
+            if systemd_match:
+                current_systemd_environment[systemd_match.group(1)] = current_line
+    rendered: list[str] = []
+    for line in text.splitlines():
+        systemd_redaction = re.match(
+            r'^Environment=([A-Za-z_][A-Za-z0-9_]*)=\[REDACTED\]$', line
+        )
+        if systemd_redaction:
+            preserved = current_systemd_environment.get(systemd_redaction.group(1))
+            if preserved:
+                rendered.append(preserved)
+            continue
+        key, separator, value = line.partition("=")
+        if separator and value == "[REDACTED]":
+            if key in current_by_key:
+                rendered.append(current_by_key[key])
+            continue
+        if category == "kiosk" and key == "AutomaticLogin" and "kiosk.user" in mappings:
+            rendered.append(f"AutomaticLogin={mappings['kiosk.user']}")
+        elif category == "kiosk" and key == "UserName" and "kiosk.user" in mappings:
+            rendered.append(f"UserName={mappings['kiosk.user']}")
+        elif (
+            category == "manager"
+            and key in {"MODELS_DIR", "modelsDir"}
+            and "storage.models_dir" in mappings
+        ):
+            rendered.append(f"{key}={mappings['storage.models_dir']}")
+        else:
+            rendered.append(line)
+    return ("\n".join(rendered) + "\n").encode()
+
+
+def target_metadata(
+    root: Path, metadata: os.stat_result | None, logical: str
+) -> tuple[int, int, int]:
+    """Choose owner, group, and mode without weakening an existing target.
+
+    Args:
+        root: Target filesystem root.
+        metadata: Existing target metadata from a no-follow snapshot.
+        logical: Logical system path used for the safe-new-file policy.
+
+    Returns:
+        Tuple of ``(uid, gid, mode)`` for the atomic replacement.
+    """
+    if metadata is not None:
+        return metadata.st_uid, metadata.st_gid, metadata.st_mode & 0o7777
+    uid = 0 if root.resolve() == Path("/") else os.geteuid()
+    gid = 0 if root.resolve() == Path("/") else os.getegid()
+    manager_paths = ("/etc/llama-manager/", "/etc/default/llama-manager")
+    if root.resolve() == Path("/") and logical.startswith(manager_paths):
+        try:
+            gid = grp.getgrnam("llama-manager").gr_gid
+        except KeyError:
+            gid = 0
+    mode = SAFE_NEW_FILE_MODES.get(logical, 0o644)
+    if logical.startswith("/var/lib/AccountsService/users/"):
+        mode = 0o600
+    return uid, gid, mode
+
+
+def atomic_write(target: Path, payload: bytes, uid: int, gid: int, mode: int) -> None:
+    """Durably replace a file in-place with explicit metadata.
+
+    Args:
+        target: Final file path.
+        payload: Complete new file bytes.
+        uid: Owner for the replacement inode.
+        gid: Group for the replacement inode.
+        mode: Permission bits for the replacement inode.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".llama-manager-recovery-", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fchown(stream.fileno(), uid, gid)
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        fsync_directory(target.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def fsync_directory(path: Path) -> None:
+    """Flush directory entry changes to durable storage.
+
+    Args:
+        path: Existing directory whose metadata should be synchronized.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fsync_directory_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_directory_fd(descriptor: int) -> None:
+    """Synchronize an already-open directory descriptor.
+
+    Args:
+        descriptor: Read-only directory file descriptor.
+    """
+    os.fsync(descriptor)
+
+
+def backup_restore_targets(
+    root: Path, rollback: Path, targets: Sequence[tuple[str, Path]]
+) -> list[dict[str, Any]]:
+    """Snapshot every target before any restore write occurs.
+
+    Args:
+        root: Target filesystem root.
+        rollback: Rollback directory receiving originals.
+        targets: Logical paths paired with concrete target paths.
+
+    Returns:
+        Rollback manifest entries recording prior existence.
+    """
+    records: list[dict[str, Any]] = []
+    for logical, _target in targets:
+        kind, payload, metadata = snapshot_restore_target(root, logical)
+        record: dict[str, Any] = {"path": logical, "kind": kind}
+        if kind == "file":
+            if payload is None or metadata is None:
+                raise ValueError(f"failed to snapshot restore target: {logical}")
+            destination = rollback / "original" / logical.lstrip("/")
+            atomic_write(
+                destination,
+                payload,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_mode & 0o7777,
+            )
+            record["backup"] = str(destination.relative_to(rollback))
+            record.update(
+                {
+                    "uid": metadata.st_uid,
+                    "gid": metadata.st_gid,
+                    "mode": metadata.st_mode & 0o7777,
+                }
+            )
+        records.append(record)
+    return records
+
+
+def write_rollback_guide(
+    rollback: Path, records: Sequence[dict[str, Any]], state: str
+) -> None:
+    """Write explicit rollback commands for a completed restore.
+
+    Args:
+        rollback: Rollback directory containing prior state.
+        records: Target state records created before restoration.
+        state: Current transaction state.
+    """
+    lines = [
+        "# Llama Manager Recovery Rollback",
+        "",
+        f"Transaction state: `{state}`.",
+        "An interrupted or failed restore attempts automatic rollback before exiting.",
+        "",
+        "Restore this directory before retrying or adapting the recovery plan.",
+        "Run these commands as root after reviewing each target:",
+        "",
+    ]
+    for record in records:
+        if record["kind"] == "file":
+            lines.append(f"- Restore `{record['path']}` from `{record['backup']}`.")
+        elif record["kind"] == "absent":
+            lines.append(f"- Remove `{record['path']}`; it did not exist before restore.")
+        else:
+            lines.append(f"- Leave `{record['path']}` in place; it was an existing directory.")
+    lines.extend(
+        [
+            "",
+            "After restoring systemd or boot files, reload the corresponding manager",
+            "or regenerate boot configuration before restarting the host.",
+        ]
+    )
+    atomic_write(
+        rollback / "ROLLBACK.md",
+        ("\n".join(lines) + "\n").encode(),
+        os.geteuid(),
+        os.getegid(),
+        0o600,
+    )
+
+
+def write_rollback_state(
+    rollback: Path,
+    timestamp: str,
+    records: Sequence[dict[str, Any]],
+    state: str,
+    error: str | None = None,
+) -> None:
+    """Durably persist transaction state before or after mutations.
+
+    Args:
+        rollback: Transaction rollback directory.
+        timestamp: Stable transaction identifier.
+        records: Prepared target snapshots.
+        state: ``prepared``, ``completed``, ``rolled_back``, or ``rollback_failed``.
+        error: Optional failure summary without configuration values.
+    """
+    manifest: dict[str, Any] = {
+        "createdAt": timestamp,
+        "state": state,
+        "targets": list(records),
+    }
+    if error is not None:
+        manifest["error"] = error
+    atomic_write(
+        rollback / "manifest.json",
+        (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
+        os.geteuid(),
+        os.getegid(),
+        0o600,
+    )
+    write_rollback_guide(rollback, records, state)
+
+
+def rollback_targets(root: Path, rollback: Path, records: Sequence[dict[str, Any]]) -> None:
+    """Restore every prepared target in reverse order after an apply failure.
+
+    Args:
+        root: Target filesystem root.
+        rollback: Transaction rollback directory.
+        records: Prepared target snapshots.
+    """
+    for record in reversed(records):
+        target = safe_target(root, record["path"])
+        if record["kind"] == "file":
+            backup = rollback / record["backup"]
+            atomic_write_destination(
+                root,
+                record["path"],
+                backup.read_bytes(),
+                record["uid"],
+                record["gid"],
+                record["mode"],
+            )
+        elif record["kind"] == "absent":
+            remove_restore_destination(root, record["path"])
+
+
+def rendered_fstab(
+    current: str, mounts: Sequence[dict[str, Any]], mappings: dict[str, str]
+) -> str:
+    """Append explicitly mapped NFS mounts while preserving unrelated fstab lines.
+
+    Args:
+        current: Existing target fstab content.
+        mounts: Portable captured NFS mount records.
+        mappings: Explicit NFS source and mountpoint replacements.
+
+    Returns:
+        Updated fstab content with one managed block.
+    """
+    begin = "# BEGIN llama-manager-recovery NFS"
+    end = "# END llama-manager-recovery NFS"
+    kept: list[str] = []
+    in_managed_block = False
+    for line in current.splitlines():
+        if line == begin:
+            in_managed_block = True
+            continue
+        if line == end:
+            in_managed_block = False
+            continue
+        if not in_managed_block:
+            kept.append(line)
+    while kept and not kept[-1]:
+        kept.pop()
+    kept.extend([begin])
+    for index, mount in enumerate(mounts):
+        source = mappings[f"nfs.{index}.source"]
+        mountpoint = mappings[f"nfs.{index}.mountpoint"]
+        options = ",".join(mount["options"])
+        kept.append(f"{source} {mountpoint} {mount['filesystem']} {options} 0 0")
+    kept.append(end)
+    return "\n".join(kept) + "\n"
+
+
+def validate_timestamp(timestamp: str) -> None:
+    """Validate a timestamp before using it as a transaction path component.
+
+    Args:
+        timestamp: Expected compact UTC timestamp.
+
+    Raises:
+        ValueError: If format or calendar values are invalid.
+    """
+    if not re.fullmatch(r"\d{8}T\d{6}Z", timestamp):
+        raise ValueError("timestamp must use YYYYMMDDTHHMMSSZ")
+    try:
+        datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ")
+    except ValueError as error:
+        raise ValueError("timestamp is not a valid UTC date/time") from error
+
+
+def validate_hostname(hostname: str) -> None:
+    """Validate a hostname before treating it as trusted bundle metadata/path.
+
+    Args:
+        hostname: Hostname captured in or supplied for a bundle.
+
+    Raises:
+        ValueError: If the hostname is not a safe path component.
+    """
+    if (
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", hostname)
+        or ".." in hostname
+    ):
+        raise ValueError("hostname is unsafe for a backup path")
+
+
+def restore_bundle(args: argparse.Namespace) -> dict[str, Any]:
+    """Preview or apply explicitly selected recovery categories.
+
+    Args:
+        args: Parsed restore command arguments.
+
+    Returns:
+        JSON-compatible restore summary.
+
+    Raises:
+        ValueError: If validation, mapping, or authorization requirements fail.
+    """
+    bundle = Path(args.bundle)
+    if not verify_checksums(bundle):
+        raise ValueError("bundle checksum validation failed")
+    manifest = load_manifest(bundle)
+    categories = parse_categories(args.categories)
+    mappings = parse_mappings(args.map)
+    target_hostname = args.hostname or socket.gethostname()
+    validate_mappings(mappings, target_hostname)
+    outstanding = [
+        key
+        for key in required_mappings(bundle, manifest, target_hostname, categories)
+        if key not in mappings
+    ]
+    if outstanding:
+        raise ValueError("missing required mappings: " + ", ".join(outstanding))
+    root = Path(args.root)
+    mapped_models_dir = (
+        mappings.get("storage.models_dir") if "storage" in categories else None
+    )
+    manager_identity = resolve_manager_identity(
+        root,
+        args.manager_uid,
+        args.manager_gid,
+        mapped_models_dir is not None,
+    )
+    if mapped_models_dir is not None:
+        model_kind, _model_payload, model_metadata = snapshot_restore_target(
+            root, mapped_models_dir
+        )
+        if model_kind == "file":
+            raise ValueError("model storage target is an existing regular file")
+        if model_kind == "directory" and manager_identity is not None:
+            if model_metadata is None:
+                raise ValueError("failed to inspect existing model storage directory")
+            mode = model_metadata.st_mode & 0o7777
+            if model_metadata.st_gid != manager_identity[1] or mode & 0o2070 != 0o2070:
+                raise ValueError(
+                    "existing model storage directory is not setgid and group-manageable"
+                )
+    changes = selected_file_changes(
+        bundle, manifest, root, categories, mappings
+    )
+    if args.dry_run:
+        return {
+            "dryRun": True,
+            "categories": sorted(categories),
+            "changes": changes,
+            "requiredMappings": [],
+        }
+    if root.resolve() == Path("/") and os.geteuid() != 0:
+        raise PermissionError("restore must run as root; preview first with --dry-run")
+    timestamp = args.timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    validate_timestamp(timestamp)
+    rollback, rollback_descriptor = secure_create_directory(
+        root / "var" / "backups" / "llama-manager-recovery" / timestamp,
+        0o700,
+        exist_ok=False,
+    )
+    os.close(rollback_descriptor)
+    selected_entries = [
+        entry for entry in manifest.get("files", []) if entry["category"] in categories
+    ]
+    targets: list[tuple[str, Path]] = [
+        (
+            restore_logical_path(entry, mappings),
+            safe_target(root, restore_logical_path(entry, mappings)),
+        )
+        for entry in selected_entries
+    ]
+    if "storage" in categories and manifest.get("storage", {}).get("nfsMounts"):
+        targets.append(("/etc/fstab", safe_target(root, "/etc/fstab")))
+    if mapped_models_dir is not None:
+        targets.append((mapped_models_dir, safe_target(root, mapped_models_dir)))
+    records = backup_restore_targets(root, rollback, targets)
+    records_by_path = {record["path"]: record for record in records}
+    file_operations: list[tuple[str, bytes, int, int, int]] = []
+    for entry in selected_entries:
+        logical = restore_logical_path(entry, mappings)
+        captured = bundle / "files" / entry["path"].lstrip("/")
+        record = records_by_path[logical]
+        current_payload = (
+            (rollback / record["backup"]).read_bytes()
+            if record["kind"] == "file"
+            else None
+        )
+        payload = rendered_payload(
+            captured, current_payload, logical, entry["category"], mappings
+        )
+        if record["kind"] == "file":
+            uid, gid, mode = record["uid"], record["gid"], record["mode"]
+        else:
+            uid, gid, mode = target_metadata(root, None, logical)
+        file_operations.append((logical, payload, uid, gid, mode))
+    fstab_operation: tuple[str, bytes, int, int, int] | None = None
+    if "storage" in categories and manifest.get("storage", {}).get("nfsMounts"):
+        record = records_by_path["/etc/fstab"]
+        current = (
+            (rollback / record["backup"]).read_text(encoding="utf-8")
+            if record["kind"] == "file"
+            else ""
+        )
+        if record["kind"] == "file":
+            uid, gid, mode = record["uid"], record["gid"], record["mode"]
+        else:
+            uid, gid, mode = target_metadata(root, None, "/etc/fstab")
+        fstab_operation = (
+            "/etc/fstab",
+            rendered_fstab(
+                current, manifest["storage"]["nfsMounts"], mappings
+            ).encode(),
+            uid,
+            gid,
+            mode,
+        )
+    write_rollback_state(rollback, timestamp, records, "prepared")
+    applied = 0
+    try:
+        for logical, payload, uid, gid, mode in file_operations:
+            atomic_write_destination(root, logical, payload, uid, gid, mode)
+            applied += 1
+            if args.fail_after is not None and applied >= args.fail_after:
+                raise OSError("injected restore failure")
+        if fstab_operation is not None:
+            atomic_write_destination(root, *fstab_operation)
+            applied += 1
+            if args.fail_after is not None and applied >= args.fail_after:
+                raise OSError("injected restore failure")
+        if mapped_models_dir is not None:
+            if manager_identity is None:
+                raise ValueError("llama-manager identity is required for model storage")
+            if create_managed_directory(
+                root, mapped_models_dir, manager_identity[0], manager_identity[1]
+            ):
+                applied += 1
+                if args.fail_after is not None and applied >= args.fail_after:
+                    raise OSError("injected restore failure")
+    except Exception as apply_error:
+        try:
+            rollback_targets(root, rollback, records)
+            write_rollback_state(
+                rollback,
+                timestamp,
+                records,
+                "rolled_back",
+                type(apply_error).__name__,
+            )
+        except Exception as rollback_error:
+            write_rollback_state(
+                rollback,
+                timestamp,
+                records,
+                "rollback_failed",
+                type(rollback_error).__name__,
+            )
+            raise ValueError(
+                f"restore failed and automatic rollback failed; inspect {rollback}"
+            ) from rollback_error
+        raise ValueError(
+            f"restore failed; automatic rollback completed from {rollback}"
+        ) from apply_error
+    write_rollback_state(rollback, timestamp, records, "completed")
+    return {
+        "dryRun": False,
+        "categories": sorted(categories),
+        "changes": changes,
+        "rollbackDir": str(rollback),
+    }
+
+
+def create_backup(args: argparse.Namespace) -> Path:
+    """Create an allowlisted, sanitized recovery bundle.
+
+    Args:
+        args: Parsed backup command arguments.
+
+    Returns:
+        Path to the newly created bundle.
+    """
+    root = Path(args.root)
+    hostname = args.hostname or socket.gethostname()
+    timestamp = args.timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    validate_hostname(hostname)
+    validate_timestamp(timestamp)
+    output_root, output_descriptor = secure_create_directory(
+        Path(args.output_dir), 0o700, exist_ok=True
+    )
+    host_descriptor = -1
+    bundle_descriptor = -1
+    try:
+        host_descriptor = create_child_directory(
+            output_descriptor, hostname, 0o700, exist_ok=True
+        )
+        host_root = output_root / hostname
+        bundle_descriptor = create_child_directory(
+            host_descriptor, timestamp, 0o700, exist_ok=False
+        )
+        bundle = host_root / timestamp
+        if (
+            root.resolve() != Path("/")
+            and os.environ.get("LLAMA_RECOVERY_TEST_OUTPUT_SWAP") == "1"
+        ):
+            target = os.environ.get("LLAMA_RECOVERY_TEST_OUTPUT_SWAP_TARGET")
+            if not target:
+                raise ValueError("output swap test target is required")
+            stable_name = f"{timestamp}.stable"
+            os.rename(
+                timestamp,
+                stable_name,
+                src_dir_fd=host_descriptor,
+                dst_dir_fd=host_descriptor,
+            )
+            os.symlink(target, timestamp, dir_fd=host_descriptor)
+            fsync_directory_fd(host_descriptor)
+            bundle = host_root / stable_name
+        payloads: dict[str, bytes] = {}
+        copied: list[dict[str, str]] = []
+        for category, paths in ALLOWLIST.items():
+            for path in paths:
+                source = safe_source_file(root, path)
+                if source is None:
+                    continue
+                relative = f"files/{path.lstrip('/')}"
+                payload = sanitize_file(source, path)
+                write_bundle_file(bundle_descriptor, relative, payload)
+                payloads[relative] = payload
+                copied.append({"category": category, "path": path})
+        nfs_mounts = collect_nfs_mounts(root)
+        manifest = {
+            "schemaVersion": SCHEMA_VERSION,
+            "createdAt": timestamp,
+            "sourceHost": hostname,
+            "files": copied,
+            "storage": collect_storage(root, nfs_mounts),
+            "platform": collect_platform(root),
+            "runtime": collect_runtime(root),
+            "exclusions": [
+                "credentials and tokens",
+                "signing private keys",
+                "machine-id and SSH keys",
+                "browser profiles and arbitrary home data",
+                "model and container image blobs",
+            ],
+        }
+        payloads["manifest.json"] = (
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        ).encode()
+        payloads["RECONFIGURE.md"] = reconfiguration_guide()
+        write_bundle_file(bundle_descriptor, "manifest.json", payloads["manifest.json"])
+        write_bundle_file(
+            bundle_descriptor, "RECONFIGURE.md", payloads["RECONFIGURE.md"]
+        )
+        checksum_lines = [
+            f"{hashlib.sha256(payloads[name]).hexdigest()}  {name}"
+            for name in sorted(payloads)
+        ]
+        write_bundle_file(
+            bundle_descriptor,
+            "SHA256SUMS",
+            ("\n".join(checksum_lines) + "\n").encode(),
+        )
+        os.fsync(bundle_descriptor)
+        return bundle
+    finally:
+        if bundle_descriptor >= 0:
+            os.close(bundle_descriptor)
+        if host_descriptor >= 0:
+            os.close(host_descriptor)
+        os.close(output_descriptor)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the public command-line argument parser.
+
+    Returns:
+        Configured parser for the recovery CLI.
+    """
+    parser = argparse.ArgumentParser(
+        prog="llama-manager-recovery",
+        description="Back up and safely adapt Llama Manager host settings.",
+    )
+    parser.add_argument(
+        "--root",
+        default="/",
+        help="relocate system paths beneath ROOT (primarily for recovery staging/tests)",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    backup = subparsers.add_parser("backup", help="create a sanitized recovery bundle")
+    backup.add_argument(
+        "--output-dir",
+        default=os.environ.get("LLAMA_MANAGER_RECOVERY_DIR", DEFAULT_OUTPUT_DIR),
+        help=f"backup root (default: {DEFAULT_OUTPUT_DIR})",
+    )
+    backup.add_argument("--hostname", help=argparse.SUPPRESS)
+    backup.add_argument("--timestamp", help=argparse.SUPPRESS)
+    backup.set_defaults(handler=create_backup)
+    inspect = subparsers.add_parser("inspect", help="summarize and validate a bundle")
+    inspect.add_argument("bundle", help="recovery bundle directory")
+    inspect.set_defaults(handler=inspect_bundle)
+    plan = subparsers.add_parser("plan", help="compare a bundle with this host")
+    plan.add_argument("bundle", help="recovery bundle directory")
+    plan.add_argument("--hostname", help=argparse.SUPPRESS)
+    plan.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="explicit replacement-host mapping (repeatable)",
+    )
+    plan.set_defaults(handler=plan_bundle)
+    restore = subparsers.add_parser(
+        "restore", help="restore explicitly selected configuration categories"
+    )
+    restore.add_argument("bundle", help="recovery bundle directory")
+    restore.add_argument("--dry-run", action="store_true", help="preview without changes")
+    restore.add_argument(
+        "--categories",
+        required=True,
+        metavar="LIST",
+        help="comma-separated manager,service,kiosk,platform,storage selection",
+    )
+    restore.add_argument("--hostname", help=argparse.SUPPRESS)
+    restore.add_argument("--timestamp", help=argparse.SUPPRESS)
+    restore.add_argument("--fail-after", type=int, help=argparse.SUPPRESS)
+    restore.add_argument("--manager-uid", type=int, help=argparse.SUPPRESS)
+    restore.add_argument("--manager-gid", type=int, help=argparse.SUPPRESS)
+    restore.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="explicit replacement-host mapping (repeatable)",
+    )
+    restore.set_defaults(handler=restore_bundle)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the recovery command.
+
+    Args:
+        argv: Optional explicit arguments for programmatic invocation.
+
+    Returns:
+        Process exit status.
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = args.handler(args)
+    except (FileNotFoundError, json.JSONDecodeError, PermissionError, ValueError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
+    if isinstance(result, Path):
+        print(result)
+    elif result is not None:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
