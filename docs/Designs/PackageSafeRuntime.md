@@ -34,8 +34,9 @@ The public repository declares the private package builder interface in
 `packaging/runtime-contract.env`. The package must bundle Node **20.18.1 or
 newer** beneath `/usr/lib/llama-manager/node` and expose its executable at
 `/usr/lib/llama-manager/node/bin/node`. The service never assumes Noble's
-`/usr/bin/node`: both `ExecStartPre` and `ExecStart` use the bundled executable,
-and the preflight script rejects an undersized runtime.
+`/usr/bin/node`: the preflight invokes the bundled executable and the sanitized
+service launcher execs that same fixed path. The preflight script rejects an
+undersized runtime.
 
 The same manifest fixes the signed DS4 executable at
 `/usr/lib/llama-manager-ds4/bin/ds4-server` plus the package locations of the
@@ -73,6 +74,24 @@ The polkit rule checks both group membership and the exact unit name and permits
 only start/stop/restart verbs. It cannot manage other services or install
 packages. Software updates remain root-authorized signed-APT operations.
 
+### Mutable configuration is data, not process environment
+
+The group-managed `/etc/llama-manager/llama-manager.env` file is deliberately
+not a systemd `EnvironmentFile`. Systemd environment files have no schema and a
+later assignment can replace an earlier `Environment=` value; loading this file
+directly would let an application operator set `LLAMA_MANAGER_PACKAGED=0`,
+`DS4_SERVER_BIN`, or `NODE_OPTIONS` before restarting the allowed service.
+
+Instead, systemd starts the root-owned `run-packaged-service` launcher through
+`/usr/bin/env -i`. The launcher reads the mutable file as literal data, accepts
+only the documented configuration/data/model/cache path keys, and then creates
+a second empty environment containing those paths plus immutable package mode,
+Node, DS4, `PATH`, and home values. It never sources the file. Executable
+selectors, language runtime options, dynamic-loader settings, and unknown keys
+are discarded. This preserves group-managed model and configuration paths
+without converting service restart permission into service-account code
+execution.
+
 ## Service hardening
 
 `llama-manager.service` is the canonical package system unit. It uses systemd
@@ -94,6 +113,9 @@ outside the default state directories and must remain writable.
   access into executable-code replacement. Rejected.
 - **Grant group members passwordless sudo:** broader than the operational need.
   Unit-scoped polkit plus group-owned mutable files is the narrower boundary.
+- **Load the group-managed file with systemd `EnvironmentFile=`:** simpler, but
+  it makes executable and runtime variables operator-controlled because systemd
+  has no per-key allowlist. Rejected in favor of the clean-environment launcher.
 - **Clone the working machine's filesystem:** not reproducible and captures
   personal state. The package and image instead materialize declared paths and
   services.

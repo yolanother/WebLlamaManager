@@ -4,8 +4,9 @@
 #
 # Runs the immutable application from /usr/lib under the dedicated service
 # account while granting write access only to the package-created configuration,
-# state, cache, and runtime directories. Local overrides belong in the optional
-# /etc/llama-manager/llama-manager.env EnvironmentFile.
+# state, cache, and runtime directories. The package-owned launcher reads only
+# allowlisted path settings from group-managed configuration and constructs a
+# clean environment before executing Node.
 
 [Unit]
 Description=Llama Manager API and Multi-Model Server
@@ -21,28 +22,12 @@ User=llama-manager
 Group=llama-manager
 SupplementaryGroups=render video
 WorkingDirectory=/usr/lib/llama-manager/api
-ExecStartPre=/usr/lib/llama-manager/node/bin/node /usr/lib/llama-manager/scripts/check-node-runtime.mjs
-ExecStart=/usr/lib/llama-manager/node/bin/node /usr/lib/llama-manager/api/server.js
+ExecStartPre=/usr/bin/env -i HOME=/var/lib/llama-manager NODE_ENV=production LLAMA_MANAGER_PACKAGED=1 LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node PATH=/usr/bin:/bin /usr/lib/llama-manager/node/bin/node /usr/lib/llama-manager/scripts/check-node-runtime.mjs
+ExecStart=/usr/bin/env -i /usr/lib/llama-manager/scripts/run-packaged-service
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30
 UMask=0007
-
-Environment=NODE_ENV=production
-Environment=LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node
-Environment=HOME=/var/lib/llama-manager
-Environment=LLAMA_MANAGER_PACKAGED=1
-Environment=LLAMA_MANAGER_CONFIG_DIR=/etc/llama-manager
-Environment=LLAMA_MANAGER_DATA_DIR=/var/lib/llama-manager
-Environment=LLAMA_MANAGER_CACHE_DIR=/var/cache/llama-manager
-Environment=MODELS_DIR=/var/lib/llama-manager/models
-Environment=DS4_GGUF_DIR=/var/lib/llama-manager/models/ds4
-Environment=DS4_STATE_DIR=/var/lib/llama-manager/ds4
-Environment=DS4_SERVER_BIN=/usr/lib/llama-manager-ds4/bin/ds4-server
-Environment=SLOT_SAVE_PATH=/var/cache/llama-manager/slots
-Environment=XDG_RUNTIME_DIR=/run/llama-manager
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
-EnvironmentFile=-/etc/llama-manager/llama-manager.env
 
 ConfigurationDirectory=llama-manager
 ConfigurationDirectoryMode=0770
