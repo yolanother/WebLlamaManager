@@ -101,7 +101,11 @@ the kiosk login session and refuses account removal if processes remain. A
 pre-existing account with that name is preserved. `cage` is left installed
 (remove with `sudo apt remove cage` if you want). Re-running the installer
 preserves its ownership markers, so uninstall still removes installer-created
-resources and reports when the installer originally added `cage`.
+resources and reports when the installer originally added `cage`. After a
+successful uninstall records `installed=false`, later uninstall commands are
+complete no-ops: they never replay stale backups or remove resources created
+after kiosk removal. A partial installation whose manifest has no `installed`
+completion marker remains recoverable through the same uninstall command.
 
 ## Tests
 

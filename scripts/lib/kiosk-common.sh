@@ -7,7 +7,8 @@
 # Provides sandbox-aware path resolution (KIOSK_ROOT), canonical manager-env
 # KIOSK_URL resolution, Firefox/Chrome browser discovery, dedicated-account and
 # session lifecycle, persistent resource-ownership markers, idempotent backups,
-# and a dry-run-aware command wrapper. This file is sourced, not executed.
+# terminal uninstall guards, and a dry-run-aware command wrapper. This file is
+# sourced, not executed.
 
 # Guard against double-sourcing.
 [ -n "${_KIOSK_COMMON_SOURCED:-}" ] && return 0
@@ -464,6 +465,10 @@ kiosk_uninstall() {
     manifest="$(kiosk_manifest_path)"
     if [ ! -f "$manifest" ]; then
         kiosk_log "No recorded kiosk installation found; nothing to uninstall."
+        return 0
+    fi
+    if [ "$(kiosk_manifest_get installed)" = "false" ]; then
+        kiosk_log "Kiosk is already uninstalled; nothing to uninstall."
         return 0
     fi
     ensure_root "$@" || true

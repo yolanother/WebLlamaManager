@@ -303,9 +303,34 @@ test_uninstall_flow() {
     assert_eq "reinstall preserves installer-added cage guidance" "yes" \
       "$(printf '%s\n' "$uninstall_out" | grep -q "cage.*installed by this script" && echo yes || echo no)"
 
-    # Uninstall again is safe (idempotent, exit 0).
-    bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
+    # Once the successful uninstall clears installation ownership, a later
+    # uninstall must be a complete no-op. In particular, resources created by
+    # an administrator or package after the first uninstall are unmanaged and
+    # must not be replaced from stale backups or removed.
+    printf 'POST-UNINSTALL GDM\n' > "$sb/etc/gdm3/custom.conf"
+    printf 'POST-UNINSTALL ACCOUNT\n' > "$sb/var/lib/AccountsService/users/$user"
+    printf 'POST-UNINSTALL SESSION\n' > "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    mkdir -p "$sb/usr/local/lib/llama-manager/kiosk" "$sb/home/llama-kiosk"
+    printf 'POST-UNINSTALL RUNTIME\n' > "$sb/usr/local/lib/llama-manager/kiosk/owner-marker"
+    printf 'POST-UNINSTALL HOME\n' > "$sb/home/llama-kiosk/owner-marker"
+
+    KIOSK_TEST_ACTION_LOG="$sb/second-uninstall-actions.log" \
+      bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" \
+      >/dev/null 2>&1
     assert_eq "second uninstall exit 0" "0" "$?"
+    assert_eq "second uninstall preserves post-uninstall gdm config" \
+      "POST-UNINSTALL GDM" "$(cat "$sb/etc/gdm3/custom.conf")"
+    assert_eq "second uninstall preserves post-uninstall account record" \
+      "POST-UNINSTALL ACCOUNT" "$(cat "$sb/var/lib/AccountsService/users/$user")"
+    assert_eq "second uninstall preserves unmanaged session entry" \
+      "POST-UNINSTALL SESSION" \
+      "$(cat "$sb/usr/share/wayland-sessions/llama-kiosk.desktop")"
+    assert_file "second uninstall preserves unmanaged runtime" \
+      "$sb/usr/local/lib/llama-manager/kiosk/owner-marker"
+    assert_file "second uninstall preserves unmanaged replacement home" \
+      "$sb/home/llama-kiosk/owner-marker"
+    assert_no_file "second uninstall performs no lifecycle actions" \
+      "$sb/second-uninstall-actions.log"
 
     rm -rf "$sb"
 }
@@ -452,6 +477,41 @@ test_uninstall_without_install_preserves_session_entry() {
         "UNMANAGED SESSION" "$(cat "$session")"
     assert_no_file "uninstall without install creates no ownership manifest" \
         "$sb/var/backups/llama-kiosk/manifest"
+    rm -rf "$sb"
+}
+
+test_partial_install_without_completion_marker_is_cleaned() {
+    printf 'test_partial_install_without_completion_marker_is_cleaned\n'
+    local sb manifest user; sb="$(new_sandbox)"; user="llama-kiosk"
+    manifest="$sb/var/backups/llama-kiosk/manifest"
+    mkdir -p "$sb/var/backups/llama-kiosk" "$sb/etc/gdm3" \
+      "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
+    printf 'ORIGINAL GDM\n' > "$sb/var/backups/llama-kiosk/gdm_custom_conf"
+    printf 'PARTIAL INSTALL GDM\n' > "$sb/etc/gdm3/custom.conf"
+    printf 'PARTIAL ACCOUNT\n' > "$sb/var/lib/AccountsService/users/$user"
+    printf 'PARTIAL SESSION\n' > "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    cat > "$manifest" <<EOF
+target_user=$user
+backup.gdm_custom_conf.existed=true
+backup.gdm_custom_conf.path=/etc/gdm3/custom.conf
+backup.accountsservice_$user.existed=false
+backup.accountsservice_$user.path=/var/lib/AccountsService/users/$user
+backup.wayland_session.existed=false
+backup.wayland_session.path=/usr/share/wayland-sessions/llama-kiosk.desktop
+installed_runtime=false
+installed_kiosk_account=false
+EOF
+
+    bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" \
+      >/dev/null 2>&1
+    assert_eq "partial install without installed marker is restored" \
+      "ORIGINAL GDM" "$(cat "$sb/etc/gdm3/custom.conf")"
+    assert_no_file "partial AccountsService record is removed" \
+      "$sb/var/lib/AccountsService/users/$user"
+    assert_no_file "partial session entry is removed" \
+      "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    assert_eq "partial cleanup records completed uninstall" false \
+      "$(grep '^installed=' "$manifest" | cut -d= -f2-)"
     rm -rf "$sb"
 }
 
@@ -607,6 +667,7 @@ test_preexisting_account_is_preserved
 test_production_account_safety_guards
 test_preexisting_session_entry_is_restored
 test_uninstall_without_install_preserves_session_entry
+test_partial_install_without_completion_marker_is_cleaned
 test_session_symlink_target_is_never_overwritten
 test_dangling_session_symlink_is_restored_exactly
 test_launcher
