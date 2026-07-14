@@ -9,6 +9,21 @@ It is deliberately not a full-system backup. Models, container image blobs,
 credentials, browser data, signing keys, and arbitrary home directories are never
 copied.
 
+## Trust model
+
+Bundles are configuration inputs with the power to modify system files. The
+`SHA256SUMS` file detects corruption and inconsistent payloads; it is **not a
+signature** and does not prove who created a bundle. Store and retrieve bundles
+only through the access-controlled private NAS path or another authenticated,
+trusted channel. Do not restore a bundle received from email, a public download,
+or an untrusted share even if its checksums pass.
+
+Every manifest is treated as hostile despite that trust boundary. File entries
+must exactly match the compiled category/path allowlist, with no duplicates; NFS
+records accept only their fixed schema and a conservative option allowlist. Bundle
+symlinks, unknown payloads, unsafe path components, and unsupported field types are
+rejected.
+
 ## Commands
 
 Create a backup with the NAS-backed default location:
@@ -77,7 +92,7 @@ chroot-aware provisioning workflow.
 | `manager` | Packaged manager configuration under `/etc/llama-manager` and `/etc/default/llama-manager`. |
 | `service` | The system service and its allowlisted override file. |
 | `kiosk` | GDM kiosk settings, the `llama-kiosk` AccountsService record, and its Wayland session entry. |
-| `storage` | Model directory plus NFS source, mountpoint, type, and options as a portable manifest. The mount is reconstructed only from explicit mappings. |
+| `storage` | Model directory plus NFS source, mountpoint, type, and options as a portable manifest. The selected mapped model directory is created setgid `2775`; the mount is reconstructed only from explicit mappings. Protected system paths are rejected. |
 | `platform` | Relevant GRUB defaults and `amdxdna` module blacklist, plus OS, kernel, hardware product, selected firmware/kernel/ROCm package versions, and packaged runtime pins. |
 
 The tool writes sanitized files under `files/`, metadata to `manifest.json`, a
@@ -86,10 +101,12 @@ planning, and restore reject unsupported schemas; planning and restore also reje
 bundles whose checksums do not match.
 
 Keys whose names resemble tokens, secrets, passwords, credentials, API keys, or
-private keys are replaced with `[REDACTED]`. Restore never writes that marker over a
-working secret: it preserves the target host's existing value when one exists and
-otherwise omits the setting. Enter missing credentials later through the owning
-setup tool.
+private keys are replaced with `[REDACTED]`. Strings containing credential
+assignments, URL userinfo, or sensitive URL query parameters are redacted as a
+complete value; safe fragments from that value are not copied. Restore never writes
+the marker over a working value: it preserves the target host's complete existing
+value when one exists and otherwise omits the setting. Enter missing credentials
+later through the owning setup tool.
 
 ## Replacement-host procedure
 
@@ -119,10 +136,18 @@ Before the first target write, restore creates:
 /var/backups/llama-manager-recovery/<UTC timestamp>/
 ```
 
-Every selected target is recorded. Existing files are copied under `original/`;
-files that did not exist are marked as such. `ROLLBACK.md` explains which originals
-to restore and which newly created targets to remove. This preparation happens for
-all targets before any configuration is changed.
+Every selected target is recorded. Existing files are copied under `original/` with
+their owner, group, and mode; files that did not exist are marked as such. New
+manager configuration uses a restrictive `0640` policy and AccountsService records
+use `0600`. Existing targets retain their original metadata. Bundle and rollback
+roots use `0700` because rollback originals may contain target-host credentials.
+
+The rollback manifest and `ROLLBACK.md` are fsynced in `prepared` state before the
+first target mutation. File replacement is atomic. A successful transaction records
+`completed`; a mid-apply failure automatically restores prepared originals in
+reverse order and records `rolled_back` (or `rollback_failed` if operator action is
+still required). This preparation happens for all targets before any configuration
+is changed.
 
 ## Explicit exclusions
 
