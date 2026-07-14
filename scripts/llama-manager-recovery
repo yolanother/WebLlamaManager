@@ -388,6 +388,27 @@ def secure_create_directory(path: Path, mode: int, exist_ok: bool) -> tuple[Path
         raise
 
 
+def resolve_backup_output_root(requested: str) -> Path:
+    """Resolve only the configured backup root through a stable volume alias.
+
+    Args:
+        requested: Output root selected by the command-line parser.
+
+    Returns:
+        The canonical configured root, or the unchanged explicit path when it
+        differs from the configured/default root.
+
+    Arbitrary explicit output paths retain strict no-follow traversal. The
+    configured root is operator-controlled and may use a system-level alias
+    such as ``/volumes`` for the canonical NAS mount.
+    """
+    configured = os.environ.get("LLAMA_MANAGER_RECOVERY_DIR", DEFAULT_OUTPUT_DIR)
+    path = Path(requested)
+    if requested != configured:
+        return path
+    return path.resolve(strict=False)
+
+
 def create_child_directory(
     parent: int, name: str, mode: int, exist_ok: bool
 ) -> int:
@@ -2037,7 +2058,7 @@ def create_backup(args: argparse.Namespace) -> Path:
     validate_hostname(hostname)
     validate_timestamp(timestamp)
     output_root, output_descriptor = secure_create_directory(
-        Path(args.output_dir), 0o700, exist_ok=True
+        resolve_backup_output_root(args.output_dir), 0o700, exist_ok=True
     )
     host_descriptor = -1
     bundle_descriptor = -1
