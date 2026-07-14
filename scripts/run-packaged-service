@@ -99,6 +99,9 @@ load_mutable_settings() {
     esac
     case "$value" in *$'\r'*|*$'\n'*) continue ;; esac
     is_valid_setting_value "$key" "$value" || continue
+    if [ "$key" = AUTO_START ]; then
+      case "$value" in 0) value=false ;; 1) value=true ;; esac
+    fi
     SERVICE_ENV["$key"]="$value"
   done < "$config_file"
 }

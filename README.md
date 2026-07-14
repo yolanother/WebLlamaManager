@@ -210,6 +210,8 @@ llama-server/
 │   └── ...
 ├── container-start.sh      # Starts llama-server in router mode (runs in container)
 ├── start-llama.sh          # Wrapper that enters distrobox
+├── start-preset.sh         # Starts one configured preset with literal argv
+├── start-ds4.sh            # Starts the package/source DS4 engine
 ├── llama-manager.service   # canonical package system service
 ├── config.json             # Configuration (auto-generated)
 ├── install.sh              # Installation script

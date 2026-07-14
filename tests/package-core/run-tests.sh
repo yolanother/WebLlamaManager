@@ -243,6 +243,85 @@ test_llama_launcher_maps_package_scripts_into_distrobox() {
   rm -rf "$sandbox"
 }
 
+test_preset_launcher_preserves_adversarial_values_as_arguments() {
+  printf 'test_preset_launcher_preserves_adversarial_values_as_arguments\n'
+  local sandbox marker model_dir model_path switches kwargs hf_repo output hf_output source_output
+  local quoted_model_dir quoted_model quoted_switches quoted_kwargs quoted_hf
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-preset-argv.XXXXXX")"
+  marker="$sandbox/injected"
+  model_dir="$sandbox/models with spaces [literal]"
+  model_path="$model_dir/model ' quote \$(touch $marker) ;.gguf"
+  switches="--jinja --alias \$(touch $marker) --verbose"
+  kwargs="{\"key\":\"quote ' ; \$(touch $marker)\"}"
+  hf_repo="org/repo:' \$(touch $marker) ;"
+  quoted_model_dir="$(printf '%q' "$model_dir")"
+  quoted_model="$(printf '%q' "$model_path")"
+  quoted_switches="$(printf '%q' "$switches")"
+  quoted_kwargs="$(printf '%q' "$kwargs")"
+  quoted_hf="$(printf '%q' "$hf_repo")"
+
+  output="$(LLAMA_MANAGER_PACKAGED=1 DISTROBOX_CONTAINER=operator-container \
+    LLAMA_SERVER_BIN=/tmp/operator-llama MODELS_DIR="$model_dir" MODEL_PATH="$model_path" \
+    CONTEXT=32768 EXTRA_SWITCHES="$switches" CHAT_TEMPLATE_KWARGS="$kwargs" \
+    bash "$REPO_ROOT/start-preset.sh" --print-cmd 2>&1)"
+  assert_contains "packaged preset pins ROCm container" "$output" "container=llama-rocm-7.2.4"
+  assert_contains "packaged preset pins container binary" "$output" "binary=/usr/local/bin/llama-server"
+  assert_contains "preset keeps model directory as one argument" "$output" "arg=$quoted_model_dir"
+  assert_contains "preset keeps local model as one argument" "$output" "arg=$quoted_model"
+  assert_contains "preset keeps context as a literal argument" "$output" "arg=32768"
+  assert_contains "preset reports extra switches without evaluating them" "$output" "extra_switches=$quoted_switches"
+  assert_contains "preset keeps chat kwargs as one argument" "$output" "arg=$quoted_kwargs"
+
+  hf_output="$(LLAMA_MANAGER_PACKAGED=1 MODELS_DIR="$model_dir" HF_REPO="$hf_repo" \
+    bash "$REPO_ROOT/start-preset.sh" --print-cmd 2>&1)"
+  assert_contains "preset keeps Hugging Face reference as one argument" "$hf_output" "arg=$quoted_hf"
+  source_output="$(DISTROBOX_CONTAINER=source-container LLAMA_SERVER_BIN=/source/llama-server \
+    MODELS_DIR="$model_dir" MODEL_PATH="$model_path" \
+    bash "$REPO_ROOT/start-preset.sh" --print-cmd 2>&1)"
+  assert_contains "source preset preserves configured container" "$source_output" "container=source-container"
+  assert_contains "source preset preserves configured binary" "$source_output" "binary=/source/llama-server"
+  if [ -e "$marker" ]; then
+    printf '  FAIL preset configuration executed shell content\n'
+    failures=$((failures + 1))
+  else
+    printf '  ok   preset configuration remains inert data\n'
+  fi
+  rm -rf "$sandbox"
+}
+
+test_router_launcher_preserves_paths_as_single_arguments() {
+  printf 'test_router_launcher_preserves_paths_as_single_arguments\n'
+  local sandbox marker model_dir slot_dir capture output
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-router-argv.XXXXXX")"
+  marker="$sandbox/injected"
+  model_dir="$sandbox/models with spaces [literal]"
+  slot_dir="$sandbox/slots ; \$(touch $marker)"
+  capture="$sandbox/argv"
+  mkdir -p "$model_dir"
+  cat > "$sandbox/capture-server" <<'EOF'
+#!/bin/bash
+printf '<%s>\n' "$@" > "$CAPTURE_PATH"
+EOF
+  chmod +x "$sandbox/capture-server"
+
+  CAPTURE_PATH="$capture" LLAMA_SERVER_BIN="$sandbox/capture-server" \
+    MODELS_DIR="$model_dir" SLOT_SAVE_PATH="$slot_dir" MODELS_MAX=3 CONTEXT=16384 \
+    PORT=8181 GPU_LAYERS=42 NO_WARMUP=1 FLASH_ATTN=1 \
+    bash "$REPO_ROOT/container-start.sh" >/dev/null 2>"$sandbox/container-start.stderr"
+  output="$(cat "$capture")"
+  assert_contains "router keeps model path as one argument" "$output" "<$model_dir>"
+  assert_contains "router keeps slot path as one argument" "$output" "<$slot_dir>"
+  assert_contains "router retains model limit" "$output" "<3>"
+  assert_contains "router retains context" "$output" "<16384>"
+  if [ -e "$marker" ]; then
+    printf '  FAIL router path executed shell content\n'
+    failures=$((failures + 1))
+  else
+    printf '  ok   router path remains inert data\n'
+  fi
+  rm -rf "$sandbox"
+}
+
 test_packaged_service_uses_declared_offline_node_runtime() {
   printf 'test_packaged_service_uses_declared_offline_node_runtime\n'
   local service contract
@@ -254,6 +333,7 @@ test_packaged_service_uses_declared_offline_node_runtime() {
   assert_contains "manifest declares bundled Node path" "$contract" "LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node"
   assert_contains "manifest declares sanitized launcher" "$contract" "LLAMA_MANAGER_SERVICE_LAUNCHER=/usr/lib/llama-manager/scripts/run-packaged-service"
   assert_contains "manifest declares the real llama launcher" "$contract" "LLAMA_MANAGER_LLAMA_LAUNCHER=/usr/lib/llama-manager/start-llama.sh"
+  assert_contains "manifest declares the preset launcher" "$contract" "LLAMA_MANAGER_PRESET_LAUNCHER=/usr/lib/llama-manager/start-preset.sh"
   assert_contains "manifest requires the inner container launcher" "$contract" "LLAMA_MANAGER_CONTAINER_START=/usr/lib/llama-manager/container-start.sh"
   assert_contains "manifest declares the DS4 launcher" "$contract" "LLAMA_MANAGER_DS4_LAUNCHER=/usr/lib/llama-manager/start-ds4.sh"
   assert_contains "manifest declares container-visible app root" "$contract" "LLAMA_MANAGER_CONTAINER_APP_ROOT=/run/host/usr/lib/llama-manager"
@@ -339,6 +419,19 @@ EOF
   rm -rf "$sandbox"
 }
 
+test_packaged_service_normalizes_autostart_boolean() {
+  printf 'test_packaged_service_normalizes_autostart_boolean\n'
+  local sandbox disabled enabled
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-autostart-bool.XXXXXX")"
+  printf 'AUTO_START=0\n' > "$sandbox/llama-manager.env"
+  disabled="$(bash "$REPO_ROOT/scripts/run-packaged-service" --print-env "$sandbox/llama-manager.env")"
+  assert_contains "numeric zero disables server autostart" "$disabled" "AUTO_START=false"
+  printf 'AUTO_START=1\n' > "$sandbox/llama-manager.env"
+  enabled="$(bash "$REPO_ROOT/scripts/run-packaged-service" --print-env "$sandbox/llama-manager.env")"
+  assert_contains "numeric one enables server autostart" "$enabled" "AUTO_START=true"
+  rm -rf "$sandbox"
+}
+
 test_packaged_install_helper_is_sourceable
 test_packaged_install_exits_with_apt_guidance
 test_ctl_reports_overridden_runtime_paths
@@ -351,9 +444,12 @@ test_canonical_service_assets_are_package_safe
 test_packaged_ds4_uses_root_owned_binary
 test_source_ds4_keeps_managed_state_binary
 test_llama_launcher_maps_package_scripts_into_distrobox
+test_preset_launcher_preserves_adversarial_values_as_arguments
+test_router_launcher_preserves_paths_as_single_arguments
 test_packaged_service_uses_declared_offline_node_runtime
 test_packaged_service_rejects_group_config_runtime_injection
 test_packaged_service_rejects_invalid_scalar_configuration
+test_packaged_service_normalizes_autostart_boolean
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%d failed\n' "$failures"

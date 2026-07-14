@@ -39,7 +39,8 @@ Reads of keys whose names look sensitive are masked. The configuration file is
 settings live in `/etc/llama-manager/llama-manager.env`; do not put private
 signing keys there. Supported scalars are `API_PORT`, `LLAMA_PORT`, `EMBED_PORT`,
 `MODELS_MAX`, `CONTEXT_SIZE`, `AUTO_START`, and `STATS_INTERVAL`; invalid ports,
-numbers, or booleans fall back to package defaults.
+numbers, or booleans fall back to package defaults. `AUTO_START=0` and `1` are
+normalized to `false` and `true`, respectively.
 
 The service does not source that file or load it as a systemd environment file.
 A root-owned launcher reads literal values for documented path keys only and
@@ -112,10 +113,15 @@ package/ISO repository must consume `packaging/runtime-contract.env`, stage all
 declared files as root-owned/non-group-writable content, and cache the runtime
 artifact during the release build so installation works offline.
 
-The contract names `start-llama.sh`, `container-start.sh`, and `start-ds4.sh`
-explicitly so the package builder can fail when a required launcher is missing.
-Inside Distrobox, host `/usr/lib` content is addressed through `/run/host`; the
-contract exports both host and container-visible paths for validation.
+The contract names `start-llama.sh`, `start-preset.sh`, `container-start.sh`,
+and `start-ds4.sh` explicitly so the package builder can fail when a required
+launcher is missing. Inside Distrobox, host `/usr/lib` content is addressed
+through `/run/host`; the contract exports both host and container-visible paths
+for validation.
+
+Preset and router configuration is passed to llama-server as argv, not evaluated
+as shell. Model/NAS paths containing whitespace or shell metacharacters remain a
+single path argument, while preset switches are tokenized without `eval`.
 
 ## Path overrides
 

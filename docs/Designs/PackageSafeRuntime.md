@@ -41,11 +41,11 @@ undersized runtime.
 The same manifest fixes the signed DS4 executable at
 `/usr/lib/llama-manager-ds4/bin/ds4-server` plus the package locations of the
 runtime and model-storage validators. It also enumerates the actual required
-launch files: `start-llama.sh`, its inner `container-start.sh`, and
-`start-ds4.sh` (there is no package `start.sh`). Everything named by the
-manifest is root-owned and non-group-writable. The package/ISO build must
-acquire these artifacts while building the release so installation and first
-boot need no network access.
+launch files: `start-llama.sh`, `start-preset.sh`, the inner
+`container-start.sh`, and `start-ds4.sh` (there is no package `start.sh`).
+Everything named by the manifest is root-owned and non-group-writable. The
+package/ISO build must acquire these artifacts while building the release so
+installation and first boot need no network access.
 
 Distrobox exposes the host root under `/run/host`. Package launchers therefore
 translate only package-owned `/usr/lib` artifacts at the boundary:
@@ -100,12 +100,31 @@ settings (`API_PORT`, `LLAMA_PORT`, `EMBED_PORT`, `MODELS_MAX`, `CONTEXT_SIZE`,
 `AUTO_START`, and `STATS_INTERVAL`), and then creates a second empty environment
 containing those settings plus immutable package mode, Node, DS4, Distrobox,
 llama-server, `PATH`, and home values. Port ranges, positive numeric limits, and
-the boolean flag are validated before use; invalid values retain package
-defaults. The launcher never sources the file. Executable selectors, language
-runtime options, dynamic-loader settings, and unknown keys are discarded. This
+the boolean flag are validated before use; numeric `AUTO_START=0/1` is
+normalized to the server's `false/true` representation, and invalid values
+retain package defaults. The launcher never sources the file. Executable
+selectors, language runtime options, dynamic-loader settings, and unknown keys
+are discarded. This
 preserves group-managed model and configuration paths—including a non-default
 dashboard/API port—without converting service restart permission into
 service-account code execution.
+
+### Engine settings remain argv, never shell source
+
+Group-managed dashboard configuration can supply model paths, Hugging Face
+references, preset switches, chat-template JSON, and slot-cache paths. The
+launchers preserve these as data across the Distrobox boundary:
+
+- `start-preset.sh` builds the llama-server argv as a host-side array, then
+  passes every value as a positional argument after a fixed single-quoted inner
+  script. Package mode also pins the container and binary.
+- `container-start.sh` builds router arguments in a Bash array and invokes
+  `exec "${CMD[@]}"`, so spaces, quotes, semicolons, dollar expressions, and
+  glob characters in model/NAS paths cannot split into new arguments or run as
+  commands.
+
+The print/test seams use shell escaping only for diagnostics; runtime execution
+never reconstructs a command string.
 
 ## Service hardening
 
