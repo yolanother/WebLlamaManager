@@ -53,6 +53,7 @@ import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
   shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision
 } from './ds4-exclusive.js';
+import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
 import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
@@ -220,6 +221,12 @@ let currentEngine = ENGINE_TYPES.LLAMA;
 // rather than 404'd or mis-routed (established queue-during-swap operator rule).
 // Cleared back to null once the swap settles. Resolves (never rejects) for awaiters.
 let ds4SwapPromise = null;
+// Settled adaptive-DS4 runtime state (set by activateDs4Exclusive's adaptive plan;
+// cleared on deactivation). Exposes the operator's TARGET (configured max context +
+// streaming policy) alongside the EFFECTIVE settled config (the context + streaming
+// the ladder actually landed on and is serving), plus a status the UI surfaces
+// ('loading' | 'ready' | 'exhausted'). See ds4-adaptive.js.
+let ds4SettledRuntime = null;
 let lastUsedModel = null;   // most recently used model name
 let lastUsedModelTime = 0;  // timestamp of last use
 let activeLocalModel = null; // model currently being processed/loaded on local backend
@@ -2461,6 +2468,7 @@ async function getSystemStats() {
     llama: llamaStats,
     embed: embedStats,
     ds4: ds4Stats,
+    ds4Runtime: ds4SettledRuntime,
     engine: currentEngine,
     guard: guardLast,
     context: contextStats,
@@ -4304,7 +4312,12 @@ app.post('/api/presets', (req, res) => {
         power: d.power,
         kvDiskDir: d.kvDiskDir,
         kvDiskSpaceMb: d.kvDiskSpaceMb,
-        extraSwitches: d.extraSwitches || '--rocm --cors'
+        extraSwitches: d.extraSwitches || '--rocm --cors',
+        // Adaptive activation knobs (see ds4-adaptive.js); undefined → config.ds4 defaults.
+        minContext: d.minContext,
+        ssdStreaming: d.ssdStreaming,
+        ssdStreamingCacheExperts: d.ssdStreamingCacheExperts,
+        adaptiveContext: d.adaptiveContext
       }
     };
     if (!config.presets) config.presets = {};
@@ -5138,14 +5151,46 @@ function ds4HeadroomBytes() {
   return Math.round(gb * 1024 * 1024 * 1024);
 }
 
-/** Poll ds4 /v1/models until ready or timeout; resolves regardless (best-effort gate). */
-async function waitForDs4Ready() {
+/**
+ * Wait for the CURRENT adaptive-plan attempt to reach a terminal outcome: 'ready'
+ * (ds4 answered /v1/models), 'load-failure' (the process exited before ever serving —
+ * an OOM/crash at the ~80GB load tail), or 'timeout' (never became ready within the
+ * ceiling). The adaptive controller advances on anything but 'ready'. Reuses the
+ * supervisor's sawReady/exit signal — health() flips sawReady on a 200; isRunning()
+ * goes false once the child exits.
+ * @returns {Promise<'ready'|'load-failure'|'timeout'>}
+ */
+async function waitDs4AttemptOutcome() {
   const start = Date.now();
+  const sup = getDs4Supervisor();
   while (Date.now() - start < DS4_READY_TIMEOUT_MS) {
-    try { const h = await getDs4Health(); if (h?.status === 'ok') return true; } catch { /* not up yet */ }
+    let h;
+    try { h = await getDs4Health(); } catch { /* not up yet */ }
+    if (h?.status === 'ok') return 'ready';
+    if (!sup.isRunning()) return 'load-failure'; // exited before serving = load failure
     await new Promise((r) => setTimeout(r, DS4_READY_INTERVAL_MS));
   }
-  return false;
+  return 'timeout';
+}
+
+/**
+ * Resolve the effective adaptive-activation settings for a ds4 preset: per-preset
+ * overrides (stored under preset.config by the create handler, or accepted top-level
+ * by a raw update) win over the resolved config.ds4 defaults.
+ * @param {object} preset The ds4 preset.
+ * @param {object} ds4cfg resolveDs4Config() result (defaults).
+ * @returns {{minContext:number, ssdStreaming:string, ssdStreamingCacheExperts:string, adaptiveContext:boolean}}
+ */
+function ds4AdaptiveSettings(preset, ds4cfg) {
+  const pc = preset.config || {};
+  const pick = (k) => (pc[k] !== undefined && pc[k] !== null ? pc[k]
+    : (preset[k] !== undefined && preset[k] !== null ? preset[k] : undefined));
+  return {
+    minContext: pick('minContext') ?? ds4cfg.minContext,
+    ssdStreaming: pick('ssdStreaming') ?? ds4cfg.ssdStreaming,
+    ssdStreamingCacheExperts: pick('ssdStreamingCacheExperts') ?? ds4cfg.ssdStreamingCacheExperts,
+    adaptiveContext: pick('adaptiveContext') ?? ds4cfg.adaptiveContext,
+  };
 }
 
 /**
@@ -5154,18 +5199,22 @@ async function waitForDs4Ready() {
  * (so ensureModelServed early-returns and the request flood offloads instead of starting
  * a competing local llama load), robustly EVICT llama-server by host PID (waiting until
  * the model actually unmaps), verify no llama model is still resident AND that
- * MemAvailable reclaimed to (model + headroom) BEFORE spawning ds4, then spawn and (in
- * the background) wait for readiness.
+ * MemAvailable reclaimed to (model + headroom) BEFORE spawning ds4, then run an
+ * ADAPTIVE load ladder in the background (see ds4-adaptive.js): size a context that
+ * fits from live MemAvailable, step it down on each actual OOM, and switch to SSD
+ * expert-streaming when the non-streaming ladder bottoms out — settling on the first
+ * config that serves and recording it (ds4SettledRuntime) for the UI + auto-restart.
  *
- * Crucially, the rollback semantics are driven by ds4ActivationDecision():
+ * The eviction-phase rollback semantics are driven by ds4ActivationDecision():
  *   - A kill/reclaim HICCUP (a llama model that won't die → possible wedged GPU, or RAM
  *     that won't free in time) does NOT roll the box back to the llama router. Rolling
  *     back re-admits local loads and is exactly what OOM-killed ds4 in the field. Instead
  *     the box STAYS in exclusive-DS4 mode (engine=ds4, flood offloads) and the activation
  *     reports a 503; nothing reloads a llama model on top of the in-progress state.
- *   - Only a genuine ds4-SPAWN failure — after eviction TRULY succeeded (RAM free, no
- *     resident model) — rolls back to llama. That is safe because there is nothing to race.
- *     The half-started ds4 is stopped FIRST so the two engines never co-reside.
+ *   - Once eviction succeeds, the adaptive ladder owns the load. If EVERY attempt fails
+ *     to serve, the box STAYS exclusive (engine=ds4, clean 503 for local ds4 requests) —
+ *     it never rolls back to a competing local llama load. The supervisor's load-failure
+ *     circuit breaker bounds any post-settle auto-restart thrash.
  *
  * @returns {Promise<{ok:true}|{ok:false,status:number,error:string,stayedExclusive?:boolean}>}
  */
@@ -5242,36 +5291,74 @@ async function activateDs4Exclusive(presetId, preset) {
     return { ok: false, status: 503, error: msg, stayedExclusive: true };
   }
 
-  // ── Spawn phase (eviction truly succeeded: no resident model + RAM free) ──────
-  let spawnOk = true;
-  try {
-    const child = startDs4Server(preset);
-    if (!child) spawnOk = false;
-  } catch (err) {
-    spawnOk = false;
-    addLog('presets', `ds4: spawn threw: ${err.message}`);
-  }
+  // ── Adaptive spawn phase (eviction truly succeeded: no resident model + RAM free) ─
+  // Build a memory-fit attempt ladder from LIVE MemAvailable + the weight size: a
+  // descending non-streaming context ladder, then (when allowed) an SSD-streaming
+  // ladder that re-raises context. The controller drives the retries; the supervisor's
+  // own auto-restart breaker is suppressed during the plan (planMode) and becomes the
+  // backstop only after settle. currentEngine stays ds4 for the WHOLE plan, so a
+  // request flood keeps offloading and never re-admits a competing local llama load.
+  const adaptive = ds4AdaptiveSettings(preset, ds4cfg);
+  const targetContext = Number(preset.context) || adaptive.minContext;
+  const plan = planDs4Attempts({
+    configuredContext: targetContext,
+    minContext: adaptive.minContext,
+    availBytes: memAvailableBytes(),
+    weightBytes: ds4ModelBytes,
+    kvBytesPerToken: ds4cfg.kvBytesPerToken,
+    safetyBytes: ds4cfg.safetyBytes,
+    ssdStreamingMode: adaptive.ssdStreaming,
+    streamingWeightBytes: ds4cfg.streamingWeightBytes,
+    ssdStreamingCacheExperts: adaptive.ssdStreamingCacheExperts,
+    adaptiveContext: adaptive.adaptiveContext,
+  });
+  const target = { context: targetContext, ssdStreamingMode: adaptive.ssdStreaming, minContext: adaptive.minContext };
+  ds4SettledRuntime = { target, effective: null, status: 'loading', plannedAttempts: plan.length, attemptsMade: 0, settledAt: null };
+  addLog('presets', `ds4: adaptive plan (${plan.length} attempt${plan.length === 1 ? '' : 's'}): ${plan.map((a) => `${a.context}${a.ssdStreaming ? '/stream' : ''}`).join(' → ')}`);
 
-  const spawnDecision = ds4ActivationDecision({ residentAfterEvict: false, reclaimOk: true, spawnOk });
-  if (spawnDecision.action === 'rollback-to-llama') {
-    // ds4 failed to spawn but eviction succeeded, so RAM is free and restoring llama
-    // cannot race a competing load. Stop the half-started ds4 FIRST, then restore llama.
-    if (spawnDecision.stopDs4) { try { await stopDs4Server(); } catch { /* ignore */ } }
-    currentEngine = ENGINE_TYPES.LLAMA;
-    currentMode = 'router';
-    currentPreset = null;
-    settleGate();
-    const msg = 'ds4 activation rolled back to llama router: ds4-server failed to spawn after eviction succeeded.';
-    addLog('presets', msg);
-    return { ok: false, status: 500, error: msg };
-  }
-
-  // Background: hold the swap gate until ds4 answers /v1/models, then release it so
-  // queued mid-swap requests proceed against a ready ds4-server. currentEngine stays
-  // ds4 for the whole readiness window, so the flood keeps offloading throughout.
+  // Run the ladder in the background, holding the swap gate until it settles or
+  // exhausts. Return {ok:true} now — the activate response reports the plan started;
+  // the flood is held on ds4SwapPromise until a settled ds4-server is serving.
   (async () => {
-    try { await waitForDs4Ready(); }
-    finally { settleGate(); }
+    const sup = getDs4Supervisor();
+    try {
+      const result = await runDs4AdaptivePlan({
+        attempts: plan,
+        startAttempt: (attempt) => {
+          addLog('presets', `ds4: trying ctx=${attempt.context}${attempt.ssdStreaming ? ` + SSD streaming (cache ${attempt.cacheExperts})` : ''}`);
+          sup.start(preset, { planMode: true, override: attempt });
+        },
+        waitForOutcome: () => waitDs4AttemptOutcome(),
+        stopAttempt: async () => { try { await stopDs4Server(); } catch { /* already gone */ } },
+        onAttempt: (attempt, i) => {
+          if (i > 0) addLog('presets', `ds4: previous attempt failed to load; stepping to attempt ${i + 1}/${plan.length}`);
+        },
+      });
+      if (result.ok) {
+        sup.endPlan({ settled: result.settled });
+        ds4SettledRuntime = {
+          target,
+          effective: { context: result.settled.context, ssdStreaming: result.settled.ssdStreaming, cacheExperts: result.settled.cacheExperts },
+          status: 'ready', plannedAttempts: plan.length, attemptsMade: result.attemptsMade, settledAt: Date.now(),
+        };
+        addLog('presets', `ds4: SETTLED — serving at ctx=${result.settled.context}${result.settled.ssdStreaming ? ` with SSD streaming (cache ${result.settled.cacheExperts})` : ' (no streaming)'} after attempt ${result.attemptsMade}/${plan.length}`);
+      } else {
+        // Exhausted every attempt without serving. STAY exclusive (engine=ds4): the
+        // flood offloads / returns a clean 503 — never re-admit a local llama load.
+        sup.endPlan({ settled: null });
+        try { await stopDs4Server(); } catch { /* already gone */ }
+        ds4SettledRuntime = {
+          target, effective: null, status: 'exhausted',
+          plannedAttempts: plan.length, attemptsMade: result.attemptsMade, settledAt: Date.now(),
+        };
+        addLog('presets', `ds4 activation exhausted all ${plan.length} attempt(s) without serving (OOM at the load tail each time). Box stays in exclusive-DS4 offload mode; local ds4 requests get a clean 503. Consider a dedicated box, a higher minContext floor, or forcing SSD streaming (ssdStreaming='on').`);
+      }
+    } catch (err) {
+      sup.endPlan({ settled: null });
+      addLog('presets', `ds4 adaptive plan errored: ${err.message}; staying exclusive`);
+    } finally {
+      settleGate();
+    }
   })();
 
   return { ok: true };
@@ -5290,6 +5377,7 @@ async function deactivateDs4Exclusive() {
   try {
     addLog('presets', 'ds4: deactivating exclusive mode — stopping ds4-server and verifying reclaim');
     await stopDs4Server();
+    ds4SettledRuntime = null; // no longer serving ds4 — clear the settled runtime state
     currentEngine = ENGINE_TYPES.LLAMA;
     const targetBytes = ds4HeadroomBytes();
     const poll = await pollForReclaim({
