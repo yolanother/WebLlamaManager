@@ -155,6 +155,13 @@ home-directory protection, and a globally read-only filesystem are intentionally
 not enabled because ROCm and operator-selected local/NAS model storage may live
 outside the default state directories and must remain writable.
 
+The package tmpfiles declaration creates `/run/llama-manager` as mode `0700`
+owned by `llama-manager:llama-manager` before post-install scripts load the
+offline ROCm image with rootless Podman. The service's
+`RuntimeDirectory=llama-manager` and `RuntimeDirectoryMode=0700` reuse the same
+private path, so first install and later service starts share one ownership and
+mode contract.
+
 ## Alternatives considered
 
 - **Install and run as the interactive desktop user:** compatible with the old

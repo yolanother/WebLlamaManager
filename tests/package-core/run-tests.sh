@@ -157,9 +157,10 @@ test_ctl_rejects_model_storage_unusable_by_service_identity() {
 
 test_canonical_service_assets_are_package_safe() {
   printf 'test_canonical_service_assets_are_package_safe\n'
-  local service polkit
+  local service polkit tmpfiles
   service="$(cat "$REPO_ROOT/llama-manager.service")"
   polkit="$(cat "$REPO_ROOT/packaging/90-llama-manager.rules" 2>/dev/null || true)"
+  tmpfiles="$(cat "$REPO_ROOT/packaging/llama-manager.tmpfiles" 2>/dev/null || true)"
   assert_contains "service uses dedicated account" "$service" "User=llama-manager"
   assert_contains "service uses dedicated group" "$service" "Group=llama-manager"
   assert_contains "service code is root-owned FHS content" "$service" "WorkingDirectory=/usr/lib/llama-manager/api"
@@ -167,6 +168,10 @@ test_canonical_service_assets_are_package_safe() {
   assert_contains "service launches through immutable package code" "$service" "/usr/lib/llama-manager/scripts/run-packaged-service"
   assert_contains "polkit checks manager group" "$polkit" 'subject.isInGroup("llama-manager")'
   assert_contains "polkit restricts authority to one unit" "$polkit" 'unit == "llama-manager.service"'
+  assert_contains "tmpfiles provisions rootless Podman runtime before service start" "$tmpfiles" \
+    "d /run/llama-manager 0700 llama-manager llama-manager -"
+  assert_contains "service reuses the tmpfiles runtime directory" "$service" "RuntimeDirectory=llama-manager"
+  assert_contains "service preserves the private runtime mode" "$service" "RuntimeDirectoryMode=0700"
   if [[ "$service" == *"/home/yolan"* ]]; then
     printf '  FAIL canonical service contains a developer home path\n'
     failures=$((failures + 1))
