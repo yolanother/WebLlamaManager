@@ -36,7 +36,8 @@ import { resolveDs4Config, resolveDs4ModelPath } from './engines.js';
  * @param {Function} [deps.sleep] async (ms) => void — grace delay between SIGTERM and SIGKILL.
  * @param {Function} [deps.setTimeoutFn] setTimeout (or a fake) for scheduling auto-restart.
  * @returns {{start:Function, stop:Function, restart:Function, health:Function,
- *   isRunning:Function, getPid:Function, getActivePreset:Function}}
+ *   isRunning:Function, getPid:Function, getActivePreset:Function,
+ *   getActiveOverride:Function, endPlan:Function}}
  */
 export function createDs4Supervisor({
   spawn,
@@ -67,6 +68,14 @@ export function createDs4Supervisor({
   // fresh (non-auto) activation and on a successful serve.
   let sawReady = false;
   let consecutiveLoadFailures = 0;
+  // Adaptive activation: the exclusive-DS4 controller (server.js) drives a ladder of
+  // load attempts (context step-down → SSD-streaming fallback). While a plan is in
+  // progress the CONTROLLER owns retries, so an exit must NOT trigger the supervisor's
+  // own auto-restart or circuit breaker. `activeOverride` carries the per-attempt
+  // context + streaming config into buildEnv; endPlan() locks in the SETTLED config so
+  // a later (post-settle) auto-restart reuses what actually worked.
+  let planInProgress = false;
+  let activeOverride = null;
 
   /** @returns {boolean} whether the ds4 child is currently alive. */
   function isRunning() {
@@ -83,9 +92,16 @@ export function createDs4Supervisor({
     return activePreset;
   }
 
+  /** @returns {object|null} the active per-attempt/settled ctx+streaming override, or null. */
+  function getActiveOverride() {
+    return activeOverride;
+  }
+
   /**
    * Build the launch environment for start-ds4.sh from the resolved ds4 config
    * and the preset's model/context and ds4 launch knobs (under preset.config).
+   * When an adaptive override is active it wins for context and drives the SSD
+   * expert-streaming flags (DS4_SSD_STREAMING 0/1 + cache-experts size).
    */
   function buildEnv(preset) {
     const ds4 = resolveDs4Config(getConfig() || {}, env);
@@ -101,6 +117,19 @@ export function createDs4Supervisor({
       DS4_MODEL: modelAbs,
       DS4_CTX: String(preset.context || 0),
     };
+    // Adaptive override: the controller sets the per-attempt context + streaming.
+    if (activeOverride) {
+      if (activeOverride.context !== undefined && activeOverride.context !== null) {
+        e.DS4_CTX = String(activeOverride.context);
+      }
+      if (activeOverride.ssdStreaming) {
+        e.DS4_SSD_STREAMING = '1';
+        const ce = activeOverride.cacheExperts || ds4.ssdStreamingCacheExperts;
+        if (ce) e.DS4_SSD_STREAMING_CACHE_EXPERTS = String(ce);
+      } else {
+        e.DS4_SSD_STREAMING = '0';
+      }
+    }
     if (pc.power !== undefined && pc.power !== null && pc.power !== '') e.DS4_POWER = String(pc.power);
     if (pc.kvDiskDir) e.DS4_KV_DISK_DIR = String(pc.kvDiskDir);
     if (pc.kvDiskSpaceMb !== undefined && pc.kvDiskSpaceMb !== null && pc.kvDiskSpaceMb !== '') {
@@ -131,14 +160,23 @@ export function createDs4Supervisor({
   /**
    * Spawn the ds4 server for `preset`. Idempotent: a no-op if already running.
    * @param {object} [preset] Defaults to the last active preset (used by auto-restart).
+   * @param {object} [opts]
+   * @param {boolean} [opts.isAutoRestart=false] Governed auto-restart (accumulates toward the breaker).
+   * @param {boolean} [opts.planMode=false] Enter adaptive-plan mode: the controller drives retries,
+   *   so an exit while a plan is in progress does NOT auto-restart or count a load failure here.
+   * @param {object} [opts.override] Per-attempt context/streaming override for buildEnv
+   *   ({ context, ssdStreaming, cacheExperts }). Passing it replaces the active override; omit it
+   *   (e.g. on auto-restart) to reuse the settled override.
    * @returns {object|undefined} the spawned child, or undefined when skipped.
    */
-  function start(preset = activePreset, { isAutoRestart = false } = {}) {
+  function start(preset = activePreset, { isAutoRestart = false, planMode = false, override = undefined } = {}) {
     if (!preset) {
       log('[ds4] start called with no preset; ignoring');
       return;
     }
     activePreset = preset;
+    if (override !== undefined) activeOverride = override;
+    if (planMode) planInProgress = true;
     if (isRunning()) return proc;
     intentionalStop = false;
     // A fresh (operator/user) activation gets a clean slate of load attempts; only
@@ -165,6 +203,14 @@ export function createDs4Supervisor({
       const wasIntentional = intentionalStop;
       proc = null;
       if (wasIntentional) return;
+      // During an adaptive plan the controller owns retries (context step-down / SSD
+      // streaming fallback), so do NOT auto-restart or count a load failure here — the
+      // controller advances to the next attempt itself. The breaker is the BACKSTOP
+      // only after the plan settles (planInProgress cleared by endPlan()).
+      if (planInProgress) {
+        log('[ds4] ds4-server exited during adaptive plan; controller drives the next attempt');
+        return;
+      }
       // Load-failure circuit breaker: exited non-zero before ever serving = an OOM/
       // crash during the ~80GB load. Retrying the same config just thrashes, so stop
       // after ds4MaxLoadFailures consecutive load failures and surface the cause.
@@ -216,6 +262,21 @@ export function createDs4Supervisor({
   }
 
   /**
+   * Leave adaptive-plan mode. Called by the controller once the ladder settles (or is
+   * exhausted). When a `settled` attempt is given, it becomes the active override so a
+   * later post-settle auto-restart reuses the context + streaming config that actually
+   * worked; an exhausted plan (settled=null) clears the override.
+   * @param {object} [args]
+   * @param {object|null} [args.settled] The settled { context, ssdStreaming, cacheExperts }, or null.
+   */
+  function endPlan({ settled = null } = {}) {
+    planInProgress = false;
+    activeOverride = settled
+      ? { context: settled.context, ssdStreaming: !!settled.ssdStreaming, cacheExperts: settled.cacheExperts }
+      : null;
+  }
+
+  /**
    * Probe ds4 health via GET /v1/models (ds4 has no /health).
    * @returns {Promise<{status:string, port:number, model:(string|null)}>}
    */
@@ -232,5 +293,5 @@ export function createDs4Supervisor({
     }
   }
 
-  return { start, stop, restart, health, isRunning, getPid, getActivePreset };
+  return { start, stop, restart, health, isRunning, getPid, getActivePreset, getActiveOverride, endPlan };
 }

@@ -202,6 +202,56 @@ test('health: stopped when not running', async () => {
   assert.equal(h.status, 'stopped');
 });
 
+// ── adaptive-plan hooks (context/streaming override + controller-driven retries) ──
+test('start override: DS4_CTX + streaming env reflect the per-attempt override', () => {
+  const { sup, calls } = makeSup();
+  sup.start(PRESET, { override: { context: 16384, ssdStreaming: true, cacheExperts: '48GB' } });
+  const env = calls.spawn[0].opts.env;
+  assert.equal(env.DS4_CTX, '16384'); // override wins over preset.context (65536)
+  assert.equal(env.DS4_SSD_STREAMING, '1');
+  assert.equal(env.DS4_SSD_STREAMING_CACHE_EXPERTS, '48GB');
+});
+
+test('start override: non-streaming attempt sets DS4_SSD_STREAMING=0', () => {
+  const { sup, calls } = makeSup();
+  sup.start(PRESET, { override: { context: 8192, ssdStreaming: false } });
+  const env = calls.spawn[0].opts.env;
+  assert.equal(env.DS4_CTX, '8192');
+  assert.equal(env.DS4_SSD_STREAMING, '0');
+});
+
+test('plan mode: exit during a plan does NOT auto-restart (controller drives retries)', () => {
+  const { sup, calls, procs } = makeSup();
+  sup.start(PRESET, { planMode: true, override: { context: 32768, ssdStreaming: false } });
+  procs[0].emit('exit', 137); // load failure during the plan
+  assert.equal(calls.scheduled.length, 0); // suppressed — controller advances attempts
+  assert.equal(calls.spawn.length, 1);
+});
+
+test('endPlan: records the settled override so a later auto-restart reuses it', async () => {
+  const { sup, calls, procs } = makeSup();
+  sup.start(PRESET, { planMode: true, override: { context: 16384, ssdStreaming: true, cacheExperts: '32GB' } });
+  await sup.health();                 // sawReady=true (settled + serving)
+  sup.endPlan({ settled: { context: 16384, ssdStreaming: true, cacheExperts: '32GB' } });
+  procs[0].emit('exit', 1);           // genuine crash AFTER settle → auto-restart
+  assert.equal(calls.scheduled.length, 1);
+  calls.scheduled[0]();               // fire → procs[1] with the settled config
+  const env = calls.spawn[1].opts.env;
+  assert.equal(env.DS4_CTX, '16384');
+  assert.equal(env.DS4_SSD_STREAMING, '1');
+  assert.equal(env.DS4_SSD_STREAMING_CACHE_EXPERTS, '32GB');
+});
+
+test('endPlan: exhausted plan (settled=null) clears the override and restores auto-restart', () => {
+  const { sup, calls, procs } = makeSup();
+  sup.start(PRESET, { planMode: true, override: { context: 8192, ssdStreaming: false } });
+  sup.endPlan({ settled: null });     // plan exhausted → no settled config
+  assert.equal(sup.getActiveOverride(), null);
+  // Leaving plan mode restores normal auto-restart on a crash.
+  procs[0].emit('exit', 1);
+  assert.equal(calls.scheduled.length, 1);
+});
+
 test('load-failure breaker: stops auto-restart after ds4MaxLoadFailures exits before ready', () => {
   const { sup, calls, procs } = makeSup({ config: { ds4: {}, guard: { ds4MaxLoadFailures: 2 } } });
   sup.start(PRESET);                 // procs[0]
