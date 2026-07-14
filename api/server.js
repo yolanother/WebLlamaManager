@@ -69,8 +69,10 @@ import { resolveRuntimePaths } from './runtime-paths.js';
 import {
   packagedDs4UpdateStatus,
   packagedDs4UpdateRejection,
+  packagedLlamaUpdateStatus,
   resolveDistributionPolicy,
 } from './distribution-policy.js';
+import { beginLlamaUpdate, createLlamaSourceUpdateSpec } from './llama-update-controller.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -5096,7 +5098,7 @@ function getDs4Updater() {
       log: (m) => console.log(m),
       addLog,
       paths: {
-        repoDir: process.env.DS4_REPO_DIR || '/home/yolan/workspace/ai/ds4',
+        repoDir: process.env.DS4_REPO_DIR || join(process.env.HOME || '/var/lib/llama-manager', 'workspace', 'ai', 'ds4'),
         stateDir: DS4_STATE_DIR,
         buildsDir: join(DS4_STATE_DIR, 'builds'),
         currentLink: join(DS4_STATE_DIR, 'current'),
@@ -5599,51 +5601,20 @@ let llamaUpdateProcess = null;
 let llamaUpdateStatus = { status: 'idle', output: '', startedAt: null, completedAt: null };
 
 app.get('/api/llama/update/status', (req, res) => {
-  res.json(llamaUpdateStatus);
+  res.json(packagedLlamaUpdateStatus(DISTRIBUTION_POLICY) || llamaUpdateStatus);
 });
 
-app.post('/api/llama/update', async (req, res) => {
-  if (llamaUpdateProcess && !llamaUpdateProcess.killed) {
-    return res.json({ success: false, error: 'Update already in progress' });
-  }
-
-  // Stop llama server if running
-  if (llamaProcess && !llamaProcess.killed) {
-    addLog('update', 'Stopping llama server before update...');
-    await stopLlamaServer();
-  }
-
+/** Start and observe the mutable-checkout llama.cpp updater. */
+function startLlamaSourceUpdate() {
   llamaUpdateStatus = { status: 'updating', output: '', startedAt: new Date().toISOString(), completedAt: null };
 
-  // Run update script in distrobox
-  const updateScript = `
-    cd /home/yolan/llama.cpp && \
-    echo "=== Fetching latest changes ===" && \
-    git fetch origin master && \
-    echo "" && \
-    echo "=== Current version ===" && \
-    git log --oneline -1 && \
-    echo "" && \
-    echo "=== Pulling updates ===" && \
-    git checkout master && \
-    git pull origin master && \
-    echo "" && \
-    echo "=== New version ===" && \
-    git log --oneline -1 && \
-    echo "" && \
-    echo "=== Building llama.cpp ===" && \
-    cmake --build build -j$(nproc) && \
-    echo "" && \
-    echo "=== Installing ===" && \
-    cmake --install build --prefix ~/.local && \
-    echo "" && \
-    echo "=== Update complete ===" && \
-    llama-server --version
-  `;
-
   const distrobox = existsSync('/usr/local/bin/distrobox') ? '/usr/local/bin/distrobox' : 'distrobox';
+  const spec = createLlamaSourceUpdateSpec(RUNTIME_ENV, {
+    distrobox,
+    containerName: CONTAINER_NAME,
+  });
 
-  llamaUpdateProcess = spawn(distrobox, ['enter', CONTAINER_NAME, '--', 'bash', '-c', updateScript], {
+  llamaUpdateProcess = spawn(spec.command, spec.args, {
     env: {
       ...RUNTIME_ENV,
       XDG_RUNTIME_DIR: '/run/user/1000',
@@ -5677,8 +5648,21 @@ app.post('/api/llama/update', async (req, res) => {
     broadcast({ type: 'llama_update', data: { status: llamaUpdateStatus.status, code } });
     llamaUpdateProcess = null;
   });
+}
 
-  res.json({ success: true, message: 'Update started' });
+app.post('/api/llama/update', async (req, res) => {
+  const result = await beginLlamaUpdate({
+    policy: DISTRIBUTION_POLICY,
+    updateInProgress: Boolean(llamaUpdateProcess && !llamaUpdateProcess.killed),
+    serverRunning: Boolean(llamaProcess && !llamaProcess.killed),
+    stopServer: async () => {
+      addLog('update', 'Stopping llama server before update...');
+      await stopLlamaServer();
+    },
+    startSourceUpdate: startLlamaSourceUpdate,
+  });
+
+  res.status(result.status).json(result.body);
 });
 
 // Helper: Flatten nested GGUF files to one level deep

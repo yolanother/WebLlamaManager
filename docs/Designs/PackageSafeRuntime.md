@@ -42,7 +42,8 @@ The same manifest fixes the signed DS4 executable at
 `/usr/lib/llama-manager-ds4/bin/ds4-server` plus the package locations of the
 runtime and model-storage validators. It also enumerates the actual required
 launch files: `start-llama.sh`, `start-preset.sh`, the inner
-`container-start.sh`, and `start-ds4.sh` (there is no package `start.sh`).
+`container-start.sh`, `start-embed.sh`, and `start-ds4.sh` (there is no package
+`start.sh`).
 Everything named by the manifest is root-owned and non-group-writable. The
 package/ISO build must acquire these artifacts while building the release so
 installation and first boot need no network access.
@@ -63,6 +64,19 @@ may execute `DS4_STATE_DIR/current/ds4-server`. Package mode disables its check,
 apply, API mutation, and scheduler surfaces. Status instead reports signed APT
 as the update manager. `start-ds4.sh` ignores the writable state symlink and
 uses only the root-owned DS4 package binary.
+
+## llama.cpp update boundary
+
+Source installations retain the dashboard's git fetch, CMake build, and
+install updater. Its checkout defaults to `$HOME/llama.cpp`, can be selected
+with `LLAMA_CPP_DIR`, and crosses the shell boundary as a positional argument;
+there is no developer-specific home path in the command.
+
+Package mode rejects `POST /api/llama/update` before stopping a running server
+or creating any git, CMake, or Distrobox process. The status endpoint identifies
+APT as the manager, names `llama-manager-rocm-gfx1151`, and returns the signed
+repository upgrade command. The dashboard renders that guidance and does not
+render the source-update control.
 
 ## Authorization boundary
 
@@ -118,6 +132,10 @@ launchers preserve these as data across the Distrobox boundary:
 - `start-preset.sh` builds the llama-server argv as a host-side array, then
   passes every value as a positional argument after a fixed single-quoted inner
   script. Package mode also pins the container and binary.
+- `start-embed.sh` applies the same fixed-script/positional-argv boundary.
+  Package mode ignores `DISTROBOX_CONTAINER`, `LLAMA_SERVER_BIN`, and the
+  operator's `PATH` for runtime selection, pinning `llama-rocm-7.2.4` and
+  `/usr/local/bin/llama-server`; source mode retains configured values.
 - `container-start.sh` builds router arguments in a Bash array and invokes
   `exec "${CMD[@]}"`, so spaces, quotes, semicolons, dollar expressions, and
   glob characters in model/NAS paths cannot split into new arguments or run as

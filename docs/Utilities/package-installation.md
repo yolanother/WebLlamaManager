@@ -104,6 +104,11 @@ manual check/apply operations, and scheduler are disabled; the API returns the
 signed-APT command instead. The service never executes DS4 binaries from writable
 state.
 
+The dashboard's llama.cpp updater is also source-only. A packaged dashboard
+shows the signed-APT command for `llama-manager-rocm-gfx1151` instead of an
+update button, and the API rejects attempts to invoke the source updater before
+it can stop inference or launch a build.
+
 ## Bundled offline Node runtime
 
 The package includes Node 20.18.1 or newer at
@@ -113,15 +118,18 @@ package/ISO repository must consume `packaging/runtime-contract.env`, stage all
 declared files as root-owned/non-group-writable content, and cache the runtime
 artifact during the release build so installation works offline.
 
-The contract names `start-llama.sh`, `start-preset.sh`, `container-start.sh`,
-and `start-ds4.sh` explicitly so the package builder can fail when a required
-launcher is missing. Inside Distrobox, host `/usr/lib` content is addressed
-through `/run/host`; the contract exports both host and container-visible paths
-for validation.
+The contract names `start-llama.sh`, `start-preset.sh`, `start-embed.sh`,
+`container-start.sh`, and `start-ds4.sh` explicitly so the package builder can
+fail when a required launcher is missing. Inside Distrobox, host `/usr/lib`
+content is addressed through `/run/host`; the contract exports both host and
+container-visible paths for validation.
 
-Preset and router configuration is passed to llama-server as argv, not evaluated
-as shell. Model/NAS paths containing whitespace or shell metacharacters remain a
-single path argument, while preset switches are tokenized without `eval`.
+Preset, embedding, and router configuration is passed to llama-server as argv,
+not evaluated as shell. Model/NAS paths containing whitespace or shell
+metacharacters remain a single path argument, while preset switches are
+tokenized without `eval`. Package embedding launches always use
+`/usr/local/bin/llama-server` inside `llama-rocm-7.2.4`; source installations may
+still configure the container and binary.
 
 ## Path overrides
 

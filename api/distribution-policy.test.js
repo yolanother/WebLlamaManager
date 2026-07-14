@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import {
   packagedDs4UpdateStatus,
   packagedDs4UpdateRejection,
+  packagedLlamaUpdateStatus,
+  packagedLlamaUpdateRejection,
   resolveDistributionPolicy,
 } from './distribution-policy.js';
 
@@ -47,4 +49,22 @@ test('packaged DS4 update surfaces return status and reject check/apply with APT
   assert.equal(rejection.body.code, 'PACKAGE_MANAGED');
   assert.match(rejection.body.error, /cannot apply/i);
   assert.equal(rejection.body.command, policy.command);
+});
+
+test('packaged llama update surfaces use the signed gfx1151 package and reject source mutation', () => {
+  const policy = resolveDistributionPolicy({ LLAMA_MANAGER_PACKAGED: '1' });
+  const status = packagedLlamaUpdateStatus(policy);
+  const rejection = packagedLlamaUpdateRejection(policy);
+
+  assert.deepEqual(status, {
+    status: 'package-managed',
+    managedBy: 'apt',
+    selfUpdateEnabled: false,
+    package: 'llama-manager-rocm-gfx1151',
+    guidance: policy.llamaGuidance,
+    command: policy.llamaCommand,
+  });
+  assert.equal(rejection.status, 409);
+  assert.equal(rejection.body.code, 'PACKAGE_MANAGED');
+  assert.match(rejection.body.command, /apt install --only-upgrade llama-manager-rocm-gfx1151/);
 });

@@ -289,6 +289,40 @@ test_preset_launcher_preserves_adversarial_values_as_arguments() {
   rm -rf "$sandbox"
 }
 
+test_embed_launcher_pins_packaged_runtime_and_preserves_source_configuration() {
+  printf 'test_embed_launcher_pins_packaged_runtime_and_preserves_source_configuration\n'
+  local sandbox marker model quoted_model output source_output
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-embed-runtime.XXXXXX")"
+  marker="$sandbox/injected"
+  model="$sandbox/model with spaces ; \$(touch $marker).gguf"
+  quoted_model="$(printf '%q' "$model")"
+
+  output="$(LLAMA_MANAGER_PACKAGED=1 DISTROBOX_CONTAINER=operator-container \
+    LLAMA_SERVER_BIN=/tmp/operator-server PATH="/tmp/operator-path:$PATH" \
+    EMBED_MODEL="$model" bash "$REPO_ROOT/start-embed.sh" --print-cmd 2>&1)"
+  assert_contains "packaged embed pins ROCm container" "$output" "container=llama-rocm-7.2.4"
+  assert_contains "packaged embed pins container binary" "$output" "binary=/usr/local/bin/llama-server"
+  assert_contains "packaged embed keeps model as one inert argument" "$output" "arg=$quoted_model"
+  if [[ "$output" == *"operator-container"* || "$output" == *"operator-server"* ]]; then
+    printf '  FAIL packaged embed accepted an operator runtime override\n'
+    failures=$((failures + 1))
+  else
+    printf '  ok   packaged embed ignores operator runtime overrides\n'
+  fi
+
+  source_output="$(DISTROBOX_CONTAINER=source-container LLAMA_SERVER_BIN=/source/llama-server \
+    EMBED_MODEL="$model" bash "$REPO_ROOT/start-embed.sh" --print-cmd 2>&1)"
+  assert_contains "source embed preserves configured container" "$source_output" "container=source-container"
+  assert_contains "source embed preserves configured binary" "$source_output" "binary=/source/llama-server"
+  if [ -e "$marker" ]; then
+    printf '  FAIL embed model configuration executed shell content\n'
+    failures=$((failures + 1))
+  else
+    printf '  ok   embed model configuration remains inert data\n'
+  fi
+  rm -rf "$sandbox"
+}
+
 test_router_launcher_preserves_paths_as_single_arguments() {
   printf 'test_router_launcher_preserves_paths_as_single_arguments\n'
   local sandbox marker model_dir slot_dir capture output
@@ -333,6 +367,7 @@ test_packaged_service_uses_declared_offline_node_runtime() {
   assert_contains "manifest declares bundled Node path" "$contract" "LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node"
   assert_contains "manifest declares sanitized launcher" "$contract" "LLAMA_MANAGER_SERVICE_LAUNCHER=/usr/lib/llama-manager/scripts/run-packaged-service"
   assert_contains "manifest declares the real llama launcher" "$contract" "LLAMA_MANAGER_LLAMA_LAUNCHER=/usr/lib/llama-manager/start-llama.sh"
+  assert_contains "manifest declares the embedding launcher" "$contract" "LLAMA_MANAGER_EMBED_LAUNCHER=/usr/lib/llama-manager/start-embed.sh"
   assert_contains "manifest declares the preset launcher" "$contract" "LLAMA_MANAGER_PRESET_LAUNCHER=/usr/lib/llama-manager/start-preset.sh"
   assert_contains "manifest requires the inner container launcher" "$contract" "LLAMA_MANAGER_CONTAINER_START=/usr/lib/llama-manager/container-start.sh"
   assert_contains "manifest declares the DS4 launcher" "$contract" "LLAMA_MANAGER_DS4_LAUNCHER=/usr/lib/llama-manager/start-ds4.sh"
@@ -445,6 +480,7 @@ test_packaged_ds4_uses_root_owned_binary
 test_source_ds4_keeps_managed_state_binary
 test_llama_launcher_maps_package_scripts_into_distrobox
 test_preset_launcher_preserves_adversarial_values_as_arguments
+test_embed_launcher_pins_packaged_runtime_and_preserves_source_configuration
 test_router_launcher_preserves_paths_as_single_arguments
 test_packaged_service_uses_declared_offline_node_runtime
 test_packaged_service_rejects_group_config_runtime_injection
