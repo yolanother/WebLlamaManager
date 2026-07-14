@@ -55,11 +55,11 @@ test_url_resolution() {
       local sb; sb="$(new_sandbox)"
 
       # No .env -> default port 3001
-      assert_eq "default url" "http://localhost:3001" "$(kiosk_resolve_url "$sb/none.env")"
+      assert_eq "default url" "http://localhost:3001/kiosk" "$(kiosk_resolve_url "$sb/none.env")"
 
       # API_PORT in .env -> default host, that port
       printf 'API_PORT=4444\n' > "$sb/a.env"
-      assert_eq "url from API_PORT" "http://localhost:4444" "$(kiosk_resolve_url "$sb/a.env")"
+      assert_eq "url from API_PORT" "http://localhost:4444/kiosk" "$(kiosk_resolve_url "$sb/a.env")"
 
       # Explicit KIOSK_URL in .env wins over API_PORT
       printf 'API_PORT=4444\nKIOSK_URL=http://dash.local:9000/\n' > "$sb/b.env"
@@ -165,7 +165,7 @@ test_install_flow() {
     local sb; sb="$(new_sandbox)"
 
     # Seed a pre-existing gdm config and an AccountsService record for the user.
-    local user; user="$(id -un)"
+    local user="llama-kiosk"
     mkdir -p "$sb/etc/gdm3" "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
     printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
     printf '[User]\nSession=ubuntu\nXSession=ubuntu\n' > "$sb/var/lib/AccountsService/users/$user"
@@ -176,10 +176,21 @@ test_install_flow() {
     local rc=$?
     assert_eq "install exit 0" "0" "$rc"
 
+    # A dedicated account owns the kiosk session; the invoking administrator's
+    # desktop account is never converted into an autologin account.
+    assert_eq "dedicated kiosk account recorded" "$user" \
+      "$(grep '^target_user=' "$sb/var/backups/llama-kiosk/manifest" | cut -d= -f2-)"
+    assert_eq "dedicated kiosk home created" "yes" \
+      "$([ -d "$sb/var/lib/llama-kiosk" ] && echo yes || echo no)"
+
     # Session desktop file generated and points at the launcher.
     assert_file "session file created" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
-    assert_eq "session Exec set" "yes" \
-      "$(grep -q "llama-kiosk-launch.sh" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop" && echo yes || echo no)"
+    assert_eq "session Exec uses readable installed runtime" "yes" \
+      "$(grep -q '^Exec=/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh' "$sb/usr/share/wayland-sessions/llama-kiosk.desktop" && echo yes || echo no)"
+    assert_file "launcher installed outside administrator home" \
+      "$sb/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh"
+    assert_file "control helper installed with launcher" \
+      "$sb/usr/local/lib/llama-manager/kiosk/llama-kiosk-control.py"
 
     # gdm autologin enabled for the user.
     assert_eq "autologin enabled" "yes" \
@@ -228,7 +239,7 @@ test_dry_run_no_mutation() {
 test_uninstall_flow() {
     printf 'test_uninstall_flow\n'
     local sb; sb="$(new_sandbox)"
-    local user; user="$(id -un)"
+    local user="llama-kiosk"
 
     mkdir -p "$sb/etc/gdm3" "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
     printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
@@ -248,6 +259,10 @@ test_uninstall_flow() {
       "$(grep -q '^Session=ubuntu' "$sb/var/lib/AccountsService/users/$user" && echo yes || echo no)"
     # Session entry removed.
     assert_no_file "session entry removed" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    assert_eq "installer-created kiosk runtime removed" no \
+      "$([ -e "$sb/usr/local/lib/llama-manager/kiosk" ] && echo yes || echo no)"
+    assert_eq "installer-created kiosk home removed" "no" \
+      "$([ -e "$sb/var/lib/llama-kiosk" ] && echo yes || echo no)"
 
     # Uninstall again is safe (idempotent, exit 0).
     bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1

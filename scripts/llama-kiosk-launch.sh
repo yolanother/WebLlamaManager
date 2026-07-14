@@ -8,8 +8,11 @@
 # not flash a connection error while the llama-manager service starts), then
 # replaces itself with `cage` running full-screen Chrome in kiosk mode.
 #
+# Starts the separate loopback-only control helper so the local kiosk can switch
+# to GDM without adding a remotely reachable API route.
+#
 # Test seams (env): KIOSK_WAIT_BUDGET (seconds, default 60),
-# KIOSK_LAUNCH_ONCE=1 (do not loop), KIOSK_URL to override the target.
+# KIOSK_LAUNCH_ONCE=1 (do not loop or start the helper), KIOSK_URL override.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +24,18 @@ source "$SCRIPT_DIR/lib/kiosk-common.sh"
 URL="$(kiosk_resolve_url "$REPO_ROOT/.env")"
 WAIT_BUDGET="${KIOSK_WAIT_BUDGET:-60}"
 PROFILE_DIR="${HOME:-/tmp}/.config/llama-kiosk/chrome"
+CONTROL_HELPER="$SCRIPT_DIR/llama-kiosk-control.py"
+
+# Start the desktop-session helper only for the real kiosk session. It is bound
+# to 127.0.0.1 by its own implementation and validates the dashboard Origin.
+start_control_helper() {
+    [ "${KIOSK_LAUNCH_ONCE:-0}" = "1" ] && return 0
+    if [ -x "$CONTROL_HELPER" ]; then
+        python3 "$CONTROL_HELPER" --dashboard-url "$URL" &
+    else
+        kiosk_warn "local System Login helper is missing or not executable"
+    fi
+}
 
 # Poll URL until reachable or the time budget is exhausted. Never fatal: after
 # the budget, fall through and let Chrome show its own retry page.
@@ -70,5 +85,6 @@ launch() {
     fi
 }
 
+start_control_helper
 wait_for_url
 launch

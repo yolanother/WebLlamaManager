@@ -5,8 +5,9 @@
 #
 # Shared helpers for scripts/install-kiosk.sh and scripts/llama-kiosk-launch.sh.
 # Provides: sandbox-aware path resolution (KIOSK_ROOT), .env-driven KIOSK_URL
-# resolution, install-manifest read/write, idempotent file backups, and a
-# dry-run-aware command wrapper. This file is meant to be SOURCED, not executed.
+# resolution, dedicated-account lifecycle, install-manifest read/write,
+# idempotent file backups, and a dry-run-aware command wrapper. This file is
+# meant to be SOURCED, not executed.
 
 # Guard against double-sourcing.
 [ -n "${_KIOSK_COMMON_SOURCED:-}" ] && return 0
@@ -36,7 +37,7 @@ kiosk_resolve_url() {
         api_port="$(grep -E '^API_PORT=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- | xargs || true)"
     fi
     if [ -n "$url" ]; then printf '%s\n' "$url"; return 0; fi
-    printf 'http://localhost:%s\n' "${api_port:-3001}"
+    printf 'http://localhost:%s/kiosk\n' "${api_port:-3001}"
 }
 
 # Absolute path to the install manifest (records what install changed).
@@ -175,6 +176,79 @@ kiosk_ensure_cage() {
     kiosk_manifest_set installed_cage true
 }
 
+# Ensure the dedicated kiosk account exists. Production installs create a
+# locked system account with a writable private home and a normal shell so GDM
+# can start its Wayland session. Sandboxed installs model the same lifecycle
+# without touching the host user database. The manifest records ownership so
+# uninstall never removes an account that predated Llama Manager.
+# Args: $1 = account name.
+kiosk_ensure_account() {
+    local user="$1" home
+    home="$(kiosk_path /var/lib/llama-kiosk)"
+    if [ "$KIOSK_ROOT" != "/" ]; then
+        if [ -d "$home" ]; then
+            kiosk_manifest_set installed_kiosk_account false
+        else
+            kiosk_run mkdir -p "$home"
+            kiosk_manifest_set installed_kiosk_account true
+        fi
+        return 0
+    fi
+    if id "$user" >/dev/null 2>&1; then
+        kiosk_manifest_set installed_kiosk_account false
+        return 0
+    fi
+    kiosk_run useradd --system --create-home --home-dir /var/lib/llama-kiosk \
+        --shell /bin/bash --user-group "$user"
+    kiosk_manifest_set installed_kiosk_account true
+}
+
+# Remove the dedicated kiosk account only when this installer created it.
+# Existing accounts are preserved. Sandboxed installs remove only the modeled
+# private home directory.
+# Args: $1 = account name.
+kiosk_remove_account() {
+    local user="$1" home
+    [ "$(kiosk_manifest_get installed_kiosk_account)" = "true" ] || return 0
+    home="$(kiosk_path /var/lib/llama-kiosk)"
+    if [ "$KIOSK_ROOT" != "/" ]; then
+        kiosk_run rm -rf "$home"
+    elif id "$user" >/dev/null 2>&1; then
+        kiosk_run userdel --remove "$user"
+    fi
+}
+
+# Install the kiosk launcher, helper, and shared library in a world-traversable
+# system location. This is required because the dedicated kiosk account cannot
+# be expected to read a source checkout inside an administrator's private home.
+# Existing unmanaged content is never overwritten.
+# Args: $1 = source repository root.
+kiosk_install_runtime() {
+    local source_root="$1" logical_dir="/usr/local/lib/llama-manager/kiosk" dest
+    dest="$(kiosk_path "$logical_dir")"
+    if [ -e "$dest" ] && [ -z "$(kiosk_manifest_get installed_runtime)" ]; then
+        kiosk_warn "$logical_dir already exists but is not managed by this installer"
+        return 1
+    fi
+    if [ "$KIOSK_DRY_RUN" = "true" ]; then
+        kiosk_log "DRY-RUN would install kiosk runtime to $logical_dir"
+        return 0
+    fi
+    mkdir -p "$dest/lib"
+    install -m 0755 "$source_root/scripts/llama-kiosk-launch.sh" "$dest/llama-kiosk-launch.sh"
+    install -m 0755 "$source_root/scripts/llama-kiosk-control.py" "$dest/llama-kiosk-control.py"
+    install -m 0644 "$source_root/scripts/lib/kiosk-common.sh" "$dest/lib/kiosk-common.sh"
+    kiosk_manifest_set installed_runtime true
+}
+
+# Remove only the kiosk runtime directory created by this installer.
+kiosk_remove_runtime() {
+    local dest
+    [ "$(kiosk_manifest_get installed_runtime)" = "true" ] || return 0
+    dest="$(kiosk_path /usr/local/lib/llama-manager/kiosk)"
+    kiosk_run rm -rf "$dest"
+}
+
 # Set or replace a "key=value" line under an [section]-less or simple INI file,
 # appending if absent. Used for gdm custom.conf [daemon] keys.
 # Args: $1 = file path, $2 = key, $3 = value.
@@ -227,12 +301,14 @@ kiosk_install() {
     local user launcher gdm acct
     ensure_root "$@" || true
     user="$(kiosk_target_user)"
-    launcher="$REPO_ROOT/scripts/llama-kiosk-launch.sh"
+    launcher="/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh"
     gdm="$(kiosk_path /etc/gdm3/custom.conf)"
     acct="$(kiosk_path /var/lib/AccountsService/users/$user)"
 
     kiosk_require_chrome >/dev/null
     kiosk_ensure_cage
+    kiosk_ensure_account "$user"
+    kiosk_install_runtime "$REPO_ROOT"
 
     # Back up before mutating.
     kiosk_backup_file gdm_custom_conf /etc/gdm3/custom.conf
@@ -310,6 +386,9 @@ kiosk_uninstall() {
         kiosk_run rm -f "$session_entry"
         kiosk_log "removed session entry: $session_entry"
     fi
+
+    kiosk_remove_runtime
+    kiosk_remove_account "$user"
 
     # Report cage (do not auto-remove an apt package).
     if [ "$(kiosk_manifest_get installed_cage)" = "true" ]; then
