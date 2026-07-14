@@ -317,10 +317,12 @@ kiosk_set_ini_key() {
     fi
 }
 
-# Write the kiosk Wayland session desktop entry.
+# Atomically publish the kiosk Wayland session desktop entry through a
+# same-directory regular temp file, never following an existing destination
+# symlink. The final entry is mode 0644.
 # Arg: $1 = absolute path to llama-kiosk-launch.sh.
 kiosk_write_session() {
-    local launcher="$1" dest content
+    local launcher="$1" dest dest_dir temp content
     dest="$(kiosk_path /usr/share/wayland-sessions/llama-kiosk.desktop)"
     content="[Desktop Entry]
 Name=Llama Kiosk
@@ -332,8 +334,15 @@ DesktopNames=llama-kiosk"
         kiosk_log "DRY-RUN would write session file to $dest"
         return 0
     fi
-    mkdir -p "$(dirname "$dest")"
-    printf '%s\n' "$content" > "$dest"
+    dest_dir="$(dirname "$dest")"
+    mkdir -p "$dest_dir"
+    temp="$(mktemp "$dest_dir/.llama-kiosk.desktop.XXXXXX")"
+    if ! printf '%s\n' "$content" > "$temp" ||
+        ! chmod 0644 "$temp" ||
+        ! mv -Tf "$temp" "$dest"; then
+        rm -f "$temp"
+        return 1
+    fi
     kiosk_log "wrote session entry: $dest"
 }
 

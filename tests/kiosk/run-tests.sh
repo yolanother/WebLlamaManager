@@ -355,6 +355,45 @@ test_uninstall_without_install_preserves_session_entry() {
     rm -rf "$sb"
 }
 
+test_session_symlink_target_is_never_overwritten() {
+    printf 'test_session_symlink_target_is_never_overwritten\n'
+    local sb session external expected; sb="$(new_sandbox)"
+    session="$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    external="$(mktemp "${TMPDIR:-/tmp}/kiosk-elf-target.XXXXXX")"
+    expected='ELF FIXTURE BYTES MUST REMAIN UNCHANGED'
+    printf '%s\n' "$expected" > "$external"
+    chmod 0755 "$external"
+    mkdir -p "$(dirname "$session")"
+    ln -s "$external" "$session"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "install leaves external session-symlink target bytes unchanged" \
+        "$expected" "$(cat "$external")"
+    assert_eq "install atomically replaces session symlink with regular file" yes \
+        "$([ -f "$session" ] && [ ! -L "$session" ] && echo yes || echo no)"
+    assert_eq "installed session entry has safe permissions" 644 \
+        "$(stat -c %a "$session")"
+    assert_eq "session backup preserves original symlink" "$external" \
+        "$(readlink "$sb/var/backups/llama-kiosk/wayland_session")"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "reinstall leaves external symlink target bytes unchanged" \
+        "$expected" "$(cat "$external")"
+    assert_eq "reinstall preserves original session symlink backup" "$external" \
+        "$(readlink "$sb/var/backups/llama-kiosk/wayland_session")"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "uninstall leaves external session-symlink target bytes unchanged" \
+        "$expected" "$(cat "$external")"
+    assert_eq "uninstall restores original session symlink" "$external" \
+        "$(readlink "$session" 2>/dev/null)"
+    rm -rf "$sb"
+    rm -f "$external"
+}
+
 test_launcher() {
     printf 'test_launcher\n'
     local sb; sb="$(new_sandbox)"
@@ -426,6 +465,7 @@ test_uninstall_flow
 test_preexisting_account_is_preserved
 test_preexisting_session_entry_is_restored
 test_uninstall_without_install_preserves_session_entry
+test_session_symlink_target_is_never_overwritten
 test_launcher
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.

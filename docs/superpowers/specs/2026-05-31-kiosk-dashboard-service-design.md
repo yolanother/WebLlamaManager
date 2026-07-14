@@ -99,7 +99,10 @@ the autologin session — the kiosk self-heals.
    user's previous session.
 5. **`/usr/share/wayland-sessions/llama-kiosk.desktop`** — back up a
    pre-existing entry or record that the installer created it, then publish the
-   managed session. Repeated installs retain the original ownership record.
+   managed session as a mode-`0644` regular temp file followed by an atomic
+   same-directory rename. This replaces, rather than follows, a destination
+   symlink. Repeated installs retain the original ownership record, including a
+   pristine symlink backup whose external target is never written.
 6. **Bring the kiosk up now** (unless `--no-start`): restart the display manager
    so gdm autologin immediately enters the kiosk session — no reboot required for
    first use.
