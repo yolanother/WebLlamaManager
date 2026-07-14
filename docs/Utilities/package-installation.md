@@ -42,6 +42,11 @@ signing keys there. Supported scalars are `API_PORT`, `LLAMA_PORT`, `EMBED_PORT`
 numbers, or booleans fall back to package defaults. `AUTO_START=0` and `1` are
 normalized to `false` and `true`, respectively.
 
+Persisted JSON settings override these defaults key by key. Missing keys still
+inherit the validated service values, including when tmpfiles has created the
+initial empty `{}` config. This makes first boot auto-start the bundled model
+while preserving an explicit dashboard choice such as `autoStart: false`.
+
 The service does not source that file or load it as a systemd environment file.
 A root-owned launcher reads literal values for documented path keys only and
 starts Node from an empty environment. Entries such as `NODE_OPTIONS`,
