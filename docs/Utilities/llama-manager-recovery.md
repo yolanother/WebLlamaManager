@@ -22,10 +22,16 @@ Every manifest is treated as hostile despite that trust boundary. File entries
 must exactly match the compiled category/path allowlist, with no duplicates; NFS
 records accept only their fixed schema and a conservative option allowlist. Bundle
 symlinks, unknown payloads, unsafe path components, and unsupported field types are
-rejected. Backup output and hostname directories are created with fd-relative,
-no-follow traversal so an existing symlink cannot redirect a bundle. Platform
-metadata links are accepted only when their final target remains inside the selected
-backup root (needed for normal sysfs links).
+rejected. Backup sources are read through retained, fd-relative `O_NOFOLLOW`
+descriptors, so a source parent cannot be swapped after validation to redirect the
+read. Root-internal metadata links such as Ubuntu's `/etc/os-release` are resolved
+to a canonical in-root path and then reopened through the same descriptor-safe
+traversal. External links remain forbidden.
+
+Backup output, hostname, and bundle directories are also created through retained
+no-follow descriptors. Every payload, manifest, guide, and checksum write remains
+fd-relative to the opened bundle inode through its final fsync. Swapping the lexical
+bundle path after creation therefore cannot redirect data to another directory.
 
 ## Commands
 
@@ -152,9 +158,11 @@ first target mutation. File replacement is atomic. A successful transaction reco
 reverse order and records `rolled_back` (or `rollback_failed` if operator action is
 still required). Restore file access and replacement use fd-relative `O_NOFOLLOW`
 operations, rejecting every symlink ancestor and preventing a checked parent from
-being swapped before the write. Directory creation and rollback deletion fsync their
-parents before the durable transaction state advances. This preparation happens for
-all targets before any configuration is changed.
+being swapped before the write. Replacement ownership and permissions are applied
+to the temporary inode before its file fsync and atomic rename, so the renamed file
+is durably synchronized with its final metadata. Directory creation and rollback
+deletion fsync their parents before the durable transaction state advances. This
+preparation happens for all targets before any configuration is changed.
 
 ## Explicit exclusions
 
@@ -174,4 +182,5 @@ python3 -m unittest tests.recovery.test_recovery -v
 ```
 
 The tests use only temporary `--root` trees and never inspect or mutate the active
-host.
+host. Deterministic race seams verify that swapping a validated source parent or a
+created output bundle cannot redirect reads or writes.

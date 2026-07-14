@@ -54,12 +54,18 @@ class RecoveryCliTests(unittest.TestCase):
         model.parent.mkdir(parents=True)
         model.write_bytes(b"model blob must not be copied")
 
-    def run_cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        self,
+        *args: str,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         """Run the recovery CLI and return its captured process result.
 
         Args:
             *args: Arguments supplied after the CLI executable.
             check: Raise when the command exits unsuccessfully.
+            env: Optional environment overrides used by deterministic race tests.
 
         Returns:
             The completed subprocess with text output captured.
@@ -69,6 +75,7 @@ class RecoveryCliTests(unittest.TestCase):
             check=check,
             text=True,
             capture_output=True,
+            env={**os.environ, **(env or {})},
         )
 
     def resign_bundle(self, bundle: Path) -> None:
@@ -522,6 +529,116 @@ class RecoveryCliTests(unittest.TestCase):
         )
         self.assertNotEqual(0, result.returncode)
         self.assertIn("platform", result.stderr.lower())
+
+    def test_backup_source_parent_swap_uses_open_descriptor(self) -> None:
+        """A validated source parent swap cannot redirect the captured bytes."""
+        source_file = (
+            self.source_root
+            / "usr"
+            / "share"
+            / "wayland-sessions"
+            / "llama-kiosk.desktop"
+        )
+        source_file.parent.mkdir(parents=True)
+        source_file.write_text("Exec=/usr/bin/llama-kiosk\n", encoding="utf-8")
+        outside = self.base / "outside-session"
+        outside.mkdir()
+        (outside / "llama-kiosk.desktop").write_text(
+            "Exec=/usr/bin/redirected\n", encoding="utf-8"
+        )
+
+        result = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(self.output),
+            "--hostname",
+            "source-host",
+            "--timestamp",
+            "20260714T120258Z",
+            env={
+                "LLAMA_RECOVERY_TEST_SOURCE_SWAP": (
+                    "/usr/share/wayland-sessions/llama-kiosk.desktop"
+                ),
+                "LLAMA_RECOVERY_TEST_SOURCE_SWAP_TARGET": str(outside),
+            },
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        captured = (
+            Path(result.stdout.strip())
+            / "files"
+            / "usr"
+            / "share"
+            / "wayland-sessions"
+            / "llama-kiosk.desktop"
+        ).read_text(encoding="utf-8")
+        self.assertTrue(source_file.parent.is_symlink())
+        self.assertTrue(
+            source_file.parent.with_name("wayland-sessions.stable").is_dir()
+        )
+        self.assertEqual("Exec=/usr/bin/llama-kiosk\n", captured)
+
+    def test_backup_output_parent_swap_cannot_redirect_payloads(self) -> None:
+        """A created bundle swap cannot redirect fd-relative payload writes."""
+        outside = self.base / "outside-output"
+        outside.mkdir()
+        result = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(self.output),
+            "--hostname",
+            "source-host",
+            "--timestamp",
+            "20260714T120259Z",
+            env={
+                "LLAMA_RECOVERY_TEST_OUTPUT_SWAP": "1",
+                "LLAMA_RECOVERY_TEST_OUTPUT_SWAP_TARGET": str(outside),
+            },
+        )
+
+        bundle = Path(result.stdout.strip())
+        original = self.output / "source-host" / "20260714T120259Z"
+        self.assertTrue(original.is_symlink())
+        self.assertEqual("20260714T120259Z.stable", bundle.name)
+        self.assertTrue((bundle / "manifest.json").is_file())
+        self.assertTrue((bundle / "SHA256SUMS").is_file())
+        self.assertEqual([], list(outside.iterdir()))
+
+    def test_backup_allows_root_internal_os_release_symlink(self) -> None:
+        """Ubuntu's root-internal os-release symlink is read through stable fds."""
+        canonical = self.source_root / "usr" / "lib" / "os-release"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text("ID=ubuntu\nPRETTY_NAME=Ubuntu Recovery\n", encoding="utf-8")
+        os_release = self.source_root / "etc" / "os-release"
+        os_release.parent.mkdir(parents=True, exist_ok=True)
+        os_release.symlink_to("../usr/lib/os-release")
+
+        result = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(self.output),
+            "--hostname",
+            "source-host",
+            "--timestamp",
+            "20260714T120300Z",
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        manifest = json.loads(
+            (Path(result.stdout.strip()) / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual("ubuntu", manifest["platform"]["osRelease"]["ID"])
+        self.assertEqual(
+            "Ubuntu Recovery", manifest["platform"]["osRelease"]["PRETTY_NAME"]
+        )
 
     def test_plan_requires_explicit_replacement_host_storage_mappings(self) -> None:
         """Plan flags host-specific values instead of proposing blind restoration."""

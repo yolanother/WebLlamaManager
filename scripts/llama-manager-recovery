@@ -140,26 +140,27 @@ def mask_sensitive_assignments(text: str) -> str:
     return SENSITIVE_ASSIGNMENT.sub(lambda match: f"{match.group('key')}=[REDACTED]", text)
 
 
-def sanitize_file(source: Path, destination: Path) -> None:
-    """Copy one allowlisted configuration file while masking sensitive values.
+def sanitize_file(source: bytes, logical: str) -> bytes:
+    """Sanitize one already-open allowlisted configuration payload.
 
     Args:
-        source: Existing configuration file on the source host.
-        destination: Bundle path that will receive sanitized content.
+        source: Stable bytes read from the source host through a descriptor.
+        logical: Logical source path used to select JSON handling.
+
+    Returns:
+        Sanitized bytes ready for an fd-relative bundle write.
 
     Raises:
         ValueError: If a JSON configuration file cannot be parsed.
     """
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.suffix == ".json":
-        parsed = json.loads(source.read_text(encoding="utf-8"))
-        destination.write_text(
-            json.dumps(redact_json(parsed), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        return
+    text = source.decode("utf-8")
+    if Path(logical).suffix == ".json":
+        parsed = json.loads(text)
+        return (
+            json.dumps(redact_json(parsed), indent=2, sort_keys=True) + "\n"
+        ).encode()
     sanitized_lines: list[str] = []
-    for line in source.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         key, separator, value = line.partition("=")
         systemd_match = re.match(r'^(Environment=)([A-Za-z_][A-Za-z0-9_]*)(=)(.*?)("?)$', line)
         if systemd_match and (
@@ -173,7 +174,7 @@ def sanitize_file(source: Path, destination: Path) -> None:
             sanitized_lines.append(f"{key}=[REDACTED]")
         else:
             sanitized_lines.append(mask_sensitive_assignments(line))
-    destination.write_text("\n".join(sanitized_lines) + "\n", encoding="utf-8")
+    return ("\n".join(sanitized_lines) + "\n").encode()
 
 
 def logical_path(root: Path, absolute_path: str) -> Path:
@@ -189,15 +190,15 @@ def logical_path(root: Path, absolute_path: str) -> Path:
     return root / absolute_path.lstrip("/")
 
 
-def safe_source_file(root: Path, absolute_path: str) -> Path | None:
-    """Resolve an allowlisted source without following symbolic links.
+def read_source_file(root: Path, absolute_path: str) -> bytes | None:
+    """Read a logical regular file through no-follow ancestor descriptors.
 
     Args:
         root: Filesystem root used for this invocation.
         absolute_path: Logical absolute source path.
 
     Returns:
-        Existing regular source path, or ``None`` when it is absent.
+        Stable file bytes, or ``None`` when the file is absent or not regular.
 
     Raises:
         ValueError: If any existing component is a symbolic link or escapes root.
@@ -205,25 +206,89 @@ def safe_source_file(root: Path, absolute_path: str) -> Path | None:
     if not absolute_path.startswith("/") or ".." in Path(absolute_path).parts:
         raise ValueError(f"unsafe source path: {absolute_path}")
     resolved_root = root.resolve()
-    cursor = resolved_root
-    for part in Path(absolute_path).parts[1:]:
-        cursor = cursor / part
-        if cursor.is_symlink():
-            raise ValueError(f"symbolic link is forbidden in backup source: {absolute_path}")
-        if not cursor.exists():
+    parts = Path(absolute_path).parts[1:]
+    descriptor = os.open(
+        resolved_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        f"symbolic link is forbidden in backup source: {absolute_path}"
+                    ) from error
+                raise
+            os.close(descriptor)
+            descriptor = child
+        inject_source_parent_swap(resolved_root, absolute_path)
+        try:
+            source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+        except FileNotFoundError:
             return None
-    resolved = cursor.resolve()
-    if resolved_root != resolved and resolved_root not in resolved.parents:
-        raise ValueError(f"backup source escapes root: {absolute_path}")
-    if not cursor.is_file():
-        return None
-    return cursor
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ValueError(
+                    f"symbolic link is forbidden in backup source: {absolute_path}"
+                ) from error
+            raise
+        try:
+            metadata = os.fstat(source)
+            if not stat.S_ISREG(metadata.st_mode):
+                return None
+            with os.fdopen(source, "rb") as stream:
+                source = -1
+                return stream.read()
+        finally:
+            if source >= 0:
+                os.close(source)
+    finally:
+        os.close(descriptor)
+
+
+def inject_source_parent_swap(root: Path, absolute_path: str) -> None:
+    """Inject a deterministic source race for integration tests only.
+
+    Args:
+        root: Resolved non-production source root.
+        absolute_path: Logical path currently being read.
+    """
+    requested = os.environ.get("LLAMA_RECOVERY_TEST_SOURCE_SWAP")
+    target = os.environ.get("LLAMA_RECOVERY_TEST_SOURCE_SWAP_TARGET")
+    if root == Path("/") or requested != absolute_path or not target:
+        return
+    parent = logical_path(root, absolute_path).parent
+    stable = parent.with_name(f"{parent.name}.stable")
+    if stable.exists():
+        return
+    parent.rename(stable)
+    parent.symlink_to(Path(target), target_is_directory=True)
+
+
+def safe_source_file(root: Path, absolute_path: str) -> bytes | None:
+    """Read an allowlisted source without following symbolic links.
+
+    Args:
+        root: Filesystem root used for this invocation.
+        absolute_path: Logical absolute source path.
+
+    Returns:
+        Stable regular-file bytes, or ``None`` when absent.
+    """
+    return read_source_file(root, absolute_path)
 
 
 def root_bounded_source_file(
     root: Path, absolute_path: str, description: str
-) -> Path | None:
-    """Resolve a metadata source while allowing only root-internal links.
+) -> bytes | None:
+    """Read metadata through stable fds while allowing root-internal links.
 
     Args:
         root: Filesystem root used for this invocation.
@@ -231,7 +296,7 @@ def root_bounded_source_file(
         description: Human-readable source class for safe error messages.
 
     Returns:
-        Existing regular resolved path, or ``None`` when absent.
+        Stable regular-file bytes, or ``None`` when absent.
 
     Raises:
         ValueError: If resolution escapes the supplied filesystem root.
@@ -245,7 +310,8 @@ def root_bounded_source_file(
         raise ValueError(f"{description} source escapes the backup root")
     if not resolved.is_file():
         return None
-    return resolved
+    canonical = "/" + str(resolved.relative_to(resolved_root))
+    return read_source_file(resolved_root, canonical)
 
 
 def reject_symlink_components(path: Path) -> None:
@@ -265,8 +331,8 @@ def reject_symlink_components(path: Path) -> None:
             raise ValueError(f"symbolic link is forbidden in path: {cursor}")
 
 
-def secure_create_directory(path: Path, mode: int, exist_ok: bool) -> Path:
-    """Create an absolute directory via no-follow, fd-relative traversal.
+def secure_create_directory(path: Path, mode: int, exist_ok: bool) -> tuple[Path, int]:
+    """Create and retain an absolute directory through no-follow traversal.
 
     Args:
         path: Directory path to create.
@@ -274,7 +340,7 @@ def secure_create_directory(path: Path, mode: int, exist_ok: bool) -> Path:
         exist_ok: Whether an existing leaf directory is acceptable.
 
     Returns:
-        Absolute lexical directory path.
+        Absolute lexical directory path and its open directory descriptor.
 
     Raises:
         FileExistsError: If the leaf exists and ``exist_ok`` is false.
@@ -316,23 +382,67 @@ def secure_create_directory(path: Path, mode: int, exist_ok: bool) -> Path:
                 os.fsync(child)
             os.close(descriptor)
             descriptor = child
-    finally:
+        return absolute, descriptor
+    except Exception:
         os.close(descriptor)
-    return absolute
+        raise
 
 
-def read_text_if_present(path: Path) -> str | None:
-    """Read a small metadata text file when it exists.
+def create_child_directory(
+    parent: int, name: str, mode: int, exist_ok: bool
+) -> int:
+    """Create one child directory and return a stable open descriptor.
 
     Args:
-        path: Metadata file to read.
+        parent: Open trusted parent directory descriptor.
+        name: Validated single child name.
+        mode: Permission mode for a newly created child.
+        exist_ok: Whether an existing directory is acceptable.
+
+    Returns:
+        Open no-follow child directory descriptor.
+    """
+    if name in {"", ".", ".."} or "/" in name:
+        raise ValueError("unsafe output directory name")
+    created = False
+    try:
+        child = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+        )
+    except FileNotFoundError:
+        os.mkdir(name, mode, dir_fd=parent)
+        fsync_directory_fd(parent)
+        child = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+        )
+        created = True
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ValueError(
+                f"symbolic link or non-directory in output path: {name}"
+            ) from error
+        raise
+    if not created and not exist_ok:
+        os.close(child)
+        raise FileExistsError(f"directory already exists: {name}")
+    if created:
+        os.fchmod(child, mode)
+        os.fsync(child)
+    return child
+
+
+def read_text_if_present(payload: bytes | None) -> str | None:
+    """Decode small metadata bytes when present.
+
+    Args:
+        payload: Metadata bytes already read through a stable descriptor.
 
     Returns:
         Stripped text, or ``None`` when the file is absent.
     """
-    if not path.is_file():
+    if payload is None:
         return None
-    return path.read_text(encoding="utf-8", errors="replace").strip()
+    return payload.decode("utf-8", errors="replace").strip()
 
 
 def collect_nfs_mounts(root: Path) -> list[dict[str, Any]]:
@@ -348,7 +458,7 @@ def collect_nfs_mounts(root: Path) -> list[dict[str, Any]]:
     if fstab is None:
         return []
     mounts: list[dict[str, Any]] = []
-    for raw_line in fstab.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw_line in fstab.decode("utf-8", errors="replace").splitlines():
         line = raw_line.split("#", 1)[0].strip()
         if not line:
             continue
@@ -379,7 +489,7 @@ def collect_storage(root: Path, nfs_mounts: list[dict[str, Any]]) -> dict[str, A
     models_dir: str | None = None
     config_path = safe_source_file(root, "/etc/llama-manager/config.json")
     if config_path is not None:
-        parsed = json.loads(config_path.read_text(encoding="utf-8"))
+        parsed = json.loads(config_path.decode("utf-8"))
         candidate = parsed.get("modelsDir") or parsed.get("models_dir")
         if isinstance(candidate, str):
             models_dir = candidate
@@ -398,8 +508,8 @@ def collect_platform(root: Path) -> dict[str, Any]:
     os_release: dict[str, str] = {}
     os_release_path = root_bounded_source_file(root, "/etc/os-release", "platform")
     if os_release_path is not None:
-        os_release_lines = os_release_path.read_text(
-            encoding="utf-8", errors="replace"
+        os_release_lines = os_release_path.decode(
+            "utf-8", errors="replace"
         ).splitlines()
         for line in os_release_lines:
             key, separator, value = line.partition("=")
@@ -412,9 +522,7 @@ def collect_platform(root: Path) -> dict[str, Any]:
     packages: list[dict[str, str]] = []
     if package_status is not None:
         current: dict[str, str] = {}
-        status_lines = package_status.read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines()
+        status_lines = package_status.decode("utf-8", errors="replace").splitlines()
         for line in status_lines + [""]:
             if not line:
                 name = current.get("Package", "")
@@ -433,8 +541,8 @@ def collect_platform(root: Path) -> dict[str, Any]:
         root, "/sys/class/dmi/id/product_name", "platform"
     )
     return {
-        "kernel": read_text_if_present(kernel_path) if kernel_path else None,
-        "product": read_text_if_present(product_path) if product_path else None,
+        "kernel": read_text_if_present(kernel_path),
+        "product": read_text_if_present(product_path),
         "osRelease": os_release,
         "packages": packages,
     }
@@ -452,19 +560,14 @@ def collect_runtime(root: Path) -> dict[str, Any]:
     runtime_path = safe_source_file(root, "/var/lib/llama-manager/runtime.json")
     if runtime_path is None:
         return {}
-    parsed = json.loads(runtime_path.read_text(encoding="utf-8"))
+    parsed = json.loads(runtime_path.decode("utf-8"))
     sanitized = redact_json(parsed)
     return sanitized if isinstance(sanitized, dict) else {}
 
 
-def write_reconfiguration_guide(bundle: Path) -> None:
-    """Write replacement-host adaptation instructions into a bundle.
-
-    Args:
-        bundle: Recovery bundle receiving ``RECONFIGURE.md``.
-    """
-    (bundle / "RECONFIGURE.md").write_text(
-        """# Reconfigure a Replacement Llama Manager Host
+def reconfiguration_guide() -> bytes:
+    """Return replacement-host adaptation instructions for a bundle."""
+    return b"""# Reconfigure a Replacement Llama Manager Host
 
 This bundle is an inspectable configuration reference for a human, Codex or Claude.
 It is not a disk image and intentionally contains no credentials or model blobs.
@@ -481,24 +584,63 @@ Use bundles only from the access-controlled private NAS or another trusted chann
 Never copy machine-id, SSH keys, browser profiles, tokens, signing keys, or arbitrary
 home data into this bundle. Re-enter required credentials through their owning setup
 tools after restoration.
-""",
-        encoding="utf-8",
-    )
+"""
 
 
-def write_checksums(bundle: Path) -> None:
-    """Write SHA-256 checksums for every regular bundle payload file.
+def write_bundle_file(bundle: int, relative: str, payload: bytes) -> None:
+    """Atomically write one payload beneath an open bundle descriptor.
 
     Args:
-        bundle: Recovery bundle whose payload will be checksummed.
+        bundle: Open trusted bundle directory descriptor.
+        relative: Validated bundle-relative payload path.
+        payload: Complete file content.
     """
-    lines: list[str] = []
-    for path in sorted(item for item in bundle.rglob("*") if item.is_file()):
-        if path.name == "SHA256SUMS":
-            continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        lines.append(f"{digest}  {path.relative_to(bundle)}")
-    (bundle / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path = Path(relative)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise ValueError(f"unsafe bundle payload path: {relative}")
+    parent = os.dup(bundle)
+    temporary = f".llama-manager-recovery-{secrets.token_hex(12)}"
+    descriptor = -1
+    try:
+        for part in path.parts[:-1]:
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, 0o700, dir_fd=parent)
+                fsync_directory_fd(parent)
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent,
+                )
+            os.close(parent)
+            parent = child
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o600)
+            os.fsync(stream.fileno())
+        os.replace(temporary, path.parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+        fsync_directory_fd(parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        os.close(parent)
 
 
 def validate_nfs_mount(mount: Any) -> None:
@@ -1170,9 +1312,9 @@ def atomic_write_destination(
             descriptor = -1
             stream.write(payload)
             stream.flush()
-            os.fsync(stream.fileno())
             os.fchown(stream.fileno(), uid, gid)
             os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
         os.replace(temporary, leaf, src_dir_fd=parent, dst_dir_fd=parent)
         fsync_directory_fd(parent)
     finally:
@@ -1456,9 +1598,9 @@ def atomic_write(target: Path, payload: bytes, uid: int, gid: int, mode: int) ->
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(payload)
             stream.flush()
-            os.fsync(stream.fileno())
             os.fchown(stream.fileno(), uid, gid)
             os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
         os.replace(temporary, target)
         fsync_directory(target.parent)
     finally:
@@ -1764,11 +1906,12 @@ def restore_bundle(args: argparse.Namespace) -> dict[str, Any]:
         raise PermissionError("restore must run as root; preview first with --dry-run")
     timestamp = args.timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     validate_timestamp(timestamp)
-    rollback = secure_create_directory(
+    rollback, rollback_descriptor = secure_create_directory(
         root / "var" / "backups" / "llama-manager-recovery" / timestamp,
         0o700,
         exist_ok=False,
     )
+    os.close(rollback_descriptor)
     selected_entries = [
         entry for entry in manifest.get("files", []) if entry["category"] in categories
     ]
@@ -1893,41 +2036,91 @@ def create_backup(args: argparse.Namespace) -> Path:
     timestamp = args.timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     validate_hostname(hostname)
     validate_timestamp(timestamp)
-    output_root = secure_create_directory(Path(args.output_dir), 0o700, exist_ok=True)
-    host_root = secure_create_directory(output_root / hostname, 0o700, exist_ok=True)
-    bundle = secure_create_directory(host_root / timestamp, 0o700, exist_ok=False)
-    copied: list[dict[str, str]] = []
-    for category, paths in ALLOWLIST.items():
-        for path in paths:
-            source = safe_source_file(root, path)
-            if source is None:
-                continue
-            destination = bundle / "files" / path.lstrip("/")
-            sanitize_file(source, destination)
-            copied.append({"category": category, "path": path})
-    nfs_mounts = collect_nfs_mounts(root)
-    manifest = {
-        "schemaVersion": SCHEMA_VERSION,
-        "createdAt": timestamp,
-        "sourceHost": hostname,
-        "files": copied,
-        "storage": collect_storage(root, nfs_mounts),
-        "platform": collect_platform(root),
-        "runtime": collect_runtime(root),
-        "exclusions": [
-            "credentials and tokens",
-            "signing private keys",
-            "machine-id and SSH keys",
-            "browser profiles and arbitrary home data",
-            "model and container image blobs",
-        ],
-    }
-    (bundle / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    output_root, output_descriptor = secure_create_directory(
+        Path(args.output_dir), 0o700, exist_ok=True
     )
-    write_reconfiguration_guide(bundle)
-    write_checksums(bundle)
-    return bundle
+    host_descriptor = -1
+    bundle_descriptor = -1
+    try:
+        host_descriptor = create_child_directory(
+            output_descriptor, hostname, 0o700, exist_ok=True
+        )
+        host_root = output_root / hostname
+        bundle_descriptor = create_child_directory(
+            host_descriptor, timestamp, 0o700, exist_ok=False
+        )
+        bundle = host_root / timestamp
+        if (
+            root.resolve() != Path("/")
+            and os.environ.get("LLAMA_RECOVERY_TEST_OUTPUT_SWAP") == "1"
+        ):
+            target = os.environ.get("LLAMA_RECOVERY_TEST_OUTPUT_SWAP_TARGET")
+            if not target:
+                raise ValueError("output swap test target is required")
+            stable_name = f"{timestamp}.stable"
+            os.rename(
+                timestamp,
+                stable_name,
+                src_dir_fd=host_descriptor,
+                dst_dir_fd=host_descriptor,
+            )
+            os.symlink(target, timestamp, dir_fd=host_descriptor)
+            fsync_directory_fd(host_descriptor)
+            bundle = host_root / stable_name
+        payloads: dict[str, bytes] = {}
+        copied: list[dict[str, str]] = []
+        for category, paths in ALLOWLIST.items():
+            for path in paths:
+                source = safe_source_file(root, path)
+                if source is None:
+                    continue
+                relative = f"files/{path.lstrip('/')}"
+                payload = sanitize_file(source, path)
+                write_bundle_file(bundle_descriptor, relative, payload)
+                payloads[relative] = payload
+                copied.append({"category": category, "path": path})
+        nfs_mounts = collect_nfs_mounts(root)
+        manifest = {
+            "schemaVersion": SCHEMA_VERSION,
+            "createdAt": timestamp,
+            "sourceHost": hostname,
+            "files": copied,
+            "storage": collect_storage(root, nfs_mounts),
+            "platform": collect_platform(root),
+            "runtime": collect_runtime(root),
+            "exclusions": [
+                "credentials and tokens",
+                "signing private keys",
+                "machine-id and SSH keys",
+                "browser profiles and arbitrary home data",
+                "model and container image blobs",
+            ],
+        }
+        payloads["manifest.json"] = (
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        ).encode()
+        payloads["RECONFIGURE.md"] = reconfiguration_guide()
+        write_bundle_file(bundle_descriptor, "manifest.json", payloads["manifest.json"])
+        write_bundle_file(
+            bundle_descriptor, "RECONFIGURE.md", payloads["RECONFIGURE.md"]
+        )
+        checksum_lines = [
+            f"{hashlib.sha256(payloads[name]).hexdigest()}  {name}"
+            for name in sorted(payloads)
+        ]
+        write_bundle_file(
+            bundle_descriptor,
+            "SHA256SUMS",
+            ("\n".join(checksum_lines) + "\n").encode(),
+        )
+        os.fsync(bundle_descriptor)
+        return bundle
+    finally:
+        if bundle_descriptor >= 0:
+            os.close(bundle_descriptor)
+        if host_descriptor >= 0:
+            os.close(host_descriptor)
+        os.close(output_descriptor)
 
 
 def build_parser() -> argparse.ArgumentParser:
