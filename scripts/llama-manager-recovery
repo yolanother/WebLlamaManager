@@ -497,24 +497,110 @@ def collect_nfs_mounts(root: Path) -> list[dict[str, Any]]:
     return mounts
 
 
-def collect_storage(root: Path, nfs_mounts: list[dict[str, Any]]) -> dict[str, Any]:
+def collect_storage(
+    root: Path,
+    nfs_mounts: list[dict[str, Any]],
+    manager_config: bytes | None = None,
+) -> dict[str, Any]:
     """Describe model storage without copying model content.
 
     Args:
         root: Filesystem root used for this invocation.
         nfs_mounts: Parsed NFS records to include in the storage manifest.
+        manager_config: Optional already-read manager configuration payload.
 
     Returns:
         Portable storage configuration.
     """
     models_dir: str | None = None
-    config_path = safe_source_file(root, "/etc/llama-manager/config.json")
+    config_path = manager_config
+    if config_path is None:
+        config_path = safe_source_file(root, "/etc/llama-manager/config.json")
     if config_path is not None:
         parsed = json.loads(config_path.decode("utf-8"))
         candidate = parsed.get("modelsDir") or parsed.get("models_dir")
         if isinstance(candidate, str):
             models_dir = candidate
     return {"modelsDir": models_dir, "nfsMounts": nfs_mounts}
+
+
+def validate_legacy_directory(value: str, description: str) -> str:
+    """Validate one operator-selected legacy installation directory.
+
+    Args:
+        value: Logical absolute directory path from CLI/default discovery.
+        description: Human-readable path class for safe errors.
+
+    Returns:
+        The normalized lexical absolute path.
+
+    Raises:
+        ValueError: If the path is relative or contains traversal components.
+    """
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or "\x00" in value:
+        raise ValueError(f"{description} must be a safe absolute path")
+    return str(path)
+
+
+def invoking_user_home() -> str:
+    """Return the invoking sudo user's home, falling back to the current user.
+
+    Returns:
+        Absolute home directory suitable for legacy user-service discovery.
+
+    Raises:
+        ValueError: If ``SUDO_USER`` names an unknown account.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            return pwd.getpwnam(sudo_user).pw_dir
+        except KeyError as error:
+            raise ValueError("SUDO_USER does not identify a local account") from error
+    return str(Path.home())
+
+
+def collect_legacy_install(
+    root: Path, project_root_value: str, user_home_value: str
+) -> dict[str, Any] | None:
+    """Capture a validated legacy ``install.sh`` configuration and user unit.
+
+    Args:
+        root: Filesystem root used for production or replacement-host tests.
+        project_root_value: Logical checkout path containing ``install.sh``.
+        user_home_value: Logical home containing the systemd user unit.
+
+    Returns:
+        Original config bytes plus sanitized migration metadata, or ``None``
+        when the selected checkout is not a legacy Llama Manager install.
+
+    Raises:
+        ValueError: If selected paths are unsafe or the checkout escapes home.
+    """
+    project_root = validate_legacy_directory(project_root_value, "legacy project root")
+    user_home = validate_legacy_directory(user_home_value, "legacy user home")
+    project_path = Path(project_root)
+    home_path = Path(user_home)
+    if project_path != home_path and home_path not in project_path.parents:
+        raise ValueError("legacy project root must be within the invoking user's home")
+    marker = safe_source_file(root, f"{project_root}/install.sh")
+    config = safe_source_file(root, f"{project_root}/config.json")
+    if marker is None or config is None:
+        return None
+    service_path = f"{user_home}/.config/systemd/user/llama-manager.service"
+    service = safe_source_file(root, service_path)
+    service_reference = None
+    if service is not None:
+        service_reference = sanitize_file(service, service_path).decode("utf-8")
+    return {
+        "config": config,
+        "metadata": {
+            "projectRoot": project_root,
+            "userHome": user_home,
+            "userServiceReference": service_reference,
+        },
+    }
 
 
 def collect_platform(root: Path) -> dict[str, Any]:
@@ -769,10 +855,23 @@ def validate_manifest(bundle: Path, manifest: Any) -> dict[str, Any]:
         raise ValueError("manifest NFS mounts must be a list")
     for mount in mounts:
         validate_nfs_mount(mount)
-    if not isinstance(manifest.get("platform"), dict) or not isinstance(
-        manifest.get("runtime"), dict
-    ):
+    runtime = manifest.get("runtime")
+    if not isinstance(manifest.get("platform"), dict) or not isinstance(runtime, dict):
         raise ValueError("manifest platform/runtime metadata has invalid types")
+    legacy = runtime.get("legacyInstall")
+    if legacy is not None:
+        expected_legacy = {"projectRoot", "userHome", "userServiceReference"}
+        if not isinstance(legacy, dict) or set(legacy) != expected_legacy:
+            raise ValueError("manifest legacy install reference has invalid fields")
+        if not isinstance(legacy["projectRoot"], str) or not isinstance(
+            legacy["userHome"], str
+        ):
+            raise ValueError("manifest legacy install paths have invalid types")
+        validate_legacy_directory(legacy["projectRoot"], "legacy project root")
+        validate_legacy_directory(legacy["userHome"], "legacy user home")
+        reference = legacy["userServiceReference"]
+        if reference is not None and not isinstance(reference, str):
+            raise ValueError("manifest legacy service reference has an invalid type")
     if not isinstance(manifest.get("exclusions"), list) or any(
         not isinstance(item, str) for item in manifest["exclusions"]
     ):
@@ -852,6 +951,9 @@ def inspect_bundle(args: argparse.Namespace) -> dict[str, Any]:
     )
     if manifest.get("storage", {}).get("nfsMounts"):
         categories.append("storage")
+    legacy = manifest.get("runtime", {}).get("legacyInstall")
+    if isinstance(legacy, dict) and legacy.get("userServiceReference"):
+        categories.append("service-reference")
     return {
         "schemaVersion": manifest["schemaVersion"],
         "sourceHost": manifest.get("sourceHost"),
@@ -859,6 +961,7 @@ def inspect_bundle(args: argparse.Namespace) -> dict[str, Any]:
         "categories": sorted(set(categories)),
         "fileCount": len(manifest.get("files", [])),
         "nfsMountCount": len(manifest.get("storage", {}).get("nfsMounts", [])),
+        "legacyInstallCaptured": isinstance(legacy, dict),
         "checksumsValid": verify_checksums(bundle),
         "exclusions": manifest.get("exclusions", []),
     }
@@ -2090,25 +2193,46 @@ def create_backup(args: argparse.Namespace) -> Path:
             bundle = host_root / stable_name
         payloads: dict[str, bytes] = {}
         copied: list[dict[str, str]] = []
+        manager_config: bytes | None = None
         for category, paths in ALLOWLIST.items():
             for path in paths:
                 source = safe_source_file(root, path)
                 if source is None:
                     continue
+                if path == "/etc/llama-manager/config.json":
+                    manager_config = source
                 relative = f"files/{path.lstrip('/')}"
                 payload = sanitize_file(source, path)
                 write_bundle_file(bundle_descriptor, relative, payload)
                 payloads[relative] = payload
                 copied.append({"category": category, "path": path})
+        legacy_install = None
+        if manager_config is None:
+            legacy_install = collect_legacy_install(
+                root,
+                args.legacy_project_root,
+                args.legacy_user_home or invoking_user_home(),
+            )
+            if legacy_install is not None:
+                manager_config = legacy_install["config"]
+                normalized_path = "/etc/llama-manager/config.json"
+                relative = f"files/{normalized_path.lstrip('/')}"
+                payload = sanitize_file(manager_config, normalized_path)
+                write_bundle_file(bundle_descriptor, relative, payload)
+                payloads[relative] = payload
+                copied.append({"category": "manager", "path": normalized_path})
         nfs_mounts = collect_nfs_mounts(root)
+        runtime = collect_runtime(root)
+        if legacy_install is not None:
+            runtime["legacyInstall"] = legacy_install["metadata"]
         manifest = {
             "schemaVersion": SCHEMA_VERSION,
             "createdAt": timestamp,
             "sourceHost": hostname,
             "files": copied,
-            "storage": collect_storage(root, nfs_mounts),
+            "storage": collect_storage(root, nfs_mounts, manager_config),
             "platform": collect_platform(root),
-            "runtime": collect_runtime(root),
+            "runtime": runtime,
             "exclusions": [
                 "credentials and tokens",
                 "signing private keys",
@@ -2165,6 +2289,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default=os.environ.get("LLAMA_MANAGER_RECOVERY_DIR", DEFAULT_OUTPUT_DIR),
         help=f"backup root (default: {DEFAULT_OUTPUT_DIR})",
+    )
+    backup.add_argument(
+        "--legacy-project-root",
+        default=os.environ.get("LLAMA_MANAGER_PROJECT_ROOT", str(Path.cwd())),
+        help="legacy install.sh checkout to migrate when packaged config is absent",
+    )
+    backup.add_argument(
+        "--legacy-user-home",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     backup.add_argument("--hostname", help=argparse.SUPPRESS)
     backup.add_argument("--timestamp", help=argparse.SUPPRESS)
