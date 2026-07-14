@@ -47,6 +47,13 @@ The command prints the created bundle path. By default it is:
 /volumes/llama-manager/private/system-backups/<host>/<UTC timestamp>/
 ```
 
+The configured/default backup root is canonicalized before its descriptor-safe
+directory traversal. This supports a root-managed volume alias such as
+`/volumes -> /mnt/nas/volumes` and the printed bundle path is the canonical mount
+path. Arbitrary symbolic links supplied through a different explicit
+`--output-dir` remain rejected. The backup must run with `sudo` on a production
+desktop because GDM and AccountsService configuration can be root-readable only.
+
 Set `LLAMA_MANAGER_RECOVERY_DIR` in the invoking environment or pass
 `--output-dir` to relocate it. Private build infrastructure may source that value
 from its `.env`, but this public tool never reads `.env` itself because the file may

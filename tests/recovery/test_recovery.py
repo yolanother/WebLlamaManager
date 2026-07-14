@@ -530,6 +530,37 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("platform", result.stderr.lower())
 
+    def test_backup_resolves_configured_volume_alias(self) -> None:
+        """The configured backup root may use a stable system volume alias."""
+        canonical_volume = self.base / "mnt" / "nas" / "volumes"
+        canonical_volume.mkdir(parents=True)
+        volume_alias = self.base / "volumes"
+        volume_alias.symlink_to(canonical_volume, target_is_directory=True)
+        configured_output = volume_alias / "llama-manager" / "private" / "backups"
+
+        result = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--hostname",
+            "source-host",
+            "--timestamp",
+            "20260714T120258Z",
+            env={"LLAMA_MANAGER_RECOVERY_DIR": str(configured_output)},
+        )
+
+        bundle = Path(result.stdout.strip())
+        self.assertEqual(
+            canonical_volume
+            / "llama-manager"
+            / "private"
+            / "backups"
+            / "source-host"
+            / "20260714T120258Z",
+            bundle,
+        )
+        self.assertTrue((bundle / "manifest.json").is_file())
+
     def test_backup_source_parent_swap_uses_open_descriptor(self) -> None:
         """A validated source parent swap cannot redirect the captured bytes."""
         source_file = (
