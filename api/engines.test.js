@@ -81,6 +81,42 @@ test('resolveDs4Config: defaults when nothing set', () => {
   assert.deepEqual(c.allowedRepos, ['antirez/deepseek-v4-gguf']);
 });
 
+test('resolveDs4Config: adaptive defaults (minContext / ssdStreaming / cacheExperts / adaptiveContext)', () => {
+  const c = resolveDs4Config({}, {});
+  assert.equal(c.minContext, 8192);
+  assert.equal(c.ssdStreaming, 'auto');
+  assert.equal(c.ssdStreamingCacheExperts, '32GB');
+  assert.equal(c.adaptiveContext, true);
+  assert.ok(c.kvBytesPerToken > 0);
+  assert.ok(c.safetyBytes > 0);
+  assert.ok(c.streamingWeightBytes > 0);
+});
+
+test('resolveDs4Config: adaptive fields honored from config block', () => {
+  const c = resolveDs4Config({ ds4: {
+    minContext: 16384, ssdStreaming: 'on', ssdStreamingCacheExperts: '48GB',
+    adaptiveContext: false, kvBytesPerToken: 65536, safetyBytes: 123, streamingWeightBytes: 456,
+  } }, {});
+  assert.equal(c.minContext, 16384);
+  assert.equal(c.ssdStreaming, 'on');
+  assert.equal(c.ssdStreamingCacheExperts, '48GB');
+  assert.equal(c.adaptiveContext, false);
+  assert.equal(c.kvBytesPerToken, 65536);
+  assert.equal(c.safetyBytes, 123);
+  assert.equal(c.streamingWeightBytes, 456);
+});
+
+test('resolveDs4Config: adaptive fields env overrides win', () => {
+  const c = resolveDs4Config(
+    { ds4: { minContext: 16384, ssdStreaming: 'off', adaptiveContext: false } },
+    { DS4_MIN_CONTEXT: '4096', DS4_SSD_STREAMING_MODE: 'auto', DS4_ADAPTIVE_CONTEXT: '1', DS4_SSD_STREAMING_CACHE_EXPERTS: '64GB' }
+  );
+  assert.equal(c.minContext, 4096);
+  assert.equal(c.ssdStreaming, 'auto');
+  assert.equal(c.adaptiveContext, true);
+  assert.equal(c.ssdStreamingCacheExperts, '64GB');
+});
+
 test('resolveDs4Config: allowedRepos from config array and env override', () => {
   assert.deepEqual(
     resolveDs4Config({ ds4: { allowedRepos: ['a/b', 'c/d'] } }, {}).allowedRepos,
@@ -183,6 +219,36 @@ test('validate: ds4 accepts valid fields', () => {
   assert.equal(r.ds4.kvDiskDir, '/var/kv');
   assert.equal(r.ds4.kvDiskSpaceMb, 40000);
   assert.equal(r.ds4.extraSwitches, '--quality');
+});
+
+test('validate: ds4 accepts adaptive fields (minContext / ssdStreaming / cacheExperts / adaptiveContext)', () => {
+  const r = validatePresetEngineFields({
+    engine: 'ds4', modelPath: 'm.gguf',
+    minContext: 16384, ssdStreaming: 'on', ssdStreamingCacheExperts: '48GB', adaptiveContext: false,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.ds4.minContext, 16384);
+  assert.equal(r.ds4.ssdStreaming, 'on');
+  assert.equal(r.ds4.ssdStreamingCacheExperts, '48GB');
+  assert.equal(r.ds4.adaptiveContext, false);
+});
+
+test('validate: ds4 rejects invalid ssdStreaming mode', () => {
+  const r = validatePresetEngineFields({ engine: 'ds4', modelPath: 'm.gguf', ssdStreaming: 'sometimes' });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /ssdStreaming/i);
+});
+
+test('validate: ds4 rejects negative minContext', () => {
+  const r = validatePresetEngineFields({ engine: 'ds4', modelPath: 'm.gguf', minContext: -1 });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /minContext/i);
+});
+
+test('validate: ds4 rejects non-boolean adaptiveContext', () => {
+  const r = validatePresetEngineFields({ engine: 'ds4', modelPath: 'm.gguf', adaptiveContext: 'yes' });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /adaptiveContext/i);
 });
 
 test('validate: ds4 rejects out-of-range power', () => {

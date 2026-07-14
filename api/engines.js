@@ -66,6 +66,18 @@ const DS4_DEFAULTS = {
   // is hard-restricted to this allowlist (any other repo is rejected) — this
   // keeps arbitrary GGUFs out of the dedicated ds4 ggufDir.
   allowedRepos: ['antirez/deepseek-v4-gguf'],
+  // Adaptive activation defaults (see ds4-adaptive.js). context floor before the
+  // planner switches from shrinking ctx to SSD expert-streaming; the streaming
+  // policy; the expert-cache size for streaming; whether OOM-driven ctx scaling is
+  // enabled; and the memory-fit estimates (per-token KV, safety margin, streaming
+  // resident-weight estimate) the planner uses. All operator-overridable.
+  minContext: 8192,
+  ssdStreaming: 'auto',
+  ssdStreamingCacheExperts: '32GB',
+  adaptiveContext: true,
+  kvBytesPerToken: 128 * 1024,
+  safetyBytes: 5 * 1024 * 1024 * 1024,
+  streamingWeightBytes: 50 * 1024 * 1024 * 1024,
 };
 
 /** Coerce a value to a finite number, falling back to `d` for empty/NaN input. */
@@ -115,12 +127,22 @@ export function isDs4Preset(preset) {
   return presetEngine(preset) === ENGINE_TYPES.DS4;
 }
 
+/** Normalize an SSD-streaming policy to 'off' | 'on' | 'auto' (default 'auto'). */
+export function normalizeSsdStreamingMode(mode, dflt = DS4_DEFAULTS.ssdStreaming) {
+  if (mode === undefined || mode === null || mode === '') return dflt;
+  const s = String(mode).toLowerCase();
+  return s === 'off' || s === 'on' || s === 'auto' ? s : dflt;
+}
+
 /**
  * Resolve the ds4-server configuration from config.json + environment.
  * Env (DS4_*) overrides the config.ds4 block; both fall back to defaults.
  * @param {object} config Parsed config.json (may lack a `ds4` block).
  * @param {object} env Environment object (e.g. process.env).
- * @returns {{binPath:string, port:number, ggufDir:string, container:string, runInDistrobox:boolean, allowEmbedServer:boolean, allowedRepos:string[]}}
+ * @returns {{binPath:string, port:number, ggufDir:string, container:string, runInDistrobox:boolean,
+ *   allowEmbedServer:boolean, allowedRepos:string[], minContext:number, ssdStreaming:('off'|'on'|'auto'),
+ *   ssdStreamingCacheExperts:string, adaptiveContext:boolean, kvBytesPerToken:number, safetyBytes:number,
+ *   streamingWeightBytes:number}}
  */
 export function resolveDs4Config(config = {}, env = {}) {
   const d = config.ds4 || {};
@@ -136,6 +158,22 @@ export function resolveDs4Config(config = {}, env = {}) {
       ? boolFlag(env.DS4_ALLOW_EMBED_SERVER, DS4_DEFAULTS.allowEmbedServer)
       : boolFlag(d.allowEmbedServer, DS4_DEFAULTS.allowEmbedServer),
     allowedRepos: resolveAllowedRepos(env.DS4_ALLOWED_REPOS, d.allowedRepos, DS4_DEFAULTS.allowedRepos),
+    // ── Adaptive activation (see ds4-adaptive.js) ────────────────────────────
+    // NOTE: the streaming MODE env is DS4_SSD_STREAMING_MODE. DS4_SSD_STREAMING
+    // (0/1) is a distinct per-attempt flag the controller passes to start-ds4.sh.
+    minContext: num(env.DS4_MIN_CONTEXT, num(d.minContext, DS4_DEFAULTS.minContext)),
+    ssdStreaming: normalizeSsdStreamingMode(
+      env.DS4_SSD_STREAMING_MODE !== undefined && env.DS4_SSD_STREAMING_MODE !== ''
+        ? env.DS4_SSD_STREAMING_MODE
+        : d.ssdStreaming
+    ),
+    ssdStreamingCacheExperts: env.DS4_SSD_STREAMING_CACHE_EXPERTS || d.ssdStreamingCacheExperts || DS4_DEFAULTS.ssdStreamingCacheExperts,
+    adaptiveContext: env.DS4_ADAPTIVE_CONTEXT !== undefined
+      ? boolFlag(env.DS4_ADAPTIVE_CONTEXT, DS4_DEFAULTS.adaptiveContext)
+      : boolFlag(d.adaptiveContext, DS4_DEFAULTS.adaptiveContext),
+    kvBytesPerToken: num(env.DS4_KV_BYTES_PER_TOKEN, num(d.kvBytesPerToken, DS4_DEFAULTS.kvBytesPerToken)),
+    safetyBytes: num(env.DS4_SAFETY_BYTES, num(d.safetyBytes, DS4_DEFAULTS.safetyBytes)),
+    streamingWeightBytes: num(env.DS4_STREAMING_WEIGHT_BYTES, num(d.streamingWeightBytes, DS4_DEFAULTS.streamingWeightBytes)),
   };
 }
 
@@ -223,6 +261,31 @@ export function validatePresetEngineFields(body = {}) {
   if (body.extraSwitches !== undefined && body.extraSwitches !== null && body.extraSwitches !== '') {
     if (typeof body.extraSwitches !== 'string') return { ok: false, error: 'ds4 extraSwitches must be a string.' };
     ds4.extraSwitches = body.extraSwitches;
+  }
+  // Adaptive activation fields (see ds4-adaptive.js).
+  if (body.minContext !== undefined && body.minContext !== null && body.minContext !== '') {
+    const m = Number(body.minContext);
+    if (Number.isNaN(m) || m < 0) return { ok: false, error: 'ds4 minContext must be a non-negative number.' };
+    ds4.minContext = m;
+  }
+  if (body.ssdStreaming !== undefined && body.ssdStreaming !== null && body.ssdStreaming !== '') {
+    const s = String(body.ssdStreaming).toLowerCase();
+    if (s !== 'off' && s !== 'on' && s !== 'auto') {
+      return { ok: false, error: "ds4 ssdStreaming must be one of 'off', 'on', or 'auto'." };
+    }
+    ds4.ssdStreaming = s;
+  }
+  if (body.ssdStreamingCacheExperts !== undefined && body.ssdStreamingCacheExperts !== null && body.ssdStreamingCacheExperts !== '') {
+    if (typeof body.ssdStreamingCacheExperts !== 'string') {
+      return { ok: false, error: 'ds4 ssdStreamingCacheExperts must be a string (e.g. "32GB").' };
+    }
+    ds4.ssdStreamingCacheExperts = body.ssdStreamingCacheExperts;
+  }
+  if (body.adaptiveContext !== undefined && body.adaptiveContext !== null && body.adaptiveContext !== '') {
+    if (typeof body.adaptiveContext !== 'boolean') {
+      return { ok: false, error: 'ds4 adaptiveContext must be a boolean.' };
+    }
+    ds4.adaptiveContext = body.adaptiveContext;
   }
   return { ok: true, engine: ENGINE_TYPES.DS4, ds4 };
 }
