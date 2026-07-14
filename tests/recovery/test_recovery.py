@@ -115,6 +115,61 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertFalse((bundle / "files" / "home").exists())
         self.assertFalse((bundle / "files" / "srv" / "models").exists())
 
+    def test_backup_migrates_legacy_install_settings_without_service_secrets(self) -> None:
+        """Legacy config is normalized while its user unit remains a redacted reference."""
+        (self.source_root / "etc" / "llama-manager" / "config.json").unlink()
+        project = self.source_root / "home" / "operator" / "llama-server"
+        (project / "api").mkdir(parents=True)
+        (project / "install.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        (project / "api" / "server.js").write_text("// server\n", encoding="utf-8")
+        (project / "config.json").write_text(
+            json.dumps({"modelsDir": "/srv/models", "HF_TOKEN": "legacy-secret"}),
+            encoding="utf-8",
+        )
+        service = (
+            self.source_root
+            / "home"
+            / "operator"
+            / ".config"
+            / "systemd"
+            / "user"
+            / "llama-manager.service"
+        )
+        service.parent.mkdir(parents=True)
+        service.write_text(
+            "[Service]\n"
+            "WorkingDirectory=/home/operator/llama-server/api\n"
+            "Environment=HF_TOKEN=legacy-service-secret\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_cli(
+            "--root",
+            str(self.source_root),
+            "backup",
+            "--output-dir",
+            str(self.output),
+            "--legacy-project-root",
+            "/home/operator/llama-server",
+            "--legacy-user-home",
+            "/home/operator",
+            "--hostname",
+            "source-host",
+            "--timestamp",
+            "20260714T120025Z",
+        )
+
+        bundle = Path(result.stdout.strip())
+        migrated = bundle / "files" / "etc" / "llama-manager" / "config.json"
+        self.assertEqual("[REDACTED]", json.loads(migrated.read_text())["HF_TOKEN"])
+        manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+        reference = manifest["runtime"]["legacyInstall"]["userServiceReference"]
+        self.assertIn("Environment=HF_TOKEN=[REDACTED]", reference)
+        self.assertNotIn("legacy-secret", (bundle / "manifest.json").read_text())
+        inspected = json.loads(self.run_cli("inspect", str(bundle)).stdout)
+        self.assertEqual(["manager", "service-reference"], inspected["categories"])
+        self.assertTrue(inspected["legacyInstallCaptured"])
+
     def test_backup_masks_service_environment_secrets(self) -> None:
         """Systemd Environment assignments cannot leak captured credentials."""
         service = (

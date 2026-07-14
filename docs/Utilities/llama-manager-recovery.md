@@ -59,6 +59,28 @@ Set `LLAMA_MANAGER_RECOVERY_DIR` in the invoking environment or pass
 from its `.env`, but this public tool never reads `.env` itself because the file may
 also contain tokens.
 
+### Existing `install.sh` systems
+
+When packaged `/etc/llama-manager/config.json` is absent, `backup` recognizes the
+legacy `install.sh` checkout in the current directory. It sanitizes that checkout's
+`config.json` and records it as `/etc/llama-manager/config.json`, so restoration
+migrates settings into the package-owned layout rather than recreating a
+source-checkout dependency. Run the backup from the active checkout, or select it
+explicitly:
+
+```bash
+sudo scripts/llama-manager-recovery backup \
+  --legacy-project-root /home/USER/path/to/llama-server
+```
+
+The selected checkout must remain beneath the invoking user's home and contain
+both `install.sh` and `config.json`. The invoking user is taken from `SUDO_USER`.
+The matching systemd user unit is sanitized and retained only as a migration
+reference in the manifest; it is never restored wholesale as a system unit. This
+preserves non-secret tuning context while preventing a legacy `HF_TOKEN` or other
+credential from entering the bundle. Packaged configuration always takes
+precedence when both layouts exist.
+
 Inspect a bundle without printing captured configuration values:
 
 ```bash
@@ -105,8 +127,8 @@ chroot-aware provisioning workflow.
 
 | Category | Captured material |
 |---|---|
-| `manager` | Packaged manager configuration under `/etc/llama-manager` and `/etc/default/llama-manager`. |
-| `service` | The system service and its allowlisted override file. |
+| `manager` | Packaged manager configuration under `/etc/llama-manager` and `/etc/default/llama-manager`; legacy checkout configuration is normalized into this layout. |
+| `service` | The packaged system service and its allowlisted override file. A legacy user unit is stored only as a sanitized `service-reference`. |
 | `kiosk` | GDM kiosk settings, the `llama-kiosk` AccountsService record, and its Wayland session entry. |
 | `storage` | Model directory plus NFS source, mountpoint, type, and options as a portable manifest. The selected mapped model directory is created as the `llama-manager` account/group with setgid `2775`; missing production identities, regular-file collisions, incorrectly owned existing directories, and protected system paths are rejected. The mount is reconstructed only from explicit mappings. |
 | `platform` | Relevant GRUB defaults and `amdxdna` module blacklist, plus OS, kernel, hardware product, selected firmware/kernel/ROCm package versions, and packaged runtime pins. |
