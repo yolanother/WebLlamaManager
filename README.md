@@ -100,6 +100,8 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
 
 ## Requirements
 
+For source checkouts:
+
 - Node.js 18+
 - distrobox with the ROCm 7.2.4 toolbox `llama-rocm-7.2.4` (image
   `docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4`; selectable via
@@ -108,6 +110,10 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
 - llama.cpp with ROCm support — provided prebuilt by the toolbox above (a custom
   build via `scripts/build-llama-cpp.sh` is optional). See
   [`docs/llama-cpp-rocm-build-and-deployment.md`](docs/llama-cpp-rocm-build-and-deployment.md).
+
+The Debian package does not use Noble's system Node. It bundles Node 20.18.1 or
+newer at `/usr/lib/llama-manager/node/bin/node` for reproducible offline installs;
+the machine-readable builder contract is `packaging/runtime-contract.env`.
 
 ## Quick Start
 

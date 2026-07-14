@@ -66,6 +66,11 @@ import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
 import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
 import { resolveRuntimePaths } from './runtime-paths.js';
+import {
+  packagedDs4UpdateStatus,
+  packagedDs4UpdateRejection,
+  resolveDistributionPolicy,
+} from './distribution-policy.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -79,6 +84,7 @@ const RUNTIME_ENV = {
   DS4_STATE_DIR: RUNTIME_PATHS.ds4StateDir,
   SLOT_SAVE_PATH: RUNTIME_PATHS.slotCacheDir,
 };
+const DISTRIBUTION_POLICY = resolveDistributionPolicy(RUNTIME_ENV);
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
 // default behavior on unhandledRejection (since Node 16) is to terminate. We'd
@@ -5106,12 +5112,16 @@ function getDs4Updater() {
 
 // Status: current/upstream commit, last check, last result, history.
 app.get('/api/ds4/update/status', (req, res) => {
+  const packagedStatus = packagedDs4UpdateStatus(DISTRIBUTION_POLICY);
+  if (packagedStatus) return res.json(packagedStatus);
   try { res.json(getDs4Updater().getStatus()); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Manual "check now": git fetch + compare, no build. Cheap; runs synchronously.
 app.post('/api/ds4/update/check', async (req, res) => {
+  const rejection = packagedDs4UpdateRejection(DISTRIBUTION_POLICY, 'check');
+  if (rejection) return res.status(rejection.status).json(rejection.body);
   try {
     const r = await getDs4Updater().check();
     res.json({ ...r, status: getDs4Updater().getStatus() });
@@ -5122,6 +5132,8 @@ app.post('/api/ds4/update/check', async (req, res) => {
 // take minutes) and return 202 immediately; poll /status for progress. `force`
 // rebuilds+swaps even when already up to date.
 app.post('/api/ds4/update/apply', (req, res) => {
+  const rejection = packagedDs4UpdateRejection(DISTRIBUTION_POLICY, 'apply');
+  if (rejection) return res.status(rejection.status).json(rejection.body);
   const up = getDs4Updater();
   if (ds4UpdateInFlight) {
     return res.status(409).json({ error: 'ds4 update already in progress', status: up.getStatus() });
@@ -9897,7 +9909,9 @@ setInterval(async () => {
   }
 }, IDLE_CHECK_INTERVAL);
 
-// ds4 auto-update scheduler. Evaluates every 30 min but only runs a check/cycle
+// Source-install-only ds4 auto-update scheduler. Package installations use
+// signed APT and never instantiate or schedule the git builder. Source mode
+// evaluates every 30 min but only runs a check/cycle
 // once the configured interval (config.ds4.update.intervalHours, default 6h) has
 // elapsed since the last check. Disabled via config.ds4.update.enabled === false;
 // auto-apply (build+smoke+swap on a new commit) via config.ds4.update.autoApply
@@ -9905,22 +9919,24 @@ setInterval(async () => {
 // builds (memory-light) and defers the memory-hungry swap. Never runs two updates
 // at once (shares the ds4UpdateInFlight guard with the manual apply endpoint).
 const DS4_UPDATE_TICK_MS = 30 * 60_000;
-setInterval(async () => {
-  const u = config?.ds4?.update || {};
-  if (u.enabled === false) return;
-  if (ds4UpdateInFlight) return;
-  const intervalMs = (Number(u.intervalHours) > 0 ? Number(u.intervalHours) : 6) * 3_600_000;
-  const lastCheck = getDs4Updater().getStatus().lastCheck || 0;
-  if (Date.now() - lastCheck < intervalMs) return;
-  ds4UpdateInFlight = true;
-  try {
-    await getDs4Updater().runCycle({ autoApply: u.autoApply !== false });
-  } catch (e) {
-    console.error('[ds4-update] scheduled cycle failed', e);
-  } finally {
-    ds4UpdateInFlight = false;
-  }
-}, DS4_UPDATE_TICK_MS).unref?.();
+if (DISTRIBUTION_POLICY.ds4SelfUpdateAllowed) {
+  setInterval(async () => {
+    const u = config?.ds4?.update || {};
+    if (u.enabled === false) return;
+    if (ds4UpdateInFlight) return;
+    const intervalMs = (Number(u.intervalHours) > 0 ? Number(u.intervalHours) : 6) * 3_600_000;
+    const lastCheck = getDs4Updater().getStatus().lastCheck || 0;
+    if (Date.now() - lastCheck < intervalMs) return;
+    ds4UpdateInFlight = true;
+    try {
+      await getDs4Updater().runCycle({ autoApply: u.autoApply !== false });
+    } catch (e) {
+      console.error('[ds4-update] scheduled cycle failed', e);
+    } finally {
+      ds4UpdateInFlight = false;
+    }
+  }, DS4_UPDATE_TICK_MS).unref?.();
+}
 
 // Graceful shutdown with forced exit timeout
 function shutdownWithTimeout(signal) {

@@ -107,8 +107,10 @@ test_ctl_selects_persistent_model_storage() {
   model_dir="$sandbox/nas-models"
   mkdir -p "$model_dir"
   : > "$sandbox/llama-manager.env"
+  printf 'process.exit(0);\n' > "$sandbox/accept-storage.mjs"
 
   LLAMA_MANAGER_ENV_FILE="$sandbox/llama-manager.env" \
+    LLAMA_MANAGER_STORAGE_CHECKER="$sandbox/accept-storage.mjs" \
     bash "$REPO_ROOT/scripts/llama-managerctl" models set-directory "$model_dir" >/dev/null
   output="$(LLAMA_MANAGER_ENV_FILE="$sandbox/llama-manager.env" bash "$REPO_ROOT/scripts/llama-managerctl" models path)"
   assert_contains "ctl persists selected model directory" "$output" "$model_dir"
@@ -128,6 +130,31 @@ test_ctl_reads_path_overrides_from_package_environment_file() {
   rm -rf "$sandbox"
 }
 
+test_ctl_rejects_model_storage_unusable_by_service_identity() {
+  printf 'test_ctl_rejects_model_storage_unusable_by_service_identity\n'
+  local sandbox selected output status persisted
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-ctl-denied.XXXXXX")"
+  selected="$sandbox/operator-only"
+  mkdir -p "$selected"
+  printf 'MODELS_DIR=/safe/existing\n' > "$sandbox/llama-manager.env"
+  printf 'process.stderr.write("service identity cannot write selected storage\\n"); process.exit(1);\n' \
+    > "$sandbox/reject-storage.mjs"
+
+  set +e
+  output="$(LLAMA_MANAGER_ENV_FILE="$sandbox/llama-manager.env" \
+    LLAMA_MANAGER_STORAGE_CHECKER="$sandbox/reject-storage.mjs" \
+    bash "$REPO_ROOT/scripts/llama-managerctl" models set-directory "$selected" 2>&1)"
+  status=$?
+  set -e
+  persisted="$(LLAMA_MANAGER_ENV_FILE="$sandbox/llama-manager.env" bash "$REPO_ROOT/scripts/llama-managerctl" models path)"
+
+  if [ "$status" -ne 0 ]; then printf '  ok   inaccessible storage is rejected\n';
+  else printf '  FAIL inaccessible storage was accepted\n'; failures=$((failures + 1)); fi
+  assert_contains "rejection identifies service access" "$output" "service identity"
+  assert_contains "failed validation preserves prior model path" "$persisted" "/safe/existing"
+  rm -rf "$sandbox"
+}
+
 test_canonical_service_assets_are_package_safe() {
   printf 'test_canonical_service_assets_are_package_safe\n'
   local service polkit
@@ -137,6 +164,7 @@ test_canonical_service_assets_are_package_safe() {
   assert_contains "service uses dedicated group" "$service" "Group=llama-manager"
   assert_contains "service code is root-owned FHS content" "$service" "WorkingDirectory=/usr/lib/llama-manager/api"
   assert_contains "service opts into packaged path defaults" "$service" "Environment=LLAMA_MANAGER_PACKAGED=1"
+  assert_contains "service declares root-owned DS4 binary" "$service" "Environment=DS4_SERVER_BIN=/usr/lib/llama-manager-ds4/bin/ds4-server"
   assert_contains "polkit checks manager group" "$polkit" 'subject.isInGroup("llama-manager")'
   assert_contains "polkit restricts authority to one unit" "$polkit" 'unit == "llama-manager.service"'
   if [[ "$service" == *"/home/yolan"* ]]; then
@@ -147,6 +175,57 @@ test_canonical_service_assets_are_package_safe() {
   fi
 }
 
+test_packaged_ds4_uses_root_owned_binary() {
+  printf 'test_packaged_ds4_uses_root_owned_binary\n'
+  local sandbox output
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-ds4-package.XXXXXX")"
+  mkdir -p "$sandbox/current"
+  printf '#!/bin/sh\n' > "$sandbox/current/ds4-server"
+  chmod +x "$sandbox/current/ds4-server"
+
+  output="$(LLAMA_MANAGER_PACKAGED=1 DS4_STATE_DIR="$sandbox" DS4_MODEL=model.gguf \
+    bash "$REPO_ROOT/start-ds4.sh" --print-cmd)"
+  assert_contains "packaged launcher selects package binary" "$output" "/usr/lib/llama-manager-ds4/bin/ds4-server"
+  if [[ "$output" == *"$sandbox/current/ds4-server"* ]]; then
+    printf '  FAIL packaged launcher selected writable DS4 state binary\n'
+    failures=$((failures + 1))
+  else
+    printf '  ok   packaged launcher ignores writable DS4 state binary\n'
+  fi
+  rm -rf "$sandbox"
+}
+
+test_source_ds4_keeps_managed_state_binary() {
+  printf 'test_source_ds4_keeps_managed_state_binary\n'
+  local sandbox output
+  sandbox="$(mktemp -d "${TMPDIR:-/tmp}/llama-ds4-source.XXXXXX")"
+  mkdir -p "$sandbox/current"
+  printf '#!/bin/sh\n' > "$sandbox/current/ds4-server"
+  chmod +x "$sandbox/current/ds4-server"
+  output="$(DS4_STATE_DIR="$sandbox" DS4_MODEL=model.gguf bash "$REPO_ROOT/start-ds4.sh" --print-cmd)"
+  assert_contains "source launcher retains managed current binary" "$output" "$sandbox/current/ds4-server"
+  rm -rf "$sandbox"
+}
+
+test_packaged_service_uses_declared_offline_node_runtime() {
+  printf 'test_packaged_service_uses_declared_offline_node_runtime\n'
+  local service contract
+  service="$(cat "$REPO_ROOT/llama-manager.service")"
+  contract="$(cat "$REPO_ROOT/packaging/runtime-contract.env" 2>/dev/null || true)"
+  assert_contains "service executes package-owned Node" "$service" "ExecStart=/usr/lib/llama-manager/node/bin/node"
+  assert_contains "service validates package-owned Node before startup" "$service" "ExecStartPre=/usr/lib/llama-manager/node/bin/node /usr/lib/llama-manager/scripts/check-node-runtime.mjs"
+  assert_contains "manifest declares minimum Node" "$contract" "LLAMA_MANAGER_NODE_VERSION_MIN=20.18.1"
+  assert_contains "manifest declares bundled Node path" "$contract" "LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node"
+  assert_contains "manifest declares DS4 package path" "$contract" "LLAMA_MANAGER_DS4_BIN=/usr/lib/llama-manager-ds4/bin/ds4-server"
+  assert_contains "manifest declares storage validator path" "$contract" "LLAMA_MANAGER_STORAGE_CHECK=/usr/lib/llama-manager/scripts/check-model-storage.mjs"
+  if [[ "$service" == *"ExecStart=/usr/bin/node"* ]]; then
+    printf '  FAIL service depends on Ubuntu system Node\n'
+    failures=$((failures + 1))
+  else
+    printf '  ok   service does not depend on Ubuntu system Node\n'
+  fi
+}
+
 test_packaged_install_helper_is_sourceable
 test_packaged_install_exits_with_apt_guidance
 test_ctl_reports_overridden_runtime_paths
@@ -154,7 +233,11 @@ test_ctl_manages_json_config_without_root
 test_ctl_only_targets_llama_manager_service
 test_ctl_selects_persistent_model_storage
 test_ctl_reads_path_overrides_from_package_environment_file
+test_ctl_rejects_model_storage_unusable_by_service_identity
 test_canonical_service_assets_are_package_safe
+test_packaged_ds4_uses_root_owned_binary
+test_source_ds4_keeps_managed_state_binary
+test_packaged_service_uses_declared_offline_node_runtime
 
 if [ "$failures" -ne 0 ]; then
   printf '\n%d failed\n' "$failures"

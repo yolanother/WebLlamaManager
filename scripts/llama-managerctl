@@ -10,6 +10,7 @@
 # unit-specific service authorization.
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Read one literal KEY=value entry from the package environment file without
 # sourcing it. This prevents shell syntax in configuration from being executed.
@@ -50,6 +51,13 @@ FILE_SLOT_CACHE_DIR="$(read_env_setting "$ENV_FILE" SLOT_SAVE_PATH || true)"
 SLOT_CACHE_DIR="${SLOT_SAVE_PATH:-${FILE_SLOT_CACHE_DIR:-$CACHE_DIR/slots}}"
 SYSTEMCTL="${LLAMA_MANAGER_SYSTEMCTL:-systemctl}"
 JOURNALCTL="${LLAMA_MANAGER_JOURNALCTL:-journalctl}"
+PACKAGE_NODE_BIN="/usr/lib/llama-manager/node/bin/node"
+if [ -x "$PACKAGE_NODE_BIN" ]; then NODE_BIN="$PACKAGE_NODE_BIN";
+else NODE_BIN="${LLAMA_MANAGER_NODE_BIN:-$(command -v node || true)}"; fi
+[ -n "$NODE_BIN" ] || { printf 'llama-managerctl: Node runtime not found\n' >&2; exit 1; }
+PACKAGE_STORAGE_CHECKER="/usr/lib/llama-manager/scripts/check-model-storage.mjs"
+if [ -f "$PACKAGE_STORAGE_CHECKER" ]; then STORAGE_CHECKER="$PACKAGE_STORAGE_CHECKER";
+else STORAGE_CHECKER="${LLAMA_MANAGER_STORAGE_CHECKER:-$SCRIPT_DIR/check-model-storage.mjs}"; fi
 
 # Print the effective mutable paths used by package-managed installations.
 print_paths() {
@@ -72,7 +80,7 @@ manage_config() {
   [ "$action" != "set" ] || [ "$#" -ge 3 ] || {
     printf 'llama-managerctl: config set requires a value\n' >&2; exit 2;
   }
-  node - "$action" "$CONFIG_PATH" "$key" "$value" <<'NODE'
+  "$NODE_BIN" - "$action" "$CONFIG_PATH" "$key" "$value" <<'NODE'
 const fs = require('fs');
 const [action, configPath, key, rawValue] = process.argv.slice(2);
 const parts = key.split('.');
@@ -153,7 +161,8 @@ manage_models() {
       case "$selected" in /*) ;; *) printf 'llama-managerctl: model directory must be absolute\n' >&2; exit 2 ;; esac
       [ -d "$selected" ] || { printf 'llama-managerctl: directory does not exist: %s\n' "$selected" >&2; exit 2; }
       [ -w "$selected" ] || { printf 'llama-managerctl: directory is not writable: %s\n' "$selected" >&2; exit 2; }
-      node - "$ENV_FILE" "$selected" <<'NODE'
+      "$NODE_BIN" "$STORAGE_CHECKER" "$selected"
+      "$NODE_BIN" - "$ENV_FILE" "$selected" <<'NODE'
 const fs = require('fs');
 const path = require('path');
 const [envPath, selected] = process.argv.slice(2);

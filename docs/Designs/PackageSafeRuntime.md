@@ -28,6 +28,30 @@ user-home model/cache defaults.
 Explicit resource overrides win over derived defaults. For example, an explicit
 `DS4_GGUF_DIR` is not relocated when `MODELS_DIR` changes.
 
+## Offline runtime contract
+
+The public repository declares the private package builder interface in
+`packaging/runtime-contract.env`. The package must bundle Node **20.18.1 or
+newer** beneath `/usr/lib/llama-manager/node` and expose its executable at
+`/usr/lib/llama-manager/node/bin/node`. The service never assumes Noble's
+`/usr/bin/node`: both `ExecStartPre` and `ExecStart` use the bundled executable,
+and the preflight script rejects an undersized runtime.
+
+The same manifest fixes the signed DS4 executable at
+`/usr/lib/llama-manager-ds4/bin/ds4-server` plus the package locations of the
+runtime and model-storage validators. Everything named by the manifest is
+root-owned and non-group-writable. The package/ISO build must acquire these
+artifacts while building the release so installation and first boot need no
+network access.
+
+## DS4 update boundary
+
+Source installations retain the git fetch/build/smoke/atomic-swap updater and
+may execute `DS4_STATE_DIR/current/ds4-server`. Package mode disables its check,
+apply, API mutation, and scheduler surfaces. Status instead reports signed APT
+as the update manager. `start-ds4.sh` ignores the writable state symlink and
+uses only the root-owned DS4 package binary.
+
 ## Authorization boundary
 
 Members of the `llama-manager` group are trusted application operators, not host
@@ -38,6 +62,12 @@ administrators. Package-created mutable paths are owned by
 - dotted JSON configuration get/set/delete, with sensitive reads masked;
 - model path inspection, GGUF listing, and selection of an existing writable
   absolute model directory.
+
+Before persisting model storage, `llama-managerctl` evaluates the canonical path
+as the fixed service UID/groups: every ancestor must be traversable and the
+target must grant read/write/execute. This conservative POSIX-mode check rejects
+a directory that only the invoking desktop user can write and leaves the prior
+configuration unchanged.
 
 The polkit rule checks both group membership and the exact unit name and permits
 only start/stop/restart verbs. It cannot manage other services or install

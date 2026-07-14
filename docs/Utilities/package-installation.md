@@ -52,8 +52,10 @@ llama-managerctl models list
 ```
 
 The directory must already exist, be absolute, and be writable by the invoking
-operator. Ensure the `llama-manager` service account/group can traverse and write
-it as well. For example, on locally owned storage an administrator can use a
+operator. The command also validates the full canonical path as the
+`llama-manager` service identity before saving it: ancestors need traverse
+permission and the target needs read/write/execute. A failure preserves the old
+model path. For example, on locally owned storage an administrator can use a
 setgid group directory:
 
 ```bash
@@ -66,6 +68,10 @@ match server-side ownership/ACLs to the service account. Test the mount after a
 reboot before changing `MODELS_DIR`. `llama-managerctl` deliberately does not
 edit mounts or request NAS credentials; a future setup UI may guide that
 administrator-owned step.
+
+The validator intentionally uses conservative POSIX ownership/mode semantics.
+If an NFSv4 ACL grants access that the mode bits do not express, expose an
+equivalent `llama-manager` group permission or choose another mountpoint.
 
 ## Upgrade safely
 
@@ -80,6 +86,20 @@ sudo apt install --only-upgrade llama-manager llama-manager-rocm-gfx1151 llama-m
 APT verifies repository metadata and package signatures and preserves the
 root-owned application tree. `install.sh` remains supported for source-checkout
 deployments and continues to create the historical per-user service there.
+
+DS4 follows the same rule. In a package installation, its git self-builder,
+manual check/apply operations, and scheduler are disabled; the API returns the
+signed-APT command instead. The service never executes DS4 binaries from writable
+state.
+
+## Bundled offline Node runtime
+
+The package includes Node 20.18.1 or newer at
+`/usr/lib/llama-manager/node/bin/node`. It does not depend on Ubuntu Noble's
+`/usr/bin/node`, and service startup validates the bundled version. The private
+package/ISO repository must consume `packaging/runtime-contract.env`, stage all
+declared files as root-owned/non-group-writable content, and cache the runtime
+artifact during the release build so installation works offline.
 
 ## Path overrides
 
