@@ -1,3 +1,12 @@
+// Llama Manager — management API, inference supervision, and web application host.
+// Copyright (c) Llama Manager project. Use of this file is governed by the
+// LICENSE file in the repository root.
+//
+// This process serves the dashboard and OpenAI-compatible API, supervises the
+// llama.cpp and DS4 inference engines, manages models and configuration, and
+// persists operational analytics. Mutable resources are resolved through the
+// package-safe runtime path contract so installed application files stay immutable.
+
 import express from 'express';
 import cors from 'cors';
 import { spawn, exec, execSync } from 'child_process';
@@ -6,7 +15,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join, basename } from 'path';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { cpus, totalmem, freemem, loadavg, homedir } from 'os';
+import { cpus, totalmem, freemem, loadavg } from 'os';
 import { EventEmitter } from 'events';
 import { createHash } from 'crypto';
 import pty from 'node-pty';
@@ -56,7 +65,20 @@ import {
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
 import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
+import { resolveRuntimePaths } from './runtime-paths.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
+
+const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
+  projectRoot: PROJECT_ROOT,
+  home: process.env.HOME || '/root',
+});
+const RUNTIME_ENV = {
+  ...process.env,
+  MODELS_DIR: RUNTIME_PATHS.modelsDir,
+  DS4_GGUF_DIR: RUNTIME_PATHS.ds4ModelsDir,
+  DS4_STATE_DIR: RUNTIME_PATHS.ds4StateDir,
+  SLOT_SAVE_PATH: RUNTIME_PATHS.slotCacheDir,
+};
 
 // Safety net: log unhandled rejections instead of crashing the process. Node's
 // default behavior on unhandledRejection (since Node 16) is to terminate. We'd
@@ -189,8 +211,8 @@ if (existsSync(UI_BUILD_PATH)) {
 }
 
 // Configuration
-const CONFIG_PATH = process.env.CONFIG_PATH || join(PROJECT_ROOT, 'config.json');
-const MODELS_DIR = process.env.MODELS_DIR || join(process.env.HOME, 'models');
+const CONFIG_PATH = RUNTIME_PATHS.configPath;
+const MODELS_DIR = RUNTIME_PATHS.modelsDir;
 const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
@@ -441,7 +463,7 @@ function lookupOrAssignSlot(model, messages) {
 // SLOT_SAVE_DIR must match the router's --slot-save-path. distrobox shares $HOME,
 // so the host path and the in-container path are identical; the router writes the
 // dumps and this manager (running on the host) reads their sizes / evicts them.
-const SLOT_SAVE_DIR = process.env.SLOT_SAVE_PATH || join(process.env.HOME || '/root', '.cache', 'llama-slots');
+const SLOT_SAVE_DIR = RUNTIME_PATHS.slotCacheDir;
 const SLOT_CACHE_DEFAULTS = { enabled: true, maxBytes: 24 * 1024 * 1024 * 1024, maxCount: 64 };
 // conversation prefix key -> { filename, model, slotId, bytes, savedAt }
 const conversationSlotFiles = new Map();
@@ -1327,7 +1349,7 @@ const analyticsData = {
 };
 
 // Persistent analytics storage (minute-level aggregates in JSONL file)
-const ANALYTICS_DIR = join(PROJECT_ROOT, 'data');
+const ANALYTICS_DIR = RUNTIME_PATHS.dataDir;
 const ANALYTICS_FILE = join(ANALYTICS_DIR, 'analytics.jsonl');
 const MAX_ANALYTICS_HISTORY = 525600; // 1 year of minute-level data
 let analyticsHistory = [];
@@ -1948,6 +1970,7 @@ function loadConfig() {
 }
 
 function saveConfig(config) {
+  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
@@ -1958,7 +1981,7 @@ let config = loadConfig();
 // still applies defaults + DS4_* env at read time, so this is purely for
 // discoverability and persistence — non-destructive to any operator overrides.
 if (!config.ds4) {
-  config.ds4 = resolveDs4Config(config, process.env);
+  config.ds4 = resolveDs4Config(config, RUNTIME_ENV);
   try { saveConfig(config); } catch { /* best-effort seed */ }
 }
 
@@ -2707,7 +2730,7 @@ async function collectGpuStats() {
       'bash', '-c',
       'rocm-smi --showmeminfo vram --showuse --showtemp --showpower --showclocks --json 2>/dev/null || echo "{}"'
     ], {
-      env: { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' },
+      env: { ...RUNTIME_ENV, PATH: '/usr/local/bin:/usr/bin:/bin' },
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
@@ -4294,7 +4317,7 @@ app.post('/api/presets', (req, res) => {
   // ds4 models live under the dedicated ds4 ggufDir (NEVER ~/models). Store the
   // absolute path + ds4 launch knobs under config so the ds4 supervisor can run it.
   if (engineCheck.engine === ENGINE_TYPES.DS4) {
-    const ds4 = resolveDs4Config(config, process.env);
+    const ds4 = resolveDs4Config(config, RUNTIME_ENV);
     const d = engineCheck.ds4;
     const ds4ModelPath = d.modelPath.startsWith('/') ? d.modelPath : `${ds4.ggufDir}/${d.modelPath}`;
     if (!existsSync(ds4ModelPath)) {
@@ -4497,7 +4520,7 @@ function runKillCommand({ label, command, useContainer, timeoutMs = 4000 }) {
     try {
       child = useContainer
         ? spawn('/usr/local/bin/distrobox', ['enter', CONTAINER_NAME, '--', 'bash', '-c', command],
-            { cwd: PROJECT_ROOT, env: { ...process.env, PATH: '/usr/local/bin:/usr/bin:/bin' }, stdio: 'pipe', detached: true })
+            { cwd: PROJECT_ROOT, env: { ...RUNTIME_ENV, PATH: '/usr/local/bin:/usr/bin:/bin' }, stdio: 'pipe', detached: true })
         : spawn('bash', ['-c', command], { stdio: 'pipe', detached: true });
     } catch (err) {
       console.error(`[stop] ${label} spawn failed: ${err.message}`);
@@ -4782,7 +4805,7 @@ async function restartLlamaServer({ governed = true } = {}) {
       const preset = config.presets[currentPreset];
       const startScript = join(PROJECT_ROOT, 'start-preset.sh');
       const env = {
-        ...process.env,
+        ...RUNTIME_ENV,
         PORT: String(LLAMA_PORT),
         MODELS_DIR,
         HF_REPO: preset.hfRepo || '',
@@ -4806,7 +4829,7 @@ async function restartLlamaServer({ governed = true } = {}) {
     } else {
       const startScript = join(PROJECT_ROOT, 'start-llama.sh');
       const env = {
-        ...process.env,
+        ...RUNTIME_ENV,
         MODELS_DIR,
         MODELS_MAX: String(config.modelsMax || 2),
         CONTEXT: String(config.contextSize || 8192),
@@ -4882,7 +4905,7 @@ function attachLlamaExitHandler(proc) {
 
 /** Spawn the embed server from config (if runnable). Idempotent: no-op if already running. */
 function startEmbedServer() {
-  const ec = resolveEmbedConfig(config, process.env);
+  const ec = resolveEmbedConfig(config, RUNTIME_ENV);
   if (!ec.runnable) {
     console.log('[embed] Not started (disabled or no model selected).');
     return;
@@ -4890,7 +4913,7 @@ function startEmbedServer() {
   if (embedProcess && !embedProcess.killed) return;
   const startScript = join(PROJECT_ROOT, 'start-embed.sh');
   const env = {
-    ...process.env,
+    ...RUNTIME_ENV,
     MODELS_DIR,
     EMBED_MODEL: ec.model,
     EMBED_PORT: String(ec.port),
@@ -4941,7 +4964,7 @@ async function restartEmbedServer() {
 
 /** Fetch embed server health (null if down). */
 async function getEmbedHealth() {
-  const ec = resolveEmbedConfig(config, process.env);
+  const ec = resolveEmbedConfig(config, RUNTIME_ENV);
   if (!ec.runnable) return { status: 'disabled', model: ec.model || null, port: ec.port };
   try {
     const r = await fetch(`http://localhost:${ec.port}/health`, { signal: AbortSignal.timeout(3000) });
@@ -4962,7 +4985,7 @@ async function getEmbedHealth() {
 
 /** Host-side reap of any ds4-server process + free the ds4 port. Never matches "llama-server". */
 async function ds4RunKill() {
-  const ds4 = resolveDs4Config(config, process.env);
+  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   // Primary: robust host-PID reap that waits until the ds4-server pids are gone (an 81GB
   // model takes real time to unmap). Exact comm match — never touches llama-server.
   const kill = await killEnginePidsRobust('ds4-server');
@@ -4983,7 +5006,7 @@ function getDs4Supervisor() {
       spawn,
       fetchFn: fetch,
       getConfig: () => config,
-      env: process.env,
+      env: RUNTIME_ENV,
       projectRoot: PROJECT_ROOT,
       restartDecision,
       restartDefaults: RESTART_DEFAULTS,
@@ -5019,7 +5042,7 @@ async function getDs4Health() { return getDs4Supervisor().health(); }
 // with a `current` symlink that start-ds4.sh resolves for the binary path.
 
 /** Absolute state dir for the ds4 updater (versioned builds + current symlink + state.json). */
-const DS4_STATE_DIR = process.env.DS4_STATE_DIR || join(homedir(), '.local/share/ds4');
+const DS4_STATE_DIR = RUNTIME_PATHS.ds4StateDir;
 
 /** Promisified shell exec returning {code,stdout,stderr}; never rejects (build/git steps
  *  report failure via a nonzero code the updater state machine handles). */
@@ -5042,7 +5065,7 @@ let ds4UpdateInFlight = false;
 /** Lazily construct the singleton ds4 updater (config + deps are defined by now). */
 function getDs4Updater() {
   if (!ds4Updater) {
-    const ds4cfg = resolveDs4Config(config, process.env);
+    const ds4cfg = resolveDs4Config(config, RUNTIME_ENV);
     // Model for the smoke test: env override, else any configured ds4 preset's model,
     // else the documented DeepSeek V4 Flash GGUF under the ds4 gguf dir.
     let smokeModel = process.env.DS4_MODEL || '';
@@ -5219,7 +5242,7 @@ function ds4AdaptiveSettings(preset, ds4cfg) {
  * @returns {Promise<{ok:true}|{ok:false,status:number,error:string,stayedExclusive?:boolean}>}
  */
 async function activateDs4Exclusive(presetId, preset) {
-  const ds4cfg = resolveDs4Config(config, process.env);
+  const ds4cfg = resolveDs4Config(config, RUNTIME_ENV);
   const modelAbs = resolveDs4ModelPath(preset.modelPath || '', ds4cfg.ggufDir);
   const ds4ModelBytes = ggufFileSizeBytes(modelAbs) || DS4_MODEL_FALLBACK_BYTES;
   const headroomBytes = ds4HeadroomBytes();
@@ -5410,7 +5433,7 @@ app.post('/api/server/start', async (req, res) => {
 
     const startScript = join(PROJECT_ROOT, 'start-llama.sh');
     const env = {
-      ...process.env,
+      ...RUNTIME_ENV,
       MODELS_DIR,
       MODELS_MAX: String(config.modelsMax || 2),
       CONTEXT: String(config.contextSize || 8192),
@@ -5493,7 +5516,7 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
     // All presets use the same script with environment variables
     const startScript = join(PROJECT_ROOT, 'start-preset.sh');
     const env = {
-      ...process.env,
+      ...RUNTIME_ENV,
       PORT: String(LLAMA_PORT),
       MODELS_DIR,
       // Use HF_REPO if available, otherwise MODEL_PATH
@@ -5610,7 +5633,7 @@ app.post('/api/llama/update', async (req, res) => {
 
   llamaUpdateProcess = spawn(distrobox, ['enter', CONTAINER_NAME, '--', 'bash', '-c', updateScript], {
     env: {
-      ...process.env,
+      ...RUNTIME_ENV,
       XDG_RUNTIME_DIR: '/run/user/1000',
       DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus'
     }
@@ -5753,7 +5776,7 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
 
     // Shared environment for the download process.
     const downloadEnv = {
-      ...process.env,
+      ...RUNTIME_ENV,
       HF_HUB_ENABLE_HF_TRANSFER: '1',
       HF_TOKEN: resolveHfToken(config, process.env),
       PYTHONUNBUFFERED: '1'
@@ -5943,7 +5966,7 @@ app.post('/api/pull', (req, res) => {
 
 // List the GGUF files currently present in the ds4 ggufDir.
 app.get('/api/ds4/models', (req, res) => {
-  const ds4 = resolveDs4Config(config, process.env);
+  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const models = listDs4GgufFiles(ds4.ggufDir, { existsSync, readdirSync, statSync });
   res.json({ ggufDir: ds4.ggufDir, allowedRepos: ds4.allowedRepos, models });
 });
@@ -5952,7 +5975,7 @@ app.get('/api/ds4/models', (req, res) => {
 // (default ["antirez/deepseek-v4-gguf"]) — any other repo is rejected with 400 — and
 // the write target is pinned to the ggufDir so a ds4 download can never reach ~/models.
 app.post('/api/ds4/download', (req, res) => {
-  const ds4 = resolveDs4Config(config, process.env);
+  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const decision = validateDs4DownloadRequest(req.body, ds4);
   if (!decision.ok) {
     return res.status(decision.status).json({ error: decision.error });
@@ -6084,7 +6107,7 @@ async function listRepoFilesWithCli(repoId) {
     // Use 'hf models info --expand=siblings' to get file listing as JSON
     const cmd = spawn(HF_CLI_PATH, ['models', 'info', repoId, '--expand=siblings'], {
       env: {
-        ...process.env,
+        ...RUNTIME_ENV,
         HF_TOKEN: resolveHfToken(config, process.env)
       },
       stdio: ['ignore', 'pipe', 'pipe']
@@ -6889,7 +6912,7 @@ app.get('/api/v1/models', async (req, res) => {
       data.data.push(entry);
     }
     // Append the dedicated embedding model so it is selectable by the orchestrator.
-    const ec = resolveEmbedConfig(config, process.env);
+    const ec = resolveEmbedConfig(config, RUNTIME_ENV);
     if (ec.runnable) {
       let embedId = ec.model;
       try {
@@ -7364,7 +7387,7 @@ function injectModelSamplingDefaults(body) {
  * @param {{requestedModel:string, isStreaming:boolean, startTime:number}} ctx
  */
 async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime }) {
-  const ds4 = resolveDs4Config(config, process.env);
+  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const url = ds4TargetUrl(ds4.port, '/v1/chat/completions');
   console.log(`[chat/completions] ds4 engine active — forwarding to ${url}`);
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: 'ds4' });
@@ -7449,7 +7472,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
  * @param {{requestedModel:string, isStreaming:boolean, startTime:number}} ctx
  */
 async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, startTime }) {
-  const ds4 = resolveDs4Config(config, process.env);
+  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const url = ds4TargetUrl(ds4.port, '/v1/completions');
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'completions', messages: null, backend: 'ds4' });
   const controller = new AbortController();
@@ -8695,7 +8718,7 @@ async function handleEmbeddings(req, res) {
   }
 
   // Local path → dedicated embed server (EMBED_PORT), NOT the chat router.
-  const ec = resolveEmbedConfig(config, process.env);
+  const ec = resolveEmbedConfig(config, RUNTIME_ENV);
   try {
     const response = await fetch(embedTargetUrl(ec.port), {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body)
@@ -8731,7 +8754,7 @@ app.get('/api/v1/embed/health', async (req, res) => {
 
 // Get/set the dedicated embedding model. Setting it persists config + restarts the embed server.
 app.get('/api/embed/model', (req, res) => {
-  const ec = resolveEmbedConfig(config, process.env);
+  const ec = resolveEmbedConfig(config, RUNTIME_ENV);
   res.json({ enabled: ec.enabled, model: ec.model, port: ec.port, dimension: config.embed?.dimension || null });
 });
 app.post('/api/embed/model', async (req, res) => {

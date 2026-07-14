@@ -198,7 +198,7 @@ Turn the host into a full-screen dashboard appliance (gdm autologin → a Waylan
 | Embeddings / HF token / app usage | `api/embeddings.js`, `api/hf-token.js`, `api/app-usage.js` |
 | Launchers | `start-llama.sh`, `start-preset.sh`, `container-start.sh`, `start-ds4.sh`, `start-embed.sh` |
 | UI | `ui/src/App.jsx` |
-| Config | `config.json`, `.env` |
+| Config | Source: `config.json`, `.env`; package: `/etc/llama-manager/` |
 
 ## Related docs
 
@@ -206,5 +206,7 @@ Turn the host into a full-screen dashboard appliance (gdm autologin → a Waylan
 - [`ds4-build.md`](ds4-build.md) / [`ds4-auto-update.md`](ds4-auto-update.md) — build + self-updater
 - [`Designs/EngineAbstraction.md`](Designs/EngineAbstraction.md) — engine-seam design
 - [`Designs/ModelManagement.md`](Designs/ModelManagement.md) — model lifecycle
+- [`Designs/PackageSafeRuntime.md`](Designs/PackageSafeRuntime.md) — FHS paths, ownership, and authorization
+- [`Utilities/package-installation.md`](Utilities/package-installation.md) — package operator guide
 - [`llama-cpp-rocm-build-and-deployment.md`](llama-cpp-rocm-build-and-deployment.md) — the llama.cpp engine build
 - [`strix-halo-gpu-stability.md`](strix-halo-gpu-stability.md) / [`GOTCHAS.md`](GOTCHAS.md) — hardware stability

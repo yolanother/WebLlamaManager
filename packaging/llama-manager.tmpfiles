@@ -1,0 +1,16 @@
+# Llama Manager — mutable directory ownership and mode declaration.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Creates only runtime-owned configuration, state, cache, and model locations;
+# application files under /usr/lib remain root-owned and are never group-writable.
+
+d /etc/llama-manager 2770 llama-manager llama-manager -
+f /etc/llama-manager/llama-manager.env 0660 llama-manager llama-manager -
+f /etc/llama-manager/config.json 0660 llama-manager llama-manager - {}
+d /var/lib/llama-manager 2770 llama-manager llama-manager -
+d /var/lib/llama-manager/models 2770 llama-manager llama-manager -
+d /var/lib/llama-manager/models/ds4 2770 llama-manager llama-manager -
+d /var/lib/llama-manager/ds4 2770 llama-manager llama-manager -
+d /var/cache/llama-manager 2770 llama-manager llama-manager -
+d /var/cache/llama-manager/slots 2770 llama-manager llama-manager -

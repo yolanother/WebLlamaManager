@@ -1,7 +1,41 @@
 #!/bin/bash
+# Llama Manager — source-checkout dependency, UI, and user-service installer.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# This installer provisions development/source deployments while preserving
+# their existing per-user service behavior. On hosts managed by the signed
+# Debian package it exits before making changes and directs upgrades through
+# APT so root-owned package files are never overwritten in place.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Return success when this host is managed by the llama-manager Debian package.
+# LLAMA_MANAGER_PACKAGED is the explicit package/service marker; the filesystem
+# marker supports package staging tests, and dpkg-query covers normal installs.
+llama_manager_is_packaged() {
+  case "${LLAMA_MANAGER_PACKAGED:-}" in 1|true|yes) return 0 ;; esac
+  local package_root="${LLAMA_MANAGER_PACKAGE_ROOT:-/usr/lib/llama-manager}"
+  [ -e "$package_root/.packaged-install" ] && return 0
+  command -v dpkg-query >/dev/null 2>&1 || return 1
+  [ "$(dpkg-query -W -f='${db:Status-Abbrev}' llama-manager 2>/dev/null || true)" = "ii " ]
+}
+
+# Print the supported software-upgrade path for package-managed installations.
+llama_manager_print_packaged_upgrade() {
+  cat <<'EOF'
+Llama Manager is installed as a root-owned Debian package.
+This source installer will not overwrite package-managed files.
+
+Upgrade through the signed APT repository instead:
+  sudo apt update
+  sudo apt install --only-upgrade llama-manager llama-manager-rocm-gfx1151 llama-manager-ds4
+
+Use llama-managerctl for service, configuration, and model management.
+EOF
+}
 
 # Seed config.json's embed block (idempotent). Args: <config-path> <model-id>.
 # Only sets embed.model when unset, so re-running install never clobbers a choice.
@@ -39,6 +73,11 @@ embed_bootstrap_model() {
 
 # Allow tests to source this file for its helpers without running the installer.
 if [ "${EMBED_SEED_LIB:-0}" = "1" ]; then return 0 2>/dev/null || true; fi
+
+if llama_manager_is_packaged; then
+  llama_manager_print_packaged_upgrade
+  exit 0
+fi
 
 SERVICE_NAME="llama-manager"
 
