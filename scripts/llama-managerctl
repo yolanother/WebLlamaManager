@@ -1,0 +1,224 @@
+#!/bin/bash
+# Llama Manager — constrained operator management interface.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# This command lets members of the llama-manager group manage the one Llama
+# Manager system service, its JSON configuration, and its model storage without
+# granting a general root shell or permission to control unrelated services.
+# Package-created group ownership supplies file access; polkit supplies the
+# unit-specific service authorization.
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Read one literal KEY=value entry from the package environment file without
+# sourcing it. This prevents shell syntax in configuration from being executed.
+read_env_setting() {
+  local file="$1" wanted="$2" line value
+  [ -r "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$wanted="*)
+        value="${line#*=}"
+        case "$value" in \"*\") value="${value#\"}"; value="${value%\"}" ;; esac
+        printf '%s' "$value"
+        return 0
+        ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+SERVICE_UNIT="llama-manager.service"
+BOOTSTRAP_CONFIG_DIR="${LLAMA_MANAGER_CONFIG_DIR:-/etc/llama-manager}"
+ENV_FILE="${LLAMA_MANAGER_ENV_FILE:-$BOOTSTRAP_CONFIG_DIR/llama-manager.env}"
+FILE_CONFIG_DIR="$(read_env_setting "$ENV_FILE" LLAMA_MANAGER_CONFIG_DIR || true)"
+CONFIG_DIR="${LLAMA_MANAGER_CONFIG_DIR:-${FILE_CONFIG_DIR:-/etc/llama-manager}}"
+FILE_CONFIG_PATH="$(read_env_setting "$ENV_FILE" CONFIG_PATH || true)"
+CONFIG_PATH="${CONFIG_PATH:-${FILE_CONFIG_PATH:-$CONFIG_DIR/config.json}}"
+FILE_DATA_DIR="$(read_env_setting "$ENV_FILE" LLAMA_MANAGER_DATA_DIR || true)"
+DATA_DIR="${LLAMA_MANAGER_DATA_DIR:-${FILE_DATA_DIR:-/var/lib/llama-manager}}"
+FILE_CACHE_DIR="$(read_env_setting "$ENV_FILE" LLAMA_MANAGER_CACHE_DIR || true)"
+CACHE_DIR="${LLAMA_MANAGER_CACHE_DIR:-${FILE_CACHE_DIR:-/var/cache/llama-manager}}"
+FILE_MODELS_DIR="$(read_env_setting "$ENV_FILE" MODELS_DIR || true)"
+MODELS_DIR="${MODELS_DIR:-${FILE_MODELS_DIR:-$DATA_DIR/models}}"
+FILE_DS4_GGUF_DIR="$(read_env_setting "$ENV_FILE" DS4_GGUF_DIR || true)"
+DS4_GGUF_DIR="${DS4_GGUF_DIR:-${FILE_DS4_GGUF_DIR:-$MODELS_DIR/ds4}}"
+FILE_DS4_STATE_DIR="$(read_env_setting "$ENV_FILE" DS4_STATE_DIR || true)"
+DS4_STATE_DIR="${DS4_STATE_DIR:-${FILE_DS4_STATE_DIR:-$DATA_DIR/ds4}}"
+FILE_SLOT_CACHE_DIR="$(read_env_setting "$ENV_FILE" SLOT_SAVE_PATH || true)"
+SLOT_CACHE_DIR="${SLOT_SAVE_PATH:-${FILE_SLOT_CACHE_DIR:-$CACHE_DIR/slots}}"
+SYSTEMCTL="${LLAMA_MANAGER_SYSTEMCTL:-systemctl}"
+JOURNALCTL="${LLAMA_MANAGER_JOURNALCTL:-journalctl}"
+PACKAGE_NODE_BIN="/usr/lib/llama-manager/node/bin/node"
+if [ -x "$PACKAGE_NODE_BIN" ]; then NODE_BIN="$PACKAGE_NODE_BIN";
+else NODE_BIN="${LLAMA_MANAGER_NODE_BIN:-$(command -v node || true)}"; fi
+[ -n "$NODE_BIN" ] || { printf 'llama-managerctl: Node runtime not found\n' >&2; exit 1; }
+PACKAGE_STORAGE_CHECKER="/usr/lib/llama-manager/scripts/check-model-storage.mjs"
+if [ -f "$PACKAGE_STORAGE_CHECKER" ]; then STORAGE_CHECKER="$PACKAGE_STORAGE_CHECKER";
+else STORAGE_CHECKER="${LLAMA_MANAGER_STORAGE_CHECKER:-$SCRIPT_DIR/check-model-storage.mjs}"; fi
+
+# Print the effective mutable paths used by package-managed installations.
+print_paths() {
+  printf 'config_dir=%s\n' "$CONFIG_DIR"
+  printf 'config_path=%s\n' "$CONFIG_PATH"
+  printf 'data_dir=%s\n' "$DATA_DIR"
+  printf 'cache_dir=%s\n' "$CACHE_DIR"
+  printf 'models_dir=%s\n' "$MODELS_DIR"
+  printf 'ds4_models_dir=%s\n' "$DS4_GGUF_DIR"
+  printf 'ds4_state_dir=%s\n' "$DS4_STATE_DIR"
+  printf 'slot_cache_dir=%s\n' "$SLOT_CACHE_DIR"
+}
+
+# Read or mutate one dotted JSON configuration key without evaluating shell
+# input. The config file itself is group-owned; this helper never invokes sudo.
+manage_config() {
+  local action="${1:-}" key="${2:-}" value="${3:-}"
+  case "$action" in get|set|delete) ;; *) usage >&2; exit 2 ;; esac
+  [ -n "$key" ] || { printf 'llama-managerctl: config key is required\n' >&2; exit 2; }
+  [ "$action" != "set" ] || [ "$#" -ge 3 ] || {
+    printf 'llama-managerctl: config set requires a value\n' >&2; exit 2;
+  }
+  "$NODE_BIN" - "$action" "$CONFIG_PATH" "$key" "$value" <<'NODE'
+const fs = require('fs');
+const [action, configPath, key, rawValue] = process.argv.slice(2);
+const parts = key.split('.');
+const blocked = new Set(['__proto__', 'prototype', 'constructor']);
+if (!parts.every((p) => /^[A-Za-z][A-Za-z0-9_-]*$/.test(p) && !blocked.has(p))) {
+  console.error('llama-managerctl: invalid config key');
+  process.exit(2);
+}
+let config = {};
+try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); }
+catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+  if (action === 'get' || action === 'delete') {
+    console.error(`${key}: not set`);
+    process.exit(3);
+  }
+}
+let cursor = config;
+for (const part of parts.slice(0, -1)) {
+  if (action === 'set') {
+    if (!cursor[part] || typeof cursor[part] !== 'object' || Array.isArray(cursor[part])) cursor[part] = {};
+  } else if (!cursor[part] || typeof cursor[part] !== 'object') {
+    console.error(`${key}: not set`);
+    process.exit(3);
+  }
+  cursor = cursor[part];
+}
+const leaf = parts.at(-1);
+if (action === 'get') {
+  if (!Object.hasOwn(cursor, leaf)) {
+    console.error(`${key}: not set`);
+    process.exit(3);
+  }
+  const sensitive = /(token|secret|key|password|credential|api[_-]?key)/i.test(key);
+  const value = cursor[leaf];
+  console.log(sensitive && value ? '****' : (typeof value === 'string' ? value : JSON.stringify(value)));
+} else if (action === 'delete') {
+  if (!Object.hasOwn(cursor, leaf)) {
+    console.error(`${key}: not set`);
+    process.exit(3);
+  }
+  delete cursor[leaf];
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+} else {
+  let value = rawValue;
+  try { value = JSON.parse(rawValue); } catch { /* unquoted input is a string */ }
+  cursor[leaf] = value;
+  fs.mkdirSync(require('path').dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o660 });
+}
+NODE
+}
+
+# Run one allowlisted action against the canonical service unit. Polkit grants
+# llama-manager group members authority for this unit only.
+manage_service() {
+  local action="$1"
+  case "$action" in
+    status) "$SYSTEMCTL" status "$SERVICE_UNIT" --no-pager ;;
+    start|stop|restart) "$SYSTEMCTL" "$action" "$SERVICE_UNIT" ;;
+    *) printf 'llama-managerctl: unsupported service action\n' >&2; exit 2 ;;
+  esac
+}
+
+# Inspect or change the model storage root. set-directory accepts only an
+# existing writable absolute directory and updates only MODELS_DIR in the
+# package environment file; mounting NAS storage remains an administrator task.
+manage_models() {
+  local action="${1:-}" selected="${2:-}"
+  case "$action" in
+    path) printf '%s\n' "$MODELS_DIR" ;;
+    list)
+      [ -d "$MODELS_DIR" ] || exit 0
+      find "$MODELS_DIR" -type f -iname '*.gguf' -printf '%P\n' | sort
+      ;;
+    set-directory)
+      [ -n "$selected" ] || { printf 'llama-managerctl: model directory is required\n' >&2; exit 2; }
+      case "$selected" in /*) ;; *) printf 'llama-managerctl: model directory must be absolute\n' >&2; exit 2 ;; esac
+      [ -d "$selected" ] || { printf 'llama-managerctl: directory does not exist: %s\n' "$selected" >&2; exit 2; }
+      [ -w "$selected" ] || { printf 'llama-managerctl: directory is not writable: %s\n' "$selected" >&2; exit 2; }
+      "$NODE_BIN" "$STORAGE_CHECKER" "$selected"
+      "$NODE_BIN" - "$ENV_FILE" "$selected" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const [envPath, selected] = process.argv.slice(2);
+if (/[\r\n\0]/.test(selected)) throw new Error('invalid model directory');
+let lines = [];
+try { lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/); }
+catch (error) { if (error.code !== 'ENOENT') throw error; }
+const encoded = /\s/.test(selected) ? JSON.stringify(selected) : selected;
+const replacement = `MODELS_DIR=${encoded}`;
+let replaced = false;
+lines = lines.filter((line) => {
+  if (!line.startsWith('MODELS_DIR=')) return true;
+  if (!replaced) { replaced = true; return true; }
+  return false;
+}).map((line) => {
+  if (line.startsWith('MODELS_DIR=') && line !== replacement) return replacement;
+  return line;
+});
+if (!replaced) lines.push(replacement);
+while (lines.length && lines.at(-1) === '') lines.pop();
+fs.mkdirSync(path.dirname(envPath), { recursive: true });
+fs.writeFileSync(envPath, `${lines.join('\n')}\n`, { mode: 0o660 });
+NODE
+      printf 'Model directory set to %s. Restart llama-manager.service to apply.\n' "$selected"
+      ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+# Print command help and the deliberately small supported operation set.
+usage() {
+  cat <<'EOF'
+Usage: llama-managerctl <command> [arguments]
+
+Commands:
+  paths                     Show effective mutable filesystem locations
+  config get KEY            Print one dotted JSON key (secrets are masked)
+  config set KEY VALUE      Set one key; JSON values are parsed when valid
+  config delete KEY         Remove one dotted JSON key
+  status|start|stop|restart Manage only llama-manager.service
+  logs [-f]                 Read service logs; -f follows new entries
+  models path|list           Show model storage or list GGUF files
+  models set-directory DIR   Select existing local/NAS model storage
+EOF
+}
+
+case "${1:-}" in
+  paths) print_paths ;;
+  config) shift; manage_config "$@" ;;
+  models) shift; manage_models "$@" ;;
+  status|start|stop|restart) manage_service "$1" ;;
+  logs)
+    if [ "${2:-}" = "-f" ]; then "$JOURNALCTL" -u "$SERVICE_UNIT" -f;
+    elif [ -n "${2:-}" ]; then usage >&2; exit 2;
+    else "$JOURNALCTL" -u "$SERVICE_UNIT" --no-pager -n 200; fi
+    ;;
+  help|-h|--help|'') usage ;;
+  *) printf 'llama-managerctl: unknown command: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac

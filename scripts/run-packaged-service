@@ -1,0 +1,139 @@
+#!/bin/bash
+# Llama Manager — sanitized Debian package service launcher.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# This root-owned launcher converts the group-managed package configuration
+# file into a clean, allowlisted process environment. Security-critical mode,
+# runtime, executable, loader, and search-path values are supplied only from
+# immutable package constants, so llama-manager group members can configure
+# storage without gaining code execution as the service account.
+
+set -euo pipefail
+
+readonly CONFIG_FILE_DEFAULT=/etc/llama-manager/llama-manager.env
+readonly NODE_BIN=/usr/lib/llama-manager/node/bin/node
+readonly SERVER_ENTRY=/usr/lib/llama-manager/api/server.js
+readonly DS4_BIN=/usr/lib/llama-manager-ds4/bin/ds4-server
+readonly ROCM_CONTAINER=llama-rocm-7.2.4
+readonly LLAMA_BIN=/usr/local/bin/llama-server
+
+declare -A SERVICE_ENV=(
+  [NODE_ENV]=production
+  [LLAMA_MANAGER_NODE_BIN]="$NODE_BIN"
+  [HOME]=/var/lib/llama-manager
+  [LLAMA_MANAGER_PACKAGED]=1
+  [LLAMA_MANAGER_CONFIG_DIR]=/etc/llama-manager
+  [LLAMA_MANAGER_DATA_DIR]=/var/lib/llama-manager
+  [LLAMA_MANAGER_CACHE_DIR]=/var/cache/llama-manager
+  [MODELS_DIR]=/var/lib/llama-manager/models
+  [DS4_GGUF_DIR]=/var/lib/llama-manager/models/ds4
+  [DS4_STATE_DIR]=/var/lib/llama-manager/ds4
+  [DS4_SERVER_BIN]="$DS4_BIN"
+  [DISTROBOX_CONTAINER]="$ROCM_CONTAINER"
+  [LLAMA_SERVER_BIN]="$LLAMA_BIN"
+  [SLOT_SAVE_PATH]=/var/cache/llama-manager/slots
+  [XDG_RUNTIME_DIR]=/run/llama-manager
+  [PATH]=/usr/local/bin:/usr/bin:/bin
+  [API_PORT]=3001
+  [LLAMA_PORT]=8080
+  [EMBED_PORT]=5252
+  [MODELS_MAX]=2
+  [CONTEXT_SIZE]=8192
+  [AUTO_START]=true
+  [STATS_INTERVAL]=1000
+)
+
+# Return success only for mutable path settings that the package service may
+# accept from the group-managed configuration file.
+is_mutable_setting() {
+  case "$1" in
+    LLAMA_MANAGER_CONFIG_DIR|CONFIG_PATH|LLAMA_MANAGER_DATA_DIR|LLAMA_MANAGER_CACHE_DIR|\
+      MODELS_DIR|DS4_GGUF_DIR|DS4_STATE_DIR|SLOT_SAVE_PATH|API_PORT|LLAMA_PORT|\
+      EMBED_PORT|MODELS_MAX|CONTEXT_SIZE|AUTO_START|STATS_INTERVAL) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Validate the documented scalar settings before copying them into the service
+# environment. Path settings remain literal strings and are constrained by the
+# service account and systemd filesystem policy.
+is_valid_setting_value() {
+  local key="$1" value="$2" number
+  case "$key" in
+    API_PORT|LLAMA_PORT|EMBED_PORT)
+      [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+      number=$((10#$value))
+      [ "$number" -ge 1 ] && [ "$number" -le 65535 ]
+      ;;
+    MODELS_MAX)
+      [[ "$value" =~ ^[0-9]{1,4}$ ]] || return 1
+      number=$((10#$value))
+      [ "$number" -ge 1 ] && [ "$number" -le 1024 ]
+      ;;
+    CONTEXT_SIZE)
+      [[ "$value" =~ ^[0-9]{1,10}$ ]] && [ "$((10#$value))" -ge 1 ]
+      ;;
+    STATS_INTERVAL)
+      [[ "$value" =~ ^[0-9]{1,9}$ ]] && [ "$((10#$value))" -ge 1 ]
+      ;;
+    AUTO_START) [[ "$value" =~ ^(true|false|1|0)$ ]] ;;
+    *) return 0 ;;
+  esac
+}
+
+# Read literal KEY=value records without sourcing shell content. Unknown keys,
+# including NODE_OPTIONS, loader variables, and executable selectors, are
+# deliberately discarded.
+load_mutable_settings() {
+  local config_file="$1" line key value
+  [ -r "$config_file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    key="${line%%=*}"
+    [ "$key" != "$line" ] || continue
+    is_mutable_setting "$key" || continue
+    value="${line#*=}"
+    case "$value" in
+      \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    esac
+    case "$value" in *$'\r'*|*$'\n'*) continue ;; esac
+    is_valid_setting_value "$key" "$value" || continue
+    if [ "$key" = AUTO_START ]; then
+      case "$value" in 0) value=false ;; 1) value=true ;; esac
+    fi
+    SERVICE_ENV["$key"]="$value"
+  done < "$config_file"
+}
+
+# Convert the map into env(1) arguments. An array keeps every value literal,
+# including paths containing whitespace or shell metacharacters.
+environment_arguments() {
+  local key
+  ENV_ARGS=()
+  for key in "${!SERVICE_ENV[@]}"; do
+    ENV_ARGS+=("$key=${SERVICE_ENV[$key]}")
+  done
+}
+
+config_file="$CONFIG_FILE_DEFAULT"
+print_only=0
+case "${1:-}" in
+  '') ;;
+  --print-env)
+    print_only=1
+    config_file="${2:-$CONFIG_FILE_DEFAULT}"
+    [ "$#" -le 2 ] || { printf 'run-packaged-service: too many arguments\n' >&2; exit 2; }
+    ;;
+  *) printf 'run-packaged-service: unsupported argument\n' >&2; exit 2 ;;
+esac
+
+load_mutable_settings "$config_file"
+environment_arguments
+
+if [ "$print_only" -eq 1 ]; then
+  printf '%s\n' "${ENV_ARGS[@]}" | sort
+  exit 0
+fi
+
+exec /usr/bin/env -i "${ENV_ARGS[@]}" "$NODE_BIN" "$SERVER_ENTRY"

@@ -1,3 +1,10 @@
+// Llama Manager — browser dashboard and configuration interface.
+// Copyright (c) Llama Manager project. Use of this file is governed by the
+// LICENSE file in the repository root.
+//
+// This React application presents inference, model, service, update, and system
+// controls while adapting mutable operations to the active distribution policy.
+
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, NavLink, useLocation, useParams, useNavigate } from 'react-router-dom';
 import {
@@ -7,6 +14,7 @@ import {
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
 import './App.css';
+import { resolveLlamaUpdateView } from './llama-update-policy.js';
 
 const API_BASE = '/api';
 
@@ -6419,14 +6427,17 @@ function BackendEditForm({ backend, localModels, remoteModels, onSave, onCancel 
 function LlamaCppUpdateSection() {
   const [updating, setUpdating] = useState(false);
   const [status, setStatus] = useState(null);
+  const [updateInfo, setUpdateInfo] = useState(null);
   const [output, setOutput] = useState('');
   const outputRef = useRef(null);
+  const updateView = resolveLlamaUpdateView(updateInfo);
 
   // Check initial status
   useEffect(() => {
     fetch(`${API_BASE}/llama/update/status`)
       .then(res => res.json())
       .then(data => {
+        setUpdateInfo(data);
         setStatus(data.status);
         setOutput(data.output || '');
         if (data.status === 'updating') {
@@ -6469,6 +6480,7 @@ function LlamaCppUpdateSection() {
   }, [output]);
 
   const startUpdate = async () => {
+    if (!updateView.canSourceUpdate) return;
     setUpdating(true);
     setStatus('updating');
     setOutput('');
@@ -6491,17 +6503,26 @@ function LlamaCppUpdateSection() {
     <section className="page-section">
       <h3>llama.cpp Updates</h3>
       <div className="setting-item">
-        <p className="setting-hint">
-          Pull the latest llama.cpp changes from GitHub and rebuild. This will stop any running llama server during the update.
-        </p>
-        <button
-          className={`btn-secondary ${updating ? 'disabled' : ''}`}
-          onClick={startUpdate}
-          disabled={updating}
-        >
-          {updating ? 'Updating...' : 'Update llama.cpp'}
-        </button>
-        {status && status !== 'idle' && (
+        {updateView.packageManaged ? (
+          <>
+            <p className="setting-hint">{updateView.guidance}</p>
+            {updateView.command && <code>{updateView.command}</code>}
+          </>
+        ) : (
+          <>
+            <p className="setting-hint">
+              Pull the latest llama.cpp changes from GitHub and rebuild. This will stop any running llama server during the update.
+            </p>
+            <button
+              className={`btn-secondary ${updating ? 'disabled' : ''}`}
+              onClick={startUpdate}
+              disabled={updating}
+            >
+              {updating ? 'Updating...' : 'Update llama.cpp'}
+            </button>
+          </>
+        )}
+        {!updateView.packageManaged && status && status !== 'idle' && (
           <span className={`update-status ${status}`}>
             {status === 'updating' && ' Building...'}
             {status === 'success' && ' Update complete'}

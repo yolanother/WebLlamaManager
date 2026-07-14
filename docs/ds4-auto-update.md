@@ -7,6 +7,14 @@ frequently — this mechanism picks them up without manual babysitting, but only
 promotes a new build after it passes a smoke test, with automatic rollback to the
 last-known-good build on any failure.
 
+> **Distribution boundary:** this git builder exists only for mutable source
+> checkouts. When `LLAMA_MANAGER_PACKAGED=1`, the scheduler is not registered,
+> `check`/`apply` return `409 PACKAGE_MANAGED` with signed-APT guidance, and the
+> status endpoint reports `managedBy: "apt"`. The launcher ignores
+> `DS4_STATE_DIR/current` and executes the root-owned
+> `/usr/lib/llama-manager-ds4/bin/ds4-server`. Package upgrades are the only
+> supported way to replace that binary.
+
 Implemented as a dependency-injected state machine in
 [`api/ds4-updater.js`](../api/ds4-updater.js) (unit-tested in
 `api/ds4-updater.test.js`), wired into the manager in `api/server.js`, with the
@@ -83,11 +91,18 @@ machine and symlink atomicity fully unit-testable without a real GPU build or th
 - `POST /api/ds4/update/check` — manual "check now" (fetch + compare, no build); runs synchronously and returns the check result + status.
 - `POST /api/ds4/update/apply` — manual "update now". Body `{ "force": true }` rebuilds+swaps even when up to date. A build can take minutes, so this runs in the **background** and returns `202 { started: true, status }`; poll `/status` for progress. Returns `409` if an update is already in flight.
 
+Those response shapes describe source mode. In packaged mode, `GET status`
+returns the APT manager/guidance/command and both POST operations return `409`
+without constructing the updater or executing git/build commands.
+
 ## Scheduler & config
 
 A manager-internal timer (`setInterval`, following the existing periodic-job
 pattern in `server.js`) evaluates every 30 minutes and runs a cycle once the
 configured interval has elapsed. Configured under `config.ds4.update`:
+
+The timer is created only when source self-updates are allowed. Package mode
+does not create a disabled/no-op timer; there is no git updater scheduled at all.
 
 ```jsonc
 {

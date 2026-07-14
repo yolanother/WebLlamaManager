@@ -100,6 +100,8 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
 
 ## Requirements
 
+For source checkouts:
+
 - Node.js 18+
 - distrobox with the ROCm 7.2.4 toolbox `llama-rocm-7.2.4` (image
   `docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4`; selectable via
@@ -109,7 +111,14 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
   build via `scripts/build-llama-cpp.sh` is optional). See
   [`docs/llama-cpp-rocm-build-and-deployment.md`](docs/llama-cpp-rocm-build-and-deployment.md).
 
+The Debian package does not use Noble's system Node. It bundles Node 20.18.1 or
+newer at `/usr/lib/llama-manager/node/bin/node` for reproducible offline installs;
+the machine-readable builder contract is `packaging/runtime-contract.env`.
+
 ## Quick Start
+
+This is the source-checkout installation flow. It preserves the current user's
+paths and creates a per-user service:
 
 ```bash
 # Install dependencies and build UI
@@ -124,6 +133,11 @@ systemctl --user start llama-manager
 # Access the web UI
 # http://localhost:3001
 ```
+
+Debian packages use a dedicated `llama-manager` system account, immutable code
+under `/usr/lib/llama-manager`, signed APT upgrades, and the constrained
+`llama-managerctl` interface. See
+[Operating a packaged installation](docs/Utilities/package-installation.md).
 
 ## How It Works
 
@@ -196,7 +210,9 @@ llama-server/
 │   └── ...
 ├── container-start.sh      # Starts llama-server in router mode (runs in container)
 ├── start-llama.sh          # Wrapper that enters distrobox
-├── llama-manager.service   # systemd user service
+├── start-preset.sh         # Starts one configured preset with literal argv
+├── start-ds4.sh            # Starts the package/source DS4 engine
+├── llama-manager.service   # canonical package system service
 ├── config.json             # Configuration (auto-generated)
 ├── install.sh              # Installation script
 └── uninstall.sh            # Uninstallation script
@@ -257,6 +273,8 @@ commands.
 
 ## Service Management
 
+For a source-checkout installation:
+
 ```bash
 # Start
 systemctl --user start llama-manager
@@ -283,6 +301,14 @@ systemctl --user disable llama-manager
 sudo loginctl enable-linger $USER
 ```
 
+For a packaged installation:
+
+```bash
+llama-managerctl status
+llama-managerctl restart
+llama-managerctl logs -f
+```
+
 ## Kiosk mode (optional)
 
 To dedicate this machine to the dashboard (boot straight into full-screen
@@ -296,7 +322,8 @@ sudo bash scripts/install-kiosk.sh uninstall   # revert
 
 ## Configuration
 
-Edit `config.json` to change settings:
+Source installs edit `config.json`; package installs default to
+`/etc/llama-manager/config.json` and can use `llama-managerctl config`:
 
 ```json
 {
@@ -308,6 +335,12 @@ Edit `config.json` to change settings:
 
 Environment variables (set in systemd service or shell):
 - `MODELS_DIR`: Models directory (default: `~/models`)
+- `LLAMA_MANAGER_CONFIG_DIR`: Configuration directory (package default: `/etc/llama-manager`)
+- `LLAMA_MANAGER_DATA_DIR`: Persistent data root (package default: `/var/lib/llama-manager`)
+- `LLAMA_MANAGER_CACHE_DIR`: Cache root (package default: `/var/cache/llama-manager`)
+- `DS4_GGUF_DIR`: Dedicated DS4 model directory
+- `DS4_STATE_DIR`: DS4 version/build state directory
+- `SLOT_SAVE_PATH`: llama.cpp slot KV-cache directory
 - `API_PORT`: Management API port (default: `3001`)
 - `LLAMA_PORT`: Llama server port (default: `8080`)
 - `MODELS_MAX`: Max simultaneous models (default: `2`)
@@ -453,10 +486,12 @@ huggingface-cli download Qwen/Qwen2.5-Coder-32B-Instruct-GGUF \
 Check logs: `journalctl --user -u llama-manager -f`
 
 ### distrobox errors
-Ensure the container exists: `distrobox list`
-If not running, initialize it: `distrobox enter llama-rocm-7.2.4` (or set
-`DISTROBOX_CONTAINER` in the `llama-manager.service` env to use a different
-container — note `.env` alone does not override the systemd user environment; see
+Ensure the container exists: `distrobox list`. If it is not running, initialize
+it with `distrobox enter llama-rocm-7.2.4`.
+For source installs, set `DISTROBOX_CONTAINER` in the user
+`llama-manager.service` environment to use a different container. Debian
+packages intentionally pin `llama-rocm-7.2.4`; note `.env` alone does not
+override the systemd user environment; see
 [`docs/llama-cpp-rocm-build-and-deployment.md`](docs/llama-cpp-rocm-build-and-deployment.md)).
 To create it: `distrobox create --name llama-rocm-7.2.4 --image docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4 --yes`
 

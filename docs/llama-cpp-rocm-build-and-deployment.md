@@ -79,6 +79,12 @@ Both are pinned in **two** places, and both matter:
    `LLAMA_SERVER_BIN=/usr/local/bin/llama-server`, so a fresh install writes the
    correct service env.
 
+These override instructions apply to source installations. Debian packages pin
+both values in the root-owned package launcher and intentionally ignore mutable
+configuration attempts to replace them. Packaged `start-llama.sh` executes
+`container-start.sh` through Distrobox's host mount at
+`/run/host/usr/lib/llama-manager/container-start.sh`.
+
 ### Gotcha: `.env` alone is NOT enough
 
 Setting `DISTROBOX_CONTAINER` / `LLAMA_SERVER_BIN` only in `.env` does **not** take

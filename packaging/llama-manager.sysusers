@@ -1,0 +1,8 @@
+# Llama Manager — dedicated system account declaration.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Creates the non-login service account and matching operator group used by the
+# canonical system service and package-owned mutable directories.
+
+u llama-manager - "Llama Manager service account" /var/lib/llama-manager /usr/sbin/nologin

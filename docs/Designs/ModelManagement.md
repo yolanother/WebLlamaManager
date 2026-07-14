@@ -117,8 +117,10 @@ POST /api/presets/:presetId/activate
 **`start-preset.sh`** handles all presets:
 - Validates that `HF_REPO` or `MODEL_PATH` is set
 - Sets AMD GPU environment (`HSA_OVERRIDE_GFX_VERSION=11.5.1`)
-- Uses the correct binary at `~/.local/bin/llama-server`
-- Builds the command dynamically based on environment variables
+- Uses the source-configured binary or the package-pinned container binary
+- Builds a literal argv array from environment values
+- Passes argv after a fixed single-quoted Distrobox script; values are never
+  interpolated as shell source
 - If `HF_REPO` is set: uses `-hf 'repo'` flag (downloads/caches automatically)
 - If `MODEL_PATH` is set: uses `--model 'path'` flag
 
@@ -126,6 +128,7 @@ POST /api/presets/:presetId/activate
 - Sets `LLAMA_CACHE=$MODELS_DIR` so HuggingFace downloads land in the models directory
 - Launches with `--models-dir`, `--models-max`, `--ctx-size`, `-ngl`, `--no-mmap`
 - Optionally adds `--no-warmup` and `--flash-attn`
+- Uses an argv array so model and slot-cache paths remain single literal values
 
 ## Automatic OOM Recovery
 

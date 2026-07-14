@@ -1,23 +1,60 @@
+# Llama Manager — canonical package-managed system service.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Runs the immutable application from /usr/lib under the dedicated service
+# account while granting write access only to the package-created configuration,
+# state, cache, and runtime directories. The package-owned launcher reads only
+# allowlisted path settings from group-managed configuration and constructs a
+# clean environment before executing Node.
+
 [Unit]
 Description=Llama Manager API and Multi-Model Server
-After=network.target
+Documentation=https://github.com/yolanother/llama-manager
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=/home/yolan/workspace/ai/llama-server/api
-ExecStart=/usr/bin/node server.js
+User=llama-manager
+Group=llama-manager
+SupplementaryGroups=render video
+WorkingDirectory=/usr/lib/llama-manager/api
+ExecStartPre=/usr/bin/env -i HOME=/var/lib/llama-manager NODE_ENV=production LLAMA_MANAGER_PACKAGED=1 LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node PATH=/usr/bin:/bin /usr/lib/llama-manager/node/bin/node /usr/lib/llama-manager/scripts/check-node-runtime.mjs
+ExecStart=/usr/bin/env -i /usr/lib/llama-manager/scripts/run-packaged-service
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=30
+UMask=0007
 
-# Configuration
-Environment=NODE_ENV=production
-Environment=API_PORT=3001
-Environment=LLAMA_PORT=8080
-Environment=MODELS_DIR=/home/yolan/models
+ConfigurationDirectory=llama-manager
+ConfigurationDirectoryMode=0770
+StateDirectory=llama-manager
+StateDirectoryMode=0770
+CacheDirectory=llama-manager
+CacheDirectoryMode=0770
+RuntimeDirectory=llama-manager
+RuntimeDirectoryMode=0700
 
-# Allow the service to manage distrobox containers
-Environment=XDG_RUNTIME_DIR=/run/user/1000
-Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+# Rootless Podman/Distrobox requires the setuid newuidmap/newgidmap helpers to
+# install subordinate-ID mappings; enabling NoNewPrivileges blocks that transition.
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/etc/llama-manager
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Mapping helpers may acquire only the two capabilities required to write the
+# service account's subordinate uid/gid maps; Node receives no ambient caps.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+AmbientCapabilities=
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

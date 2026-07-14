@@ -1,4 +1,12 @@
 #!/bin/bash
+# Llama Manager — llama.cpp multi-model router process launcher.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# This script runs inside the ROCm Distrobox, applies gfx1151 unified-memory
+# settings, prepares model and slot-cache directories, and execs llama-server
+# with a literal argv so configurable paths cannot be split or glob-expanded.
+
 set -euo pipefail
 
 ##
@@ -75,20 +83,24 @@ echo
 # ABI mismatch and makes every model fail to load. The router also spawns its
 # per-model child servers using this same binary, so it must be the current build.
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$HOME/.local/bin/llama-server}"
-CMD="$LLAMA_SERVER_BIN"
-CMD="$CMD --models-dir $MODELS_DIR"
-CMD="$CMD --models-max $MODELS_MAX"
-CMD="$CMD --ctx-size $CONTEXT"
-CMD="$CMD -ngl $GPU_LAYERS"
-CMD="$CMD --no-mmap"
-CMD="$CMD --jinja"
-CMD="$CMD --host 0.0.0.0"
-CMD="$CMD --port $PORT"
-[ -n "$NO_WARMUP" ] && CMD="$CMD --no-warmup"
-[ -n "$FLASH_ATTN" ] && CMD="$CMD --flash-attn on"
+CMD=(
+    "$LLAMA_SERVER_BIN"
+    --models-dir "$MODELS_DIR"
+    --models-max "$MODELS_MAX"
+    --ctx-size "$CONTEXT"
+    -ngl "$GPU_LAYERS"
+    --no-mmap
+    --jinja
+    --host 0.0.0.0
+    --port "$PORT"
+)
+[ -n "$NO_WARMUP" ] && CMD+=(--no-warmup)
+[ -n "$FLASH_ATTN" ] && CMD+=(--flash-attn on)
 # --slot-save-path is propagated by the router to every per-model child server,
 # enabling POST /slots/{id}?action=save|restore for conversation KV persistence.
-[ -n "$SLOT_SAVE_PATH" ] && CMD="$CMD --slot-save-path $SLOT_SAVE_PATH"
+[ -n "$SLOT_SAVE_PATH" ] && CMD+=(--slot-save-path "$SLOT_SAVE_PATH")
 
-echo "Command: $CMD"
-exec $CMD
+printf 'Command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
+exec "${CMD[@]}"

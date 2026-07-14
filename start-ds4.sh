@@ -13,8 +13,10 @@
 # Env: DS4_MODEL (gguf path or bare name under DS4_GGUF_DIR, required),
 #      DS4_SERVER_BIN (override; default resolves the auto-updater's managed
 #        binary at DS4_STATE_DIR/current/ds4-server, else ~/.local/bin/ds4-server),
-#      DS4_STATE_DIR (default ~/.local/share/ds4 — holds the updater's versioned
-#        builds/<commit>/ dirs + the `current` symlink), DS4_PORT (default 5253),
+#      DS4_STATE_DIR (source installs: updater builds/current; packages: runtime
+#        state only), LLAMA_MANAGER_PACKAGED (1 forces the root-owned binary at
+#        /usr/lib/llama-manager-ds4/bin/ds4-server on the host and its
+#        /run/host path inside Distrobox), DS4_PORT (default 5253),
 #      DS4_CTX (0 = model default), DS4_GGUF_DIR
 #      (default /home/yolan/models-ds4/deepseek-v4-gguf), DS4_POWER (1-100, opt),
 #      DS4_KV_DISK_DIR (opt), DS4_KV_DISK_SPACE_MB (opt),
@@ -32,7 +34,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -f "$SCRIPT_DIR/.env" ]; then set -a; . "$SCRIPT_DIR/.env"; set +a; fi
 
-# Resolve the ds4-server binary. The auto-updater (api/ds4-updater.js) installs
+# Resolve the ds4-server binary. Package installations never execute binaries
+# from group-writable state: signed APT owns the fixed /usr/lib binary. For a
+# source checkout, the auto-updater (api/ds4-updater.js) installs
 # versioned builds under DS4_STATE_DIR/builds/<commit>/ and atomically flips a
 # `current` symlink to the active one; prefer that managed binary so a swap takes
 # effect on the next (re)start. config.ds4.binPath (passed through as
@@ -41,10 +45,21 @@ if [ -f "$SCRIPT_DIR/.env" ]; then set -a; . "$SCRIPT_DIR/.env"; set +a; fi
 DS4_STATE_DIR="${DS4_STATE_DIR:-$HOME/.local/share/ds4}"
 DS4_CURRENT_BIN="$DS4_STATE_DIR/current/ds4-server"
 DS4_LEGACY_DEFAULT="$HOME/.local/bin/ds4-server"
-if [ -x "$DS4_CURRENT_BIN" ] && { [ -z "${DS4_SERVER_BIN:-}" ] || [ "${DS4_SERVER_BIN}" = "$DS4_LEGACY_DEFAULT" ]; }; then
-  DS4_SERVER_BIN="$DS4_CURRENT_BIN"
-fi
-DS4_SERVER_BIN="${DS4_SERVER_BIN:-$DS4_LEGACY_DEFAULT}"
+DS4_PACKAGED_BIN="/usr/lib/llama-manager-ds4/bin/ds4-server"
+DS4_PACKAGED_CONTAINER_BIN="/run/host/usr/lib/llama-manager-ds4/bin/ds4-server"
+PACKAGED_MODE=0
+case "${LLAMA_MANAGER_PACKAGED:-}" in
+  1|true)
+    PACKAGED_MODE=1
+    DS4_SERVER_BIN="$DS4_PACKAGED_BIN"
+    ;;
+  *)
+    if [ -x "$DS4_CURRENT_BIN" ] && { [ -z "${DS4_SERVER_BIN:-}" ] || [ "${DS4_SERVER_BIN}" = "$DS4_LEGACY_DEFAULT" ]; }; then
+      DS4_SERVER_BIN="$DS4_CURRENT_BIN"
+    fi
+    DS4_SERVER_BIN="${DS4_SERVER_BIN:-$DS4_LEGACY_DEFAULT}"
+    ;;
+esac
 DS4_PORT="${DS4_PORT:-5253}"
 DS4_CTX="${DS4_CTX:-0}"
 DS4_GGUF_DIR="${DS4_GGUF_DIR:-/home/yolan/models-ds4/deepseek-v4-gguf}"
@@ -55,8 +70,16 @@ DS4_KV_DISK_SPACE_MB="${DS4_KV_DISK_SPACE_MB:-}"
 DS4_SSD_STREAMING="${DS4_SSD_STREAMING:-0}"
 DS4_SSD_STREAMING_CACHE_EXPERTS="${DS4_SSD_STREAMING_CACHE_EXPERTS:-}"
 DS4_EXTRA_SWITCHES="${DS4_EXTRA_SWITCHES:---rocm --cors}"
-CONTAINER_NAME="${DS4_CONTAINER:-llama-rocm-7.2.4}"
 DS4_IN_DISTROBOX="${DS4_IN_DISTROBOX:-1}"
+if [ "$PACKAGED_MODE" -eq 1 ]; then
+  CONTAINER_NAME=llama-rocm-7.2.4
+else
+  CONTAINER_NAME="${DS4_CONTAINER:-llama-rocm-7.2.4}"
+fi
+DS4_EXEC_BIN="$DS4_SERVER_BIN"
+if [ "$PACKAGED_MODE" -eq 1 ] && [ "$DS4_IN_DISTROBOX" != "0" ]; then
+  DS4_EXEC_BIN="$DS4_PACKAGED_CONTAINER_BIN"
+fi
 
 if [ -z "$DS4_MODEL" ]; then
   echo "start-ds4.sh: DS4_MODEL is not set; nothing to serve" >&2
@@ -98,7 +121,7 @@ build_args() {
 build_args
 
 if [ "${1:-}" = "--print-cmd" ]; then
-  printf '%s ' "$DS4_SERVER_BIN" "${DS4_ARGS[@]}"; echo; exit 0
+  printf '%s ' "$DS4_EXEC_BIN" "${DS4_ARGS[@]}"; echo; exit 0
 fi
 
 echo "Starting ds4-server on 127.0.0.1:$DS4_PORT (model: $MODEL_ARG, distrobox: $DS4_IN_DISTROBOX)"
@@ -130,4 +153,4 @@ exec "$DISTROBOX" enter "$CONTAINER_NAME" -- bash -c '
   export HSA_OVERRIDE_GFX_VERSION=11.5.1
   BIN="$1"; shift
   exec "$BIN" "$@"
-' ds4-launch "$DS4_SERVER_BIN" "${DS4_ARGS[@]}"
+' ds4-launch "$DS4_EXEC_BIN" "${DS4_ARGS[@]}"
