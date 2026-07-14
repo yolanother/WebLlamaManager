@@ -2,10 +2,10 @@
 
 Turns this host into a dashboard appliance: on boot GDM logs the dedicated,
 locked `llama-kiosk` system account in automatically and launches full-screen
-Chrome (via the `cage` Wayland compositor) showing the Llama Manager dashboard.
-The administrator's GNOME account and preferences are not changed. GNOME stays
-installed; uninstall restores the original login behavior from backups and
-removes `llama-kiosk` only when the installer created it.
+Firefox (or Chrome/Chromium, when installed) through the `cage` Wayland
+compositor. The administrator's GNOME account and preferences are not changed.
+GNOME stays installed; uninstall restores the original login behavior from
+backups and removes `llama-kiosk` only when the installer created it.
 
 This is standalone and **not** part of `install.sh` — install it only if you want
 the machine dedicated to the dashboard.
@@ -21,7 +21,9 @@ sudo bash scripts/install-kiosk.sh install --no-start
 ```
 
 The installer:
-- installs `cage` (via apt) if missing; requires `google-chrome`,
+- requires `cage` and installs it through apt if missing,
+- uses Ubuntu Desktop's bundled Firefox offline, while retaining optional
+  Chrome/Chromium support,
 - creates the dedicated `llama-kiosk` account with `/var/lib/llama-kiosk` as
   its private home,
 - copies the kiosk runtime to `/usr/local/lib/llama-manager/kiosk` so the
@@ -36,6 +38,12 @@ The launcher waits for the dashboard to come up before showing it. Configure the
 target with `KIOSK_URL=` (or `API_PORT=`) in the canonical package environment
 `/etc/llama-manager/llama-manager.env`; the default is
 `http://localhost:3001/kiosk`.
+
+The appliance DEB and Ubuntu image **must include `cage` as a package
+dependency** so the kiosk is available without network access. The standalone
+script's apt installation is a fallback for source-based installations, not a
+replacement for declaring the appliance package dependency. Proprietary Chrome
+is never required.
 
 The kiosk page includes **System Login**. It posts to a separate Python helper
 bound only to `127.0.0.1:8798`; the helper accepts only exact localhost browser
@@ -77,7 +85,10 @@ Restores the backed-up gdm/session settings and removes the kiosk session entry.
 If the installer created `llama-kiosk`, it removes that account and its private
 home. It first terminates the kiosk login session and refuses account removal if
 processes remain. A pre-existing account with that name is preserved. `cage` is
-left installed (remove with `sudo apt remove cage` if you want).
+left installed (remove with `sudo apt remove cage` if you want). Re-running the
+installer preserves its ownership markers, so uninstall still removes an
+installer-created account and reports when the installer originally added
+`cage`.
 
 ## Tests
 

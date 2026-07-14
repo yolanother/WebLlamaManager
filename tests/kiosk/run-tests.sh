@@ -3,9 +3,9 @@
 # Copyright (c) Llama Manager project. See the LICENSE file in the repository
 # root for license terms.
 #
-# Dependency-free bash test runner for the kiosk feature. Sources
-# scripts/lib/kiosk-common.sh inside a throwaway sandbox (KIOSK_ROOT) and
-# asserts behavior of the pure helpers plus the installer's --dry-run path.
+# Dependency-free bash integration runner for kiosk URL/browser discovery,
+# launcher arguments, dry-run behavior, and repeated install/uninstall resource
+# ownership. All filesystem lifecycle checks use throwaway KIOSK_ROOT sandboxes.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -160,6 +160,23 @@ test_cli() {
     rm -rf "$sb"
 }
 
+test_browser_prerequisite() {
+    printf 'test_browser_prerequisite\n'
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb browser; sb="$(new_sandbox)"
+      mkdir -p "$sb/bin"
+      cat > "$sb/bin/firefox" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+      chmod +x "$sb/bin/firefox"
+      browser="$(PATH="$sb/bin" kiosk_require_browser)"
+      assert_eq "Firefox-only Ubuntu satisfies kiosk browser prerequisite" \
+        "firefox" "$browser"
+      rm -rf "$sb"
+    )
+}
+
 test_install_flow() {
     printf 'test_install_flow\n'
     local sb; sb="$(new_sandbox)"
@@ -239,16 +256,19 @@ test_dry_run_no_mutation() {
 test_uninstall_flow() {
     printf 'test_uninstall_flow\n'
     local sb; sb="$(new_sandbox)"
-    local user="llama-kiosk"
+    local user="llama-kiosk" uninstall_out
 
     mkdir -p "$sb/etc/gdm3" "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
     printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
     printf '[User]\nSession=ubuntu\nXSession=ubuntu\n' > "$sb/var/lib/AccountsService/users/$user"
 
-    # Install then uninstall.
+    # A repeated install must preserve ownership of resources created by the
+    # first run so uninstall can still remove them safely.
+    KIOSK_TEST_CAGE_MISSING=1 KIOSK_FAKE_CHROME=1 \
+      bash "$REPO_ROOT/scripts/install-kiosk.sh" install --root "$sb" >/dev/null 2>&1
     KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install   --root "$sb" >/dev/null 2>&1
-    KIOSK_TEST_ACTION_LOG="$sb/actions.log" KIOSK_FAKE_CHROME=1 \
-      bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
+    uninstall_out="$(KIOSK_TEST_ACTION_LOG="$sb/actions.log" KIOSK_FAKE_CHROME=1 \
+      bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" 2>&1)"
     local rc=$?
     assert_eq "uninstall exit 0" "0" "$rc"
 
@@ -264,13 +284,37 @@ test_uninstall_flow() {
       "$([ -e "$sb/usr/local/lib/llama-manager/kiosk" ] && echo yes || echo no)"
     assert_eq "installer-created kiosk home removed" "no" \
       "$([ -e "$sb/var/lib/llama-kiosk" ] && echo yes || echo no)"
+    assert_eq "removed account ownership marker is cleared" false \
+      "$(grep '^installed_kiosk_account=' "$sb/var/backups/llama-kiosk/manifest" | cut -d= -f2-)"
     assert_eq "active kiosk session stopped before account removal" "yes" \
       "$(awk '/stop-session/{stopped=NR} /remove-account/{removed=NR} END{print (stopped && removed && stopped < removed) ? "yes" : "no"}' "$sb/actions.log")"
+    assert_eq "reinstall preserves installer-added cage guidance" "yes" \
+      "$(printf '%s\n' "$uninstall_out" | grep -q "cage.*installed by this script" && echo yes || echo no)"
 
     # Uninstall again is safe (idempotent, exit 0).
     bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
     assert_eq "second uninstall exit 0" "0" "$?"
 
+    rm -rf "$sb"
+}
+
+test_preexisting_account_is_preserved() {
+    printf 'test_preexisting_account_is_preserved\n'
+    local sb; sb="$(new_sandbox)"
+    mkdir -p "$sb/var/lib/llama-kiosk"
+    printf 'preexisting home\n' > "$sb/var/lib/llama-kiosk/owner-marker"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    KIOSK_TEST_ACTION_LOG="$sb/actions.log" KIOSK_FAKE_CHROME=1 \
+        bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" \
+        >/dev/null 2>&1
+    assert_file "reinstall/uninstall preserves pre-existing kiosk account home" \
+        "$sb/var/lib/llama-kiosk/owner-marker"
+    assert_eq "pre-existing kiosk account is never scheduled for removal" no \
+        "$([ -f "$sb/actions.log" ] && grep -q '^remove-account$' "$sb/actions.log" && echo yes || echo no)"
     rm -rf "$sb"
 }
 
@@ -315,6 +359,22 @@ EOF
     assert_eq "launcher reads canonical manager env path" "yes" \
       "$(grep -q 'localhost:4555/kiosk' "$sb/launch.txt" && echo yes || echo no)"
 
+    # The Ubuntu Desktop image works offline with its bundled Firefox snap and
+    # does not require proprietary Chrome. Isolate PATH so only Firefox exists.
+    rm -f "$sb/bin/google-chrome" "$sb/launch.txt"
+    cat > "$sb/bin/firefox" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    ln -s /usr/bin/dirname "$sb/bin/dirname"
+    chmod +x "$sb/bin/firefox"
+    PATH="$sb/bin" KIOSK_LAUNCH_ONCE=1 KIOSK_URL="http://localhost:3001" \
+        KIOSK_WAIT_BUDGET=2 /bin/bash "$REPO_ROOT/scripts/llama-kiosk-launch.sh" \
+        >/dev/null 2>&1
+    assert_eq "Firefox fallback uses Wayland kiosk mode" "yes" \
+      "$(grep -q 'MOZ_ENABLE_WAYLAND=1 firefox --kiosk' "$sb/launch.txt" && \
+          grep -q 'localhost:3001' "$sb/launch.txt" && echo yes || echo no)"
+
     rm -rf "$sb"
 }
 
@@ -322,9 +382,11 @@ test_url_resolution
 test_manifest
 test_backup
 test_cli
+test_browser_prerequisite
 test_install_flow
 test_dry_run_no_mutation
 test_uninstall_flow
+test_preexisting_account_is_preserved
 test_launcher
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.

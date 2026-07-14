@@ -7,8 +7,8 @@
 # directory, an existing filesystem partition, or an NFS export. Mount-backed
 # modes generate portable systemd mount units, activate them, verify the service
 # account can write, and only then atomically update the canonical manager env,
-# root-only state, and service dependency. Reconfiguration preserves the prior
-# active contract until commit; reset preserves all model data.
+# root-only state, and service dependency. Reconfiguration and reset restore the
+# prior active contract on failure, and reset never deletes model data.
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
@@ -603,7 +603,7 @@ configure_partition() {
 
 # Remove generated service/mount configuration while preserving model contents.
 reset_storage() {
-    local unit base_present base_value env_temp
+    local unit base_present base_value env_temp txn config_dir unit_path
     if [ "$DRY_RUN" = true ]; then
         log "DRY-RUN would remove generated storage configuration without deleting models"
         return 0
@@ -611,17 +611,46 @@ reset_storage() {
     unit="$(state_get UNIT)"
     base_present="$(state_get BASE_MODELS_DIR_PRESENT)"
     base_value="$(state_get BASE_MODELS_DIR)"
-    env_temp="$(mktemp)"
+    config_dir="$(root_path /etc/llama-manager)"
+    mkdir -p "$config_dir"
+    txn="$(mktemp -d "$config_dir/.model-storage-reset.XXXXXX")"
+    snapshot_file "$ENV_LOGICAL" env.old "$txn"
+    snapshot_file "$STATE_LOGICAL" state.old "$txn"
+    snapshot_file "$DROPIN_LOGICAL" dropin.old "$txn"
+    if [ -n "$unit" ]; then
+        unit_path="$(root_path "/etc/systemd/system/$unit")"
+        [ ! -f "$unit_path" ] || cp -a "$unit_path" "$txn/old-unit"
+    fi
+    env_temp="$txn/env.new"
     if [ "$base_present" = true ]; then
         render_manager_env "$env_temp" set "$base_value"
     else
         render_manager_env "$env_temp" remove
     fi
-    atomic_install "$env_temp" "$(root_path "$ENV_LOGICAL")" 0660
-    "$CHGRP_BIN" "$SERVICE_GROUP" "$(root_path "$ENV_LOGICAL")"
-    rm -f "$env_temp" "$(root_path "$STATE_LOGICAL")" "$(root_path "$DROPIN_LOGICAL")"
-    reload_manager
-    [ -z "$unit" ] || remove_mount_unit "$unit"
+    if ! atomic_install "$env_temp" "$(root_path "$ENV_LOGICAL")" 0660 ||
+        ! "$CHGRP_BIN" "$SERVICE_GROUP" "$(root_path "$ENV_LOGICAL")" ||
+        ! rm -f "$(root_path "$STATE_LOGICAL")" "$(root_path "$DROPIN_LOGICAL")"; then
+        restore_metadata "$txn"
+        rm -rf "$txn"
+        return 1
+    fi
+    if ! reload_manager; then
+        restore_metadata "$txn"
+        rm -rf "$txn"
+        return 1
+    fi
+    if [ -n "$unit" ] && {
+        [ "${MODEL_STORAGE_FORCE_CLEANUP_FAILURE:-0}" = 1 ] || ! remove_mount_unit "$unit";
+    }; then
+        if [ -f "$txn/old-unit" ]; then
+            atomic_install "$txn/old-unit" "$(root_path "/etc/systemd/system/$unit")" 0644
+            activate_mount "$unit" || true
+        fi
+        restore_metadata "$txn"
+        rm -rf "$txn"
+        return 1
+    fi
+    rm -rf "$txn"
     log "Configuration removed; model data was not deleted."
 }
 

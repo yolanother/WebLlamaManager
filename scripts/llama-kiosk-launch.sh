@@ -6,7 +6,8 @@
 # Invoked by the "Llama Kiosk" Wayland session (see install-kiosk.sh). Resolves
 # the dashboard URL from the canonical packaged manager EnvironmentFile, waits
 # until it is reachable, then replaces itself with `cage` running full-screen
-# Chrome in kiosk mode.
+# Firefox, Chrome, or Chromium in kiosk mode. Firefox is the offline-safe Ubuntu
+# Desktop default; Chrome-family browsers remain supported when installed.
 #
 # Starts the separate loopback-only control helper so the local kiosk can switch
 # to GDM without adding a remotely reachable API route.
@@ -38,7 +39,7 @@ start_control_helper() {
 }
 
 # Poll URL until reachable or the time budget is exhausted. Never fatal: after
-# the budget, fall through and let Chrome show its own retry page.
+# the budget, fall through and let the browser show its own retry page.
 wait_for_url() {
     local waited=0
     while [ "$waited" -lt "$WAIT_BUDGET" ]; do
@@ -54,30 +55,28 @@ wait_for_url() {
     return 0
 }
 
-# Pick the Chrome binary.
-chrome_bin() {
-    local b
-    for b in google-chrome google-chrome-stable chromium chromium-browser; do
-        command -v "$b" >/dev/null 2>&1 && { printf '%s\n' "$b"; return 0; }
-    done
-    printf 'google-chrome\n'
-}
-
-# Launch cage + Chrome. With KIOSK_LAUNCH_ONCE set, run once (tests); otherwise
-# exec so the session lifecycle is tied to the compositor.
+# Launch cage with a supported browser. Firefox gets its native kiosk/private
+# flags and an explicit Wayland environment; Chrome-family browsers retain the
+# appliance profile and app-mode flags. Tests may request one launch only.
 launch() {
-    local chrome; chrome="$(chrome_bin)"
-    local -a cmd=(cage -- "$chrome"
-        --kiosk
-        --ozone-platform=wayland
-        --noerrdialogs
-        --disable-infobars
-        --no-first-run
-        --disable-session-crashed-bubble
-        --disable-features=Translate
-        --password-store=basic
-        "--user-data-dir=$PROFILE_DIR"
-        "--app=$URL")
+    local browser
+    local -a cmd
+    browser="$(kiosk_require_browser)" || return 1
+    if [ "$browser" = firefox ]; then
+        cmd=(cage -- env MOZ_ENABLE_WAYLAND=1 "$browser" --kiosk --private-window "$URL")
+    else
+        cmd=(cage -- "$browser"
+            --kiosk
+            --ozone-platform=wayland
+            --noerrdialogs
+            --disable-infobars
+            --no-first-run
+            --disable-session-crashed-bubble
+            --disable-features=Translate
+            --password-store=basic
+            "--user-data-dir=$PROFILE_DIR"
+            "--app=$URL")
+    fi
     if [ "${KIOSK_LAUNCH_ONCE:-0}" = "1" ]; then
         "${cmd[@]}"
     else

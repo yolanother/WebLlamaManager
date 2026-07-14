@@ -4,10 +4,10 @@
 # root for license terms.
 #
 # Shared helpers for scripts/install-kiosk.sh and scripts/llama-kiosk-launch.sh.
-# Provides: sandbox-aware path resolution (KIOSK_ROOT), canonical manager-env
-# KIOSK_URL resolution, dedicated-account/session lifecycle, manifest read/write,
-# idempotent file backups, and a dry-run-aware command wrapper. This file is
-# meant to be SOURCED, not executed.
+# Provides sandbox-aware path resolution (KIOSK_ROOT), canonical manager-env
+# KIOSK_URL resolution, Firefox/Chrome browser discovery, dedicated-account and
+# session lifecycle, persistent resource-ownership markers, idempotent backups,
+# and a dry-run-aware command wrapper. This file is sourced, not executed.
 
 # Guard against double-sourcing.
 [ -n "${_KIOSK_COMMON_SOURCED:-}" ] && return 0
@@ -145,23 +145,27 @@ kiosk_restore_file() {
     fi
 }
 
-# Verify google-chrome is available (or faked for tests). Echo the binary name.
-# Honors KIOSK_FAKE_CHROME=1 to bypass the check in sandboxed tests.
-kiosk_require_chrome() {
+# Find a supported Wayland kiosk browser. Prefer Chrome/Chromium when installed,
+# then fall back to Ubuntu Desktop's offline Firefox snap command. Echoes the
+# binary name, or fails with installation guidance when none is available.
+# Honors KIOSK_FAKE_CHROME=1 to preserve the sandboxed installer test seam.
+kiosk_require_browser() {
     if [ "${KIOSK_FAKE_CHROME:-0}" = "1" ]; then printf 'google-chrome\n'; return 0; fi
     local b
     for b in google-chrome google-chrome-stable chromium chromium-browser; do
         if command -v "$b" >/dev/null 2>&1; then printf '%s\n' "$b"; return 0; fi
     done
-    kiosk_warn "No Chrome/Chromium found. Install google-chrome before continuing."
+    if command -v firefox >/dev/null 2>&1; then printf 'firefox\n'; return 0; fi
+    kiosk_warn "No supported browser found. Install Firefox, Chrome, or Chromium before continuing."
     return 1
 }
 
 # Ensure the `cage` compositor is installed (apt). Records in the manifest
 # whether WE installed it, so uninstall can offer to remove it.
 kiosk_ensure_cage() {
-    if command -v cage >/dev/null 2>&1; then
-        kiosk_manifest_set installed_cage false
+    if [ "${KIOSK_TEST_CAGE_MISSING:-0}" != 1 ] && command -v cage >/dev/null 2>&1; then
+        [ "$(kiosk_manifest_get installed_cage)" = true ] || \
+            kiosk_manifest_set installed_cage false
         return 0
     fi
     # In a sandbox we cannot apt-install; just record intent.
@@ -187,7 +191,8 @@ kiosk_ensure_account() {
     home="$(kiosk_path /var/lib/llama-kiosk)"
     if [ "$KIOSK_ROOT" != "/" ]; then
         if [ -d "$home" ]; then
-            kiosk_manifest_set installed_kiosk_account false
+            [ "$(kiosk_manifest_get installed_kiosk_account)" = true ] || \
+                kiosk_manifest_set installed_kiosk_account false
         else
             kiosk_run mkdir -p "$home"
             kiosk_manifest_set installed_kiosk_account true
@@ -195,7 +200,8 @@ kiosk_ensure_account() {
         return 0
     fi
     if id "$user" >/dev/null 2>&1; then
-        kiosk_manifest_set installed_kiosk_account false
+        [ "$(kiosk_manifest_get installed_kiosk_account)" = true ] || \
+            kiosk_manifest_set installed_kiosk_account false
         return 0
     fi
     kiosk_run useradd --system --create-home --home-dir /var/lib/llama-kiosk \
@@ -221,6 +227,7 @@ kiosk_remove_account() {
     elif id "$user" >/dev/null 2>&1; then
         kiosk_run userdel --remove "$user"
     fi
+    kiosk_manifest_set installed_kiosk_account false
 }
 
 # Append an action to the optional test audit log.
@@ -339,7 +346,7 @@ kiosk_install() {
     gdm="$(kiosk_path /etc/gdm3/custom.conf)"
     acct="$(kiosk_path /var/lib/AccountsService/users/$user)"
 
-    kiosk_require_chrome >/dev/null
+    kiosk_require_browser >/dev/null
     kiosk_ensure_cage
     kiosk_ensure_account "$user"
     kiosk_install_runtime "$REPO_ROOT"

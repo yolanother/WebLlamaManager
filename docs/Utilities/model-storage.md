@@ -69,7 +69,8 @@ preview mode does not create directories, units, state, or environment changes.
 ## Safety and rollback
 
 - `/`, `/etc`, `/usr`, `/boot`, `/proc`, `/sys`, `/run`, and `/dev` are rejected
-  as model directories, including after resolving symlinks.
+  as model directories, including after resolving final or parent symlinks.
+  Relocated-root validation also rejects symlink paths that escape that root.
 - Existing non-Llama-Manager systemd mount units are never overwritten.
 - Non-empty mountpoints are rejected so a new mount cannot hide existing model
   files.
@@ -81,6 +82,8 @@ preview mode does not create directories, units, state, or environment changes.
   until the candidate is verified. Commit, restart, and old-unit cleanup
   failures restore the prior contract, including manager-env group access, and
   remove the candidate.
+- Reset is also transactional: manager environment/state/dependencies are
+  restored if the old mount cannot be stopped and removed.
 - Write probes are created and removed as `llama-manager`, never as root.
 - No command formats a disk or deletes model contents.
 

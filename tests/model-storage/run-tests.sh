@@ -3,9 +3,9 @@
 # Copyright (c) Llama Manager project. See the LICENSE file in the repository
 # root for license terms.
 #
-# Runs the public storage CLI against disposable filesystem roots to verify safe
-# local, NFS, and partition configuration without mounting devices or requiring
-# root access.
+# Runs the public storage CLI against disposable filesystem roots to verify path
+# containment, local/NFS/partition setup, transactional reconfiguration/reset,
+# and service-user access without mounting devices or requiring root access.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -88,7 +88,7 @@ storage_cli() {
 
 test_local_storage() {
     printf 'test_local_storage\n'
-    local root rc
+    local root rc outside
     root="$(new_root)"
     seed_identity "$root"
     storage_cli "$root" local --path /srv/llama-models >/dev/null 2>&1
@@ -106,10 +106,27 @@ test_local_storage() {
     storage_cli "$root" local --path /srv/symlink-models >/dev/null 2>&1
     assert_eq "symlink resolving into protected path rejected" no "$([ $? -eq 0 ] && echo yes || echo no)"
     assert_eq "protected target mode unchanged" 750 "$(stat -c %a "$root/etc/protected")"
+
+    ln -s ../etc "$root/srv/parent-link"
+    storage_cli "$root" local --path /srv/parent-link/protected/models >/dev/null 2>&1
+    assert_eq "symlinked parent resolving into protected path rejected" no \
+        "$([ $? -eq 0 ] && echo yes || echo no)"
+    assert_eq "symlinked protected parent mode unchanged" 750 \
+        "$(stat -c %a "$root/etc/protected")"
+
+    outside="$(mktemp -d "${TMPDIR:-/tmp}/model-storage-outside.XXXXXX")"
+    chmod 0700 "$outside"
+    ln -s "$outside" "$root/srv/root-escape"
+    storage_cli "$root" local --path /srv/root-escape/models >/dev/null 2>&1
+    assert_eq "symlinked parent cannot escape relocated root" no \
+        "$([ $? -eq 0 ] && echo yes || echo no)"
+    assert_eq "escaped target is not created" no \
+        "$([ -e "$outside/models" ] && echo yes || echo no)"
+    assert_eq "escaped parent mode unchanged" 700 "$(stat -c %a "$outside")"
     assert_contains "canonical manager env updated" "$root/etc/llama-manager/llama-manager.env" "MODELS_DIR=/srv/llama-models"
     assert_contains "write probe created as service account" "$root/runuser.log" "-u llama-manager -- touch"
     assert_contains "write probe removed as service account" "$root/runuser.log" "-u llama-manager -- rm -f"
-    rm -rf "$root"
+    rm -rf "$root" "$outside"
 }
 
 test_nfs_storage() {
@@ -239,6 +256,34 @@ test_reset_restores_original_override() {
     rm -rf "$root"
 }
 
+test_reset_rolls_back_on_mount_cleanup_failure() {
+    printf 'test_reset_rolls_back_on_mount_cleanup_failure\n'
+    local root unit
+    root="$(new_root)"
+    seed_identity "$root"
+    mkdir -p "$root/etc/llama-manager"
+    printf 'API_PORT=4567\n' > "$root/etc/llama-manager/llama-manager.env"
+    storage_cli "$root" nfs --server nas.home --export /models \
+        --mountpoint /srv/models >/dev/null 2>&1
+    unit="$root/etc/systemd/system/srv-models.mount"
+
+    MODEL_STORAGE_FORCE_CLEANUP_FAILURE=1 storage_cli "$root" reset >/dev/null 2>&1
+    assert_eq "reset cleanup failure returns failure" no \
+        "$([ $? -eq 0 ] && echo yes || echo no)"
+    assert_contains "failed reset restores model override" \
+        "$root/etc/llama-manager/llama-manager.env" "MODELS_DIR=/srv/models"
+    assert_contains "failed reset preserves unrelated manager env" \
+        "$root/etc/llama-manager/llama-manager.env" "API_PORT=4567"
+    assert_contains "failed reset restores storage state" \
+        "$root/etc/llama-manager/model-storage.state" "UNIT=srv-models.mount"
+    assert_contains "failed reset restores service dependency" \
+        "$root/etc/systemd/system/llama-manager.service.d/model-storage.conf" \
+        "Requires=srv-models.mount"
+    assert_eq "failed reset preserves generated mount unit" yes \
+        "$([ -e "$unit" ] && echo yes || echo no)"
+    rm -rf "$root"
+}
+
 test_missing_service_identity() {
     printf 'test_missing_service_identity\n'
     local root
@@ -297,6 +342,7 @@ test_activation_requires_writable_target
 test_dry_run_does_not_mutate
 test_reset_preserves_models
 test_reset_restores_original_override
+test_reset_rolls_back_on_mount_cleanup_failure
 test_missing_service_identity
 test_transactional_reconfiguration
 

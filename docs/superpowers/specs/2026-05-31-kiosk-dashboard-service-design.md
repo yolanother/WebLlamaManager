@@ -24,7 +24,7 @@ optional for source installations and is included by the appliance package.
 ### Success criteria
 
 - Running `scripts/install-kiosk.sh install` (with sudo) configures the machine
-  so the next boot lands directly on the dashboard in full-screen Chrome, and
+  so the next boot lands directly on the dashboard in a full-screen browser, and
   **brings the kiosk up immediately** (by restarting the display manager) so no
   reboot is required for first use. A `--no-start` flag configures without
   bringing it up.
@@ -45,9 +45,10 @@ Derived from the target host:
 
 - Ubuntu-family system with **GNOME** via **gdm3**, default session is
   **Wayland**.
-- **google-chrome** / `google-chrome-stable` is already installed.
-- **cage** (minimal Wayland kiosk compositor) is *not* installed and will be
-  installed by the script via `apt`.
+- Ubuntu Desktop's **Firefox snap** is available in the offline base image.
+  Chrome and Chromium are optional alternatives, never requirements.
+- **cage** is a mandatory appliance-package/image dependency. The standalone
+  source installer uses `apt` as a fallback when it is missing.
 - The dashboard is served by the package system service at
   `http://localhost:${API_PORT}` (default port `3001`). Runtime values come from
   `/etc/llama-manager/llama-manager.env`.
@@ -61,29 +62,30 @@ Power on
       → llama-kiosk-launch.sh
         → start 127.0.0.1-only System Login helper
         → wait until KIOSK_URL is reachable (curl retry loop)
-        → exec cage -- google-chrome --kiosk … KIOSK_URL
+        → exec cage -- firefox --kiosk … KIOSK_URL
 ```
 
 GNOME stays installed; the kiosk is simply a *different session* that gdm
-auto-logs into. If Chrome or cage exits, the session ends and gdm restarts the
-autologin session — the kiosk self-heals.
+auto-logs into. If the browser or cage exits, the session ends and gdm restarts
+the autologin session — the kiosk self-heals.
 
 ## 4. Components / artifacts
 
 | Artifact | Location | Purpose |
 |---|---|---|
 | `scripts/install-kiosk.sh` | repo | Installer / uninstaller / restarter. Subcommands `install`, `uninstall`, `restart`; flags `--dry-run`, `--no-start` (install only). Requires root for system changes. |
-| `scripts/llama-kiosk-launch.sh` | `/usr/local/lib/llama-manager/kiosk/` | Reads the canonical manager environment, starts the helper, waits for readiness, then launches `cage -- chrome --kiosk`. |
+| `scripts/llama-kiosk-launch.sh` | `/usr/local/lib/llama-manager/kiosk/` | Reads the canonical manager environment, starts the helper, waits for readiness, then launches Firefox or a Chrome-family browser through `cage`. |
 | `scripts/llama-kiosk-control.py` | `/usr/local/lib/llama-manager/kiosk/` | Binds only to `127.0.0.1`, validates exact localhost origins, and invokes `gdmflexiserver`. |
 | `llama-kiosk.desktop` | `/usr/share/wayland-sessions/` (generated) | Registers the kiosk session with an `Exec=` under `/usr/local/lib/llama-manager/kiosk`. |
 | Backups + manifest | `/var/backups/llama-kiosk/` | Original `gdm3/custom.conf`, original AccountsService user file, and a `manifest` recording exactly what install changed. |
 
 ### 4.1 System changes made by `install` (all backed up first)
 
-1. **Install `cage`** via `apt-get install -y cage` if not already present.
-   Record in the manifest whether *we* installed it (so uninstall can offer to
-   remove it). Abort with a clear message if `google-chrome`/
-   `google-chrome-stable` is not found.
+1. **Require `cage`**. Appliance packages declare it as a dependency so offline
+   installations already contain it; the standalone installer falls back to
+   `apt-get install -y cage`. Record whether *we* installed it so uninstall can
+   offer removal. Require any supported browser, preferring Chrome/Chromium when
+   present and otherwise using the Firefox command bundled with Ubuntu Desktop.
 2. Create the dedicated locked `llama-kiosk` system account with private home
    `/var/lib/llama-kiosk`, and copy runtime files outside administrator homes.
 3. **`/etc/gdm3/custom.conf`** — back up, then enable:
@@ -130,11 +132,16 @@ user's GNOME preferences.
 2. **Wait for readiness:** poll `KIOSK_URL` with `curl --silent --max-time` in a
    retry loop (≈60s total budget, fixed short interval), logging progress to the
    journal. This prevents a cold boot from flashing a connection error while the
-   `llama-manager` user service is still coming up. After the budget expires,
-   launch anyway (Chrome shows its own retry page rather than failing the
-   session).
+   packaged `llama-manager` system service is still coming up. After the budget
+   expires, launch anyway (the browser shows its own retry page rather than
+   failing the session).
 3. **Launch:**
    ```
+   exec cage -- env MOZ_ENABLE_WAYLAND=1 firefox \
+     --kiosk \
+     --private-window "$KIOSK_URL"
+
+   # Optional Chrome/Chromium path when installed:
    exec cage -- google-chrome \
      --kiosk \
      --ozone-platform=wayland \
@@ -146,8 +153,8 @@ user's GNOME preferences.
      --user-data-dir="$HOME/.config/llama-kiosk/chrome" \
      --app="$KIOSK_URL"
    ```
-   A dedicated `--user-data-dir` keeps kiosk Chrome state isolated from any
-   normal Chrome profile.
+   Firefox provides the offline-safe default. A dedicated `--user-data-dir`
+   keeps optional kiosk Chrome state isolated from any normal Chrome profile.
 
 ## 6. Uninstall
 
@@ -179,7 +186,9 @@ item" with a warning, not a fatal error.
 - **Install is idempotent.** Re-running `install` must not clobber the *original*
   backups with already-modified files. The script only takes a backup of a file
   if no backup for it already exists in `/var/backups/llama-kiosk/`. The manifest
-  is the authority for "have we already installed".
+  is the authority for "have we already installed". Ownership markers for an
+  installer-created account and installer-added `cage` remain true across
+  repeated installs so uninstall can still clean up and provide correct guidance.
 - **`--dry-run`** is honored by every mutating step (apt, file writes, backups):
   it prints the intended action and changes nothing. This is also what the
   automated tests exercise.
@@ -196,12 +205,14 @@ Bash that mutates `/etc` is not classic-TDD friendly, so:
 - **`bats` (or plain shell) test suite** covering the *pure* logic:
   - `KIOSK_URL` resolution from the manager env (explicit value, default from `API_PORT`,
     default when neither set).
+  - Firefox-only browser discovery and Wayland kiosk launch.
   - Manifest read/write round-trip.
   - Dry-run output asserts the right actions are *named* and that no target
     files are touched (run against a temp `--prefix`/`--root` redirection or by
     asserting dry-run never writes).
   - Idempotency: a second `install --dry-run` after a simulated first install
-    does not propose re-backing-up an already-backed-up file.
+    does not propose re-backing-up an already-backed-up file, and a real repeated
+    sandbox install preserves installer resource-ownership markers.
 - **Manual verification checklist** for the real reboot path (documented in the
   implementation plan): install → reboot → dashboard appears → VT switch works →
   uninstall → reboot → normal login restored.

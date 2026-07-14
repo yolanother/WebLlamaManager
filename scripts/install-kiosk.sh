@@ -5,9 +5,10 @@
 #
 # Turns this host into a dashboard appliance: on boot, gdm auto-logs into a
 # dedicated "Llama Kiosk" Wayland session that runs the `cage` compositor with
-# full-screen Chrome pointed at the Llama Manager dashboard. GNOME stays
-# installed; uninstall restores the original login behavior from backups taken
-# at install time. Standalone and optional — NOT wired into install.sh.
+# full-screen Firefox, Chrome, or Chromium pointed at the Llama Manager
+# dashboard. GNOME stays installed; uninstall restores the original login
+# behavior from backups taken at install time. Standalone and optional — NOT
+# wired into install.sh.
 #
 # Usage:
 #   scripts/install-kiosk.sh install   [--dry-run] [--root DIR] [--no-start]
