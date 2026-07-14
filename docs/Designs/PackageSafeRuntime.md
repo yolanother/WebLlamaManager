@@ -148,9 +148,19 @@ never reconstructs a command string.
 
 `llama-manager.service` is the canonical package system unit. It uses systemd
 `ConfigurationDirectory`, `StateDirectory`, `CacheDirectory`, and
-`RuntimeDirectory` ownership, clears ambient/bounding capabilities, enables
-`NoNewPrivileges`, and makes the operating-system and package trees read-only,
-with a narrow exception for `/etc/llama-manager`. GPU device isolation,
+`RuntimeDirectory` ownership, clears ambient capabilities, narrowly bounds
+acquirable capabilities, and makes the operating-system and package trees
+read-only, with a narrow exception for `/etc/llama-manager`.
+`NoNewPrivileges` is explicitly disabled because rootless Podman/Distrobox must
+execute the distribution's setuid `newuidmap` and `newgidmap` helpers to install
+the service account's subordinate-ID mappings; enabling it makes the packaged
+gfx1151 container fail before inference starts. The bounding set contains only
+`CAP_SETUID` and `CAP_SETGID`, which those helpers require; the empty ambient set
+means Node starts with neither capability. The service still runs as the
+unprivileged `llama-manager` identity and retains `PrivateTmp`, `ProtectSystem`,
+kernel protection, and `RestrictSUIDSGID` (which prevents creating new
+setuid/setgid files but does not block the installed mapping helpers). GPU
+device isolation,
 home-directory protection, and a globally read-only filesystem are intentionally
 not enabled because ROCm and operator-selected local/NAS model storage may live
 outside the default state directories and must remain writable.

@@ -172,6 +172,20 @@ test_canonical_service_assets_are_package_safe() {
     "d /run/llama-manager 0700 llama-manager llama-manager -"
   assert_contains "service reuses the tmpfiles runtime directory" "$service" "RuntimeDirectory=llama-manager"
   assert_contains "service preserves the private runtime mode" "$service" "RuntimeDirectoryMode=0700"
+  assert_contains "service permits rootless subordinate-id mapping helpers" "$service" "NoNewPrivileges=no"
+  if [[ "$service" == *"NoNewPrivileges=yes"* ]]; then
+    printf '  FAIL service blocks rootless Podman newuidmap/newgidmap helpers\n'
+    failures=$((failures + 1))
+  else
+    printf '  ok   service does not block rootless subordinate-id helpers\n'
+  fi
+  assert_contains "service retains private temporary storage" "$service" "PrivateTmp=yes"
+  assert_contains "service retains read-only package and OS trees" "$service" "ProtectSystem=full"
+  assert_contains "service retains kernel module protection" "$service" "ProtectKernelModules=yes"
+  assert_contains "service retains setuid/setgid creation restrictions" "$service" "RestrictSUIDSGID=yes"
+  assert_contains "service bounds mapping helper capabilities to uid and gid setup" "$service" \
+    "CapabilityBoundingSet=CAP_SETUID CAP_SETGID"
+  assert_contains "service grants no ambient capabilities to Node" "$service" "AmbientCapabilities="
   if [[ "$service" == *"/home/yolan"* ]]; then
     printf '  FAIL canonical service contains a developer home path\n'
     failures=$((failures + 1))

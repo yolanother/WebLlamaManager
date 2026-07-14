@@ -486,8 +486,8 @@ huggingface-cli download Qwen/Qwen2.5-Coder-32B-Instruct-GGUF \
 Check logs: `journalctl --user -u llama-manager -f`
 
 ### distrobox errors
-Ensure the container exists: `distrobox list`
-If not running, initialize it: `distrobox enter llama-rocm-7.2.4` (or set
+Ensure the container exists: `distrobox list`. If it is not running, initialize
+it with `distrobox enter llama-rocm-7.2.4`.
 For source installs, set `DISTROBOX_CONTAINER` in the user
 `llama-manager.service` environment to use a different container. Debian
 packages intentionally pin `llama-rocm-7.2.4`; note `.env` alone does not
