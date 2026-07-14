@@ -73,6 +73,7 @@ import {
   resolveDistributionPolicy,
 } from './distribution-policy.js';
 import { beginLlamaUpdate, createLlamaSourceUpdateSpec } from './llama-update-controller.js';
+import { applyConfigDefaults } from './config-defaults.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -1928,20 +1929,11 @@ if (!existsSync(MODELS_DIR)) {
 
 // Load or initialize config
 function loadConfig() {
-  let cfg;
+  let persisted = {};
   if (existsSync(CONFIG_PATH)) {
-    cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
-  } else {
-    // Use environment variables for defaults
-    cfg = {
-      autoStart: process.env.AUTO_START !== 'false',
-      modelsMax: parseInt(process.env.MODELS_MAX) || 2,
-      contextSize: parseInt(process.env.CONTEXT_SIZE) || 8192,
-      logFilters: [],
-      requestLogging: false,
-      maxConcurrentRequests: 1
-    };
+    persisted = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
   }
+  const cfg = applyConfigDefaults(persisted, process.env);
 
   // Migration: rename customPresets to presets
   if (cfg.customPresets) {
