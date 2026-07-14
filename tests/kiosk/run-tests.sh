@@ -3,9 +3,9 @@
 # Copyright (c) Llama Manager project. See the LICENSE file in the repository
 # root for license terms.
 #
-# Dependency-free bash test runner for the kiosk feature. Sources
-# scripts/lib/kiosk-common.sh inside a throwaway sandbox (KIOSK_ROOT) and
-# asserts behavior of the pure helpers plus the installer's --dry-run path.
+# Dependency-free bash integration runner for kiosk URL/browser discovery,
+# launcher arguments, dry-run behavior, and repeated install/uninstall resource
+# ownership. All filesystem lifecycle checks use throwaway KIOSK_ROOT sandboxes.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -55,11 +55,11 @@ test_url_resolution() {
       local sb; sb="$(new_sandbox)"
 
       # No .env -> default port 3001
-      assert_eq "default url" "http://localhost:3001" "$(kiosk_resolve_url "$sb/none.env")"
+      assert_eq "default url" "http://localhost:3001/kiosk" "$(kiosk_resolve_url "$sb/none.env")"
 
       # API_PORT in .env -> default host, that port
       printf 'API_PORT=4444\n' > "$sb/a.env"
-      assert_eq "url from API_PORT" "http://localhost:4444" "$(kiosk_resolve_url "$sb/a.env")"
+      assert_eq "url from API_PORT" "http://localhost:4444/kiosk" "$(kiosk_resolve_url "$sb/a.env")"
 
       # Explicit KIOSK_URL in .env wins over API_PORT
       printf 'API_PORT=4444\nKIOSK_URL=http://dash.local:9000/\n' > "$sb/b.env"
@@ -119,6 +119,18 @@ test_backup() {
       assert_eq "existed=false" "false" "$(kiosk_manifest_get backup.accountsservice.existed)"
       assert_no_file "no backup for missing src" "$(kiosk_path /var/backups/llama-kiosk/accountsservice)"
 
+      # A dangling symlink exists as a filesystem object even though -e/-f are
+      # false; backup must preserve the link itself and its exact target text.
+      mkdir -p "$(dirname "$(kiosk_path /usr/share/wayland-sessions/dangling.desktop)")"
+      ln -s '../missing/vendor-session.desktop' \
+        "$(kiosk_path /usr/share/wayland-sessions/dangling.desktop)"
+      kiosk_backup_file dangling_session /usr/share/wayland-sessions/dangling.desktop
+      assert_eq "dangling symlink recorded as existing" true \
+        "$(kiosk_manifest_get backup.dangling_session.existed)"
+      assert_eq "dangling symlink backup preserves exact target text" \
+        '../missing/vendor-session.desktop' \
+        "$(readlink "$(kiosk_path /var/backups/llama-kiosk/dangling_session)" 2>/dev/null)"
+
       # Dry-run mutating command changes nothing
       export KIOSK_DRY_RUN=true
       kiosk_run touch "$sb/should-not-exist"
@@ -160,12 +172,29 @@ test_cli() {
     rm -rf "$sb"
 }
 
+test_browser_prerequisite() {
+    printf 'test_browser_prerequisite\n'
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb browser; sb="$(new_sandbox)"
+      mkdir -p "$sb/bin"
+      cat > "$sb/bin/firefox" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+      chmod +x "$sb/bin/firefox"
+      browser="$(PATH="$sb/bin" kiosk_require_browser)"
+      assert_eq "Firefox-only Ubuntu satisfies kiosk browser prerequisite" \
+        "firefox" "$browser"
+      rm -rf "$sb"
+    )
+}
+
 test_install_flow() {
     printf 'test_install_flow\n'
     local sb; sb="$(new_sandbox)"
 
     # Seed a pre-existing gdm config and an AccountsService record for the user.
-    local user; user="$(id -un)"
+    local user="llama-kiosk"
     mkdir -p "$sb/etc/gdm3" "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
     printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
     printf '[User]\nSession=ubuntu\nXSession=ubuntu\n' > "$sb/var/lib/AccountsService/users/$user"
@@ -176,10 +205,21 @@ test_install_flow() {
     local rc=$?
     assert_eq "install exit 0" "0" "$rc"
 
+    # A dedicated account owns the kiosk session; the invoking administrator's
+    # desktop account is never converted into an autologin account.
+    assert_eq "dedicated kiosk account recorded" "$user" \
+      "$(grep '^target_user=' "$sb/var/backups/llama-kiosk/manifest" | cut -d= -f2-)"
+    assert_eq "dedicated kiosk home created" "yes" \
+      "$([ -d "$sb/home/llama-kiosk" ] && echo yes || echo no)"
+
     # Session desktop file generated and points at the launcher.
     assert_file "session file created" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
-    assert_eq "session Exec set" "yes" \
-      "$(grep -q "llama-kiosk-launch.sh" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop" && echo yes || echo no)"
+    assert_eq "session Exec uses readable installed runtime" "yes" \
+      "$(grep -q '^Exec=/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh' "$sb/usr/share/wayland-sessions/llama-kiosk.desktop" && echo yes || echo no)"
+    assert_file "launcher installed outside administrator home" \
+      "$sb/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh"
+    assert_file "control helper installed with launcher" \
+      "$sb/usr/local/lib/llama-manager/kiosk/llama-kiosk-control.py"
 
     # gdm autologin enabled for the user.
     assert_eq "autologin enabled" "yes" \
@@ -228,15 +268,19 @@ test_dry_run_no_mutation() {
 test_uninstall_flow() {
     printf 'test_uninstall_flow\n'
     local sb; sb="$(new_sandbox)"
-    local user; user="$(id -un)"
+    local user="llama-kiosk" uninstall_out
 
     mkdir -p "$sb/etc/gdm3" "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
     printf '[daemon]\nWaylandEnable=true\n' > "$sb/etc/gdm3/custom.conf"
     printf '[User]\nSession=ubuntu\nXSession=ubuntu\n' > "$sb/var/lib/AccountsService/users/$user"
 
-    # Install then uninstall.
+    # A repeated install must preserve ownership of resources created by the
+    # first run so uninstall can still remove them safely.
+    KIOSK_TEST_CAGE_MISSING=1 KIOSK_FAKE_CHROME=1 \
+      bash "$REPO_ROOT/scripts/install-kiosk.sh" install --root "$sb" >/dev/null 2>&1
     KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install   --root "$sb" >/dev/null 2>&1
-    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
+    uninstall_out="$(KIOSK_TEST_ACTION_LOG="$sb/actions.log" KIOSK_FAKE_CHROME=1 \
+      bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" 2>&1)"
     local rc=$?
     assert_eq "uninstall exit 0" "0" "$rc"
 
@@ -248,11 +292,294 @@ test_uninstall_flow() {
       "$(grep -q '^Session=ubuntu' "$sb/var/lib/AccountsService/users/$user" && echo yes || echo no)"
     # Session entry removed.
     assert_no_file "session entry removed" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    assert_eq "installer-created kiosk runtime removed" no \
+      "$([ -e "$sb/usr/local/lib/llama-manager/kiosk" ] && echo yes || echo no)"
+    assert_eq "installer-created kiosk home removed" "no" \
+      "$([ -e "$sb/home/llama-kiosk" ] && echo yes || echo no)"
+    assert_eq "removed account ownership marker is cleared" false \
+      "$(grep '^installed_kiosk_account=' "$sb/var/backups/llama-kiosk/manifest" | cut -d= -f2-)"
+    assert_eq "active kiosk session stopped before account removal" "yes" \
+      "$(awk '/stop-session/{stopped=NR} /remove-account/{removed=NR} END{print (stopped && removed && stopped < removed) ? "yes" : "no"}' "$sb/actions.log")"
+    assert_eq "reinstall preserves installer-added cage guidance" "yes" \
+      "$(printf '%s\n' "$uninstall_out" | grep -q "cage.*installed by this script" && echo yes || echo no)"
 
-    # Uninstall again is safe (idempotent, exit 0).
-    bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" >/dev/null 2>&1
+    # Once the successful uninstall clears installation ownership, a later
+    # uninstall must be a complete no-op. In particular, resources created by
+    # an administrator or package after the first uninstall are unmanaged and
+    # must not be replaced from stale backups or removed.
+    printf 'POST-UNINSTALL GDM\n' > "$sb/etc/gdm3/custom.conf"
+    printf 'POST-UNINSTALL ACCOUNT\n' > "$sb/var/lib/AccountsService/users/$user"
+    printf 'POST-UNINSTALL SESSION\n' > "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    mkdir -p "$sb/usr/local/lib/llama-manager/kiosk" "$sb/home/llama-kiosk"
+    printf 'POST-UNINSTALL RUNTIME\n' > "$sb/usr/local/lib/llama-manager/kiosk/owner-marker"
+    printf 'POST-UNINSTALL HOME\n' > "$sb/home/llama-kiosk/owner-marker"
+
+    KIOSK_TEST_ACTION_LOG="$sb/second-uninstall-actions.log" \
+      bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" \
+      >/dev/null 2>&1
     assert_eq "second uninstall exit 0" "0" "$?"
+    assert_eq "second uninstall preserves post-uninstall gdm config" \
+      "POST-UNINSTALL GDM" "$(cat "$sb/etc/gdm3/custom.conf")"
+    assert_eq "second uninstall preserves post-uninstall account record" \
+      "POST-UNINSTALL ACCOUNT" "$(cat "$sb/var/lib/AccountsService/users/$user")"
+    assert_eq "second uninstall preserves unmanaged session entry" \
+      "POST-UNINSTALL SESSION" \
+      "$(cat "$sb/usr/share/wayland-sessions/llama-kiosk.desktop")"
+    assert_file "second uninstall preserves unmanaged runtime" \
+      "$sb/usr/local/lib/llama-manager/kiosk/owner-marker"
+    assert_file "second uninstall preserves unmanaged replacement home" \
+      "$sb/home/llama-kiosk/owner-marker"
+    assert_no_file "second uninstall performs no lifecycle actions" \
+      "$sb/second-uninstall-actions.log"
 
+    rm -rf "$sb"
+}
+
+test_preexisting_account_is_preserved() {
+    printf 'test_preexisting_account_is_preserved\n'
+    local sb; sb="$(new_sandbox)"
+    mkdir -p "$sb/home/llama-kiosk"
+    printf 'preexisting home\n' > "$sb/home/llama-kiosk/owner-marker"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    KIOSK_TEST_ACTION_LOG="$sb/actions.log" KIOSK_FAKE_CHROME=1 \
+        bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" \
+        >/dev/null 2>&1
+    assert_file "reinstall/uninstall preserves pre-existing kiosk account home" \
+        "$sb/home/llama-kiosk/owner-marker"
+    assert_eq "pre-existing kiosk account is never scheduled for removal" no \
+        "$([ -f "$sb/actions.log" ] && grep -q '^remove-account$' "$sb/actions.log" && echo yes || echo no)"
+    rm -rf "$sb"
+}
+
+test_production_account_safety_guards() {
+    printf 'test_production_account_safety_guards\n'
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 0; }
+      getent() { printf 'llama-kiosk:x:900:900::/var/lib/legacy-kiosk:/bin/bash\n'; }
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "installer refuses an existing account with snap-incompatible home" \
+          1 "$rc"
+      assert_no_file "mismatched existing account is not claimed by manifest" \
+          "$sb/var/backups/llama-kiosk/manifest"
+      rm -rf "$sb"
+    )
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 1; }
+      useradd() { printf '%s\n' "$*" > "$sb/useradd.txt"; }
+      mkdir -p "$sb/home/llama-kiosk"
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "installer refuses to adopt an unmanaged target home" 1 "$rc"
+      assert_no_file "unmanaged home never reaches useradd" "$sb/useradd.txt"
+      rm -rf "$sb"
+    )
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 0; }
+      getent() { printf 'llama-kiosk:x:900:900::/home/llama-kiosk:/bin/bash\n'; }
+      mkdir -p "$sb/home"
+      ln -s /tmp/replaced-home "$sb/home/llama-kiosk"
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "installer rejects an existing account whose home is a symlink" \
+          1 "$rc"
+      rm -f "$sb/home/llama-kiosk"
+      printf 'not a directory\n' > "$sb/home/llama-kiosk"
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "installer rejects an existing account whose home is not a directory" \
+          1 "$rc"
+      rm -rf "$sb"
+    )
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 1; }
+      useradd() { printf '%s\n' "$*" > "$sb/useradd.txt"; }
+      chown() { printf '%s\n' "$*" > "$sb/chown.txt"; }
+      mkdir -p "$sb/var/backups/llama-kiosk" "$sb/home"
+      printf 'installed_kiosk_account=true\n' \
+          > "$sb/var/backups/llama-kiosk/manifest"
+      ln -s /tmp/replaced-home "$sb/home/llama-kiosk"
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "stale ownership marker cannot claim a symlink after account loss" \
+          1 "$rc"
+      assert_no_file "stale marker never reaches useradd" "$sb/useradd.txt"
+      assert_no_file "stale marker never reaches recursive chown" "$sb/chown.txt"
+      rm -rf "$sb"
+    )
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 0; }
+      getent() { printf 'llama-kiosk:x:900:900::/home/llama-kiosk:/bin/bash\n'; }
+      userdel() { printf '%s\n' "$*" > "$sb/userdel.txt"; }
+      mkdir -p "$sb/var/backups/llama-kiosk" "$sb/home"
+      printf 'installed_kiosk_account=true\nsession_stopped=true\n' \
+          > "$sb/var/backups/llama-kiosk/manifest"
+      ln -s /tmp/replaced-home "$sb/home/llama-kiosk"
+
+      kiosk_remove_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "uninstall refuses a replaced managed-home symlink" 1 "$rc"
+      assert_no_file "unsafe replacement never reaches userdel" "$sb/userdel.txt"
+      assert_eq "refused removal retains account ownership marker" true \
+          "$(kiosk_manifest_get installed_kiosk_account)"
+      rm -rf "$sb"
+    )
+}
+
+test_preexisting_session_entry_is_restored() {
+    printf 'test_preexisting_session_entry_is_restored\n'
+    local sb session; sb="$(new_sandbox)"
+    session="$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    mkdir -p "$(dirname "$session")"
+    printf 'ORIGINAL VENDOR SESSION\n' > "$session"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "repeated install keeps pristine session-entry backup" \
+        "ORIGINAL VENDOR SESSION" \
+        "$(cat "$sb/var/backups/llama-kiosk/wayland_session")"
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "repeated install/uninstall restores pre-existing session entry" \
+        "ORIGINAL VENDOR SESSION" "$(cat "$session" 2>/dev/null)"
+    rm -rf "$sb"
+}
+
+test_uninstall_without_install_preserves_session_entry() {
+    printf 'test_uninstall_without_install_preserves_session_entry\n'
+    local sb session; sb="$(new_sandbox)"
+    session="$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    mkdir -p "$(dirname "$session")"
+    printf 'UNMANAGED SESSION\n' > "$session"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "uninstall without install never deletes unmanaged session entry" \
+        "UNMANAGED SESSION" "$(cat "$session")"
+    assert_no_file "uninstall without install creates no ownership manifest" \
+        "$sb/var/backups/llama-kiosk/manifest"
+    rm -rf "$sb"
+}
+
+test_partial_install_without_completion_marker_is_cleaned() {
+    printf 'test_partial_install_without_completion_marker_is_cleaned\n'
+    local sb manifest user; sb="$(new_sandbox)"; user="llama-kiosk"
+    manifest="$sb/var/backups/llama-kiosk/manifest"
+    mkdir -p "$sb/var/backups/llama-kiosk" "$sb/etc/gdm3" \
+      "$sb/var/lib/AccountsService/users" "$sb/usr/share/wayland-sessions"
+    printf 'ORIGINAL GDM\n' > "$sb/var/backups/llama-kiosk/gdm_custom_conf"
+    printf 'PARTIAL INSTALL GDM\n' > "$sb/etc/gdm3/custom.conf"
+    printf 'PARTIAL ACCOUNT\n' > "$sb/var/lib/AccountsService/users/$user"
+    printf 'PARTIAL SESSION\n' > "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    cat > "$manifest" <<EOF
+target_user=$user
+backup.gdm_custom_conf.existed=true
+backup.gdm_custom_conf.path=/etc/gdm3/custom.conf
+backup.accountsservice_$user.existed=false
+backup.accountsservice_$user.path=/var/lib/AccountsService/users/$user
+backup.wayland_session.existed=false
+backup.wayland_session.path=/usr/share/wayland-sessions/llama-kiosk.desktop
+installed_runtime=false
+installed_kiosk_account=false
+EOF
+
+    bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" \
+      >/dev/null 2>&1
+    assert_eq "partial install without installed marker is restored" \
+      "ORIGINAL GDM" "$(cat "$sb/etc/gdm3/custom.conf")"
+    assert_no_file "partial AccountsService record is removed" \
+      "$sb/var/lib/AccountsService/users/$user"
+    assert_no_file "partial session entry is removed" \
+      "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    assert_eq "partial cleanup records completed uninstall" false \
+      "$(grep '^installed=' "$manifest" | cut -d= -f2-)"
+    rm -rf "$sb"
+}
+
+test_session_symlink_target_is_never_overwritten() {
+    printf 'test_session_symlink_target_is_never_overwritten\n'
+    local sb session external expected; sb="$(new_sandbox)"
+    session="$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    external="$(mktemp "${TMPDIR:-/tmp}/kiosk-elf-target.XXXXXX")"
+    expected='ELF FIXTURE BYTES MUST REMAIN UNCHANGED'
+    printf '%s\n' "$expected" > "$external"
+    chmod 0755 "$external"
+    mkdir -p "$(dirname "$session")"
+    ln -s "$external" "$session"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "install leaves external session-symlink target bytes unchanged" \
+        "$expected" "$(cat "$external")"
+    assert_eq "install atomically replaces session symlink with regular file" yes \
+        "$([ -f "$session" ] && [ ! -L "$session" ] && echo yes || echo no)"
+    assert_eq "installed session entry has safe permissions" 644 \
+        "$(stat -c %a "$session")"
+    assert_eq "session backup preserves original symlink" "$external" \
+        "$(readlink "$sb/var/backups/llama-kiosk/wayland_session")"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "reinstall leaves external symlink target bytes unchanged" \
+        "$expected" "$(cat "$external")"
+    assert_eq "reinstall preserves original session symlink backup" "$external" \
+        "$(readlink "$sb/var/backups/llama-kiosk/wayland_session")"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "uninstall leaves external session-symlink target bytes unchanged" \
+        "$expected" "$(cat "$external")"
+    assert_eq "uninstall restores original session symlink" "$external" \
+        "$(readlink "$session" 2>/dev/null)"
+    rm -rf "$sb"
+    rm -f "$external"
+}
+
+test_dangling_session_symlink_is_restored_exactly() {
+    printf 'test_dangling_session_symlink_is_restored_exactly\n'
+    local sb session target; sb="$(new_sandbox)"
+    session="$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+    target='../missing/vendor-session.desktop'
+    mkdir -p "$(dirname "$session")"
+    ln -s "$target" "$session"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "install replaces dangling session symlink with regular file" yes \
+        "$([ -f "$session" ] && [ ! -L "$session" ] && echo yes || echo no)"
+    assert_eq "backup preserves dangling session link target text" "$target" \
+        "$(readlink "$sb/var/backups/llama-kiosk/wayland_session")"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "reinstall preserves dangling link backup target text" "$target" \
+        "$(readlink "$sb/var/backups/llama-kiosk/wayland_session")"
+
+    KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall \
+        --root "$sb" >/dev/null 2>&1
+    assert_eq "uninstall restores dangling session symlink target exactly" \
+        "$target" "$(readlink "$session" 2>/dev/null)"
+    assert_eq "restored session link remains dangling" yes \
+        "$([ -L "$session" ] && [ ! -e "$session" ] && echo yes || echo no)"
     rm -rf "$sb"
 }
 
@@ -270,6 +597,7 @@ EOF
     cat > "$sb/bin/cage"  <<EOF
 #!/bin/bash
 printf '%s\n' "\$*" > "$sb/launch.txt"
+printf '%s\n' "\${HOME:-}" > "$sb/launch-home.txt"
 exit 0
 EOF
     cat > "$sb/bin/google-chrome" <<'EOF'
@@ -287,6 +615,43 @@ EOF
     assert_eq "chrome kiosk + url passed" "yes" \
       "$(grep -q -- '--kiosk' "$sb/launch.txt" && grep -q 'localhost:3001' "$sb/launch.txt" && echo yes || echo no)"
 
+    # GDM normally supplies HOME from the managed account record. The launcher
+    # also supplies the same snap-compatible fallback when the environment is
+    # incomplete, rather than falling back outside /home where strict Firefox
+    # snap confinement cannot access its profile.
+    rm -f "$sb/launch.txt" "$sb/launch-home.txt"
+    /usr/bin/env -u HOME PATH="$sb/bin:$PATH" KIOSK_LAUNCH_ONCE=1 \
+        KIOSK_URL="http://localhost:3001" KIOSK_WAIT_BUDGET=2 \
+        /bin/bash "$REPO_ROOT/scripts/llama-kiosk-launch.sh" >/dev/null 2>&1
+    assert_eq "launcher defaults HOME to the managed snap-compatible home" \
+        "/home/llama-kiosk" "$(cat "$sb/launch-home.txt" 2>/dev/null)"
+
+    # Packaged runtime reads the canonical manager EnvironmentFile rather than
+    # looking for a nonexistent .env beside /usr/local/lib.
+    printf 'API_PORT=4555\n' > "$sb/llama-manager.env"
+    rm -f "$sb/launch.txt"
+    PATH="$sb/bin:$PATH" KIOSK_LAUNCH_ONCE=1 \
+        LLAMA_MANAGER_ENV_FILE="$sb/llama-manager.env" KIOSK_WAIT_BUDGET=2 \
+        bash "$REPO_ROOT/scripts/llama-kiosk-launch.sh" >/dev/null 2>&1
+    assert_eq "launcher reads canonical manager env path" "yes" \
+      "$(grep -q 'localhost:4555/kiosk' "$sb/launch.txt" && echo yes || echo no)"
+
+    # The Ubuntu Desktop image works offline with its bundled Firefox snap and
+    # does not require proprietary Chrome. Isolate PATH so only Firefox exists.
+    rm -f "$sb/bin/google-chrome" "$sb/launch.txt"
+    cat > "$sb/bin/firefox" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    ln -s /usr/bin/dirname "$sb/bin/dirname"
+    chmod +x "$sb/bin/firefox"
+    PATH="$sb/bin" KIOSK_LAUNCH_ONCE=1 KIOSK_URL="http://localhost:3001" \
+        KIOSK_WAIT_BUDGET=2 /bin/bash "$REPO_ROOT/scripts/llama-kiosk-launch.sh" \
+        >/dev/null 2>&1
+    assert_eq "Firefox fallback uses Wayland kiosk mode" "yes" \
+      "$(grep -q 'MOZ_ENABLE_WAYLAND=1 firefox --kiosk' "$sb/launch.txt" && \
+          grep -q 'localhost:3001' "$sb/launch.txt" && echo yes || echo no)"
+
     rm -rf "$sb"
 }
 
@@ -294,9 +659,17 @@ test_url_resolution
 test_manifest
 test_backup
 test_cli
+test_browser_prerequisite
 test_install_flow
 test_dry_run_no_mutation
 test_uninstall_flow
+test_preexisting_account_is_preserved
+test_production_account_safety_guards
+test_preexisting_session_entry_is_restored
+test_uninstall_without_install_preserves_session_entry
+test_partial_install_without_completion_marker_is_cleaned
+test_session_symlink_target_is_never_overwritten
+test_dangling_session_symlink_is_restored_exactly
 test_launcher
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.

@@ -4,9 +4,11 @@
 # root for license terms.
 #
 # Shared helpers for scripts/install-kiosk.sh and scripts/llama-kiosk-launch.sh.
-# Provides: sandbox-aware path resolution (KIOSK_ROOT), .env-driven KIOSK_URL
-# resolution, install-manifest read/write, idempotent file backups, and a
-# dry-run-aware command wrapper. This file is meant to be SOURCED, not executed.
+# Provides sandbox-aware path resolution (KIOSK_ROOT), canonical manager-env
+# KIOSK_URL resolution, Firefox/Chrome browser discovery, dedicated-account and
+# session lifecycle, persistent resource-ownership markers, idempotent backups,
+# terminal uninstall guards, and a dry-run-aware command wrapper. This file is
+# sourced, not executed.
 
 # Guard against double-sourcing.
 [ -n "${_KIOSK_COMMON_SOURCED:-}" ] && return 0
@@ -25,8 +27,8 @@ kiosk_path() {
 }
 
 # Resolve the dashboard URL the kiosk should display.
-# Precedence: $KIOSK_URL env > KIOSK_URL= in .env > http://localhost:$API_PORT.
-# Arg: $1 = path to a .env file (need not exist).
+# Precedence: $KIOSK_URL env > KIOSK_URL= in manager env > localhost:$API_PORT.
+# Arg: $1 = path to the canonical manager EnvironmentFile (need not exist).
 # Echo: the resolved URL.
 kiosk_resolve_url() {
     local env_file="$1" url="" api_port=""
@@ -36,7 +38,7 @@ kiosk_resolve_url() {
         api_port="$(grep -E '^API_PORT=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2- | xargs || true)"
     fi
     if [ -n "$url" ]; then printf '%s\n' "$url"; return 0; fi
-    printf 'http://localhost:%s\n' "${api_port:-3001}"
+    printf 'http://localhost:%s/kiosk\n' "${api_port:-3001}"
 }
 
 # Absolute path to the install manifest (records what install changed).
@@ -96,8 +98,9 @@ kiosk_backup_dir() { kiosk_path /var/backups/llama-kiosk; }
 
 # Idempotently back up a system file before install modifies it. No-op under
 # dry-run (logs intent only). Only the FIRST backup is kept, so re-running
-# install never clobbers the pristine original. Records backup.<name>.existed
-# (true/false) and backup.<name>.path in the manifest.
+# install never clobbers the pristine original. Symlinks are copied as links,
+# including dangling links whose targets do not exist. Records
+# backup.<name>.existed (true/false) and backup.<name>.path in the manifest.
 # Args: $1 = logical name (manifest/file key), $2 = logical source path.
 kiosk_backup_file() {
     local name="$1" src_logical="$2" src backup
@@ -112,7 +115,7 @@ kiosk_backup_file() {
     if [ -n "$(kiosk_manifest_get "backup.$name.existed")" ]; then
         return 0
     fi
-    if [ -f "$src" ]; then
+    if [ -e "$src" ] || [ -L "$src" ]; then
         cp -a "$src" "$backup"
         kiosk_manifest_set "backup.$name.existed" "true"
     else
@@ -144,23 +147,27 @@ kiosk_restore_file() {
     fi
 }
 
-# Verify google-chrome is available (or faked for tests). Echo the binary name.
-# Honors KIOSK_FAKE_CHROME=1 to bypass the check in sandboxed tests.
-kiosk_require_chrome() {
+# Find a supported Wayland kiosk browser. Prefer Chrome/Chromium when installed,
+# then fall back to Ubuntu Desktop's offline Firefox snap command. Echoes the
+# binary name, or fails with installation guidance when none is available.
+# Honors KIOSK_FAKE_CHROME=1 to preserve the sandboxed installer test seam.
+kiosk_require_browser() {
     if [ "${KIOSK_FAKE_CHROME:-0}" = "1" ]; then printf 'google-chrome\n'; return 0; fi
     local b
     for b in google-chrome google-chrome-stable chromium chromium-browser; do
         if command -v "$b" >/dev/null 2>&1; then printf '%s\n' "$b"; return 0; fi
     done
-    kiosk_warn "No Chrome/Chromium found. Install google-chrome before continuing."
+    if command -v firefox >/dev/null 2>&1; then printf 'firefox\n'; return 0; fi
+    kiosk_warn "No supported browser found. Install Firefox, Chrome, or Chromium before continuing."
     return 1
 }
 
 # Ensure the `cage` compositor is installed (apt). Records in the manifest
 # whether WE installed it, so uninstall can offer to remove it.
 kiosk_ensure_cage() {
-    if command -v cage >/dev/null 2>&1; then
-        kiosk_manifest_set installed_cage false
+    if [ "${KIOSK_TEST_CAGE_MISSING:-0}" != 1 ] && command -v cage >/dev/null 2>&1; then
+        [ "$(kiosk_manifest_get installed_cage)" = true ] || \
+            kiosk_manifest_set installed_cage false
         return 0
     fi
     # In a sandbox we cannot apt-install; just record intent.
@@ -173,6 +180,153 @@ kiosk_ensure_cage() {
     kiosk_run apt-get update
     kiosk_run apt-get install -y cage
     kiosk_manifest_set installed_cage true
+}
+
+# Resolve the snap-compatible home for a dedicated kiosk account.
+# Firefox's strict snap confinement permits normal homes under /home without a
+# system-wide homedirs override. Arg: $1 = account name. Echo: logical path.
+kiosk_account_home() {
+    printf '/home/%s\n' "$1"
+}
+
+# Ensure the dedicated kiosk account exists. Production installs create a
+# locked system account with a writable private home under /home and a normal
+# shell so GDM and strict Firefox snap confinement can start the Wayland
+# session. Sandboxed installs model the same lifecycle without touching the
+# host user database. The manifest records ownership so uninstall never removes
+# an account or home that predated Llama Manager.
+# Args: $1 = account name.
+kiosk_ensure_account() {
+    local user="$1" logical_home home existing_home managed
+    logical_home="$(kiosk_account_home "$user")"
+    home="$(kiosk_path "$logical_home")"
+    managed="$(kiosk_manifest_get installed_kiosk_account)"
+    if [ "$KIOSK_ROOT" != "/" ]; then
+        if [ -L "$home" ]; then
+            kiosk_warn "$logical_home is a symlink; refusing to use it as the kiosk home"
+            return 1
+        elif [ -e "$home" ] && [ ! -d "$home" ]; then
+            kiosk_warn "$logical_home exists but is not a directory"
+            return 1
+        elif [ -d "$home" ]; then
+            [ "$managed" = true ] || kiosk_manifest_set installed_kiosk_account false
+        else
+            kiosk_run mkdir -p "$home"
+            kiosk_manifest_set installed_kiosk_account true
+        fi
+        return 0
+    fi
+    if id "$user" >/dev/null 2>&1; then
+        existing_home="$(getent passwd "$user" | cut -d: -f6)"
+        if [ "$existing_home" != "$logical_home" ]; then
+            kiosk_warn "existing account '$user' uses '$existing_home', not required home '$logical_home'; refusing to modify it"
+            return 1
+        fi
+        if [ -L "$home" ] || [ ! -d "$home" ]; then
+            kiosk_warn "existing account '$user' does not have a real directory at '$logical_home'"
+            return 1
+        fi
+        [ "$managed" = true ] || kiosk_manifest_set installed_kiosk_account false
+        return 0
+    fi
+    if [ -e "$home" ] || [ -L "$home" ]; then
+        kiosk_warn "$logical_home already exists while account '$user' is absent; refusing to claim it"
+        return 1
+    fi
+    kiosk_run useradd --system --create-home --home-dir "$logical_home" \
+        --shell /bin/bash --user-group "$user"
+    kiosk_run chown -R "$user:$user" "$home"
+    kiosk_manifest_set installed_kiosk_account true
+}
+
+# Remove the dedicated kiosk account only when this installer created it.
+# Existing accounts are preserved. Sandboxed installs remove only the modeled
+# private home directory.
+# Args: $1 = account name.
+kiosk_remove_account() {
+    local user="$1" logical_home home existing_home
+    [ "$(kiosk_manifest_get installed_kiosk_account)" = "true" ] || return 0
+    kiosk_record_action remove-account
+    [ "$(kiosk_manifest_get session_stopped)" = "true" ] || {
+        kiosk_warn "refusing to remove '$user' before its graphical session is stopped"
+        return 1
+    }
+    logical_home="$(kiosk_account_home "$user")"
+    home="$(kiosk_path "$logical_home")"
+    if [ "$KIOSK_ROOT" != "/" ]; then
+        kiosk_run rm -rf "$home"
+    elif id "$user" >/dev/null 2>&1; then
+        existing_home="$(getent passwd "$user" | cut -d: -f6)"
+        if [ "$existing_home" != "$logical_home" ] || [ -L "$home" ]; then
+            kiosk_warn "refusing to remove '$user': its account or home no longer matches the managed kiosk resource"
+            return 1
+        fi
+        kiosk_run userdel --remove "$user"
+    else
+        kiosk_warn "refusing to remove managed home '$logical_home' because account '$user' no longer exists"
+        return 1
+    fi
+    kiosk_manifest_set installed_kiosk_account false
+}
+
+# Append an action to the optional test audit log.
+# Args: action name.
+kiosk_record_action() {
+    [ -z "${KIOSK_TEST_ACTION_LOG:-}" ] || printf '%s\n' "$1" >> "$KIOSK_TEST_ACTION_LOG"
+}
+
+# Terminate the kiosk user's graphical/login session before runtime or account
+# removal. loginctl termination is synchronous; any remaining process prevents
+# user deletion rather than orphaning a helper or compositor under a deleted UID.
+# Args: account name.
+kiosk_stop_session() {
+    local user="$1"
+    kiosk_record_action stop-session
+    if [ "$KIOSK_DRY_RUN" = "true" ]; then
+        kiosk_log "DRY-RUN would terminate login sessions for $user"
+        return 0
+    fi
+    if [ "$KIOSK_ROOT" = "/" ] && id "$user" >/dev/null 2>&1; then
+        if command -v loginctl >/dev/null 2>&1 && loginctl show-user "$user" >/dev/null 2>&1; then
+            loginctl terminate-user "$user"
+        fi
+        if pgrep -u "$user" >/dev/null 2>&1; then
+            kiosk_warn "processes for '$user' remain after session termination"
+            return 1
+        fi
+    fi
+    kiosk_manifest_set session_stopped true
+}
+
+# Install the kiosk launcher, helper, and shared library in a world-traversable
+# system location. This is required because the dedicated kiosk account cannot
+# be expected to read a source checkout inside an administrator's private home.
+# Existing unmanaged content is never overwritten.
+# Args: $1 = source repository root.
+kiosk_install_runtime() {
+    local source_root="$1" logical_dir="/usr/local/lib/llama-manager/kiosk" dest
+    dest="$(kiosk_path "$logical_dir")"
+    if [ -e "$dest" ] && [ -z "$(kiosk_manifest_get installed_runtime)" ]; then
+        kiosk_warn "$logical_dir already exists but is not managed by this installer"
+        return 1
+    fi
+    if [ "$KIOSK_DRY_RUN" = "true" ]; then
+        kiosk_log "DRY-RUN would install kiosk runtime to $logical_dir"
+        return 0
+    fi
+    mkdir -p "$dest/lib"
+    install -m 0755 "$source_root/scripts/llama-kiosk-launch.sh" "$dest/llama-kiosk-launch.sh"
+    install -m 0755 "$source_root/scripts/llama-kiosk-control.py" "$dest/llama-kiosk-control.py"
+    install -m 0644 "$source_root/scripts/lib/kiosk-common.sh" "$dest/lib/kiosk-common.sh"
+    kiosk_manifest_set installed_runtime true
+}
+
+# Remove only the kiosk runtime directory created by this installer.
+kiosk_remove_runtime() {
+    local dest
+    [ "$(kiosk_manifest_get installed_runtime)" = "true" ] || return 0
+    dest="$(kiosk_path /usr/local/lib/llama-manager/kiosk)"
+    kiosk_run rm -rf "$dest"
 }
 
 # Set or replace a "key=value" line under an [section]-less or simple INI file,
@@ -202,10 +356,12 @@ kiosk_set_ini_key() {
     fi
 }
 
-# Write the kiosk Wayland session desktop entry.
+# Atomically publish the kiosk Wayland session desktop entry through a
+# same-directory regular temp file, never following an existing destination
+# symlink. The final entry is mode 0644.
 # Arg: $1 = absolute path to llama-kiosk-launch.sh.
 kiosk_write_session() {
-    local launcher="$1" dest content
+    local launcher="$1" dest dest_dir temp content
     dest="$(kiosk_path /usr/share/wayland-sessions/llama-kiosk.desktop)"
     content="[Desktop Entry]
 Name=Llama Kiosk
@@ -217,8 +373,15 @@ DesktopNames=llama-kiosk"
         kiosk_log "DRY-RUN would write session file to $dest"
         return 0
     fi
-    mkdir -p "$(dirname "$dest")"
-    printf '%s\n' "$content" > "$dest"
+    dest_dir="$(dirname "$dest")"
+    mkdir -p "$dest_dir"
+    temp="$(mktemp "$dest_dir/.llama-kiosk.desktop.XXXXXX")"
+    if ! printf '%s\n' "$content" > "$temp" ||
+        ! chmod 0644 "$temp" ||
+        ! mv -Tf "$temp" "$dest"; then
+        rm -f "$temp"
+        return 1
+    fi
     kiosk_log "wrote session entry: $dest"
 }
 
@@ -227,16 +390,19 @@ kiosk_install() {
     local user launcher gdm acct
     ensure_root "$@" || true
     user="$(kiosk_target_user)"
-    launcher="$REPO_ROOT/scripts/llama-kiosk-launch.sh"
+    launcher="/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh"
     gdm="$(kiosk_path /etc/gdm3/custom.conf)"
     acct="$(kiosk_path /var/lib/AccountsService/users/$user)"
 
-    kiosk_require_chrome >/dev/null
+    kiosk_require_browser >/dev/null
     kiosk_ensure_cage
+    kiosk_ensure_account "$user"
+    kiosk_install_runtime "$REPO_ROOT"
 
     # Back up before mutating.
     kiosk_backup_file gdm_custom_conf /etc/gdm3/custom.conf
     kiosk_backup_file "accountsservice_$user" "/var/lib/AccountsService/users/$user"
+    kiosk_backup_file wayland_session /usr/share/wayland-sessions/llama-kiosk.desktop
     kiosk_manifest_set target_user "$user"
 
     # Enable gdm autologin for the user.
@@ -295,21 +461,29 @@ kiosk_restart() {
 # Args: forwarded from the install-kiosk.sh dispatcher (may include --root etc.,
 #       already consumed by the parent; ensure_root re-checks privilege).
 kiosk_uninstall() {
-    local user session_entry
+    local user manifest
+    manifest="$(kiosk_manifest_path)"
+    if [ ! -f "$manifest" ]; then
+        kiosk_log "No recorded kiosk installation found; nothing to uninstall."
+        return 0
+    fi
+    if [ "$(kiosk_manifest_get installed)" = "false" ]; then
+        kiosk_log "Kiosk is already uninstalled; nothing to uninstall."
+        return 0
+    fi
     ensure_root "$@" || true
     user="$(kiosk_manifest_get target_user)"
     [ -z "$user" ] && user="$(kiosk_target_user)"
-    session_entry="$(kiosk_path /usr/share/wayland-sessions/llama-kiosk.desktop)"
+    kiosk_stop_session "$user"
 
-    # Restore the two backed-up system files.
+    # Restore every backed-up system file, including a pre-existing session
+    # entry. An unrecorded entry is never removed by uninstall.
     kiosk_restore_file gdm_custom_conf
     kiosk_restore_file "accountsservice_$user"
+    kiosk_restore_file wayland_session
 
-    # Remove the session entry we generated.
-    if [ -e "$session_entry" ]; then
-        kiosk_run rm -f "$session_entry"
-        kiosk_log "removed session entry: $session_entry"
-    fi
+    kiosk_remove_runtime
+    kiosk_remove_account "$user"
 
     # Report cage (do not auto-remove an apt package).
     if [ "$(kiosk_manifest_get installed_cage)" = "true" ]; then

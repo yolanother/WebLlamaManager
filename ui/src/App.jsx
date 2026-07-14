@@ -1,9 +1,11 @@
-// Llama Manager — browser dashboard and configuration interface.
+// Llama Manager — browser dashboard and appliance kiosk interface.
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// This React application presents inference, model, service, update, and system
-// controls while adapting mutable operations to the active distribution policy.
+// Provides the complete monitoring, model management, chat, configuration, and
+// package-update controls while adapting mutable operations to distribution
+// policy. Kiosk mode renders a local dashboard-only shell whose System Login
+// action talks exclusively to the loopback desktop-session helper.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, NavLink, useLocation, useParams, useNavigate } from 'react-router-dom';
@@ -15,6 +17,7 @@ import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
 import './App.css';
 import { resolveLlamaUpdateView } from './llama-update-policy.js';
+import { isLocalKioskHost, requestSystemLogin } from './kiosk-control.js';
 
 const API_BASE = '/api';
 
@@ -1335,11 +1338,22 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const [showAllModels, setShowAllModels] = useState(false);
+  const [systemLoginError, setSystemLoginError] = useState('');
   const fullscreenTimerRef = useRef(null);
   const FULLSCREEN_PAGES = 3;
 
   // Kiosk mode reuses the full-screen presentation without the Fullscreen API.
   const showFullscreen = isFullscreen || kiosk;
+  const showSystemLogin = kiosk && isLocalKioskHost(window.location.hostname);
+
+  const openSystemLogin = async () => {
+    setSystemLoginError('');
+    try {
+      await requestSystemLogin({ hostname: window.location.hostname });
+    } catch (error) {
+      setSystemLoginError(error.message || 'Unable to open the system login screen.');
+    }
+  };
 
   const fetchModels = useCallback(async () => {
     try {
@@ -2128,6 +2142,12 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           <div className="fullscreen-indicator-inline">
             {fullscreenPage + 1} / {FULLSCREEN_PAGES}
           </div>
+          {showSystemLogin && (
+            <button className="kiosk-system-login" onClick={openSystemLogin}>
+              System Login
+            </button>
+          )}
+          {systemLoginError && <span className="kiosk-system-login-error">{systemLoginError}</span>}
         </div>
         <ActiveRequestPanel request={activeRequest} isFullscreen={true} />
       </div>

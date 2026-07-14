@@ -5,9 +5,10 @@
 #
 # Turns this host into a dashboard appliance: on boot, gdm auto-logs into a
 # dedicated "Llama Kiosk" Wayland session that runs the `cage` compositor with
-# full-screen Chrome pointed at the Llama Manager dashboard. GNOME stays
-# installed; uninstall restores the original login behavior from backups taken
-# at install time. Standalone and optional — NOT wired into install.sh.
+# full-screen Firefox, Chrome, or Chromium pointed at the Llama Manager
+# dashboard. GNOME stays installed; uninstall restores the original login
+# behavior from backups taken at install time. Standalone and optional — NOT
+# wired into install.sh.
 #
 # Usage:
 #   scripts/install-kiosk.sh install   [--dry-run] [--root DIR] [--no-start]
@@ -106,9 +107,11 @@ ensure_root() {
     fi
 }
 
-# The unprivileged account gdm will auto-login (the human, not root).
+# The dedicated unprivileged appliance account gdm will auto-login. Keeping the
+# kiosk separate ensures the administrator's GNOME session and preferences are
+# never repurposed by appliance mode.
 # Echo: username.
-kiosk_target_user() { printf '%s\n' "${SUDO_USER:-$USER}"; }
+kiosk_target_user() { printf '%s\n' "${KIOSK_ACCOUNT:-llama-kiosk}"; }
 
 case "$SUBCMD" in
     install)   kiosk_install   "$@" ;;

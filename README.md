@@ -346,6 +346,11 @@ Environment variables (set in systemd service or shell):
 - `MODELS_MAX`: Max simultaneous models (default: `2`)
 - `CONTEXT`: Context size (default: `8192`)
 
+Packaged appliance installs can configure a group-writable local directory,
+existing partition, or credential-free NFS export with
+`scripts/configure-model-storage.sh`; see
+[`docs/Utilities/model-storage.md`](docs/Utilities/model-storage.md).
+
 ## Stability & thermal protection
 
 A resource guard protects the host from oversized models and overheating (added

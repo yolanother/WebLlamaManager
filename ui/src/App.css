@@ -1,3 +1,12 @@
+/*
+ * Llama Manager — dashboard and appliance kiosk presentation.
+ * Copyright (c) Llama Manager project. See the LICENSE file in the repository
+ * root for license terms.
+ *
+ * Defines the complete browser UI layout and responsive presentation, including
+ * the full-screen appliance dashboard and its local System Login escape hatch.
+ */
+
 /* CSS Variables */
 :root {
   --bg-primary: #0a0a0a;
@@ -5862,6 +5871,22 @@ input::placeholder {
 .kiosk-shell,
 .kiosk-shell * {
   cursor: none !important;
+}
+
+.kiosk-shell .kiosk-system-login {
+  cursor: pointer !important;
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.kiosk-system-login-error {
+  max-width: 420px;
+  color: var(--error);
+  font-size: 12px;
 }
 
 .fullscreen-persistent-header {
