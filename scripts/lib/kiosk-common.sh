@@ -181,19 +181,28 @@ kiosk_ensure_cage() {
     kiosk_manifest_set installed_cage true
 }
 
+# Resolve the snap-compatible home for a dedicated kiosk account.
+# Firefox's strict snap confinement permits normal homes under /home without a
+# system-wide homedirs override. Arg: $1 = account name. Echo: logical path.
+kiosk_account_home() {
+    printf '/home/%s\n' "$1"
+}
+
 # Ensure the dedicated kiosk account exists. Production installs create a
-# locked system account with a writable private home and a normal shell so GDM
-# can start its Wayland session. Sandboxed installs model the same lifecycle
-# without touching the host user database. The manifest records ownership so
-# uninstall never removes an account that predated Llama Manager.
+# locked system account with a writable private home under /home and a normal
+# shell so GDM and strict Firefox snap confinement can start the Wayland
+# session. Sandboxed installs model the same lifecycle without touching the
+# host user database. The manifest records ownership so uninstall never removes
+# an account or home that predated Llama Manager.
 # Args: $1 = account name.
 kiosk_ensure_account() {
-    local user="$1" home
-    home="$(kiosk_path /var/lib/llama-kiosk)"
+    local user="$1" logical_home home existing_home managed
+    logical_home="$(kiosk_account_home "$user")"
+    home="$(kiosk_path "$logical_home")"
+    managed="$(kiosk_manifest_get installed_kiosk_account)"
     if [ "$KIOSK_ROOT" != "/" ]; then
         if [ -d "$home" ]; then
-            [ "$(kiosk_manifest_get installed_kiosk_account)" = true ] || \
-                kiosk_manifest_set installed_kiosk_account false
+            [ "$managed" = true ] || kiosk_manifest_set installed_kiosk_account false
         else
             kiosk_run mkdir -p "$home"
             kiosk_manifest_set installed_kiosk_account true
@@ -201,12 +210,21 @@ kiosk_ensure_account() {
         return 0
     fi
     if id "$user" >/dev/null 2>&1; then
-        [ "$(kiosk_manifest_get installed_kiosk_account)" = true ] || \
-            kiosk_manifest_set installed_kiosk_account false
+        existing_home="$(getent passwd "$user" | cut -d: -f6)"
+        if [ "$existing_home" != "$logical_home" ]; then
+            kiosk_warn "existing account '$user' uses '$existing_home', not required home '$logical_home'; refusing to modify it"
+            return 1
+        fi
+        [ "$managed" = true ] || kiosk_manifest_set installed_kiosk_account false
         return 0
     fi
-    kiosk_run useradd --system --create-home --home-dir /var/lib/llama-kiosk \
+    if { [ -e "$home" ] || [ -L "$home" ]; } && [ "$managed" != true ]; then
+        kiosk_warn "$logical_home already exists but is not managed by this installer"
+        return 1
+    fi
+    kiosk_run useradd --system --create-home --home-dir "$logical_home" \
         --shell /bin/bash --user-group "$user"
+    kiosk_run chown -R "$user:$user" "$home"
     kiosk_manifest_set installed_kiosk_account true
 }
 
@@ -215,18 +233,27 @@ kiosk_ensure_account() {
 # private home directory.
 # Args: $1 = account name.
 kiosk_remove_account() {
-    local user="$1" home
+    local user="$1" logical_home home existing_home
     [ "$(kiosk_manifest_get installed_kiosk_account)" = "true" ] || return 0
     kiosk_record_action remove-account
     [ "$(kiosk_manifest_get session_stopped)" = "true" ] || {
         kiosk_warn "refusing to remove '$user' before its graphical session is stopped"
         return 1
     }
-    home="$(kiosk_path /var/lib/llama-kiosk)"
+    logical_home="$(kiosk_account_home "$user")"
+    home="$(kiosk_path "$logical_home")"
     if [ "$KIOSK_ROOT" != "/" ]; then
         kiosk_run rm -rf "$home"
     elif id "$user" >/dev/null 2>&1; then
+        existing_home="$(getent passwd "$user" | cut -d: -f6)"
+        if [ "$existing_home" != "$logical_home" ] || [ -L "$home" ]; then
+            kiosk_warn "refusing to remove '$user': its account or home no longer matches the managed kiosk resource"
+            return 1
+        fi
         kiosk_run userdel --remove "$user"
+    else
+        kiosk_warn "refusing to remove managed home '$logical_home' because account '$user' no longer exists"
+        return 1
     fi
     kiosk_manifest_set installed_kiosk_account false
 }

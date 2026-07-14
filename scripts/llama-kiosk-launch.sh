@@ -7,7 +7,9 @@
 # the dashboard URL from the canonical packaged manager EnvironmentFile, waits
 # until it is reachable, then replaces itself with `cage` running full-screen
 # Firefox, Chrome, or Chromium in kiosk mode. Firefox is the offline-safe Ubuntu
-# Desktop default; Chrome-family browsers remain supported when installed.
+# Desktop default; the launcher preserves its snap-compatible managed HOME when
+# GDM supplies an incomplete environment. Chrome-family browsers remain
+# supported when installed.
 #
 # Starts the separate loopback-only control helper so the local kiosk can switch
 # to GDM without adding a remotely reachable API route.
@@ -24,7 +26,8 @@ source "$SCRIPT_DIR/lib/kiosk-common.sh"
 MANAGER_ENV_FILE="${LLAMA_MANAGER_ENV_FILE:-/etc/llama-manager/llama-manager.env}"
 URL="$(kiosk_resolve_url "$MANAGER_ENV_FILE")"
 WAIT_BUDGET="${KIOSK_WAIT_BUDGET:-60}"
-PROFILE_DIR="${HOME:-/tmp}/.config/llama-kiosk/chrome"
+export HOME="${HOME:-/home/llama-kiosk}"
+PROFILE_DIR="$HOME/.config/llama-kiosk/chrome"
 CONTROL_HELPER="$SCRIPT_DIR/llama-kiosk-control.py"
 
 # Start the desktop-session helper only for the real kiosk session. It is bound

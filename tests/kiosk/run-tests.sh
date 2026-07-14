@@ -210,7 +210,7 @@ test_install_flow() {
     assert_eq "dedicated kiosk account recorded" "$user" \
       "$(grep '^target_user=' "$sb/var/backups/llama-kiosk/manifest" | cut -d= -f2-)"
     assert_eq "dedicated kiosk home created" "yes" \
-      "$([ -d "$sb/var/lib/llama-kiosk" ] && echo yes || echo no)"
+      "$([ -d "$sb/home/llama-kiosk" ] && echo yes || echo no)"
 
     # Session desktop file generated and points at the launcher.
     assert_file "session file created" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
@@ -295,7 +295,7 @@ test_uninstall_flow() {
     assert_eq "installer-created kiosk runtime removed" no \
       "$([ -e "$sb/usr/local/lib/llama-manager/kiosk" ] && echo yes || echo no)"
     assert_eq "installer-created kiosk home removed" "no" \
-      "$([ -e "$sb/var/lib/llama-kiosk" ] && echo yes || echo no)"
+      "$([ -e "$sb/home/llama-kiosk" ] && echo yes || echo no)"
     assert_eq "removed account ownership marker is cleared" false \
       "$(grep '^installed_kiosk_account=' "$sb/var/backups/llama-kiosk/manifest" | cut -d= -f2-)"
     assert_eq "active kiosk session stopped before account removal" "yes" \
@@ -313,8 +313,8 @@ test_uninstall_flow() {
 test_preexisting_account_is_preserved() {
     printf 'test_preexisting_account_is_preserved\n'
     local sb; sb="$(new_sandbox)"
-    mkdir -p "$sb/var/lib/llama-kiosk"
-    printf 'preexisting home\n' > "$sb/var/lib/llama-kiosk/owner-marker"
+    mkdir -p "$sb/home/llama-kiosk"
+    printf 'preexisting home\n' > "$sb/home/llama-kiosk/owner-marker"
 
     KIOSK_FAKE_CHROME=1 bash "$REPO_ROOT/scripts/install-kiosk.sh" install \
         --root "$sb" >/dev/null 2>&1
@@ -324,10 +324,60 @@ test_preexisting_account_is_preserved() {
         bash "$REPO_ROOT/scripts/install-kiosk.sh" uninstall --root "$sb" \
         >/dev/null 2>&1
     assert_file "reinstall/uninstall preserves pre-existing kiosk account home" \
-        "$sb/var/lib/llama-kiosk/owner-marker"
+        "$sb/home/llama-kiosk/owner-marker"
     assert_eq "pre-existing kiosk account is never scheduled for removal" no \
         "$([ -f "$sb/actions.log" ] && grep -q '^remove-account$' "$sb/actions.log" && echo yes || echo no)"
     rm -rf "$sb"
+}
+
+test_production_account_safety_guards() {
+    printf 'test_production_account_safety_guards\n'
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 0; }
+      getent() { printf 'llama-kiosk:x:900:900::/var/lib/legacy-kiosk:/bin/bash\n'; }
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "installer refuses an existing account with snap-incompatible home" \
+          1 "$rc"
+      assert_no_file "mismatched existing account is not claimed by manifest" \
+          "$sb/var/backups/llama-kiosk/manifest"
+      rm -rf "$sb"
+    )
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 1; }
+      useradd() { printf '%s\n' "$*" > "$sb/useradd.txt"; }
+      mkdir -p "$sb/home/llama-kiosk"
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "installer refuses to adopt an unmanaged target home" 1 "$rc"
+      assert_no_file "unmanaged home never reaches useradd" "$sb/useradd.txt"
+      rm -rf "$sb"
+    )
+
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 0; }
+      getent() { printf 'llama-kiosk:x:900:900::/home/llama-kiosk:/bin/bash\n'; }
+      userdel() { printf '%s\n' "$*" > "$sb/userdel.txt"; }
+      mkdir -p "$sb/var/backups/llama-kiosk" "$sb/home"
+      printf 'installed_kiosk_account=true\nsession_stopped=true\n' \
+          > "$sb/var/backups/llama-kiosk/manifest"
+      ln -s /tmp/replaced-home "$sb/home/llama-kiosk"
+
+      kiosk_remove_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "uninstall refuses a replaced managed-home symlink" 1 "$rc"
+      assert_no_file "unsafe replacement never reaches userdel" "$sb/userdel.txt"
+      assert_eq "refused removal retains account ownership marker" true \
+          "$(kiosk_manifest_get installed_kiosk_account)"
+      rm -rf "$sb"
+    )
 }
 
 test_preexisting_session_entry_is_restored() {
@@ -449,6 +499,7 @@ EOF
     cat > "$sb/bin/cage"  <<EOF
 #!/bin/bash
 printf '%s\n' "\$*" > "$sb/launch.txt"
+printf '%s\n' "\${HOME:-}" > "$sb/launch-home.txt"
 exit 0
 EOF
     cat > "$sb/bin/google-chrome" <<'EOF'
@@ -465,6 +516,17 @@ EOF
     assert_file "cage was invoked" "$sb/launch.txt"
     assert_eq "chrome kiosk + url passed" "yes" \
       "$(grep -q -- '--kiosk' "$sb/launch.txt" && grep -q 'localhost:3001' "$sb/launch.txt" && echo yes || echo no)"
+
+    # GDM normally supplies HOME from the managed account record. The launcher
+    # also supplies the same snap-compatible fallback when the environment is
+    # incomplete, rather than falling back outside /home where strict Firefox
+    # snap confinement cannot access its profile.
+    rm -f "$sb/launch.txt" "$sb/launch-home.txt"
+    /usr/bin/env -u HOME PATH="$sb/bin:$PATH" KIOSK_LAUNCH_ONCE=1 \
+        KIOSK_URL="http://localhost:3001" KIOSK_WAIT_BUDGET=2 \
+        /bin/bash "$REPO_ROOT/scripts/llama-kiosk-launch.sh" >/dev/null 2>&1
+    assert_eq "launcher defaults HOME to the managed snap-compatible home" \
+        "/home/llama-kiosk" "$(cat "$sb/launch-home.txt" 2>/dev/null)"
 
     # Packaged runtime reads the canonical manager EnvironmentFile rather than
     # looking for a nonexistent .env beside /usr/local/lib.
@@ -504,6 +566,7 @@ test_install_flow
 test_dry_run_no_mutation
 test_uninstall_flow
 test_preexisting_account_is_preserved
+test_production_account_safety_guards
 test_preexisting_session_entry_is_restored
 test_uninstall_without_install_preserves_session_entry
 test_session_symlink_target_is_never_overwritten

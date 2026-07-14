@@ -24,8 +24,9 @@ The installer:
 - requires `cage` and installs it through apt if missing,
 - uses Ubuntu Desktop's bundled Firefox offline, while retaining optional
   Chrome/Chromium support,
-- creates the dedicated `llama-kiosk` account with `/var/lib/llama-kiosk` as
-  its private home,
+- creates the dedicated `llama-kiosk` account with `/home/llama-kiosk` as its
+  private home, which is directly accessible to Ubuntu's strictly confined
+  Firefox snap,
 - copies the kiosk runtime to `/usr/local/lib/llama-manager/kiosk` so the
   dedicated account never needs access to the administrator's source checkout,
 - backs up `/etc/gdm3/custom.conf`, the kiosk AccountsService record, and any
@@ -49,6 +50,11 @@ dependency** so the kiosk is available without network access. The standalone
 script's apt installation is a fallback for source-based installations, not a
 replacement for declaring the appliance package dependency. Proprietary Chrome
 is never required.
+
+The installer intentionally does not run `snap set system homedirs=...`.
+Keeping this dedicated home under `/home` avoids granting snaps access to a
+broad nonstandard parent such as `/var/lib`, while preserving offline Firefox
+startup with Ubuntu's default confinement.
 
 The kiosk page includes **System Login**. It posts to a separate Python helper
 bound only to `127.0.0.1:8798`; the helper accepts only exact localhost browser

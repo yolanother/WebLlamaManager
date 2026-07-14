@@ -87,7 +87,10 @@ the autologin session — the kiosk self-heals.
    offer removal. Require any supported browser, preferring Chrome/Chromium when
    present and otherwise using the Firefox command bundled with Ubuntu Desktop.
 2. Create the dedicated locked `llama-kiosk` system account with private home
-   `/var/lib/llama-kiosk`, and copy runtime files outside administrator homes.
+   `/home/llama-kiosk`, and copy runtime files outside administrator homes.
+   This standard home location works with Ubuntu's strictly confined Firefox
+   snap without configuring a broad system-level `homedirs` override for
+   `/var/lib`.
 3. **`/etc/gdm3/custom.conf`** — back up, then enable:
    ```ini
    [daemon]
