@@ -66,7 +66,7 @@ ALLOWED_FILE_PAIRS = {
     (category, path) for category, paths in ALLOWLIST.items() for path in paths
 }
 NFS_OPTION = re.compile(
-    r"^(?:defaults|rw|ro|hard|soft|intr|nointr|sync|async|noauto|auto|_netdev|"
+    r"^(?:defaults|rw|ro|hard|soft|intr|nointr|sync|async|noatime|noauto|auto|_netdev|"
     r"nofail|bg|fg|cto|nocto|ac|noac|lock|nolock|"
     r"local_lock=(?:all|none|flock|posix)|"
     r"x-systemd\.(?:automount|(?:idle|mount|device)-timeout=\d+[smh]?|"

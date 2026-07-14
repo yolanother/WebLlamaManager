@@ -234,7 +234,7 @@ class RecoveryCliTests(unittest.TestCase):
         fstab.parent.mkdir(parents=True, exist_ok=True)
         fstab.write_text(
             "UUID=host-specific / ext4 defaults 0 1\n"
-            "nas.lan:/models /srv/models nfs4 rw,noauto,x-systemd.automount 0 0\n",
+            "nas.lan:/models /srv/models nfs4 rw,noatime,noauto,x-systemd.automount 0 0\n",
             encoding="utf-8",
         )
         kernel = self.source_root / "proc" / "sys" / "kernel" / "osrelease"
@@ -269,7 +269,7 @@ class RecoveryCliTests(unittest.TestCase):
                 {
                     "filesystem": "nfs4",
                     "mountpoint": "/srv/models",
-                    "options": ["rw", "noauto", "x-systemd.automount"],
+                    "options": ["rw", "noatime", "noauto", "x-systemd.automount"],
                     "source": "nas.lan:/models",
                 }
             ],
