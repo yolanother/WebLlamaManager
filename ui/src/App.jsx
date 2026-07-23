@@ -991,6 +991,133 @@ function ModelPerformanceBreakdown({ modelBreakdown }) {
   );
 }
 
+// Format a tok/s statistic; null (no samples) renders as an em dash.
+function fmtTps(v) {
+  return v == null ? '—' : v.toFixed(1);
+}
+
+// Format a millisecond duration compactly: sub-second in ms, otherwise
+// seconds with one decimal below a minute and whole seconds above it.
+function fmtMs(v) {
+  if (v == null) return '—';
+  if (v < 1000) return `${Math.round(v)}ms`;
+  const s = v / 1000;
+  return s < 60 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`;
+}
+
+// Per-model request statistics table backed by /api/analytics/request-stats,
+// which reads the durable per-request store rather than minute-level averages —
+// the only way median/min/max tok/s and TTFT can be reported at all. Each model
+// row expands to the same statistics bucketed by how many generations were
+// running concurrently ("slots"), so throughput degradation under load is
+// visible per model. TTFT is llama.cpp's prompt-processing (prefill) time;
+// remote backends report no timings, so theirs shows as "—".
+function ModelRequestStatsTable({ requestStats, window, onWindowChange }) {
+  const [expanded, setExpanded] = useState(() => new Set());
+  const models = requestStats?.models || [];
+
+  const toggle = (name) => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  };
+
+  const windows = [
+    { key: '24h', label: '24h' },
+    { key: '7d', label: '7d' },
+    { key: '30d', label: '30d' },
+    { key: 'all', label: 'all' }
+  ];
+
+  const statCells = (s, { bold = false } = {}) => (
+    <>
+      <td className="num">{s.requests.toLocaleString()}</td>
+      <td className={bold ? 'num model-tps-val' : 'num'}>{fmtTps(s.avgTps)}</td>
+      <td className="num">{fmtTps(s.medianTps)}</td>
+      <td className="num">{fmtTps(s.minTps)}</td>
+      <td className="num">{fmtTps(s.maxTps)}</td>
+      <td className="num">{fmtMs(s.avgDuration)}</td>
+      <td className="num">
+        {s.avgTtft == null
+          ? <span className="model-tps-empty" title="Engine reported no prefill timings">—</span>
+          : fmtMs(s.avgTtft)}
+      </td>
+    </>
+  );
+
+  return (
+    <div className="model-breakdown-table-wrap">
+      <div className="request-stats-windows">
+        {windows.map(w => (
+          <button
+            key={w.key}
+            type="button"
+            className={`request-stats-window${window === w.key ? ' active' : ''}`}
+            onClick={() => onWindowChange(w.key)}
+          >
+            {w.label}
+          </button>
+        ))}
+      </div>
+      <table className="model-breakdown-table">
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th className="num">Requests</th>
+            <th className="num">Avg TPS</th>
+            <th className="num">Median TPS</th>
+            <th className="num">Min TPS</th>
+            <th className="num">Max TPS</th>
+            <th className="num">Avg Duration</th>
+            <th className="num">Avg TTFT</th>
+          </tr>
+        </thead>
+        <tbody>
+          {models.length === 0 && (
+            <tr>
+              <td colSpan={8} className="model-breakdown-none">
+                No per-request samples in this window yet
+              </td>
+            </tr>
+          )}
+          {models.map(m => {
+            const isOpen = expanded.has(m.name);
+            return (
+              <React.Fragment key={m.name}>
+                <tr className="request-stats-model-row" onClick={() => toggle(m.name)}>
+                  <td className="model-cell-name" title={m.name}>
+                    <span className="request-stats-caret">{isOpen ? '▾' : '▸'}</span>
+                    {m.isRemote && (
+                      <span
+                        className="model-backend-pill"
+                        style={{ background: backendColor(m.backend), color: '#0a0a0a' }}
+                      >
+                        {m.backend}
+                      </span>
+                    )}
+                    {m.model}
+                  </td>
+                  {statCells(m, { bold: true })}
+                </tr>
+                {isOpen && m.slots.map(s => (
+                  <tr key={`${m.name}:${s.slots}`} className="request-stats-slot-row">
+                    <td className="request-stats-slot-label">
+                      {s.slots} {s.slots === 1 ? 'slot' : 'slots'}
+                    </td>
+                    {statCells(s)}
+                  </tr>
+                ))}
+              </React.Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // GPU/CPU compute-usage chart. Mirrors TemperatureChart but plots
 // utilization % so users can see when the iGPU is actually loaded
 // (and how that correlates with CPU spikes during prompt processing).
@@ -1335,6 +1462,8 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const [historyData, setHistoryData] = useState(null);
   const [crashData, setCrashData] = useState(null);
   const [modelBreakdown, setModelBreakdown] = useState(null);
+  const [requestStats, setRequestStats] = useState(null);
+  const [requestStatsWindow, setRequestStatsWindow] = useState('24h');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const [showAllModels, setShowAllModels] = useState(false);
@@ -1384,6 +1513,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     }
   }, []);
 
+  const fetchRequestStats = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/analytics/request-stats?window=${requestStatsWindow}`);
+      setRequestStats(await res.json());
+    } catch (err) {
+      console.error('Failed to fetch request stats:', err);
+    }
+  }, [requestStatsWindow]);
+
   const fetchHistory = useCallback(async () => {
     try {
       const [histRes, crashRes] = await Promise.all([
@@ -1402,18 +1540,22 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     fetchAnalytics();
     fetchHistory();
     fetchModelBreakdown();
+    fetchRequestStats();
     const modelsInterval = setInterval(fetchModels, 10000);
     const analyticsInterval = setInterval(fetchAnalytics, 2000);
     const historyInterval = setInterval(fetchHistory, 60000);
     // Breakdown aggregates the full analytics history file — refresh slowly.
     const breakdownInterval = setInterval(fetchModelBreakdown, 30000);
+    // Request stats aggregate the per-request store — equally slow refresh.
+    const requestStatsInterval = setInterval(fetchRequestStats, 30000);
     return () => {
       clearInterval(modelsInterval);
       clearInterval(analyticsInterval);
       clearInterval(historyInterval);
       clearInterval(breakdownInterval);
+      clearInterval(requestStatsInterval);
     };
-  }, [fetchModels, fetchAnalytics, fetchHistory, fetchModelBreakdown]);
+  }, [fetchModels, fetchAnalytics, fetchHistory, fetchModelBreakdown, fetchRequestStats]);
 
   // Refetch history when range changes
   useEffect(() => {
@@ -2723,6 +2865,18 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             <span className="chart-value">all models · weighted by request count</span>
           </h4>
           <ModelPerformanceBreakdown modelBreakdown={modelBreakdown} />
+        </div>
+
+        <div className="chart-card-wide model-breakdown-card">
+          <h4>
+            Request Statistics by Model
+            <span className="chart-value">per-request · click a model for slot breakdown</span>
+          </h4>
+          <ModelRequestStatsTable
+            requestStats={requestStats}
+            window={requestStatsWindow}
+            onWindowChange={setRequestStatsWindow}
+          />
         </div>
 
         <h4 className="analytics-section-header">System Resources</h4>

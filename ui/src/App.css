@@ -5568,6 +5568,51 @@ input::placeholder {
   font-style: italic;
   padding: 14px 12px;
 }
+/* Per-request statistics table: window picker + expandable slot rows */
+.request-stats-windows {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.request-stats-window {
+  background: transparent;
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: 6px;
+  color: var(--text-secondary, #9ca3af);
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.request-stats-window:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.request-stats-window.active {
+  border-color: #10b981;
+  color: #10b981;
+}
+.request-stats-model-row {
+  cursor: pointer;
+}
+.request-stats-caret {
+  display: inline-block;
+  width: 12px;
+  color: var(--text-secondary, #6b7280);
+  margin-right: 4px;
+}
+.request-stats-model-row .model-backend-pill {
+  margin-right: 6px;
+}
+.request-stats-slot-row td {
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-secondary, #9ca3af);
+}
+.request-stats-slot-label {
+  padding-left: 32px !important;
+  font-size: 11px;
+  color: var(--text-secondary, #9ca3af);
+}
+
 .model-breakdown-toggle {
   margin-top: 8px;
   background: transparent;
