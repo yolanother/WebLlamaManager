@@ -49,6 +49,7 @@ import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
+import { aggregateRequestStats } from './request-stats.js';
 import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
@@ -1446,6 +1447,57 @@ function loadAnalyticsHistory() {
 loadAnalyticsHistory();
 loadCrashHistory();
 
+// Per-request performance samples. The minute-level analytics records above
+// only keep per-model AVERAGE tok/s, which cannot yield median/min/max or
+// TTFT, so every completed generation also appends one compact record here:
+//   { ts, m, b, tps, ttft, dur, pt, ct }
+// ts = completion time, m = model key, b = backend, tps = tok/s, ttft =
+// prompt-processing (prefill) ms when the engine reported timings, dur =
+// generation duration ms, pt/ct = prompt/completion tokens.
+const REQUEST_SAMPLES_FILE = join(ANALYTICS_DIR, 'requests.jsonl');
+const MAX_REQUEST_SAMPLES = 200000;
+let requestSamples = [];
+
+/**
+ * Load persisted per-request samples on startup, trimming both memory and the
+ * file to MAX_REQUEST_SAMPLES so the store stays bounded across restarts.
+ */
+function loadRequestSamples() {
+  try {
+    if (!existsSync(REQUEST_SAMPLES_FILE)) return;
+    const lines = readFileSync(REQUEST_SAMPLES_FILE, 'utf-8').split('\n').filter(l => l.trim());
+    for (const line of lines) {
+      try { requestSamples.push(JSON.parse(line)); } catch { /* skip malformed lines */ }
+    }
+    requestSamples.sort((a, b) => a.ts - b.ts);
+    if (requestSamples.length > MAX_REQUEST_SAMPLES) {
+      requestSamples = requestSamples.slice(-MAX_REQUEST_SAMPLES);
+      // Rewrite the file so it does not grow without bound.
+      writeFileSync(REQUEST_SAMPLES_FILE, requestSamples.map(s => JSON.stringify(s)).join('\n') + '\n');
+    }
+    console.log(`[analytics] Loaded ${requestSamples.length} per-request samples`);
+  } catch (err) {
+    console.error('[analytics] Failed to load request samples:', err.message);
+  }
+}
+loadRequestSamples();
+
+/**
+ * Append one completed generation to the per-request store (memory + JSONL).
+ *
+ * @param {Object} sample - The compact record described above.
+ */
+function recordRequestSample(sample) {
+  requestSamples.push(sample);
+  if (requestSamples.length > MAX_REQUEST_SAMPLES) requestSamples.shift();
+  try {
+    if (!existsSync(ANALYTICS_DIR)) mkdirSync(ANALYTICS_DIR, { recursive: true });
+    appendFileSync(REQUEST_SAMPLES_FILE, JSON.stringify(sample) + '\n');
+  } catch (err) {
+    console.error('[analytics] Failed to write request sample:', err.message);
+  }
+}
+
 // Request stats accumulator (per-minute tallies)
 const requestStatsAccum = {
   total: 0,
@@ -1832,7 +1884,7 @@ function addAnalyticsPoint(category, data) {
 
 // Record token stats from a completion
 function recordTokenStats(stats) {
-  const { promptTokens, completionTokens, tokensPerSecond, model, duration, backend } = stats;
+  const { promptTokens, completionTokens, tokensPerSecond, model, duration, backend, ttftMs } = stats;
 
   tokenStats.totalPromptTokens += promptTokens || 0;
   tokenStats.totalCompletionTokens += completionTokens || 0;
@@ -1867,6 +1919,20 @@ function recordTokenStats(stats) {
 
     // Add to time-series
     addAnalyticsPoint('tokens', requestRecord);
+
+    // Durable per-request sample for the model performance table. Only the
+    // local llama paths report engine timings, so ttft is null for remote
+    // backends and ds4 rather than a misleading zero.
+    recordRequestSample({
+      ts: requestRecord.timestamp,
+      m: modelKey,
+      b: backend || 'local',
+      tps: Math.round((tokensPerSecond || 0) * 10) / 10,
+      ttft: Number.isFinite(ttftMs) ? Math.round(ttftMs) : null,
+      dur: Math.round(duration || 0),
+      pt: promptTokens || 0,
+      ct: completionTokens || 0
+    });
   }
 }
 
@@ -6794,6 +6860,17 @@ app.get('/api/analytics/models', (req, res) => {
   res.json({ models: result });
 });
 
+// Per-model performance detail from the durable per-request store: request
+// count, average/median/min/max tok/s, average duration and average TTFT,
+// each model additionally broken down by concurrency ("slots"). Unlike
+// /api/analytics/models — which averages minute-level snapshots and so can
+// only report a mean — this reads individual requests, which is what makes
+// median/min/max and TTFT possible.
+app.get('/api/analytics/request-stats', (req, res) => {
+  const window = req.query.window || '24h';
+  res.json(aggregateRequestStats(requestSamples, { now: Date.now(), window }));
+});
+
 app.get('/api/analytics/crashes', (req, res) => {
   const range = req.query.range || '1w';
   const now = Date.now();
@@ -8278,7 +8355,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
             completionTokens,
             tokensPerSecond,
             model,
-            duration: inferDuration
+            duration: inferDuration,
+            ttftMs: serverTimings?.prompt_ms
           });
           logLlm({
             endpoint: 'chat/completions', model, stream: true,
@@ -8347,7 +8425,8 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         completionTokens,
         tokensPerSecond,
         model: requestedModel,
-        duration: inferDuration
+        duration: inferDuration,
+        ttftMs: timings.prompt_ms
       });
 
       logLlm({
@@ -8605,7 +8684,8 @@ app.post('/api/v1/completions', async (req, res) => {
             completionTokens: completionsServerTimings?.predicted_n || tokens,
             tokensPerSecond,
             model: requestedModel,
-            duration: inferDuration
+            duration: inferDuration,
+            ttftMs: completionsServerTimings?.prompt_ms
           });
           addLlmLog({
             endpoint: 'completions', model: requestedModel, stream: true,
@@ -8638,7 +8718,8 @@ app.post('/api/v1/completions', async (req, res) => {
         completionTokens,
         tokensPerSecond,
         model: requestedModel,
-        duration: inferDuration
+        duration: inferDuration,
+        ttftMs: timings.prompt_ms
       });
 
       addLlmLog({
