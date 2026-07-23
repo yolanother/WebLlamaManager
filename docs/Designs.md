@@ -54,6 +54,7 @@ API and routes/offloads requests across local and remote backends. It provides:
 | [DocsPage.md](Designs/DocsPage.md) | In-app documentation page design |
 | [ApiDocs.md](Designs/ApiDocs.md) | API documentation enhancements |
 | [OpenCode.md](Designs/OpenCode.md) | OpenCode AI integration |
+| [RequestStatistics.md](Designs/RequestStatistics.md) | Per-request store, TTFT capture, and the per-model median/min/max tok/s table |
 | [Feature.md](Designs/Feature.md) | Template for documenting new features |
 
 ## Screenshots
