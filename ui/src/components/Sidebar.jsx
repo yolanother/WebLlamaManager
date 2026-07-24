@@ -6,12 +6,27 @@
 // site-theme logo.
 
 import React from 'react';
-import { NavLink, useLocation } from 'react-router-dom';
+import { NavLink } from 'react-router-dom';
 import { useSiteThemeLogo } from '../theme/siteTheme.js';
+import {
+  ApiDocsIcon,
+  ChatIcon,
+  DashboardIcon,
+  DocsIcon,
+  DownloadIcon,
+  ExternalLinkIcon,
+  LlamaCppIcon,
+  LogsIcon,
+  ModelsIcon,
+  PresetsIcon,
+  ProcessesIcon,
+  QueueIcon,
+  SettingsIcon,
+} from './icons.jsx';
+import '../styles/sidebar.css';
 
 // Sidebar Navigation
 function Sidebar({ stats }) {
-  const location = useLocation();
   // Healthy when EITHER the llama server is up OR the ds4 engine is active and
   // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
   // is the real signal — otherwise the chat/status would show "not running").
@@ -19,7 +34,7 @@ function Sidebar({ stats }) {
   const logoSrc = useSiteThemeLogo('/favicon/favicon-32x32.png');
 
   return (
-    <nav className="sidebar">
+    <nav className="sidebar sidebar-glass" aria-label="Primary navigation">
       <div className="sidebar-header">
         <div className="sidebar-title">
           <img src={logoSrc} alt="Llama" className="sidebar-logo" />
@@ -38,74 +53,78 @@ function Sidebar({ stats }) {
 
       <div className="sidebar-nav">
         <NavLink to="/" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x1F4CA;</span>
+          <DashboardIcon className="nav-icon" />
           Dashboard
         </NavLink>
         <NavLink to="/chat" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x1F4AC;</span>
+          <ChatIcon className="nav-icon" />
           Chat
         </NavLink>
 
         <div className="nav-divider" />
 
         <NavLink to="/models" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x1F4E6;</span>
+          <ModelsIcon className="nav-icon" />
           Models
         </NavLink>
         <NavLink to="/presets" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x2728;</span>
+          <PresetsIcon className="nav-icon" />
           Presets
         </NavLink>
         <NavLink to="/download" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x2B07;</span>
+          <DownloadIcon className="nav-icon" />
           Download
         </NavLink>
 
         <div className="nav-divider" />
 
         <NavLink to="/logs" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x1F4DC;</span>
+          <LogsIcon className="nav-icon" />
           Logs
         </NavLink>
         <NavLink to="/queue" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x1F4CB;</span>
+          <QueueIcon className="nav-icon" />
           Queue
         </NavLink>
         <NavLink to="/processes" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x1F5A5;</span>
+          <ProcessesIcon className="nav-icon" />
           Processes
         </NavLink>
 
         <div className="nav-divider" />
 
         <NavLink to="/docs" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x1F4DA;</span>
+          <DocsIcon className="nav-icon" />
           Docs
         </NavLink>
         <NavLink to="/api-docs" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x1F4D6;</span>
+          <ApiDocsIcon className="nav-icon" />
           API Docs
         </NavLink>
 
         <div className="nav-divider" />
 
-        <NavLink to="/settings" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
-          <span className="nav-icon">&#x2699;</span>
-          Settings
-        </NavLink>
-      </div>
-
-      <div className="sidebar-footer">
         <a
           href={stats?.llamaUiUrl || `http://${window.location.hostname}:${stats?.llamaPort || 5251}`}
           target="_blank"
           rel="noopener noreferrer"
           className="nav-item external"
+          aria-label="Open llama.cpp UI in a new tab"
         >
-          <span className="nav-icon">&#x1F310;</span>
+          <LlamaCppIcon className="nav-icon" />
           llama.cpp UI
-          <span className="external-icon">↗</span>
+          <ExternalLinkIcon className="nav-external-icon" />
         </a>
+      </div>
+
+      <div className="sidebar-footer">
+        <NavLink
+          to="/settings"
+          className={({ isActive }) => `nav-item sidebar-settings glass-btn ${isActive ? 'active' : ''}`}
+        >
+          <SettingsIcon className="nav-icon" />
+          Settings
+        </NavLink>
       </div>
     </nav>
   );
