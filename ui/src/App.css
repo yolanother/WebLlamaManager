@@ -6333,14 +6333,30 @@ input::placeholder {
   --ambient-image: url('/backgrounds/glass-light.webp');
 }
 
+html[data-effects="simple"] {
+  --ambient-image: none;
+}
+
 html {
   min-width: 0;
   background: var(--bg-primary);
 }
 
 body {
+  position: relative;
+  isolation: isolate;
   min-width: 0;
   min-height: 100vh;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
   /* Layer order: tinted radials float above the generated ambient artwork
      (--ambient-image, per-scheme; site themes may override or set to none),
      with --bg-primary as the base coat behind everything. */
@@ -6350,8 +6366,7 @@ body {
     radial-gradient(circle at 52% 92%, var(--ambient-success) 0, transparent 38rem),
     var(--ambient-image, none) center / cover no-repeat,
     var(--bg-primary);
-  background-attachment: fixed;
-  color: var(--text-primary);
+  transform: translateZ(0);
 }
 
 .app-layout,
@@ -6395,7 +6410,7 @@ body {
     color-mix(in srgb, var(--bg-primary) 72%, transparent);
 }
 
-/* Shared raised surfaces. Blur belongs to container panels, never table rows. */
+/* Shared raised surfaces. */
 .card,
 .stat-card,
 .resource-card,
@@ -6430,12 +6445,49 @@ body {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-raised);
+}
+
+/* Blur belongs to container panels, never repeated list/table row cards. */
+.card,
+.stat-card,
+.resource-card,
+.chart-card,
+.chart-card-wide,
+.create-preset-form,
+.no-quants-state,
+.empty-state,
+.filters-panel,
+.logs-container,
+.request-logs-table,
+.queue-table,
+.process-summary,
+.api-endpoints-list,
+.api-endpoint-detail,
+.docs-content,
+.models-modal,
+.ds4-download-section,
+.server-status-strip,
+.downloads-dropdown,
+.message-stats-tooltip,
+.query-container {
   -webkit-backdrop-filter:
     blur(var(--glass-blur))
     saturate(var(--glass-saturate));
   backdrop-filter:
     blur(var(--glass-blur))
     saturate(var(--glass-saturate));
+}
+
+/* High-frequency cards and nested dashboard stats stay compositor-cheap. */
+.preset-card,
+.model-card,
+.search-result,
+.quant-item,
+.process-card,
+.ds4-option,
+.token-stat-card.glass-panel {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
 
 .chart-card-wide,
@@ -7031,6 +7083,43 @@ tbody tr:hover td,
   background: var(--glass-sheen), var(--glass-bg-elevated);
 }
 
+/* Simple effects is fully opaque and never creates backdrop compositor layers. */
+html[data-effects="simple"] .models-modal-overlay,
+html[data-effects="simple"] .sidebar.sidebar-glass,
+html[data-effects="simple"] .chat-stage-header,
+html[data-effects="simple"] .chat-drop-overlay,
+html[data-effects="simple"] .card,
+html[data-effects="simple"] .stat-card,
+html[data-effects="simple"] .resource-card,
+html[data-effects="simple"] .chart-card,
+html[data-effects="simple"] .chart-card-wide,
+html[data-effects="simple"] .create-preset-form,
+html[data-effects="simple"] .no-quants-state,
+html[data-effects="simple"] .empty-state,
+html[data-effects="simple"] .filters-panel,
+html[data-effects="simple"] .logs-container,
+html[data-effects="simple"] .request-logs-table,
+html[data-effects="simple"] .queue-table,
+html[data-effects="simple"] .process-summary,
+html[data-effects="simple"] .api-endpoints-list,
+html[data-effects="simple"] .api-endpoint-detail,
+html[data-effects="simple"] .docs-content,
+html[data-effects="simple"] .models-modal,
+html[data-effects="simple"] .ds4-download-section,
+html[data-effects="simple"] .server-status-strip,
+html[data-effects="simple"] .downloads-dropdown,
+html[data-effects="simple"] .message-stats-tooltip,
+html[data-effects="simple"] .query-container,
+html[data-effects="simple"] input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+html[data-effects="simple"] body select,
+html[data-effects="simple"] body textarea,
+html[data-effects="simple"] .searchable-select-trigger,
+html[data-effects="simple"] .searchable-select-dropdown,
+html[data-effects="simple"] .searchable-select-search {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
 /* Opaque fallbacks mirror the foundation pattern for every extended panel. */
 @supports not (backdrop-filter: blur(1px)) {
   .card,
@@ -7101,7 +7190,7 @@ tbody tr:hover td,
 }
 
 @media (max-width: 768px) {
-  body {
+  body::before {
     background:
       radial-gradient(circle at 12% 5%, var(--ambient-accent) 0, transparent 24rem),
       radial-gradient(circle at 90% 36%, var(--ambient-info) 0, transparent 22rem),

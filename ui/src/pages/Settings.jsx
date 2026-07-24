@@ -11,8 +11,11 @@ import { resolveLlamaUpdateView } from '../llama-update-policy.js';
 import { DEFAULT_THEME_ID } from '../theme/manifest.js';
 import {
   getColorScheme,
+  rerunEffectsProbe,
   selectSiteTheme,
   setColorScheme,
+  setEffectsMode,
+  useEffectsMode,
   useSiteTheme,
 } from '../theme/siteTheme.js';
 import '../styles/pages.css';
@@ -59,10 +62,16 @@ function SiteThemeSection() {
 
 function AppearanceSection() {
   const [scheme, setScheme] = useState(() => getColorScheme());
-  const options = [
+  const effects = useEffectsMode();
+  const schemeOptions = [
     { value: 'dark', label: 'Dark' },
     { value: 'light', label: 'Light' },
     { value: 'system', label: 'System' },
+  ];
+  const effectsOptions = [
+    { value: 'auto', label: 'Auto' },
+    { value: 'glass', label: 'Glass' },
+    { value: 'simple', label: 'Simple' },
   ];
 
   const selectScheme = (value) => {
@@ -70,11 +79,23 @@ function AppearanceSection() {
     setScheme(value);
   };
 
+  const effectsHint = effects.preference === 'auto'
+    ? `Auto — ${effects.resolved} (${
+      effects.reason === 'checking'
+        ? 'checking performance…'
+        : effects.reason === 'reduced-transparency'
+          ? 'reduced transparency'
+          : effects.reason === 'unsupported'
+            ? 'backdrop filter unavailable'
+            : 'measured'
+    })`
+    : `${effects.preference === 'glass' ? 'Glass' : 'Simple'} — manually selected`;
+
   return (
     <section className="page-section glass-panel appearance-section">
       <div className="appearance-section__header">
         <h3>Appearance</h3>
-        <p>Choose the interface color scheme and optional host-provided site theme.</p>
+        <p>Choose the interface color scheme, effects, and optional host-provided site theme.</p>
       </div>
       <div className="scheme-setting">
         <span id="color-scheme-label">Color scheme</span>
@@ -83,7 +104,7 @@ function AppearanceSection() {
           role="group"
           aria-labelledby="color-scheme-label"
         >
-          {options.map(({ value, label }) => (
+          {schemeOptions.map(({ value, label }) => (
             <button
               key={value}
               type="button"
@@ -98,6 +119,42 @@ function AppearanceSection() {
         <p className="setting-hint">
           System follows your operating system preference and updates automatically.
         </p>
+      </div>
+      <div className="scheme-setting">
+        <span id="effects-mode-label">Effects</span>
+        <div
+          className="scheme-segmented"
+          role="group"
+          aria-labelledby="effects-mode-label"
+        >
+          {effectsOptions.map(({ value, label }) => (
+            <button
+              key={value}
+              type="button"
+              className={`glass-btn scheme-option ${effects.preference === value ? 'active' : ''}`}
+              aria-pressed={effects.preference === value}
+              onClick={() => setEffectsMode(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <p className="setting-hint" aria-live="polite">{effectsHint}</p>
+        <div>
+          <button
+            type="button"
+            className="btn-secondary btn-small glass-btn"
+            disabled={effects.preference !== 'auto'}
+            title={
+              effects.preference === 'auto'
+                ? 'Clear the cached result and measure visible frame performance again'
+                : 'Select Auto to run the performance check'
+            }
+            onClick={rerunEffectsProbe}
+          >
+            Re-run performance check
+          </button>
+        </div>
       </div>
       <SiteThemeSection />
     </section>
