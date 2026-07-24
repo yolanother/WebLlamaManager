@@ -10,6 +10,8 @@ import {
   presetEngine,
   resolveDs4Config,
   engineDescriptor,
+  ds4EnableGate,
+  buildLocalServerRegistry,
   validatePresetEngineFields,
   resolveDs4ModelPath,
   ds4ModelEntry,
@@ -374,4 +376,80 @@ test('validateDs4DownloadRequest: filename/quantization/default pattern shaping'
   const byDefault = validateDs4DownloadRequest({ repo: 'antirez/deepseek-v4-gguf' }, DS4_CFG);
   assert.deepEqual(byDefault.includePatterns, ['*.gguf']);
   assert.equal(byDefault.downloadId, 'antirez/deepseek-v4-gguf:all');
+});
+
+// ---------------------------------------------------------------------------
+// ds4EnableGate — is there enough unified memory to offer enabling ds4?
+// ---------------------------------------------------------------------------
+
+test('ds4EnableGate: eligible when free memory covers the streaming requirement', () => {
+  const cfg = resolveDs4Config({}, {}); // streamingWeightBytes 50G + safety 5G ≈ 55G
+  const g = ds4EnableGate({ freeMemBytes: 60 * 1024 ** 3, ds4Config: cfg });
+  assert.equal(g.eligible, true);
+  assert.equal(g.requiredBytes, cfg.streamingWeightBytes + cfg.safetyBytes);
+  assert.equal(g.freeBytes, 60 * 1024 ** 3);
+});
+
+test('ds4EnableGate: ineligible with a reason when memory is short', () => {
+  const cfg = resolveDs4Config({}, {});
+  const g = ds4EnableGate({ freeMemBytes: 20 * 1024 ** 3, ds4Config: cfg });
+  assert.equal(g.eligible, false);
+  assert.match(g.reason, /memory/i);
+});
+
+test('ds4EnableGate: non-streaming presets require the full weight + safety', () => {
+  const cfg = { ...resolveDs4Config({}, {}), ssdStreaming: 'off', weightBytes: 80 * 1024 ** 3 };
+  const g = ds4EnableGate({ freeMemBytes: 60 * 1024 ** 3, ds4Config: cfg });
+  assert.equal(g.requiredBytes, 80 * 1024 ** 3 + cfg.safetyBytes);
+  assert.equal(g.eligible, false);
+});
+
+// ---------------------------------------------------------------------------
+// buildLocalServerRegistry — one uniform descriptor per local server.
+// ---------------------------------------------------------------------------
+
+test('buildLocalServerRegistry: llama + embeddings + ds4, differing only by models/state', () => {
+  const reg = buildLocalServerRegistry({
+    llama: { running: true, healthy: true, port: 5251, models: ['gemma-4', 'gpt-oss-120b'], mode: 'router', tps: 100.5, requests: 3 },
+    embed: { running: true, healthy: true, port: 5252, models: ['Qwen3-Embedding-0.6B'] },
+    ds4: { ds4Config: resolveDs4Config({}, {}), running: false, freeMemBytes: 60 * 1024 ** 3 },
+  });
+  const byId = Object.fromEntries(reg.map((s) => [s.id, s]));
+  assert.deepEqual(reg.map((s) => s.id).sort(), ['ds4', 'embeddings', 'llama']);
+
+  // llama: running router, gemma is one of its models
+  assert.equal(byId.llama.type, ENGINE_TYPES.LLAMA);
+  assert.equal(byId.llama.state, 'running');
+  assert.ok(byId.llama.models.includes('gemma-4'));
+  assert.equal(byId.llama.tps, 100.5);
+
+  // embeddings: same shape as llama, only models differ
+  assert.deepEqual(Object.keys(byId.embeddings).sort(), Object.keys(byId.llama).sort());
+
+  // ds4: not running but eligible to enable → offered
+  assert.equal(byId.ds4.type, ENGINE_TYPES.DS4);
+  assert.equal(byId.ds4.state, 'available');
+  assert.equal(byId.ds4.enable.eligible, true);
+});
+
+test('buildLocalServerRegistry: ds4 shows insufficient-memory when it cannot fit', () => {
+  const reg = buildLocalServerRegistry({
+    llama: { running: true, healthy: true, port: 5251, models: [] },
+    embed: { running: false, healthy: false, port: 5252, models: [] },
+    ds4: { ds4Config: resolveDs4Config({}, {}), running: false, freeMemBytes: 10 * 1024 ** 3 },
+  });
+  const ds4 = reg.find((s) => s.id === 'ds4');
+  assert.equal(ds4.state, 'insufficient-memory');
+  assert.equal(ds4.enable.eligible, false);
+});
+
+test('buildLocalServerRegistry: a running ds4 reports running regardless of the gate', () => {
+  const reg = buildLocalServerRegistry({
+    llama: { running: true, healthy: true, port: 5251, models: [] },
+    embed: { running: false, healthy: false, port: 5252, models: [] },
+    ds4: { ds4Config: resolveDs4Config({}, {}), running: true, healthy: true, freeMemBytes: 5 * 1024 ** 3, models: ['deepseek-v4'] },
+  });
+  const ds4 = reg.find((s) => s.id === 'ds4');
+  assert.equal(ds4.state, 'running');
+  assert.ok(ds4.models.includes('deepseek-v4'));
 });

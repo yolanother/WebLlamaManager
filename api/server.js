@@ -54,7 +54,8 @@ import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
-  listDs4GgufFiles, validateDs4DownloadRequest
+  listDs4GgufFiles, validateDs4DownloadRequest,
+  buildLocalServerRegistry
 } from './engines.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { createDs4Updater } from './ds4-updater.js';
@@ -2537,8 +2538,37 @@ async function getSystemStats() {
     try { ds4Stats = await getDs4Health(); } catch { /* ds4 down */ }
   }
 
+  // Uniform per-local-server view: the llama.cpp router (hosts general GGUF
+  // models AND gemma-4 via --mmproj+MTP), the embeddings server, and ds4 — all
+  // in one shape, differing only by their models and state. Remote backends are
+  // intentionally out of scope here; ds4 is offered as an enable-gated option
+  // (never auto-started) when unified-memory headroom allows.
+  const servers = buildLocalServerRegistry({
+    llama: {
+      running: llamaProcess !== null && !llamaProcess.killed,
+      healthy: !!llamaStats && (llamaStats.status ? llamaStats.status === 'ok' : true),
+      port: LLAMA_PORT,
+      models: loadedModelsSnapshot.map((m) => m.id),
+      mode: currentMode,
+    },
+    embed: {
+      running: !!embedStats,
+      healthy: !!embedStats && embedStats.status !== 'error',
+      port: EMBED_PORT,
+      models: embedStats?.model ? [embedStats.model] : [],
+    },
+    ds4: {
+      ds4Config: resolveDs4Config(config, process.env),
+      running: currentEngine === ENGINE_TYPES.DS4 && !!ds4Stats,
+      healthy: !!ds4Stats,
+      freeMemBytes: memAvailableBytes(),
+      models: ds4Stats?.model ? [ds4Stats.model] : [],
+    },
+  });
+
   return {
     timestamp: Date.now(),
+    servers,
     cpu: {
       usage: Math.round(cpuUsage * 10) / 10,
       appUsage: appUsage.cpuUsage,

@@ -213,6 +213,103 @@ export function engineDescriptor(type, { ds4Config, llamaPort } = {}) {
 }
 
 /**
+ * Human-readable byte size for gate reasons (GiB, one decimal).
+ * @param {number} bytes
+ * @returns {string}
+ */
+function gib(bytes) {
+  return `${(Number(bytes || 0) / 1024 ** 3).toFixed(1)} GiB`;
+}
+
+/**
+ * Decide whether ds4 can be OFFERED as an enable-able server given current free
+ * unified memory. ds4 is never auto-started; this only powers the "enable if
+ * there is enough memory" affordance in the tracking UI. Streaming presets need
+ * only the resident streaming-weight estimate (+ safety); non-streaming presets
+ * need the full on-disk weight (+ safety).
+ * @param {{freeMemBytes?:number, ds4Config?:object}} params
+ * @returns {{eligible:boolean, requiredBytes:number, freeBytes:number, streaming:boolean, reason:string}}
+ */
+export function ds4EnableGate({ freeMemBytes = 0, ds4Config } = {}) {
+  const cfg = ds4Config || resolveDs4Config({}, {});
+  const streaming = String(cfg.ssdStreaming ?? 'auto').toLowerCase() !== 'off';
+  const weight = streaming
+    ? num(cfg.streamingWeightBytes, 50 * 1024 ** 3)
+    : num(cfg.weightBytes, 80 * 1024 ** 3);
+  const requiredBytes = weight + num(cfg.safetyBytes, 5 * 1024 ** 3);
+  const freeBytes = num(freeMemBytes, 0);
+  const eligible = freeBytes >= requiredBytes;
+  const reason = eligible
+    ? `Enough memory to enable DS4 (needs ~${gib(requiredBytes)}, ${gib(freeBytes)} free).`
+    : `Not enough memory to enable DS4: needs ~${gib(requiredBytes)}${streaming ? ' (SSD-streaming)' : ' (full weight)'}, only ${gib(freeBytes)} free.`;
+  return { eligible, requiredBytes, freeBytes, streaming, reason };
+}
+
+/**
+ * Build ONE uniform descriptor per LOCAL inference server the manager tracks —
+ * the llama.cpp router (hosts general GGUF models AND gemma-4 via --mmproj+MTP),
+ * the embeddings server, and ds4. Every entry has the SAME shape; the only
+ * things that differ are the models each serves and its state. Pure: all live
+ * inputs (running/healthy/models/queue/tps/requests, free memory) are passed in
+ * so the server handler owns I/O and this stays unit-testable.
+ *
+ * `state` is one of: 'running' (up + healthy), 'degraded' (up, not healthy),
+ * 'idle' (not running but ready to serve), 'available' (ds4 off but eligible to
+ * enable), 'insufficient-memory' (ds4 off and cannot fit), 'down'.
+ *
+ * @param {{llama:object, embed:object, ds4:object}} params
+ * @returns {Array<object>} uniform server descriptors, id-sorted
+ */
+export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {} } = {}) {
+  /** Shape a plain (llama-family) local server entry into the uniform record. */
+  const entry = (id, type, displayName, role, src, supports) => {
+    const running = !!src.running;
+    const healthy = running && src.healthy !== false;
+    let state;
+    if (running) state = healthy ? 'running' : 'degraded';
+    else state = src.idleReady ? 'idle' : 'down';
+    return {
+      id,
+      type,
+      displayName,
+      role,
+      running,
+      healthy,
+      port: src.port ?? null,
+      models: Array.isArray(src.models) ? src.models : [],
+      mode: src.mode ?? null,
+      queue: src.queue ?? null,
+      tps: src.tps ?? null,
+      requests: src.requests ?? null,
+      supports,
+      state,
+      enable: null,
+    };
+  };
+
+  const llamaEntry = entry('llama', ENGINE_TYPES.LLAMA, 'Llama.cpp Router', 'router',
+    { ...llama, idleReady: llama.idleReady ?? true },
+    { router: true, slots: true, vision: true, speculative: true });
+
+  const embedEntry = entry('embeddings', ENGINE_TYPES.LLAMA, 'Embeddings', 'embeddings',
+    { ...embed, idleReady: embed.idleReady ?? false },
+    { router: false, slots: false, vision: false, speculative: false });
+
+  // ds4: same uniform shape, plus an enable-gate when it's not running.
+  const ds4cfg = ds4.ds4Config || resolveDs4Config({}, {});
+  const ds4Entry = entry('ds4', ENGINE_TYPES.DS4, 'DS4 (DeepSeek V4 Flash)', 'single',
+    { ...ds4, idleReady: false },
+    { router: false, slots: false, vision: false, speculative: false });
+  if (!ds4Entry.running) {
+    const gate = ds4EnableGate({ freeMemBytes: ds4.freeMemBytes, ds4Config: ds4cfg });
+    ds4Entry.enable = gate;
+    ds4Entry.state = gate.eligible ? 'available' : 'insufficient-memory';
+  }
+
+  return [llamaEntry, embedEntry, ds4Entry].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
  * Validate the engine-related fields of a preset create/update request body.
  * Returns the normalized engine and (for ds4) a validated ds4 field block, or a
  * human-readable error. Does NOT touch the filesystem — existence checks stay in

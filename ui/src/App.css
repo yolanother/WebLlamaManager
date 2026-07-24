@@ -5643,6 +5643,16 @@ input::placeholder {
   border-left-width: 3px;
   border-radius: 8px;
 }
+/* Uniform per-local-server tiles (llama router / embeddings / ds4). */
+.server-registry-title {
+  margin: 16px 0 8px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+.server-registry-grid .stat-sub { white-space: normal; }
 .server-status-strip.success { border-left-color: var(--success); }
 .server-status-strip.warning { border-left-color: var(--warning); }
 .server-status-strip.error { border-left-color: var(--error); }
