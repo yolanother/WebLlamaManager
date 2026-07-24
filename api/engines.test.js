@@ -12,6 +12,8 @@ import {
   engineDescriptor,
   ds4EnableGate,
   buildLocalServerRegistry,
+  renderModelsPresetIni,
+  gemmaMtpPresetSection,
   validatePresetEngineFields,
   resolveDs4ModelPath,
   ds4ModelEntry,
@@ -452,4 +454,46 @@ test('buildLocalServerRegistry: a running ds4 reports running regardless of the 
   const ds4 = reg.find((s) => s.id === 'ds4');
   assert.equal(ds4.state, 'running');
   assert.ok(ds4.models.includes('deepseek-v4'));
+});
+
+// ---------------------------------------------------------------------------
+// models-preset INI (router speculative-decode wiring for gemma-4)
+// ---------------------------------------------------------------------------
+
+test('renderModelsPresetIni: emits [section] with dash-stripped long-flag keys', () => {
+  const ini = renderModelsPresetIni([
+    { name: 'my-model', options: { 'model-draft': '/d.gguf', 'spec-type': 'draft-mtp', 'spec-draft-n-max': '1' } },
+  ]);
+  assert.match(ini, /^\[my-model\]/m);
+  assert.match(ini, /^model-draft = \/d\.gguf$/m);
+  assert.match(ini, /^spec-type = draft-mtp$/m);
+  assert.match(ini, /^spec-draft-n-max = 1$/m);
+});
+
+test('renderModelsPresetIni: empty sections → empty string (no --models-preset needed)', () => {
+  assert.equal(renderModelsPresetIni([]), '');
+  assert.equal(renderModelsPresetIni([].filter(Boolean)), '');
+});
+
+test('gemmaMtpPresetSection: present drafter → gemma section with draft-mtp flags', () => {
+  const s = gemmaMtpPresetSection({ modelsDir: '/home/u/models', draftExists: true });
+  assert.equal(s.name, 'google_gemma-4-E2B-it-qat-q4_0-gguf');
+  assert.equal(s.options['spec-type'], 'draft-mtp');
+  assert.equal(s.options['spec-draft-n-max'], '1');
+  assert.equal(s.options['gpu-layers-draft'], '99');
+  assert.equal(s.options['model-draft'], '/home/u/models/google_gemma-4-E2B-it-assistant/gemma-4-E2B-it-assistant-BF16.gguf');
+});
+
+test('gemmaMtpPresetSection: no drafter → null (router serves gemma without MTP)', () => {
+  assert.equal(gemmaMtpPresetSection({ modelsDir: '/m', draftExists: false }), null);
+});
+
+test('renderModelsPresetIni round-trips the gemma section into a valid child argv', () => {
+  const s = gemmaMtpPresetSection({ modelsDir: '/m', draftExists: true });
+  const ini = renderModelsPresetIni([s]);
+  // The router strips dashes on write; a consumer re-adds them. Assert the four
+  // options are present so the child gets --model-draft/--spec-type/etc.
+  for (const k of ['model-draft', 'spec-type', 'spec-draft-n-max', 'gpu-layers-draft']) {
+    assert.match(ini, new RegExp(`^${k} = `, 'm'), `missing ${k}`);
+  }
 });

@@ -5229,7 +5229,12 @@ input::placeholder {
   position: absolute;
   top: 100%;
   left: 0;
-  right: 0;
+  /* Grow to fit the longest model name (not just the narrow trigger width) so
+     similarly-prefixed ids like the four google_gemma-4-* models stay
+     distinguishable; capped so it never overflows a small panel. */
+  min-width: 100%;
+  width: max-content;
+  max-width: min(460px, 90vw);
   margin-top: 4px;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
@@ -5265,9 +5270,9 @@ input::placeholder {
   font-size: 14px;
   color: var(--text);
   transition: background-color 0.15s;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /* Wrap long model ids instead of truncating them to an ambiguous prefix. */
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .searchable-select-option:hover {

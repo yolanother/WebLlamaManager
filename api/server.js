@@ -55,7 +55,7 @@ import {
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, validateDs4DownloadRequest,
-  buildLocalServerRegistry
+  buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection
 } from './engines.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { createDs4Updater } from './ds4-updater.js';
@@ -4838,6 +4838,31 @@ async function ensureModelServed(modelName) {
   }
 }
 
+/**
+ * Write the router's `--models-preset` INI (into the cache dir, shared into the
+ * distrobox via $HOME) enabling MTP speculative decode for gemma-4-E2B when its
+ * 78M drafter GGUF is present. The router auto-detects --mmproj but cannot infer
+ * a draft model, so this is how gemma gets served at ~124-140 tok/s instead of
+ * ~100. Returns the file path, or '' when there is nothing to configure (caller
+ * then omits MODELS_PRESET so the router behaves exactly as before).
+ * @returns {string}
+ */
+function writeModelsPresetFile() {
+  try {
+    const draftPath = join(MODELS_DIR, 'google_gemma-4-E2B-it-assistant', 'gemma-4-E2B-it-assistant-BF16.gguf');
+    const sections = [gemmaMtpPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(draftPath) })].filter(Boolean);
+    const ini = renderModelsPresetIni(sections);
+    if (!ini) return '';
+    const path = join(RUNTIME_PATHS.cacheDir, 'models-preset.ini');
+    mkdirSync(RUNTIME_PATHS.cacheDir, { recursive: true });
+    writeFileSync(path, ini);
+    return path;
+  } catch (e) {
+    console.warn(`[router] could not write models-preset (serving without MTP): ${e.message}`);
+    return '';
+  }
+}
+
 async function restartLlamaServer({ governed = true } = {}) {
   // When the active engine is ds4, "restart the local server" means restart the
   // ds4 supervisor's process, NOT llama-server (which is stopped). The ds4
@@ -4933,6 +4958,7 @@ async function restartLlamaServer({ governed = true } = {}) {
         NO_WARMUP: config.noWarmup ? '1' : '',
         FLASH_ATTN: config.flashAttn ? '1' : '',
         GPU_LAYERS: String(config.gpuLayers || 99),
+        MODELS_PRESET: writeModelsPresetFile(),
         HF_TOKEN: resolveHfToken(config, process.env)
       };
 
@@ -5543,6 +5569,7 @@ app.post('/api/server/start', async (req, res) => {
       NO_WARMUP: config.noWarmup ? '1' : '',
       FLASH_ATTN: config.flashAttn ? '1' : '',
       GPU_LAYERS: String(config.gpuLayers || 99),
+      MODELS_PRESET: writeModelsPresetFile(),
       HF_TOKEN: resolveHfToken(config, process.env)
     };
 

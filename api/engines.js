@@ -310,6 +310,46 @@ export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {} } = 
 }
 
 /**
+ * Render a llama.cpp router `--models-preset` INI from section descriptors. The
+ * router merges each `[model-name]` section onto the auto-generated per-model
+ * preset (so --model/--mmproj/--ctx-size are preserved and these options are
+ * ADDED). Keys are the long CLI flag with leading dashes stripped, matching the
+ * router's own INI writer. Returns '' when there are no sections (caller then
+ * omits --models-preset entirely).
+ * @param {Array<{name:string, options:Object<string,string>}>} sections
+ * @returns {string}
+ */
+export function renderModelsPresetIni(sections = []) {
+  const real = (sections || []).filter(Boolean);
+  if (!real.length) return '';
+  return real
+    .map((s) => `[${s.name}]\n` + Object.entries(s.options || {}).map(([k, v]) => `${k} = ${v}`).join('\n') + '\n')
+    .join('\n');
+}
+
+/**
+ * Build the models-preset section that enables MTP speculative decode for the
+ * gemma-4-E2B model — the router auto-detects its --mmproj but cannot infer a
+ * draft model, so we declare the 78M Gemma-4 assistant/MTP drafter here. n_max=1
+ * is the measured optimum (~124-140 tok/s vs ~100 without). Returns null when
+ * the drafter GGUF is absent so the router just serves gemma un-accelerated.
+ * @param {{modelsDir:string, draftExists:boolean}} params
+ * @returns {{name:string, options:Object<string,string>}|null}
+ */
+export function gemmaMtpPresetSection({ modelsDir, draftExists } = {}) {
+  if (!draftExists) return null;
+  return {
+    name: 'google_gemma-4-E2B-it-qat-q4_0-gguf',
+    options: {
+      'model-draft': `${modelsDir}/google_gemma-4-E2B-it-assistant/gemma-4-E2B-it-assistant-BF16.gguf`,
+      'spec-type': 'draft-mtp',
+      'spec-draft-n-max': '1',
+      'gpu-layers-draft': '99',
+    },
+  };
+}
+
+/**
  * Validate the engine-related fields of a preset create/update request body.
  * Returns the normalized engine and (for ds4) a validated ds4 field block, or a
  * human-readable error. Does NOT touch the filesystem — existence checks stay in
