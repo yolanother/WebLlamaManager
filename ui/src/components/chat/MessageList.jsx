@@ -3,9 +3,10 @@
 // LICENSE file in the repository root.
 //
 // Maintains near-bottom auto-scroll behavior, a jump-to-latest affordance,
-// streaming status, empty-state suggestions, and drag-and-drop feedback.
+// streaming status, day-group rhythm, empty-state suggestions, artifact
+// launchers, and drag-and-drop feedback.
 
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Message } from './Message.jsx';
 
@@ -16,15 +17,31 @@ const SUGGESTIONS = [
   'Paste a YouTube link and ask what happens at 01:15',
 ];
 
+function dayDetails(timestamp) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const today = new Date();
+  const key = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+  const todayKey = `${today.getFullYear()}-${today.getMonth()}-${today.getDate()}`;
+  return {
+    key,
+    label: key === todayKey
+      ? 'Today'
+      : date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }),
+  };
+}
+
 /**
  * Centered, scrollable message column with restrained auto-follow behavior.
  */
 function MessageList({
+  artifacts = [],
   messages,
   streamingMessage,
   routedModel,
   isStreaming,
   onEdit,
+  onOpenArtifact,
   onRegenerate,
   onSuggestion,
   onDropFiles,
@@ -33,6 +50,13 @@ function MessageList({
   const [nearBottom, setNearBottom] = useState(true);
   const [dragging, setDragging] = useState(false);
   const dragDepthRef = useRef(0);
+  const artifactsById = useMemo(
+    () => new Map(artifacts.map((artifact) => [artifact.id, artifact])),
+    [artifacts],
+  );
+  const lastAssistantId = !isStreaming && messages.at(-1)?.role === 'assistant'
+    ? messages.at(-1).id
+    : null;
 
   const jumpToLatest = (behavior = 'smooth') => {
     const element = scrollRef.current;
@@ -95,14 +119,33 @@ function MessageList({
             </div>
           </div>
         ) : (
-          messages.map((message) => (
-            <Message
-              key={message.id}
-              message={message}
-              onEdit={onEdit}
-              onRegenerate={onRegenerate}
-            />
-          ))
+          messages.map((message, index) => {
+            const day = dayDetails(message.timestamp);
+            const previousDay = dayDetails(messages[index - 1]?.timestamp);
+            const showDay = day && day.key !== previousDay?.key;
+            const spacing = index > 0 && messages[index - 1].role === message.role
+              ? 'same-role'
+              : 'role-change';
+            return (
+              <Fragment key={message.id}>
+                {showDay && (
+                  <div className="chat-day-divider" role="separator" aria-label={day.label}>
+                    <span className="glass-chip">{day.label}</span>
+                  </div>
+                )}
+                <Message
+                  artifacts={(message.artifactIds || [])
+                    .map((id) => artifactsById.get(id))
+                    .filter(Boolean)}
+                  message={message}
+                  onEdit={onEdit}
+                  onOpenArtifact={onOpenArtifact}
+                  onRegenerate={message.id === lastAssistantId ? onRegenerate : undefined}
+                  spacing={spacing}
+                />
+              </Fragment>
+            );
+          })
         )}
         {isStreaming && (
           <Message
@@ -113,6 +156,7 @@ function MessageList({
               content: streamingMessage,
               routedModel,
             }}
+            spacing={messages.at(-1)?.role === 'assistant' ? 'same-role' : 'role-change'}
           />
         )}
       </div>

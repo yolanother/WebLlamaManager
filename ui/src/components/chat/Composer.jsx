@@ -17,16 +17,15 @@ function ComposerIcon({ type }) {
   if (type === 'video') return <><rect x="3" y="5" width="14" height="14" rx="2" /><path d="m17 10 4-2v8l-4-2" /></>;
   if (type === 'link') return <path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1m3 6a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" />;
   if (type === 'stop') return <rect x="6" y="6" width="12" height="12" rx="2" />;
-  if (type === 'regenerate') return <path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6" />;
-  return <path d="m5 12 14-7-5 14-2-6-7-1Zm7 1 7-8" />;
+  return <path d="M12 19V5m0 0-6 6m6-6 6 6" />;
 }
 
 /**
  * Docked floating input surface for text and multimodal chat requests.
  */
 function Composer({
+  artifactContext,
   attachments,
-  canRegenerate,
   disabled,
   editing,
   isStreaming,
@@ -34,10 +33,10 @@ function Composer({
   models,
   onCancelEdit,
   onChange,
+  onDismissArtifactContext,
   onImageFiles,
   onLongText,
   onModelChange,
-  onRegenerate,
   onRemoveAttachment,
   onRetryAttachment,
   onStop,
@@ -94,6 +93,19 @@ function Composer({
         </div>
       )}
       <div className="chat-composer glass-panel glass-panel--floating">
+        {artifactContext && (
+          <div className="chat-artifact-context glass-chip">
+            <span aria-hidden="true">&lt;/&gt;</span>
+            <strong>Editing: {artifactContext.title} (v{artifactContext.versionIndex + 1})</strong>
+            <button
+              type="button"
+              onClick={onDismissArtifactContext}
+              aria-label={`Stop editing ${artifactContext.title} with the agent`}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {attachments.length > 0 && (
           <div className="chat-attachment-list">
             {attachments.map((attachment) => (
@@ -208,12 +220,7 @@ function Composer({
           {isStreaming ? (
             <button type="button" className="chat-submit-button is-stop" onClick={onStop}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><ComposerIcon type="stop" /></svg>
-              <span>Stop</span>
-            </button>
-          ) : !canSend && canRegenerate ? (
-            <button type="button" className="chat-submit-button is-regenerate" onClick={onRegenerate} disabled={disabled}>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><ComposerIcon type="regenerate" /></svg>
-              <span>Regenerate</span>
+              <span className="chat-visually-hidden">Stop generating</span>
             </button>
           ) : (
             <button type="button" className="chat-submit-button" onClick={submit} disabled={!canSend}>
