@@ -1,9 +1,9 @@
-// Llama Manager — monitoring dashboard page.
+// Llama Manager — skeuomorphic-glass monitoring dashboard page.
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Renders the standard and kiosk monitoring dashboards, including live resource,
-// request, model, and historical analytics views.
+// Renders the glass bento landing view and kiosk dashboard, including live
+// resource, request, model, and historical analytics views.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
@@ -26,13 +26,43 @@ import {
   UsageChart,
   PowerChart,
   MemoryChart,
-  MODEL_SPEED_COLORS,
   TokensChart,
   ActiveRequestPanel,
   formatHistoryTime,
   HistoryTooltip,
   TimeRangeSelector,
 } from '../components/util.jsx';
+
+// Keep Dashboard-owned Recharts series themeable. The shared chart helpers still
+// provide data/rendering primitives, while every color chosen in this page flows
+// through runtime-overridable site theme variables.
+const DASHBOARD_CHART_COLORS = {
+  ...CHART_COLORS,
+  temperature: 'var(--error)',
+  temperatureCpu: 'var(--warning)',
+  power: 'var(--warning)',
+  memory: 'var(--success)',
+  memorySecondary: 'var(--info)',
+  appUsage: 'var(--accent)',
+  tokens: 'var(--accent)',
+  requestOk: 'var(--success)',
+  requestErr: 'var(--error)',
+  requestRetry: 'var(--warning)',
+  requestRestart: 'var(--info)',
+  contextUsed: 'var(--info)',
+  contextTotal: 'var(--accent)',
+  queueActive: 'var(--accent)',
+  queuePending: 'var(--warning)',
+  offloaded: 'var(--info)',
+};
+
+const DASHBOARD_MODEL_SPEED_COLORS = [
+  'var(--accent)',
+  'var(--success)',
+  'var(--warning)',
+  'var(--error)',
+  'var(--info)',
+];
 
 // Dashboard Page
 //
@@ -382,7 +412,13 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     : [];
 
   // Build model usage over time (top 5 models as line series)
-  const MODEL_LINE_COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a78bfa'];
+  const MODEL_LINE_COLORS = [
+    'var(--accent)',
+    'var(--success)',
+    'var(--warning)',
+    'var(--error)',
+    'var(--info)',
+  ];
   const modelUsageOverTime = React.useMemo(() => {
     const points = historyData?.points || [];
     if (points.length === 0) return { data: [], models: [] };
@@ -482,14 +518,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
         {/* Persistent header — visible on all pages */}
         <div className="fullscreen-persistent-header">
           <div className="fullscreen-resources-row">
-            <div className="resource-card">
+            <div className="resource-card glass-panel">
               <ProgressRing value={stats?.cpu?.usage || 0} size={56} strokeWidth={5} color={stats?.cpu?.usage > 80 ? 'var(--error)' : 'var(--accent)'} />
               <div className="resource-info">
                 <span className="resource-label">CPU</span>
                 <span className="resource-detail">{stats?.cpu?.cores || 0} cores @ {stats?.cpu?.loadAvg?.[0]?.toFixed(1) || '0.0'} load</span>
               </div>
             </div>
-            <div className="resource-card">
+            <div className="resource-card glass-panel">
               <ProgressRing value={stats?.memory?.usage || 0} size={56} strokeWidth={5} color={stats?.memory?.usage > 80 ? 'var(--error)' : 'var(--success)'} />
               <div className="resource-info">
                 <span className="resource-label">Memory</span>
@@ -497,7 +533,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               </div>
             </div>
             {stats?.gpu && (
-              <div className="resource-card">
+              <div className="resource-card glass-panel">
                 <ProgressRing value={stats.gpu.isAPU ? (stats.gpu.gtt?.usage || 0) : (stats.gpu.vram?.usage || 0)} size={56} strokeWidth={5} color="var(--warning)" />
                 <div className="resource-info">
                   <span className="resource-label">{stats.gpu.isAPU ? 'GTT' : 'VRAM'}</span>
@@ -506,19 +542,19 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               </div>
             )}
             {stats?.gpu?.power > 0 && (
-              <div className="resource-card">
+              <div className="resource-card glass-panel">
                 <div className="power-display" style={{ width: 56, height: 56 }}><div className="power-inner"><span className="power-value" style={{ fontSize: 16 }}>{stats.gpu.power.toFixed(0)}</span><span className="power-unit">W</span></div></div>
                 <div className="resource-info"><span className="resource-label">Power</span><span className="resource-detail">{stats.gpu.temperature > 0 ? `${stats.gpu.temperature}°C` : ''}</span></div>
               </div>
             )}
-            <div className="resource-card">
+            <div className="resource-card glass-panel">
               <ProgressRing value={stats?.context?.usage || 0} size={56} strokeWidth={5} color="var(--info)" />
               <div className="resource-info">
                 <span className="resource-label">Context</span>
                 <span className="resource-detail">{stats?.context?.totalContext > 0 ? `${(stats.context.usedContext || 0).toLocaleString()} / ${(stats.context.totalContext || 0).toLocaleString()}` : 'No models'}</span>
               </div>
             </div>
-            <div className="resource-card persistent-queue-card">
+            <div className="resource-card glass-panel persistent-queue-card">
               <div className="resource-info">
                 <span className="resource-label">Queue</span>
                 <span className="resource-detail">
@@ -527,12 +563,12 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <span className={`queue-count ${(stats?.queue?.pending || 0) > 0 ? 'queue-pending' : ''}`}>{stats?.queue?.pending || 0} pending</span>
                 </span>
                 {!kiosk && (stats?.queue?.pending || 0) > 0 && (
-                  <button className="persistent-flush-btn" onClick={flushQueue}>Flush</button>
+                  <button className="persistent-flush-btn glass-btn" onClick={flushQueue}>Flush</button>
                 )}
               </div>
             </div>
             {stats?.backends && Object.keys(stats.backends).length > 0 && (
-              <div className="resource-card" style={{ minWidth: 'auto' }}>
+              <div className="resource-card glass-panel" style={{ minWidth: 'auto' }}>
                 <div className="resource-info">
                   <span className="resource-label">Remote Backends</span>
                   <span className="resource-detail" style={{ fontSize: '0.8em' }}>
@@ -555,7 +591,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               <StatCard label="Status" value={isHealthy ? 'Running' : 'Stopped'} status={isHealthy ? 'success' : 'error'} icon="&#x1F7E2;" />
               <StatCard label="Mode" value={isSingleMode ? 'Single Model' : 'Router (Multi)'} subValue={stats?.preset?.name || null} icon="&#x1F3AF;" />
               <StatCard label="Uptime" value={formatUptime(stats?.llama?.uptime)} icon="&#x23F1;&#xFE0F;" />
-              <div className="stat-card loaded-models-card">
+              <div className="stat-card glass-panel loaded-models-card">
                 <span className="stat-icon">&#x1F4E6;</span>
                 <div className="stat-content">
                   <span className="stat-value">{loadedModelCount} Loaded</span>
@@ -581,26 +617,26 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </div>
           </div>
           <div className="fullscreen-charts-grid">
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Temperature <span className="chart-value">
                 <span style={{ color: severityColor(sensorSeverity(stats?.gpu?.temperature, stats?.guard)) }}>GPU: {stats?.gpu?.temperature?.toFixed(0) || 0}°C</span>
                 {stats?.cpu?.temperature ? <> / <span style={{ color: severityColor(sensorSeverity(stats.cpu.temperature, stats?.guard)) }}>CPU: {stats.cpu.temperature}°C</span></> : ''}
               </span></h4>
               <TemperatureChart data={analytics?.temperature || []} height={200} />
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>GPU / CPU Usage <span className="chart-value">GPU: {stats?.gpu?.usage?.toFixed(0) || 0}%{stats?.cpu?.usage != null ? ` / CPU: ${stats.cpu.usage.toFixed(0)}%` : ''}</span></h4>
               <UsageChart data={analytics?.usage || []} height={200} />
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Power <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span></h4>
               <PowerChart data={analytics?.power || []} height={200} />
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Memory <span className="chart-value">{stats?.gpu?.isAPU ? `GTT: ${stats?.gpu?.gtt?.usage?.toFixed(0) || 0}%` : `VRAM: ${stats?.gpu?.vram?.usage?.toFixed(0) || 0}%`}</span></h4>
               <MemoryChart data={analytics?.memory || []} primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'} height={200} />
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Generation Speed <span className="chart-value">{analytics?.tokenStats?.averageTokensPerSecond?.toFixed(1) || 0} tok/s</span></h4>
               <TokensChart data={analytics?.tokens || []} height={200} />
             </div>
@@ -616,31 +652,31 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </div>
             {historyData?.summary && (
               <div className="fullscreen-resources-row">
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
                     <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.totalRequests.toLocaleString()}</span>
                     <span className="resource-detail">Total Requests</span>
                   </div>
                 </div>
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
                     <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--error)' }}>{historyData.summary.totalErrors.toLocaleString()}</span>
                     <span className="resource-detail">Errors</span>
                   </div>
                 </div>
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
-                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: '#f59e0b' }}>{(historyData.summary.totalRetries || 0).toLocaleString()}</span>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--warning)' }}>{(historyData.summary.totalRetries || 0).toLocaleString()}</span>
                     <span className="resource-detail">Retries</span>
                   </div>
                 </div>
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
-                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: '#f97316' }}>{(historyData.summary.totalRestarts || 0).toLocaleString()}</span>
+                    <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--info)' }}>{(historyData.summary.totalRestarts || 0).toLocaleString()}</span>
                     <span className="resource-detail">Restarts</span>
                   </div>
                 </div>
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
                     <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.avgTps}</span>
                     <span className="resource-detail">Avg tok/s</span>
@@ -650,53 +686,53 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             )}
           </div>
           <div className="fullscreen-charts-grid">
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Power Consumption</h4>
               <div className="chart-container" style={{ height: 200 }}>
                 {historyPoints.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <defs><linearGradient id="gradFsPwr" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.power} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.power} stopOpacity={0} /></linearGradient></defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <defs><linearGradient id="gradFsPwr" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.power} stopOpacity={0.3} /><stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.power} stopOpacity={0} /></linearGradient></defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                      <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit="W" range={historyRange} />} />
-                      <Area type="monotone" dataKey="pwr" name="Power" stroke={CHART_COLORS.power} fill="url(#gradFsPwr)" strokeWidth={2} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="pwr" name="Power" stroke={DASHBOARD_CHART_COLORS.power} fill="url(#gradFsPwr)" strokeWidth={2} dot={false} animationDuration={500} />
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No historical data yet</div>}
               </div>
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Memory Usage</h4>
               <div className="chart-container" style={{ height: 200 }}>
                 {historyPoints.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <defs><linearGradient id="gradFsMem" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.memory} stopOpacity={0.3} /><stop offset="95%" stopColor={CHART_COLORS.memory} stopOpacity={0} /></linearGradient><linearGradient id="gradFsSys" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0.2} /><stop offset="95%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0} /></linearGradient></defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                      <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <defs><linearGradient id="gradFsMem" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.memory} stopOpacity={0.3} /><stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.memory} stopOpacity={0} /></linearGradient><linearGradient id="gradFsSys" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.memorySecondary} stopOpacity={0.2} /><stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.memorySecondary} stopOpacity={0} /></linearGradient></defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                      <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis domain={[0, 100]} tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
-                      <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={CHART_COLORS.memory} fill="url(#gradFsMem)" strokeWidth={2} dot={false} animationDuration={500} />
-                      <Area type="monotone" dataKey="ms" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradFsSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
+                      <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={DASHBOARD_CHART_COLORS.memory} fill="url(#gradFsMem)" strokeWidth={2} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="ms" name="System" stroke={DASHBOARD_CHART_COLORS.memorySecondary} fill="url(#gradFsSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No historical data yet</div>}
               </div>
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Generation Speed by Model</h4>
               <div className="chart-container" style={{ height: 200 }}>
                 {modelSpeedOverTime.data.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={modelSpeedOverTime.data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                      <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
                       {modelSpeedOverTime.models.map((m, i) => {
-                        const color = MODEL_SPEED_COLORS[i % MODEL_SPEED_COLORS.length];
+                        const color = DASHBOARD_MODEL_SPEED_COLORS[i % DASHBOARD_MODEL_SPEED_COLORS.length];
                         const label = m.length > 30 ? m.slice(0, 27) + '...' : m;
                         return (
                           <React.Fragment key={m}>
@@ -710,20 +746,20 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 ) : <div className="chart-empty">No per-model speed data yet</div>}
               </div>
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Request Volume</h4>
               <div className="chart-container" style={{ height: 200 }}>
                 {historyPoints.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                      <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip range={historyRange} />} />
-                      <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
-                      <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
-                      <Area type="monotone" dataKey="rRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
-                      <Area type="monotone" dataKey="rRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="rOk" name="Success" stroke={DASHBOARD_CHART_COLORS.requestOk} fill={DASHBOARD_CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                      <Area type="monotone" dataKey="rErr" name="Errors" stroke={DASHBOARD_CHART_COLORS.requestErr} fill={DASHBOARD_CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                      <Area type="monotone" dataKey="rRt" name="Retries" stroke={DASHBOARD_CHART_COLORS.requestRetry} fill={DASHBOARD_CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
+                      <Area type="monotone" dataKey="rRs" name="Restarts" stroke={DASHBOARD_CHART_COLORS.requestRestart} fill={DASHBOARD_CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No historical data yet</div>}
@@ -741,25 +777,25 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </div>
             {historyData?.summary && (
               <div className="fullscreen-resources-row">
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
                     <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.totalRequests.toLocaleString()}</span>
                     <span className="resource-detail">Total Requests</span>
                   </div>
                 </div>
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
                     <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{Object.keys(historyData.summary.modelCounts || {}).length}</span>
                     <span className="resource-detail">Models Used</span>
                   </div>
                 </div>
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
                     <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--error)' }}>{(crashData?.summary?.total || 0).toLocaleString()}</span>
                     <span className="resource-detail">Crashes</span>
                   </div>
                 </div>
-                <div className="resource-card">
+                <div className="resource-card glass-panel">
                   <div className="resource-info" style={{ textAlign: 'center' }}>
                     <span className="resource-label" style={{ fontSize: 24, fontFamily: 'monospace', color: 'var(--accent)' }}>{historyData.summary.avgTps}</span>
                     <span className="resource-detail">Avg tok/s</span>
@@ -769,15 +805,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             )}
           </div>
           <div className="fullscreen-charts-grid">
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Requests by Model</h4>
               <div className="chart-container" style={{ height: 200 }}>
                 {modelUsageData.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={modelUsageData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} />
-                      <YAxis dataKey="name" type="category" tick={{ fill: '#ccc', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                      <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} />
+                      <YAxis dataKey="name" type="category" tick={{ fill: 'var(--text-primary)', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit=" requests" range={historyRange} />} />
                       <Bar dataKey="count" name="Requests" fill="var(--accent)" radius={[0, 4, 4, 0]} animationDuration={500} />
                     </BarChart>
@@ -785,15 +821,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 ) : <div className="chart-empty">No model data in this time range</div>}
               </div>
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Model Usage Over Time</h4>
               <div className="chart-container" style={{ height: 200 }}>
                 {modelUsageOverTime.data.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={modelUsageOverTime.data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                      <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                      <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                      <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                       <Tooltip content={<HistoryTooltip range={historyRange} />} />
                       {modelUsageOverTime.models.map((model, i) => (
                         <Line key={model} type="monotone" dataKey={model} name={model.length > 30 ? model.slice(0, 27) + '...' : model} stroke={MODEL_LINE_COLORS[i]} strokeWidth={2} dot={false} animationDuration={500} />
@@ -811,15 +847,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 ))}
               </div>
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Crashes by Model</h4>
               <div className="chart-container" style={{ height: 200 }}>
                 {crashByModelData.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={crashByModelData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} allowDecimals={false} />
-                      <YAxis dataKey="name" type="category" tick={{ fill: '#ccc', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                      <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} allowDecimals={false} />
+                      <YAxis dataKey="name" type="category" tick={{ fill: 'var(--text-primary)', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit=" crashes" range={historyRange} />} />
                       <Bar dataKey="count" name="Crashes" fill="var(--error)" radius={[0, 4, 4, 0]} animationDuration={500} />
                     </BarChart>
@@ -827,7 +863,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 ) : <div className="chart-empty">No crash data</div>}
               </div>
             </div>
-            <div className="chart-card">
+            <div className="chart-card glass-panel">
               <h4>Generation Speed by Model</h4>
               <div className="chart-container" style={{ height: 200 }}>
                 {(() => {
@@ -838,11 +874,11 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   return data.length > 0 ? (
                     <ResponsiveContainer width="100%" height="100%">
                       <BarChart data={data} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
-                        <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                        <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} />
-                        <YAxis dataKey="model" type="category" tick={{ fill: '#ccc', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                        <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} />
+                        <YAxis dataKey="model" type="category" tick={{ fill: 'var(--text-primary)', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
                         <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
-                        <Bar dataKey="tps" name="Avg tok/s" fill={CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
+                        <Bar dataKey="tps" name="Avg tok/s" fill={DASHBOARD_CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
                       </BarChart>
                     </ResponsiveContainer>
                   ) : <div className="chart-empty">No per-model speed data in this time range</div>;
@@ -871,7 +907,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             {fullscreenPage + 1} / {FULLSCREEN_PAGES}
           </div>
           {showSystemLogin && (
-            <button className="kiosk-system-login" onClick={openSystemLogin}>
+            <button className="kiosk-system-login glass-btn" onClick={openSystemLogin}>
               System Login
             </button>
           )}
@@ -883,35 +919,38 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   }
 
   return (
-    <div className="page dashboard">
-      <div className="page-header">
-        <h2>Dashboard</h2>
+    <div className="page dashboard dashboard-glass">
+      <div className="page-header dashboard-hero glass-panel glass-panel--floating">
+        <div>
+          <h2>Dashboard</h2>
+        </div>
         <div className="header-actions">
-          <button className="btn-secondary" onClick={enterFullscreen} title="Fullscreen Dashboard">
+          <button className="btn-secondary glass-btn" onClick={enterFullscreen} title="Fullscreen Dashboard">
             &#x26F6;
           </button>
           {(stats?.queue?.pending || 0) > 0 && (
-            <button className="btn-warning" onClick={flushQueue} title="Cancel all pending requests">
+            <button className="btn-warning glass-btn" onClick={flushQueue} title="Cancel all pending requests">
               Flush Queue ({stats.queue.pending})
             </button>
           )}
           {isHealthy ? (
-            <button className="btn-danger" onClick={stopServer} disabled={loading.server}>
+            <button className="btn-danger glass-btn" onClick={stopServer} disabled={loading.server}>
               {loading.server ? 'Stopping...' : 'Stop Server'}
             </button>
           ) : (
-            <button className="btn-primary" onClick={startServer} disabled={loading.server}>
+            <button className="btn-primary glass-btn" onClick={startServer} disabled={loading.server}>
               {loading.server ? 'Starting...' : 'Start Server'}
             </button>
           )}
         </div>
       </div>
 
+      <div className="dashboard-overview-grid">
       {/* Server Status */}
-      <section className="dashboard-section">
+      <section className="dashboard-section dashboard-overview-section">
         <h3>Server Status</h3>
         {/* Thin status strip: run-state on the left, thermal guard / temps on the right */}
-        <div className={`server-status-strip ${guardActive ? (stats.guard.state === 'critical' ? 'error' : 'warning') : (isHealthy ? 'success' : stats?.mode ? 'warning' : 'error')}`}>
+        <div className={`server-status-strip glass-panel ${guardActive ? (stats.guard.state === 'critical' ? 'error' : 'warning') : (isHealthy ? 'success' : stats?.mode ? 'warning' : 'error')}`}>
           <div className="status-strip-left">
             <span className={`status-strip-dot ${isHealthy ? 'success' : stats?.mode ? 'warning' : 'error'}`} />
             <span className="status-strip-state">{isHealthy ? 'Running' : stats?.mode ? 'Starting' : 'Stopped'}</span>
@@ -936,7 +975,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             icon="&#x1F3AF;"
             status={stats?.activeModel ? 'active' : undefined}
           />
-          <div className="stat-card loaded-models-card compact">
+          <div className="stat-card glass-panel loaded-models-card compact">
             <span className="stat-icon">&#x1F4E6;</span>
             <div className="stat-content">
               <span className="stat-value">{loadedModelCount} Loaded</span>
@@ -963,7 +1002,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               {allModels.length > loadedModels.length && (
                 <button
                   type="button"
-                  className="view-all-models-btn"
+                  className="view-all-models-btn glass-btn"
                   onClick={() => setShowAllModels(true)}
                 >
                   View all {allModels.length} models
@@ -1036,7 +1075,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               <h3>All Models <span className="models-modal-count">{loadedModelCount} / {allModels.length} loaded</span></h3>
               <button
                 type="button"
-                className="models-modal-close"
+                className="models-modal-close glass-btn"
                 aria-label="Close"
                 onClick={() => setShowAllModels(false)}
               >
@@ -1071,10 +1110,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
       )}
 
       {/* System Resources */}
-      <section className="dashboard-section">
+      <section className="dashboard-section dashboard-overview-section">
         <h3>System Resources</h3>
         <div className="resources-grid">
-          <div className="resource-card">
+          <div className="resource-card glass-panel">
             <ProgressRing
               centerValue={stats?.cpu?.usage || 0}
               segments={[
@@ -1104,7 +1143,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </div>
           </div>
 
-          <div className="resource-card">
+          <div className="resource-card glass-panel">
             <ProgressRing
               value={stats?.memory?.usage || 0}
               color={stats?.memory?.usage > 80 ? 'var(--error)' : 'var(--success)'}
@@ -1117,7 +1156,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </div>
           </div>
 
-          <div className="resource-card">
+          <div className="resource-card glass-panel">
             <ProgressRing
               value={stats?.gpu?.isAPU
                 ? (stats?.gpu?.gtt?.usage || 0)
@@ -1147,7 +1186,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {stats?.gpu && (
-            <div className="resource-card">
+            <div className="resource-card glass-panel">
               <ProgressRing
                 value={stats.gpu.usage || 0}
                 color="var(--accent)"
@@ -1168,7 +1207,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           )}
 
           {stats?.gpu?.power > 0 && (
-            <div className="resource-card">
+            <div className="resource-card glass-panel">
               <div className="power-display">
                 <div className="power-inner">
                   <span className="power-value">{stats.gpu.power.toFixed(0)}</span>
@@ -1184,7 +1223,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </div>
           )}
 
-          <div className="resource-card">
+          <div className="resource-card glass-panel">
             <ProgressRing
               value={stats?.context?.usage || 0}
               color="var(--info)"
@@ -1207,6 +1246,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
         </div>
       </section>
+      </div>
 
       {/* Downloads */}
       {stats?.downloads && Object.keys(stats.downloads).length > 0 && (
@@ -1245,7 +1285,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
         <h3>Performance Analytics (5 min)</h3>
         <div className="charts-grid">
           {/* Temperature Chart */}
-          <div className="chart-card">
+          <div className="chart-card glass-panel">
             <h4>
               Temperature
               <span className="chart-value">
@@ -1267,7 +1307,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* GPU/CPU Usage Chart */}
-          <div className="chart-card">
+          <div className="chart-card glass-panel">
             <h4>
               GPU / CPU Usage
               <span className="chart-value">
@@ -1286,14 +1326,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 CPU
               </div>
               <div className="chart-legend-item">
-                <span className="chart-legend-dot" style={{ background: CHART_COLORS.appUsage }}></span>
+                <span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.appUsage }}></span>
                 App CPU
               </div>
             </div>
           </div>
 
           {/* Power Chart */}
-          <div className="chart-card">
+          <div className="chart-card glass-panel">
             <h4>
               Power Consumption
               <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span>
@@ -1302,7 +1342,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Memory Chart */}
-          <div className="chart-card">
+          <div className="chart-card glass-panel">
             <h4>
               Memory Usage
               <span className="chart-value">
@@ -1326,14 +1366,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 System
               </div>
               <div className="chart-legend-item">
-                <span className="chart-legend-dot" style={{ background: CHART_COLORS.appUsage }}></span>
+                <span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.appUsage }}></span>
                 App
               </div>
             </div>
           </div>
 
           {/* Tokens/sec Chart */}
-          <div className="chart-card">
+          <div className="chart-card glass-panel">
             <h4>
               Generation Speed
               <span className="chart-value">
@@ -1342,15 +1382,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </h4>
             <TokensChart data={analytics?.tokens || []} />
             <div className="token-stats-grid">
-              <div className="token-stat-card">
+              <div className="token-stat-card glass-panel">
                 <div className="token-stat-value">{analytics?.tokenStats?.totalRequests || 0}</div>
                 <div className="token-stat-label">Requests</div>
               </div>
-              <div className="token-stat-card">
+              <div className="token-stat-card glass-panel">
                 <div className="token-stat-value">{((analytics?.tokenStats?.totalPromptTokens || 0) / 1000).toFixed(1)}k</div>
                 <div className="token-stat-label">Prompt Tokens</div>
               </div>
-              <div className="token-stat-card">
+              <div className="token-stat-card glass-panel">
                 <div className="token-stat-value">{((analytics?.tokenStats?.totalCompletionTokens || 0) / 1000).toFixed(1)}k</div>
                 <div className="token-stat-label">Completion Tokens</div>
               </div>
@@ -1360,7 +1400,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           {/* Per-Model tok/s ranking — pulls from long-term aggregated history so
               every model that ever served traffic appears, not just the in-memory
               recent-requests buffer. Color encodes local vs each remote backend. */}
-          <div className="chart-card chart-card-wide">
+          <div className="chart-card glass-panel chart-card-wide">
             <h4>
               Model Speed Ranking
               <span className="chart-value">avg tok/s · all time</span>
@@ -1373,7 +1413,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Context Usage Chart */}
-          <div className="chart-card">
+          <div className="chart-card glass-panel">
             <h4>
               Context Usage
               <span className="chart-value">
@@ -1386,20 +1426,20 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <AreaChart data={analytics.context} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <defs>
                       <linearGradient id="gradCtxTotal" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.contextTotal} stopOpacity={0.2} />
-                        <stop offset="95%" stopColor={CHART_COLORS.contextTotal} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.contextTotal} stopOpacity={0.2} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.contextTotal} stopOpacity={0} />
                       </linearGradient>
                       <linearGradient id="gradCtxUsed" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.contextUsed} stopOpacity={0.4} />
-                        <stop offset="95%" stopColor={CHART_COLORS.contextUsed} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.contextUsed} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.contextUsed} stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                     <XAxis dataKey="timestamp" hide />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : v} />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : v} />
                     <Tooltip content={<ChartTooltip unit=" tokens" />} />
-                    <Area type="monotone" dataKey="totalContext" name="Total" stroke={CHART_COLORS.contextTotal} fill="url(#gradCtxTotal)" strokeWidth={1} strokeDasharray="4 2" dot={false} />
-                    <Area type="monotone" dataKey="usedContext" name="Used" stroke={CHART_COLORS.contextUsed} fill="url(#gradCtxUsed)" strokeWidth={2} dot={false} />
+                    <Area type="monotone" dataKey="totalContext" name="Total" stroke={DASHBOARD_CHART_COLORS.contextTotal} fill="url(#gradCtxTotal)" strokeWidth={1} strokeDasharray="4 2" dot={false} />
+                    <Area type="monotone" dataKey="usedContext" name="Used" stroke={DASHBOARD_CHART_COLORS.contextUsed} fill="url(#gradCtxUsed)" strokeWidth={2} dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No context data yet</div>}
@@ -1407,7 +1447,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Request Queue Chart */}
-          <div className="chart-card">
+          <div className="chart-card glass-panel">
             <h4>
               Request Queue
               <span className="chart-value">
@@ -1420,20 +1460,20 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <AreaChart data={analytics.queue} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <defs>
                       <linearGradient id="gradQActive" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.queueActive} stopOpacity={0.4} />
-                        <stop offset="95%" stopColor={CHART_COLORS.queueActive} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.queueActive} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.queueActive} stopOpacity={0} />
                       </linearGradient>
                       <linearGradient id="gradQPending" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.queuePending} stopOpacity={0.4} />
-                        <stop offset="95%" stopColor={CHART_COLORS.queuePending} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.queuePending} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.queuePending} stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                     <XAxis dataKey="timestamp" hide />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <Tooltip content={<ChartTooltip />} />
-                    <Area type="monotone" dataKey="active" name="Active" stroke={CHART_COLORS.queueActive} fill="url(#gradQActive)" strokeWidth={2} dot={false} />
-                    <Area type="monotone" dataKey="pending" name="Pending" stroke={CHART_COLORS.queuePending} fill="url(#gradQPending)" strokeWidth={2} dot={false} />
+                    <Area type="monotone" dataKey="active" name="Active" stroke={DASHBOARD_CHART_COLORS.queueActive} fill="url(#gradQActive)" strokeWidth={2} dot={false} />
+                    <Area type="monotone" dataKey="pending" name="Pending" stroke={DASHBOARD_CHART_COLORS.queuePending} fill="url(#gradQPending)" strokeWidth={2} dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No queue data yet</div>}
@@ -1451,27 +1491,27 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
 
         {historyData?.summary && (
           <div className="history-summary">
-            <div className="token-stat-card">
+            <div className="token-stat-card glass-panel">
               <div className="token-stat-value">{historyData.summary.totalRequests.toLocaleString()}</div>
               <div className="token-stat-label">Total Requests</div>
             </div>
-            <div className="token-stat-card">
+            <div className="token-stat-card glass-panel">
               <div className="token-stat-value" style={{ color: 'var(--error)' }}>{historyData.summary.totalErrors.toLocaleString()}</div>
               <div className="token-stat-label">Total Errors</div>
             </div>
-            <div className="token-stat-card">
-              <div className="token-stat-value" style={{ color: '#f59e0b' }}>{(historyData.summary.totalRetries || 0).toLocaleString()}</div>
+            <div className="token-stat-card glass-panel">
+              <div className="token-stat-value" style={{ color: 'var(--warning)' }}>{(historyData.summary.totalRetries || 0).toLocaleString()}</div>
               <div className="token-stat-label">Retries</div>
             </div>
-            <div className="token-stat-card">
-              <div className="token-stat-value" style={{ color: '#f97316' }}>{(historyData.summary.totalRestarts || 0).toLocaleString()}</div>
+            <div className="token-stat-card glass-panel">
+              <div className="token-stat-value" style={{ color: 'var(--info)' }}>{(historyData.summary.totalRestarts || 0).toLocaleString()}</div>
               <div className="token-stat-label">Restarts</div>
             </div>
-            <div className="token-stat-card">
-              <div className="token-stat-value" style={{ color: '#dc2626' }}>{(crashData?.summary?.total || 0).toLocaleString()}</div>
+            <div className="token-stat-card glass-panel">
+              <div className="token-stat-value" style={{ color: 'var(--error)' }}>{(crashData?.summary?.total || 0).toLocaleString()}</div>
               <div className="token-stat-label">Crashes</div>
             </div>
-            <div className="token-stat-card">
+            <div className="token-stat-card glass-panel">
               <div className="token-stat-value">{historyData.summary.avgTps}</div>
               <div className="token-stat-label">Avg tok/s</div>
             </div>
@@ -1480,7 +1520,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
 
         {/* Long-term per-model performance breakdown table */}
         <h4 className="analytics-section-header">Model Performance Breakdown</h4>
-        <div className="chart-card-wide model-breakdown-card">
+        <div className="chart-card-wide glass-panel model-breakdown-card">
           <h4>
             Average tok/s by Time Window
             <span className="chart-value">all models · weighted by request count</span>
@@ -1488,7 +1528,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           <ModelPerformanceBreakdown modelBreakdown={modelBreakdown} />
         </div>
 
-        <div className="chart-card-wide model-breakdown-card">
+        <div className="chart-card-wide glass-panel model-breakdown-card">
           <h4>
             Request Statistics by Model
             <span className="chart-value">per-request · click a model for slot breakdown</span>
@@ -1503,7 +1543,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
         <h4 className="analytics-section-header">System Resources</h4>
         <div className="charts-grid-wide">
           {/* Power History */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Power Consumption <span className="chart-value">over time</span></h4>
             <div className="chart-container-wide">
               {historyPoints.length > 0 ? (
@@ -1511,15 +1551,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <defs>
                       <linearGradient id="gradHistPower" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.power} stopOpacity={0.3} />
-                        <stop offset="95%" stopColor={CHART_COLORS.power} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.power} stopOpacity={0.3} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.power} stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<HistoryTooltip unit="W" range={historyRange} />} />
-                    <Area type="monotone" dataKey="pwr" name="Power" stroke={CHART_COLORS.power} fill="url(#gradHistPower)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="pwr" name="Power" stroke={DASHBOARD_CHART_COLORS.power} fill="url(#gradHistPower)" strokeWidth={2} dot={false} animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet. Data is aggregated every minute.</div>}
@@ -1527,7 +1567,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Memory History */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Memory Usage <span className="chart-value">GTT/VRAM + System</span></h4>
             <div className="chart-container-wide">
               {historyPoints.length > 0 ? (
@@ -1535,20 +1575,20 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <defs>
                       <linearGradient id="gradHistMem" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.memory} stopOpacity={0.3} />
-                        <stop offset="95%" stopColor={CHART_COLORS.memory} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.memory} stopOpacity={0.3} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.memory} stopOpacity={0} />
                       </linearGradient>
                       <linearGradient id="gradHistSys" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0.2} />
-                        <stop offset="95%" stopColor={CHART_COLORS.memorySecondary} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.memorySecondary} stopOpacity={0.2} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.memorySecondary} stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis domain={[0, 100]} tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
-                    <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={CHART_COLORS.memory} fill="url(#gradHistMem)" strokeWidth={2} dot={false} animationDuration={500} />
-                    <Area type="monotone" dataKey="ms" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradHistSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
+                    <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={DASHBOARD_CHART_COLORS.memory} fill="url(#gradHistMem)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="ms" name="System" stroke={DASHBOARD_CHART_COLORS.memorySecondary} fill="url(#gradHistSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet</div>}
@@ -1560,18 +1600,18 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Generation Speed History */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Generation Speed by Model <span className="chart-value">tok/s per model</span></h4>
             <div className="chart-container-wide">
               {modelSpeedOverTime.data.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={modelSpeedOverTime.data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<HistoryTooltip unit=" tok/s" range={historyRange} />} />
                     {modelSpeedOverTime.models.map((m, i) => (
-                      <Line key={m} type="monotone" dataKey={m} name={m.length > 30 ? m.slice(0, 27) + '...' : m} stroke={MODEL_SPEED_COLORS[i % MODEL_SPEED_COLORS.length]} strokeWidth={2} dot={false} connectNulls={false} animationDuration={500} />
+                      <Line key={m} type="monotone" dataKey={m} name={m.length > 30 ? m.slice(0, 27) + '...' : m} stroke={DASHBOARD_MODEL_SPEED_COLORS[i % DASHBOARD_MODEL_SPEED_COLORS.length]} strokeWidth={2} dot={false} connectNulls={false} animationDuration={500} />
                     ))}
                   </LineChart>
                 </ResponsiveContainer>
@@ -1584,7 +1624,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
         <h4 className="analytics-section-header">Inference</h4>
         <div className="charts-grid-wide">
           {/* Context Usage History */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Context Usage <span className="chart-value">tokens used / total</span></h4>
             <div className="chart-container-wide">
               {historyPoints.length > 0 ? (
@@ -1592,32 +1632,32 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <defs>
                       <linearGradient id="gradHistCtxTotal" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.contextTotal} stopOpacity={0.2} />
-                        <stop offset="95%" stopColor={CHART_COLORS.contextTotal} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.contextTotal} stopOpacity={0.2} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.contextTotal} stopOpacity={0} />
                       </linearGradient>
                       <linearGradient id="gradHistCtxUsed" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.contextUsed} stopOpacity={0.4} />
-                        <stop offset="95%" stopColor={CHART_COLORS.contextUsed} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.contextUsed} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.contextUsed} stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : v} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : v} />
                     <Tooltip content={<HistoryTooltip unit=" tokens" range={historyRange} />} />
-                    <Area type="monotone" dataKey="cxT" name="Total" stroke={CHART_COLORS.contextTotal} fill="url(#gradHistCtxTotal)" strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
-                    <Area type="monotone" dataKey="cxU" name="Used" stroke={CHART_COLORS.contextUsed} fill="url(#gradHistCtxUsed)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="cxT" name="Total" stroke={DASHBOARD_CHART_COLORS.contextTotal} fill="url(#gradHistCtxTotal)" strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="cxU" name="Used" stroke={DASHBOARD_CHART_COLORS.contextUsed} fill="url(#gradHistCtxUsed)" strokeWidth={2} dot={false} animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet</div>}
             </div>
             <div className="chart-legend">
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.contextUsed }}></span>Used</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.contextTotal }}></span>Total</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.contextUsed }}></span>Used</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.contextTotal }}></span>Total</div>
             </div>
           </div>
 
           {/* Request Queue History */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Request Queue <span className="chart-value">active &amp; pending</span></h4>
             <div className="chart-container-wide">
               {historyPoints.length > 0 ? (
@@ -1625,29 +1665,29 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <AreaChart data={historyPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <defs>
                       <linearGradient id="gradHistQA" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.queueActive} stopOpacity={0.4} />
-                        <stop offset="95%" stopColor={CHART_COLORS.queueActive} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.queueActive} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.queueActive} stopOpacity={0} />
                       </linearGradient>
                       <linearGradient id="gradHistQP" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.queuePending} stopOpacity={0.4} />
-                        <stop offset="95%" stopColor={CHART_COLORS.queuePending} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.queuePending} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.queuePending} stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <Tooltip content={<HistoryTooltip range={historyRange} />} />
-                    <Area type="monotone" dataKey="qA" name="Avg Active" stroke={CHART_COLORS.queueActive} fill="url(#gradHistQA)" strokeWidth={2} dot={false} animationDuration={500} />
-                    <Area type="monotone" dataKey="qP" name="Avg Pending" stroke={CHART_COLORS.queuePending} fill="url(#gradHistQP)" strokeWidth={2} dot={false} animationDuration={500} />
-                    <Line type="monotone" dataKey="qMx" name="Peak Active" stroke={CHART_COLORS.queueActive} strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
-                    <Line type="monotone" dataKey="qMxP" name="Peak Pending" stroke={CHART_COLORS.queuePending} strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="qA" name="Avg Active" stroke={DASHBOARD_CHART_COLORS.queueActive} fill="url(#gradHistQA)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="qP" name="Avg Pending" stroke={DASHBOARD_CHART_COLORS.queuePending} fill="url(#gradHistQP)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Line type="monotone" dataKey="qMx" name="Peak Active" stroke={DASHBOARD_CHART_COLORS.queueActive} strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
+                    <Line type="monotone" dataKey="qMxP" name="Peak Pending" stroke={DASHBOARD_CHART_COLORS.queuePending} strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet</div>}
             </div>
             <div className="chart-legend">
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.queueActive }}></span>Active</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.queuePending }}></span>Pending</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.queueActive }}></span>Active</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.queuePending }}></span>Pending</div>
             </div>
           </div>
 
@@ -1656,7 +1696,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
         <h4 className="analytics-section-header">Request Health &amp; Errors</h4>
         <div className="charts-grid-wide">
           {/* Total Requests Over Time (cumulative growth) */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Total Requests <span className="chart-value">cumulative growth</span></h4>
             <div className="chart-container-wide">
               {requestGrowthData.length > 0 && requestGrowthData[requestGrowthData.length - 1].total > 0 ? (
@@ -1664,15 +1704,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <AreaChart data={requestGrowthData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                     <defs>
                       <linearGradient id="gradGrowth" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor={CHART_COLORS.tokens} stopOpacity={0.3} />
-                        <stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} />
+                        <stop offset="5%" stopColor={DASHBOARD_CHART_COLORS.tokens} stopOpacity={0.3} />
+                        <stop offset="95%" stopColor={DASHBOARD_CHART_COLORS.tokens} stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<HistoryTooltip unit=" requests" range={historyRange} />} />
-                    <Area type="monotone" dataKey="total" name="Total Requests" stroke={CHART_COLORS.tokens} fill="url(#gradGrowth)" strokeWidth={2} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="total" name="Total Requests" stroke={DASHBOARD_CHART_COLORS.tokens} fill="url(#gradGrowth)" strokeWidth={2} dot={false} animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No request data yet</div>}
@@ -1680,75 +1720,75 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Request Volume History */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Request Volume <span className="chart-value">per {historyRange === '1h' ? '5 min' : historyRange === '1d' ? 'hour' : historyRange === '1w' ? '6 hours' : historyRange === '1m' ? 'day' : 'week'}</span></h4>
             <div className="chart-container-wide">
               {requestVolumeData.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={requestVolumeData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <Tooltip content={<HistoryTooltip range={historyRange} />} />
-                    <Area type="monotone" dataKey="rOk" name="Success" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
-                    <Area type="monotone" dataKey="rOf" name="Offloaded" stroke={CHART_COLORS.offloaded} fill={CHART_COLORS.offloaded} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
-                    <Area type="monotone" dataKey="rErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
-                    <Area type="monotone" dataKey="rRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
-                    <Area type="monotone" dataKey="rRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="rOk" name="Success" stroke={DASHBOARD_CHART_COLORS.requestOk} fill={DASHBOARD_CHART_COLORS.requestOk} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    <Area type="monotone" dataKey="rOf" name="Offloaded" stroke={DASHBOARD_CHART_COLORS.offloaded} fill={DASHBOARD_CHART_COLORS.offloaded} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    <Area type="monotone" dataKey="rErr" name="Errors" stroke={DASHBOARD_CHART_COLORS.requestErr} fill={DASHBOARD_CHART_COLORS.requestErr} fillOpacity={0.3} strokeWidth={2} dot={false} stackId="req" animationDuration={500} />
+                    <Area type="monotone" dataKey="rRt" name="Retries" stroke={DASHBOARD_CHART_COLORS.requestRetry} fill={DASHBOARD_CHART_COLORS.requestRetry} fillOpacity={0.3} strokeWidth={1} dot={false} animationDuration={500} />
+                    <Area type="monotone" dataKey="rRs" name="Restarts" stroke={DASHBOARD_CHART_COLORS.requestRestart} fill={DASHBOARD_CHART_COLORS.requestRestart} fillOpacity={0.5} strokeWidth={1} dot={false} animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet</div>}
             </div>
             <div className="chart-legend">
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestOk }}></span>Success</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.offloaded }}></span>Offloaded</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestErr }}></span>Errors</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRetry }}></span>Retries</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRestart }}></span>Restarts</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.requestOk }}></span>Success</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.offloaded }}></span>Offloaded</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.requestErr }}></span>Errors</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.requestRetry }}></span>Retries</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.requestRestart }}></span>Restarts</div>
             </div>
           </div>
 
           {/* Request Health % */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Request Health <span className="chart-value">% breakdown</span></h4>
             <div className="chart-container-wide">
               {requestHealthPoints.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={requestHealthPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }} stackOffset="none">
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `${v}%`} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis domain={[0, 100]} tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `${v}%`} />
                     <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
-                    <Area type="monotone" dataKey="pctOk" name="Local" stroke={CHART_COLORS.requestOk} fill={CHART_COLORS.requestOk} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
-                    <Area type="monotone" dataKey="pctOf" name="Offloaded" stroke={CHART_COLORS.offloaded} fill={CHART_COLORS.offloaded} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
-                    <Area type="monotone" dataKey="pctRt" name="Retries" stroke={CHART_COLORS.requestRetry} fill={CHART_COLORS.requestRetry} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
-                    <Area type="monotone" dataKey="pctRs" name="Restarts" stroke={CHART_COLORS.requestRestart} fill={CHART_COLORS.requestRestart} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
-                    <Area type="monotone" dataKey="pctErr" name="Errors" stroke={CHART_COLORS.requestErr} fill={CHART_COLORS.requestErr} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctOk" name="Local" stroke={DASHBOARD_CHART_COLORS.requestOk} fill={DASHBOARD_CHART_COLORS.requestOk} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctOf" name="Offloaded" stroke={DASHBOARD_CHART_COLORS.offloaded} fill={DASHBOARD_CHART_COLORS.offloaded} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctRt" name="Retries" stroke={DASHBOARD_CHART_COLORS.requestRetry} fill={DASHBOARD_CHART_COLORS.requestRetry} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctRs" name="Restarts" stroke={DASHBOARD_CHART_COLORS.requestRestart} fill={DASHBOARD_CHART_COLORS.requestRestart} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
+                    <Area type="monotone" dataKey="pctErr" name="Errors" stroke={DASHBOARD_CHART_COLORS.requestErr} fill={DASHBOARD_CHART_COLORS.requestErr} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet</div>}
             </div>
             <div className="chart-legend">
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestOk }}></span>Local</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.offloaded }}></span>Offloaded</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRetry }}></span>Retries</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestRestart }}></span>Restarts</div>
-              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: CHART_COLORS.requestErr }}></span>Errors</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.requestOk }}></span>Local</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.offloaded }}></span>Offloaded</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.requestRetry }}></span>Retries</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.requestRestart }}></span>Restarts</div>
+              <div className="chart-legend-item"><span className="chart-legend-dot" style={{ background: DASHBOARD_CHART_COLORS.requestErr }}></span>Errors</div>
             </div>
           </div>
 
           {/* Error Code Breakdown */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Error Code Breakdown <span className="chart-value">status codes &ge; 400</span></h4>
             <div className="chart-container-wide">
               {errorCodeData.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={errorCodeData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="code" tick={{ fill: '#888', fontSize: 11 }} tickLine={false} />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="code" tick={{ fill: 'var(--text-secondary)', fontSize: 11 }} tickLine={false} />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<HistoryTooltip range={historyRange} />} />
-                    <Bar dataKey="count" name="Count" fill={CHART_COLORS.requestErr} radius={[4, 4, 0, 0]} animationDuration={500} />
+                    <Bar dataKey="count" name="Count" fill={DASHBOARD_CHART_COLORS.requestErr} radius={[4, 4, 0, 0]} animationDuration={500} />
                   </BarChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No errors in this time range</div>}
@@ -1760,15 +1800,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
         <h4 className="analytics-section-header">Model Analytics</h4>
         <div className="charts-grid-wide">
           {/* Model Usage */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Requests by Model <span className="chart-value">{Object.values(historyData?.summary?.modelCounts || {}).reduce((a, b) => a + b, 0)} total</span></h4>
             <div className="chart-container-wide">
               {modelUsageData.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={modelUsageData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }} layout="vertical">
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
-                    <YAxis type="category" dataKey="model" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} width={180} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <YAxis type="category" dataKey="model" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} width={180} />
                     <Tooltip content={({ active, payload }) => {
                       if (!active || !payload?.length) return null;
                       const d = payload[0].payload;
@@ -1776,14 +1816,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                         <div className="chart-tooltip">
                           <div className="chart-tooltip-time">{d.fullModel}</div>
                           <div className="chart-tooltip-row">
-                            <span className="chart-tooltip-dot" style={{ background: CHART_COLORS.tokens }} />
+                            <span className="chart-tooltip-dot" style={{ background: DASHBOARD_CHART_COLORS.tokens }} />
                             <span className="chart-tooltip-label">Requests:</span>
                             <span className="chart-tooltip-value">{d.count}</span>
                           </div>
                         </div>
                       );
                     }} />
-                    <Bar dataKey="count" name="Requests" fill={CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
+                    <Bar dataKey="count" name="Requests" fill={DASHBOARD_CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
                   </BarChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No model usage data in this time range</div>}
@@ -1791,15 +1831,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Model Usage Over Time */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Model Usage Over Time <span className="chart-value">top {modelUsageOverTime.models.length} models</span></h4>
             <div className="chart-container-wide">
               {modelUsageOverTime.data.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={modelUsageOverTime.data} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis dataKey="time" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <Tooltip content={<HistoryTooltip range={historyRange} />} />
                     {modelUsageOverTime.models.map((model, i) => (
                       <Line
@@ -1828,7 +1868,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Generation Speed by Model */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Generation Speed by Model <span className="chart-value">avg tok/s</span></h4>
             <div className="chart-container-wide">
               {(() => {
@@ -1839,9 +1879,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 return data.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={data} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
-                      <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                      <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} />
-                      <YAxis dataKey="model" type="category" tick={{ fill: '#ccc', fontSize: 11 }} width={180} tickLine={false} axisLine={false} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                      <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} />
+                      <YAxis dataKey="model" type="category" tick={{ fill: 'var(--text-primary)', fontSize: 11 }} width={180} tickLine={false} axisLine={false} />
                       <Tooltip content={({ active, payload }) => {
                         if (!active || !payload?.length) return null;
                         const d = payload[0].payload;
@@ -1849,14 +1889,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                           <div className="chart-tooltip">
                             <div className="chart-tooltip-time">{d.fullModel}</div>
                             <div className="chart-tooltip-row">
-                              <span className="chart-tooltip-dot" style={{ background: CHART_COLORS.tokens }} />
+                              <span className="chart-tooltip-dot" style={{ background: DASHBOARD_CHART_COLORS.tokens }} />
                               <span className="chart-tooltip-label">Avg Speed:</span>
                               <span className="chart-tooltip-value">{d.tps} tok/s</span>
                             </div>
                           </div>
                         );
                       }} />
-                      <Bar dataKey="tps" name="Avg tok/s" fill={CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
+                      <Bar dataKey="tps" name="Avg tok/s" fill={DASHBOARD_CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
                     </BarChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No per-model speed data in this time range</div>;
@@ -1865,15 +1905,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Crashes by Model */}
-          <div className="chart-card-wide">
+          <div className="chart-card-wide glass-panel">
             <h4>Crashes by Model <span className="chart-value">{crashData?.summary?.total || 0} total</span></h4>
             <div className="chart-container-wide">
               {crashByModelData.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={crashByModelData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }} layout="vertical">
-                    <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
-                    <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
-                    <YAxis type="category" dataKey="model" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} width={180} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                    <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <YAxis type="category" dataKey="model" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} width={180} />
                     <Tooltip content={({ active, payload }) => {
                       if (!active || !payload?.length) return null;
                       const d = payload[0].payload;
@@ -1881,14 +1921,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                         <div className="chart-tooltip">
                           <div className="chart-tooltip-time">{d.fullModel}</div>
                           <div className="chart-tooltip-row">
-                            <span className="chart-tooltip-dot" style={{ background: '#f97316' }} />
+                            <span className="chart-tooltip-dot" style={{ background: 'var(--info)' }} />
                             <span className="chart-tooltip-label">Crashes:</span>
                             <span className="chart-tooltip-value">{d.count}</span>
                           </div>
                         </div>
                       );
                     }} />
-                    <Bar dataKey="count" name="Crashes" fill="#f97316" radius={[0, 4, 4, 0]} animationDuration={500} />
+                    <Bar dataKey="count" name="Crashes" fill="var(--error)" radius={[0, 4, 4, 0]} animationDuration={500} />
                   </BarChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No crashes in this time range</div>}
