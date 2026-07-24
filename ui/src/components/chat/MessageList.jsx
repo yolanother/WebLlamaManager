@@ -168,7 +168,7 @@ function MessageList({
           <strong>Drop images or videos to attach</strong>
         </div>
       )}
-      {!nearBottom && (
+      {!nearBottom && messages.length > 0 && (
         <button type="button" className="glass-chip chat-jump-latest" onClick={() => jumpToLatest()}>
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="m7 10 5 5 5-5" />
