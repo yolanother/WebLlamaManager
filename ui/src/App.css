@@ -5503,6 +5503,11 @@ input::placeholder {
 .model-breakdown-card {
   display: block;
 }
+/* Stacked breakdown cards share a block-flow section; without an explicit gap
+   the glass panels sit flush against each other. */
+.model-breakdown-card + .model-breakdown-card {
+  margin-top: 22px;
+}
 .model-breakdown-table-wrap {
   overflow-x: auto;
   margin-top: 8px;
