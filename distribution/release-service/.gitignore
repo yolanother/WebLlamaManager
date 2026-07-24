@@ -1,0 +1,8 @@
+# Copyright (c) 2026 DoubTech. Use of this file is governed by the LICENSE file
+# in the repository root.
+#
+# Keeps local runtime state, logs, and host-specific config (never secrets — the
+# signing passphrase lives only in the private signing tree) out of git.
+state/
+logs/
+config.env
