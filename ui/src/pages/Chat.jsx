@@ -1,66 +1,153 @@
-// Llama Manager — chat page.
+// Llama Manager — first-class multimodal chat page.
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Provides persisted conversations, model selection, image attachments, message
-// rendering, and streaming chat completions.
+// Composes persisted conversations, multimodal media ingest, rich messages,
+// automatic model routing, and cancellable streaming completions.
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { API_BASE, copyTextToClipboard, formatModelName } from '../api.js';
-import { parseMessageWithCodeBlocks } from '../components/CodeBlock.jsx';
-import { SearchableSelect } from '../components/SearchableSelect.jsx';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
-// Chat Page
+import { API_BASE } from '../api.js';
+import { Composer } from '../components/chat/Composer.jsx';
+import { ConversationSidebar } from '../components/chat/ConversationSidebar.jsx';
+import { MessageList } from '../components/chat/MessageList.jsx';
+import { contentToText } from '../components/chat/Message.jsx';
+import {
+  buildMessageContent,
+  classifyUrl,
+} from '../components/chat/attachments.js';
+import { useChatStream } from '../components/chat/useChatStream.js';
+import '../styles/chat.css';
+
+const CONVERSATIONS_KEY = 'chat_conversations';
+const ACTIVE_CONVERSATION_KEY = 'chat_active_conversation';
+
+function makeId() {
+  return globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function makeConversation() {
+  const now = new Date().toISOString();
+  return {
+    id: makeId(),
+    title: 'New conversation',
+    model: 'auto',
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function loadConversations() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CONVERSATIONS_KEY) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((conversation) => ({
+      ...conversation,
+      id: conversation.id || makeId(),
+      title: conversation.title || 'New conversation',
+      model: conversation.model || 'auto',
+      messages: Array.isArray(conversation.messages) ? conversation.messages : [],
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function responseToDataUrl(url) {
+  if (url.startsWith('data:')) return url;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Could not fetch video frame (HTTP ${response.status}).`);
+  return fileToDataUrl(await response.blob());
+}
+
+async function readMediaError(response) {
+  try {
+    const data = await response.json();
+    return {
+      error: data.error || `HTTP ${response.status}`,
+      hint: data.hint || '',
+    };
+  } catch {
+    return { error: `HTTP ${response.status}`, hint: '' };
+  }
+}
+
+/**
+ * First-class chat composition root.
+ */
 function ChatPage({ stats }) {
-  const [conversations, setConversations] = useState(() => {
-    try {
-      const saved = localStorage.getItem('chat_conversations');
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
-  });
-  const [activeConversationId, setActiveConversationId] = useState(() => {
-    try {
-      return localStorage.getItem('chat_active_conversation') || null;
-    } catch {
-      return null;
-    }
-  });
+  const [conversations, setConversations] = useState(loadConversations);
+  const [activeConversationId, setActiveConversationId] = useState(() => (
+    localStorage.getItem(ACTIVE_CONVERSATION_KEY)
+  ));
   const [models, setModels] = useState([]);
+  const [railOpen, setRailOpen] = useState(() => window.innerWidth >= 1200);
   const [prompt, setPrompt] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [streamingMessage, setStreamingMessage] = useState('');
-  const [pendingImages, setPendingImages] = useState([]);
-  const [hoveredMessage, setHoveredMessage] = useState(null);
-  const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
-  const [copiedId, setCopiedId] = useState(null);
-  const messagesEndRef = useRef(null);
-  const fileInputRef = useRef(null);
+  const [attachments, setAttachments] = useState([]);
+  const [editing, setEditing] = useState(null);
+  const [pageError, setPageError] = useState('');
+  const [streamConversationId, setStreamConversationId] = useState(null);
+  const {
+    isStreaming,
+    routedModel,
+    stop,
+    streamChat,
+    streamingMessage,
+  } = useChatStream();
 
-  const activeConversation = conversations.find(c => c.id === activeConversationId);
+  const activeConversation = useMemo(
+    () => conversations.find((conversation) => conversation.id === activeConversationId),
+    [activeConversationId, conversations],
+  );
+  const healthy = !stats
+    || stats.llama?.status === 'ok'
+    || stats.ds4?.status === 'ok';
 
-  // Persist conversations
   useEffect(() => {
-    localStorage.setItem('chat_conversations', JSON.stringify(conversations));
+    if (conversations.length === 0) {
+      const conversation = makeConversation();
+      setConversations([conversation]);
+      setActiveConversationId(conversation.id);
+      return;
+    }
+    if (!conversations.some((conversation) => conversation.id === activeConversationId)) {
+      setActiveConversationId(conversations[0].id);
+    }
+  }, [activeConversationId, conversations]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(conversations));
+    } catch (error) {
+      setPageError(`Could not save conversations locally: ${error.message}`);
+    }
   }, [conversations]);
 
   useEffect(() => {
     if (activeConversationId) {
-      localStorage.setItem('chat_active_conversation', activeConversationId);
+      localStorage.setItem(ACTIVE_CONVERSATION_KEY, activeConversationId);
     }
   }, [activeConversationId]);
 
-  // Fetch models
   const fetchModels = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/v1/models`);
-      if (res.ok) {
-        const data = await res.json();
-        setModels(data.data || []);
-      }
-    } catch (err) {
-      console.error('Failed to fetch models:', err);
+      const response = await fetch(`${API_BASE}/v1/models`);
+      if (!response.ok) return;
+      const data = await response.json();
+      setModels(data.data || []);
+    } catch {
+      // The global connection state already communicates server availability.
     }
   }, []);
 
@@ -70,420 +157,424 @@ function ChatPage({ stats }) {
     return () => clearInterval(interval);
   }, [fetchModels]);
 
-  // Auto-scroll to bottom
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeConversation?.messages, streamingMessage]);
+  const updateConversation = useCallback((id, updates) => {
+    setConversations((current) => current.map((conversation) => (
+      conversation.id === id
+        ? {
+          ...conversation,
+          ...(typeof updates === 'function' ? updates(conversation) : updates),
+          updatedAt: new Date().toISOString(),
+        }
+        : conversation
+    )));
+  }, []);
 
-  const createConversation = () => {
-    const newConv = {
-      id: Date.now().toString(),
-      title: 'New Chat',
-      model: models[0]?.id || '',
-      messages: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    setConversations(prev => [newConv, ...prev]);
-    setActiveConversationId(newConv.id);
-  };
+  const replaceAttachment = useCallback((id, replacement) => {
+    setAttachments((current) => current.map((attachment) => (
+      attachment.id === id
+        ? { ...attachment, ...replacement }
+        : attachment
+    )));
+  }, []);
 
-  const deleteConversation = (id) => {
-    setConversations(prev => prev.filter(c => c.id !== id));
-    if (activeConversationId === id) {
-      const remaining = conversations.filter(c => c.id !== id);
-      setActiveConversationId(remaining[0]?.id || null);
-    }
-  };
-
-  const updateConversation = (id, updates) => {
-    setConversations(prev => prev.map(c =>
-      c.id === id ? { ...c, ...updates, updatedAt: new Date().toISOString() } : c
-    ));
-  };
-
-  const copyToClipboard = async (text, messageId) => {
-    try {
-      await copyTextToClipboard(text);
-      setCopiedId(messageId);
-      setTimeout(() => setCopiedId(null), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
-    }
-  };
-
-  const handleImageUpload = (e) => {
-    const files = Array.from(e.target.files);
-    files.forEach(file => {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        setPendingImages(prev => [...prev, {
-          id: Date.now() + Math.random(),
-          name: file.name,
-          url: event.target.result
-        }]);
-      };
-      reader.readAsDataURL(file);
-    });
-    e.target.value = '';
-  };
-
-  const removePendingImage = (id) => {
-    setPendingImages(prev => prev.filter(img => img.id !== id));
-  };
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if ((!prompt.trim() && pendingImages.length === 0) || isLoading || !activeConversation) return;
-
-    // Build message content
-    let content;
-    if (pendingImages.length > 0) {
-      content = [];
-      if (prompt.trim()) {
-        content.push({ type: 'text', text: prompt.trim() });
-      }
-      pendingImages.forEach(img => {
-        content.push({
-          type: 'image_url',
-          image_url: { url: img.url }
+  const addImages = useCallback((files) => {
+    files.forEach(async (file) => {
+      const id = makeId();
+      setAttachments((current) => [...current, {
+        id,
+        kind: 'image',
+        filename: file.name,
+        status: 'uploading',
+        source: { type: 'image', file },
+      }]);
+      try {
+        replaceAttachment(id, {
+          dataUrl: await fileToDataUrl(file),
+          status: 'ready',
+          error: '',
+          hint: '',
         });
+      } catch (error) {
+        replaceAttachment(id, { status: 'error', error: error.message, hint: '' });
+      }
+    });
+  }, [replaceAttachment]);
+
+  const ingestMedia = useCallback(async (id, source) => {
+    replaceAttachment(id, {
+      status: 'uploading',
+      error: '',
+      hint: '',
+    });
+    try {
+      let endpoint;
+      let options;
+      if (source.type === 'video-file') {
+        endpoint = `${API_BASE}/media/upload`;
+        const form = new FormData();
+        form.append('file', source.file);
+        options = { method: 'POST', body: form };
+      } else {
+        const kind = classifyUrl(source.url);
+        endpoint = kind === 'youtube'
+          ? `${API_BASE}/media/youtube`
+          : `${API_BASE}/media/link`;
+        options = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: source.url }),
+        };
+      }
+
+      const response = await fetch(endpoint, options);
+      if (!response.ok) {
+        const detail = await readMediaError(response);
+        replaceAttachment(id, { status: 'error', ...detail });
+        return;
+      }
+      const media = await response.json();
+      const frames = await Promise.all((media.frames || []).map(async (url) => ({
+        dataUrl: await responseToDataUrl(url),
+      })));
+      replaceAttachment(id, {
+        kind: 'video',
+        filename: media.filename || source.file?.name || source.url,
+        mediaId: media.id,
+        mime: media.mime,
+        size: media.size,
+        durationSec: media.durationSec || 0,
+        frames,
+        status: 'ready',
       });
+    } catch (error) {
+      replaceAttachment(id, {
+        status: 'error',
+        error: error.message || 'Media ingest failed.',
+        hint: '',
+      });
+    }
+  }, [replaceAttachment]);
+
+  const addVideoFiles = useCallback((files) => {
+    files.forEach((file) => {
+      const id = makeId();
+      const source = { type: 'video-file', file };
+      setAttachments((current) => [...current, {
+        id,
+        kind: 'video',
+        filename: file.name,
+        status: 'uploading',
+        source,
+      }]);
+      ingestMedia(id, source);
+    });
+  }, [ingestMedia]);
+
+  const addVideoUrl = useCallback((url) => {
+    const id = makeId();
+    const source = { type: 'video-url', url };
+    setAttachments((current) => [...current, {
+      id,
+      kind: 'video',
+      filename: url,
+      status: 'uploading',
+      source,
+    }]);
+    ingestMedia(id, source);
+  }, [ingestMedia]);
+
+  const retryAttachment = useCallback((id) => {
+    const attachment = attachments.find((item) => item.id === id);
+    if (!attachment?.source) return;
+    if (attachment.source.type === 'image') {
+      replaceAttachment(id, { status: 'uploading', error: '', hint: '' });
+      fileToDataUrl(attachment.source.file)
+        .then((dataUrl) => replaceAttachment(id, { status: 'ready', dataUrl }))
+        .catch((error) => replaceAttachment(id, {
+          status: 'error',
+          error: error.message,
+          hint: '',
+        }));
     } else {
-      content = prompt.trim();
+      ingestMedia(id, attachment.source);
     }
+  }, [attachments, ingestMedia, replaceAttachment]);
 
-    const userMessage = {
-      id: Date.now().toString(),
-      role: 'user',
-      content,
-      timestamp: new Date().toISOString()
-    };
+  const addLongText = useCallback((text) => {
+    setAttachments((current) => [...current, {
+      id: makeId(),
+      kind: 'text',
+      filename: 'pasted-text.txt',
+      text,
+      status: 'ready',
+      source: { type: 'text' },
+    }]);
+  }, []);
 
-    // Update title from first message
-    if (activeConversation.messages.length === 0 && typeof content === 'string') {
-      updateConversation(activeConversation.id, {
-        title: content.slice(0, 50) + (content.length > 50 ? '...' : '')
+  const serializableAttachments = (items) => items
+    .filter((attachment) => attachment.status === 'ready')
+    .map(({ source, status, ...attachment }) => attachment);
+
+  const runAssistant = useCallback(async (conversationId, baseMessages, model) => {
+    setStreamConversationId(conversationId);
+    try {
+      const result = await streamChat({
+        model: model || 'auto',
+        messages: baseMessages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
       });
+      if (!result.content && !result.stopped) return;
+      const assistant = {
+        id: makeId(),
+        role: 'assistant',
+        content: result.content || 'Response stopped.',
+        routedModel: result.routedModel,
+        stopped: result.stopped,
+        timestamp: new Date().toISOString(),
+        stats: result.stats,
+      };
+      updateConversation(conversationId, { messages: [...baseMessages, assistant] });
+    } catch (error) {
+      updateConversation(conversationId, {
+        messages: [...baseMessages, {
+          id: makeId(),
+          role: 'assistant',
+          content: `Error: ${error.message || 'Chat request failed.'}`,
+          timestamp: new Date().toISOString(),
+        }],
+      });
+    } finally {
+      setStreamConversationId((current) => (
+        current === conversationId ? null : current
+      ));
     }
+  }, [streamChat, updateConversation]);
+
+  const submit = useCallback(() => {
+    if (!activeConversation || isStreaming) return;
+    const ready = attachments.filter((attachment) => attachment.status === 'ready');
+    if (!prompt.trim() && ready.length === 0) return;
+
+    const baseMessages = editing
+      ? activeConversation.messages.slice(0, editing.index)
+      : activeConversation.messages;
+    const savedAttachments = serializableAttachments(ready);
+    const userMessage = {
+      id: editing?.id || makeId(),
+      role: 'user',
+      content: buildMessageContent({ text: prompt, attachments: ready }),
+      displayText: prompt.trim(),
+      attachments: savedAttachments,
+      timestamp: new Date().toISOString(),
+    };
+    const nextMessages = [...baseMessages, userMessage];
+    const firstUserMessage = nextMessages.find((message) => message.role === 'user');
+    const titleText = contentToText(firstUserMessage).trim()
+      || savedAttachments[0]?.filename
+      || 'Multimodal conversation';
+    const title = `${titleText.slice(0, 48)}${titleText.length > 48 ? '…' : ''}`;
 
     updateConversation(activeConversation.id, {
-      messages: [...activeConversation.messages, userMessage]
+      messages: nextMessages,
+      ...(baseMessages.length === 0 ? { title } : {}),
     });
-
     setPrompt('');
-    setPendingImages([]);
-    setIsLoading(true);
-    setStreamingMessage('');
+    setAttachments([]);
+    setEditing(null);
+    setPageError('');
+    runAssistant(activeConversation.id, nextMessages, activeConversation.model);
+  }, [
+    activeConversation,
+    attachments,
+    editing,
+    isStreaming,
+    prompt,
+    runAssistant,
+    updateConversation,
+  ]);
 
-    const startTime = Date.now();
-    let tokenCount = 0;
+  const regenerateMessage = useCallback((message) => {
+    if (!activeConversation || isStreaming) return;
+    const index = activeConversation.messages.findIndex((item) => item.id === message.id);
+    if (index < 0) return;
+    const baseMessages = activeConversation.messages.slice(0, index);
+    updateConversation(activeConversation.id, { messages: baseMessages });
+    runAssistant(activeConversation.id, baseMessages, activeConversation.model);
+  }, [activeConversation, isStreaming, runAssistant, updateConversation]);
 
-    try {
-      // Build messages array for API
-      const apiMessages = [...activeConversation.messages, userMessage].map(m => ({
-        role: m.role,
-        content: m.content
-      }));
-
-      const response = await fetch(`${API_BASE}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: activeConversation.model,
-          messages: apiMessages,
-          stream: true
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let fullContent = '';
-      let usage = null;
-      let modelUsed = activeConversation.model;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') continue;
-
-            try {
-              const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.delta?.content || '';
-              if (content) {
-                fullContent += content;
-                tokenCount++;
-                setStreamingMessage(fullContent);
-              }
-              if (parsed.usage) usage = parsed.usage;
-              if (parsed.model) modelUsed = parsed.model;
-            } catch {
-              // Skip invalid JSON
-            }
-          }
-        }
-      }
-
-      const duration = Date.now() - startTime;
-      const tokensPerSecond = duration > 0 ? (tokenCount / (duration / 1000)) : 0;
-
-      const assistantMessage = {
-        id: Date.now().toString(),
-        role: 'assistant',
-        content: fullContent,
-        timestamp: new Date().toISOString(),
-        stats: {
-          model: modelUsed,
-          promptTokens: usage?.prompt_tokens || 0,
-          completionTokens: usage?.completion_tokens || tokenCount,
-          totalTokens: (usage?.prompt_tokens || 0) + (usage?.completion_tokens || tokenCount),
-          tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
-          duration: Math.round(duration)
-        }
-      };
-
-      updateConversation(activeConversation.id, {
-        messages: [...activeConversation.messages, userMessage, assistantMessage]
-      });
-      setStreamingMessage('');
-    } catch (err) {
-      console.error('Chat failed:', err);
-      const errorMessage = {
-        id: Date.now().toString(),
-        role: 'assistant',
-        content: `Error: ${err.message}`,
-        timestamp: new Date().toISOString()
-      };
-      updateConversation(activeConversation.id, {
-        messages: [...activeConversation.messages, userMessage, errorMessage]
-      });
+  const regenerateLatest = useCallback(() => {
+    if (!activeConversation || isStreaming || activeConversation.messages.length === 0) return;
+    const lastMessage = activeConversation.messages.at(-1);
+    if (lastMessage?.role === 'assistant') {
+      regenerateMessage(lastMessage);
+    } else {
+      runAssistant(
+        activeConversation.id,
+        activeConversation.messages,
+        activeConversation.model,
+      );
     }
+  }, [activeConversation, isStreaming, regenerateMessage, runAssistant]);
 
-    setIsLoading(false);
-  };
+  const editMessage = useCallback((message) => {
+    if (!activeConversation || isStreaming) return;
+    const index = activeConversation.messages.findIndex((item) => item.id === message.id);
+    if (index < 0) return;
+    setEditing({ id: message.id, index });
+    setPrompt(contentToText(message));
+    setAttachments((message.attachments || []).map((attachment) => ({
+      ...attachment,
+      status: 'ready',
+    })));
+  }, [activeConversation, isStreaming]);
 
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit(e);
-    }
-  };
+  const cancelEdit = useCallback(() => {
+    setEditing(null);
+    setPrompt('');
+    setAttachments([]);
+  }, []);
 
-  const clearChat = () => {
-    if (activeConversation) {
-      updateConversation(activeConversation.id, { messages: [] });
-    }
-    setStreamingMessage('');
-    setHoveredMessage(null);
-  };
+  const createConversation = useCallback(() => {
+    if (isStreaming) stop();
+    const conversation = makeConversation();
+    setConversations((current) => [conversation, ...current]);
+    setActiveConversationId(conversation.id);
+    setPrompt('');
+    setAttachments([]);
+    setEditing(null);
+    if (window.innerWidth < 1200) setRailOpen(false);
+  }, [isStreaming, stop]);
 
-  // Healthy when EITHER the llama server is up OR the ds4 engine is active and
-  // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
-  // is the real signal — otherwise the chat/status would show "not running").
-  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
-
-  const formatTimestamp = (ts) => {
-    const date = new Date(ts);
-    const now = new Date();
-    const diff = now - date;
-    if (diff < 86400000) {
-      return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-    }
-    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  };
-
-  const renderMessageContent = (content) => {
-    if (typeof content === 'string') {
-      return parseMessageWithCodeBlocks(content);
-    }
-    // Multimodal content
-    return content.map((part, i) => {
-      if (part.type === 'text') {
-        return <span key={i}>{parseMessageWithCodeBlocks(part.text)}</span>;
-      }
-      if (part.type === 'image_url') {
-        return <img key={i} src={part.image_url.url} alt="User uploaded" className="message-image" />;
-      }
-      return null;
+  const deleteConversation = useCallback((id) => {
+    setConversations((current) => {
+      const remaining = current.filter((conversation) => conversation.id !== id);
+      if (id === activeConversationId) setActiveConversationId(remaining[0]?.id || null);
+      return remaining;
     });
-  };
+  }, [activeConversationId]);
+
+  const importConversations = useCallback(async (file) => {
+    try {
+      const parsed = JSON.parse(await file.text());
+      const imported = Array.isArray(parsed) ? parsed : parsed.conversations;
+      if (!Array.isArray(imported)) throw new Error('Expected a JSON conversation array.');
+      const normalized = imported.map((conversation) => ({
+        ...conversation,
+        id: conversation.id || makeId(),
+        title: conversation.title || 'Imported conversation',
+        model: conversation.model || 'auto',
+        messages: Array.isArray(conversation.messages) ? conversation.messages : [],
+        createdAt: conversation.createdAt || new Date().toISOString(),
+        updatedAt: conversation.updatedAt || new Date().toISOString(),
+      }));
+      setConversations((current) => [...normalized, ...current]);
+      if (normalized[0]) setActiveConversationId(normalized[0].id);
+      setPageError('');
+    } catch (error) {
+      setPageError(`Import failed: ${error.message}`);
+    }
+  }, []);
+
+  if (!activeConversation) {
+    return <div className="chat-page-shell" aria-busy="true" />;
+  }
+
+  const lastMessage = activeConversation.messages.at(-1);
+  const canRegenerate = Boolean(
+    lastMessage && (lastMessage.role === 'assistant' || lastMessage.role === 'user'),
+  );
 
   return (
-    <div className="page chat-page">
-      <div className="chat-layout">
-        {/* Conversations Sidebar */}
-        <div className="chat-sidebar">
-          <div className="chat-sidebar-header">
-            <h3>Conversations</h3>
-            <button className="btn-primary btn-small" onClick={createConversation}>
-              + New
-            </button>
+    <div className="chat-page-shell">
+      <ConversationSidebar
+        activeId={activeConversation.id}
+        conversations={conversations}
+        open={railOpen}
+        onClose={() => setRailOpen(false)}
+        onCreate={createConversation}
+        onDelete={deleteConversation}
+        onImport={importConversations}
+        onRename={(id, title) => updateConversation(id, { title })}
+        onSelect={(id) => {
+          setActiveConversationId(id);
+          setPrompt('');
+          setAttachments([]);
+          setEditing(null);
+        }}
+      />
+      <section className="chat-stage" aria-label="Chat">
+        <header className="chat-stage-header">
+          <button
+            type="button"
+            className="chat-icon-btn"
+            aria-label="Open conversations"
+            onClick={() => setRailOpen(true)}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 6h16M4 12h16M4 18h10" />
+            </svg>
+          </button>
+          <div className="chat-stage-title">
+            <strong>{activeConversation.title}</strong>
+            <span>{activeConversation.messages.length} messages</span>
           </div>
-          <div className="conversation-list">
-            {conversations.length === 0 ? (
-              <div className="chat-empty-sidebar">
-                <p>No conversations yet</p>
-              </div>
-            ) : (
-              conversations.map(conv => (
-                <div
-                  key={conv.id}
-                  className={`conversation-item ${conv.id === activeConversationId ? 'active' : ''}`}
-                  onClick={() => setActiveConversationId(conv.id)}
-                >
-                  <div className="conv-title">{conv.title}</div>
-                  <div className="conv-meta">
-                    {formatTimestamp(conv.updatedAt)}
-                    <button
-                      className="conv-delete"
-                      onClick={(e) => { e.stopPropagation(); deleteConversation(conv.id); }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                </div>
-              ))
-            )}
+          <button
+            type="button"
+            className="chat-icon-btn"
+            aria-label="New conversation"
+            onClick={createConversation}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+          </button>
+        </header>
+        {pageError && (
+          <div className="chat-page-error" role="alert">
+            <span>{pageError}</span>
+            <button type="button" onClick={() => setPageError('')}>Dismiss</button>
           </div>
-        </div>
-
-        {/* Main Chat Area */}
-        <div className="chat-main">
-          {activeConversation ? (
-            <>
-              <div className="chat-header">
-                <SearchableSelect
-                  value={activeConversation.model}
-                  onChange={(val) => updateConversation(activeConversation.id, { model: val })}
-                  options={models.length === 0 ? [] : models.map(m => ({
-                    value: m.id,
-                    label: formatModelName(m)
-                  }))}
-                  placeholder={models.length === 0 ? "No models available" : "Select model..."}
-                  disabled={!isHealthy || models.length === 0}
-                  storageKey="chatModel"
-                />
-                <button className="btn-ghost btn-small" onClick={clearChat} title="Clear chat">
-                  Clear
-                </button>
-              </div>
-
-              <div className="chat-messages">
-                {activeConversation.messages.length === 0 && !streamingMessage && (
-                  <div className="chat-empty">
-                    <p>Send a message to start the conversation</p>
-                    {!isHealthy && <p className="hint">Server is not running</p>}
-                  </div>
-                )}
-                {activeConversation.messages.map((msg) => (
-                  <div
-                    key={msg.id}
-                    className={`chat-message ${msg.role}`}
-                  >
-                    <div className="message-header">
-                      <span className="message-role">
-                        {msg.role === 'user' ? 'You' : `AI${msg.stats?.model ? ` - ${formatModelName({ id: msg.stats.model })}` : ''}`}
-                      </span>
-                      <div className="message-actions">
-                        <button
-                          className={`btn-icon ${copiedId === msg.id ? 'copied' : ''}`}
-                          onClick={() => copyToClipboard(
-                            typeof msg.content === 'string' ? msg.content : msg.content.map(p => p.text || '').join(''),
-                            msg.id
-                          )}
-                          title="Copy"
-                        >
-                          {copiedId === msg.id ? '✓' : '📋'}
-                        </button>
-                      </div>
-                    </div>
-                    <div className="message-content">{renderMessageContent(msg.content)}</div>
-                    {msg.role === 'assistant' && msg.stats && (
-                      <div className="message-stats-inline">
-                        {msg.stats.tokensPerSecond} tok/s · {msg.stats.completionTokens} tokens · {(msg.stats.duration / 1000).toFixed(2)}s
-                      </div>
-                    )}
-                  </div>
-                ))}
-                {streamingMessage && (
-                  <div className="chat-message assistant streaming">
-                    <div className="message-header">
-                      <span className="message-role">AI{activeConversation.model ? ` - ${formatModelName({ id: activeConversation.model })}` : ''}</span>
-                    </div>
-                    <div className="message-content">{parseMessageWithCodeBlocks(streamingMessage)}</div>
-                  </div>
-                )}
-                <div ref={messagesEndRef} />
-              </div>
-
-              {/* Pending Images */}
-              {pendingImages.length > 0 && (
-                <div className="pending-images">
-                  {pendingImages.map(img => (
-                    <div key={img.id} className="pending-image">
-                      <img src={img.url} alt={img.name} />
-                      <button onClick={() => removePendingImage(img.id)}>×</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <form className="chat-input-area" onSubmit={handleSubmit}>
-                <input
-                  type="file"
-                  ref={fileInputRef}
-                  onChange={handleImageUpload}
-                  accept="image/*"
-                  multiple
-                  style={{ display: 'none' }}
-                />
-                <button
-                  type="button"
-                  className="btn-ghost btn-small"
-                  onClick={() => fileInputRef.current?.click()}
-                  title="Upload image"
-                >
-                  📎
-                </button>
-                <textarea
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder={isHealthy ? "Type a message... (Enter to send)" : "Server not running"}
-                  disabled={!isHealthy || isLoading}
-                  rows={1}
-                  className="chat-input"
-                />
-                <button
-                  type="submit"
-                  className="btn-primary"
-                  disabled={!isHealthy || isLoading || (!prompt.trim() && pendingImages.length === 0)}
-                >
-                  {isLoading ? '...' : '→'}
-                </button>
-              </form>
-            </>
-          ) : (
-            <div className="chat-empty">
-              <p>Select a conversation or create a new one</p>
-              <button className="btn-primary" onClick={createConversation}>
-                + New Conversation
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
+        )}
+        <MessageList
+          messages={activeConversation.messages}
+          streamingMessage={streamingMessage}
+          routedModel={routedModel}
+          isStreaming={isStreaming && streamConversationId === activeConversation.id}
+          onEdit={editMessage}
+          onRegenerate={regenerateMessage}
+          onSuggestion={setPrompt}
+          onDropFiles={(files) => {
+            addImages(files.filter((file) => file.type.startsWith('image/')));
+            addVideoFiles(files.filter((file) => file.type.startsWith('video/')));
+          }}
+        />
+        <Composer
+          attachments={attachments}
+          canRegenerate={canRegenerate}
+          disabled={!healthy}
+          editing={editing}
+          isStreaming={isStreaming}
+          model={activeConversation.model || 'auto'}
+          models={models}
+          onCancelEdit={cancelEdit}
+          onChange={setPrompt}
+          onImageFiles={addImages}
+          onLongText={addLongText}
+          onModelChange={(model) => updateConversation(activeConversation.id, { model })}
+          onRegenerate={regenerateLatest}
+          onRemoveAttachment={(id) => setAttachments((current) => (
+            current.filter((attachment) => attachment.id !== id)
+          ))}
+          onRetryAttachment={retryAttachment}
+          onStop={stop}
+          onSubmit={submit}
+          onUrl={addVideoUrl}
+          onVideoFiles={addVideoFiles}
+          value={prompt}
+        />
+      </section>
     </div>
   );
 }
