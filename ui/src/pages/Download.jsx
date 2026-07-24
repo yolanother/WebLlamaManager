@@ -3,10 +3,11 @@
 // LICENSE file in the repository root.
 //
 // Searches and inspects Hugging Face GGUF repositories and starts supported
-// model downloads, including the DS4 catalog.
+// model downloads, including the DS4 catalog, in responsive glass panels.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_BASE, formatBytes } from '../api.js';
+import '../styles/pages.css';
 
 // Download Page
 // The DS4 / DeepSeek V4 download catalog. Only the antirez/deepseek-v4-gguf repo
@@ -176,7 +177,7 @@ function DownloadPage({ stats }) {
       </div>
 
       {/* ── DS4 / DeepSeek V4 section ──────────────────────────────────────── */}
-      <section className="page-section ds4-download-section">
+      <section className="page-section glass-panel ds4-download-section">
         <div className="ds4-section-header">
           <h3>DS4 / DeepSeek V4</h3>
           <span className="engine-badge ds4">exclusive engine</span>
@@ -187,7 +188,7 @@ function DownloadPage({ stats }) {
         </p>
         {recommended && (
           <button
-            className="btn-primary ds4-recommended-btn"
+            className="btn-primary glass-btn ds4-recommended-btn"
             onClick={() => downloadDs4(recommended)}
             disabled={ds4Downloading === recommended.key || isDs4OptPresent(recommended)}
             title={`Download ${recommended.label} (${recommended.size}) into the ds4 dir`}
@@ -215,14 +216,14 @@ function DownloadPage({ stats }) {
                 </div>
                 {opt.fits && opt.pattern ? (
                   <button
-                    className="btn-secondary"
+                    className="btn-secondary glass-btn"
                     onClick={() => downloadDs4(opt)}
                     disabled={ds4Downloading === opt.key || present}
                   >
                     {present ? 'Available' : ds4Downloading === opt.key ? 'Starting...' : 'Download'}
                   </button>
                 ) : (
-                  <button className="btn-secondary" disabled title="Too large for this machine">Unavailable</button>
+                  <button className="btn-secondary glass-btn" disabled title="Too large for this machine">Unavailable</button>
                 )}
               </div>
             );
@@ -242,21 +243,22 @@ function DownloadPage({ stats }) {
       </section>
 
       <div className="search-section">
-        <div className="card">
+        <div className="card glass-panel">
           <h3>Recommended embedding models</h3>
           {EMBED_SUGGESTIONS.map(s => (
-            <button key={s.repo} className="btn-secondary" onClick={() => { setSearchQuery(s.repo); }} title={s.repo}>{s.label}</button>
+            <button key={s.repo} className="btn-secondary glass-btn" onClick={() => { setSearchQuery(s.repo); }} title={s.repo}>{s.label}</button>
           ))}
         </div>
         <div className="search-bar">
           <input
             type="text"
+            className="glass-input"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Search HuggingFace for GGUF models..."
             onKeyDown={(e) => e.key === 'Enter' && searchModels()}
           />
-          <button className="btn-primary" onClick={searchModels} disabled={searching}>
+          <button className="btn-primary glass-btn" onClick={searchModels} disabled={searching}>
             {searching ? 'Searching...' : 'Search'}
           </button>
         </div>
@@ -264,7 +266,7 @@ function DownloadPage({ stats }) {
 
       {/* Active Downloads */}
       {stats?.downloads && Object.keys(stats.downloads).length > 0 && (
-        <section className="page-section">
+        <section className="page-section glass-panel">
           <h3>Active Downloads</h3>
           <div className="downloads-list">
             {Object.entries(stats.downloads).map(([id, info]) => (
@@ -296,7 +298,7 @@ function DownloadPage({ stats }) {
 
       {/* Search Results */}
       {searchResults.length > 0 && !selectedRepo && (
-        <section className="page-section">
+        <section className="page-section glass-panel">
           <h3>Search Results</h3>
           <div className="search-results">
             {searchResults.map((result) => (
@@ -314,9 +316,9 @@ function DownloadPage({ stats }) {
 
       {/* Selected Repo */}
       {selectedRepo && (
-        <section className="page-section">
+        <section className="page-section glass-panel">
           <div className="repo-header">
-            <button className="btn-ghost" onClick={() => setSelectedRepo(null)}>
+            <button className="btn-ghost glass-btn" onClick={() => setSelectedRepo(null)}>
               ← Back
             </button>
             <h3>{selectedRepo.id}</h3>
@@ -343,12 +345,13 @@ function DownloadPage({ stats }) {
                 <div className="custom-download-row">
                   <input
                     type="text"
+                    className="glass-input"
                     value={customPattern}
                     onChange={(e) => setCustomPattern(e.target.value)}
                     placeholder="e.g., *.gguf or *Q4_K_M*.gguf"
                   />
                   <button
-                    className="btn-primary"
+                    className="btn-primary glass-btn"
                     onClick={() => downloadWithPattern(selectedRepo.id, customPattern)}
                     disabled={!customPattern.trim()}
                   >
@@ -371,7 +374,7 @@ function DownloadPage({ stats }) {
                     <span className="option-desc">Downloads any file ending in .gguf</span>
                   </div>
                   <button
-                    className="btn-primary"
+                    className="btn-primary glass-btn"
                     onClick={() => downloadAllGguf(selectedRepo.id)}
                   >
                     Download All
@@ -386,12 +389,13 @@ function DownloadPage({ stats }) {
                   <div className="custom-download-row">
                     <input
                       type="text"
+                      className="glass-input"
                       value={customPattern}
                       onChange={(e) => setCustomPattern(e.target.value)}
                       placeholder="*Q4_K_M*.gguf"
                     />
                     <button
-                      className="btn-primary"
+                      className="btn-primary glass-btn"
                       onClick={() => downloadWithPattern(selectedRepo.id, customPattern)}
                       disabled={!customPattern.trim()}
                     >
@@ -413,7 +417,7 @@ function DownloadPage({ stats }) {
                     </span>
                   </div>
                   <button
-                    className="btn-primary"
+                    className="btn-primary glass-btn"
                     onClick={() => downloadModel(selectedRepo.id, quant.quantization)}
                   >
                     Download
@@ -430,11 +434,11 @@ function DownloadPage({ stats }) {
                     value={customPattern}
                     onChange={(e) => setCustomPattern(e.target.value)}
                     placeholder="Custom pattern (e.g., *IQ4*.gguf)"
-                    className="inline-input"
+                    className="inline-input glass-input"
                   />
                 </div>
                 <button
-                  className="btn-secondary"
+                  className="btn-secondary glass-btn"
                   onClick={() => downloadWithPattern(selectedRepo.id, customPattern)}
                   disabled={!customPattern.trim()}
                 >

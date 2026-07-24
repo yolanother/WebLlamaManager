@@ -1,0 +1,521 @@
+/*
+ * Copyright (c) Llama Manager contributors.
+ * Use of this source code is governed by the LICENSE file in the repository root.
+ *
+ * Glass-aligned layout and responsive styles for Settings and secondary pages.
+ * Keeps frosted backdrops on containing panels while preserving readable,
+ * single-layer tables, logs, forms, and code samples in both color schemes.
+ */
+
+.settings-page,
+.logs-page,
+.queue-page,
+.processes-page,
+.docs-page,
+.api-docs-page {
+  color: var(--text-primary);
+  --text-muted: var(--text-secondary);
+  --success-bg: color-mix(in srgb, var(--success) 13%, transparent);
+  --warning-bg: color-mix(in srgb, var(--warning) 13%, transparent);
+  --error-bg: color-mix(in srgb, var(--error) 13%, transparent);
+  --info-bg: color-mix(in srgb, var(--info) 13%, transparent);
+}
+
+[data-theme="light"] .settings-page,
+[data-theme="light"] .logs-page,
+[data-theme="light"] .queue-page,
+[data-theme="light"] .processes-page,
+[data-theme="light"] .docs-page,
+[data-theme="light"] .api-docs-page {
+  --info: #6d28d9;
+}
+
+.page .glass-panel {
+  min-width: 0;
+}
+
+.page-section.glass-panel,
+.create-preset-form.glass-panel,
+.search-section > .glass-panel,
+.filters-panel.glass-panel,
+.queue-section.glass-panel,
+.queue-empty.glass-panel,
+.process-card.glass-panel,
+.docs-sidebar.glass-panel,
+.docs-content.glass-panel,
+.api-endpoints-list.glass-panel,
+.api-endpoint-detail.glass-panel {
+  padding: clamp(16px, 2vw, 24px);
+}
+
+.page-section.glass-panel,
+.queue-section.glass-panel {
+  margin-bottom: 20px;
+}
+
+.page .glass-btn {
+  padding-inline: 16px;
+}
+
+.page .glass-input {
+  width: 100%;
+  padding: 9px 12px;
+}
+
+.page select.glass-input {
+  cursor: pointer;
+}
+
+.form-label {
+  display: block;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.glass-btn.btn-danger,
+.glass-btn.btn-danger-sm,
+.glass-btn.destructive-action {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 48%, var(--glass-border));
+}
+
+.glass-btn.btn-danger:hover:not(:disabled),
+.glass-btn.btn-danger-sm:hover:not(:disabled),
+.glass-btn.destructive-action:hover:not(:disabled) {
+  border-color: var(--error);
+}
+
+.settings-page .page-header,
+.settings-page .header-actions,
+.settings-tabs,
+.logs-actions,
+.api-tabs {
+  flex-wrap: wrap;
+}
+
+.settings-tabs,
+.logs-tabs,
+.api-tabs {
+  width: fit-content;
+  max-width: 100%;
+  padding: 4px;
+  gap: 6px;
+}
+
+.settings-tabs .glass-btn,
+.logs-tabs .glass-btn,
+.api-tabs .glass-btn {
+  min-width: 0;
+  padding-inline: 14px;
+}
+
+.settings-tabs .active,
+.logs-tabs .active,
+.api-tabs .active,
+.docs-nav-item.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 75%, var(--glass-border));
+  box-shadow: var(--shadow-pressed);
+}
+
+.appearance-section {
+  display: grid;
+  gap: 22px;
+}
+
+.appearance-section__header h3,
+.appearance-section__header p {
+  margin: 0;
+}
+
+.appearance-section__header p {
+  margin-top: 6px;
+  color: var(--text-secondary);
+}
+
+.scheme-setting {
+  display: grid;
+  gap: 10px;
+}
+
+.scheme-setting > span {
+  font-weight: 600;
+}
+
+.scheme-segmented {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  width: min(100%, 440px);
+}
+
+.scheme-segmented .scheme-option {
+  min-height: 44px;
+}
+
+.scheme-segmented .scheme-option.active {
+  color: var(--text-primary);
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--glass-border));
+  background: color-mix(in srgb, var(--accent) 14%, var(--glass-bg-elevated));
+  box-shadow: var(--shadow-pressed);
+}
+
+.appearance-site-theme {
+  padding-top: 18px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.appearance-site-theme .setting-item {
+  max-width: 560px;
+}
+
+.settings-page .page-section > h3,
+.queue-section > h3,
+.processes-page .page-section > h3 {
+  margin-top: 0;
+}
+
+.settings-page .setting-item > input:not([type="checkbox"]):not([type="range"]),
+.settings-page .setting-item > select,
+.settings-page .model-override-row > select,
+.settings-page .model-override-add > input,
+.settings-page .backend-form input:not([type="checkbox"]):not([type="range"]),
+.settings-page .backend-form select,
+.settings-page .model-map-table input,
+.settings-page .model-map-table select {
+  min-height: var(--control-height);
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.18);
+}
+
+.settings-page .backend-card {
+  padding: 16px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+  background: color-mix(in srgb, var(--glass-bg) 86%, transparent);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+.settings-page .backend-add-form {
+  padding: 16px;
+  margin-top: 12px;
+}
+
+.settings-page .model-map-table-wrap,
+.page-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.settings-page .settings-preview,
+.docs-code-block,
+.curl-code-container,
+.response-body,
+.example-code,
+.llm-log-request-body {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--glass-bg-opaque) 88%, var(--bg-tertiary));
+  border-color: var(--glass-border);
+}
+
+.create-preset-form,
+.preset-card,
+.model-card,
+.card.glass-panel,
+.option-card,
+.download-item,
+.search-result,
+.quant-item,
+.ds4-option,
+.ds4-present-list,
+.llm-log-card {
+  color: var(--text-primary);
+  border-color: var(--glass-border);
+}
+
+.preset-card.glass-panel,
+.model-card.glass-panel,
+.option-card.glass-panel {
+  padding: 16px;
+}
+
+.search-section {
+  display: grid;
+  gap: 16px;
+}
+
+.search-section > .glass-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.search-section > .glass-panel h3 {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.search-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.downloads-list,
+.search-results,
+.quant-list,
+.ds4-options-list {
+  min-width: 0;
+}
+
+.download-item,
+.search-result,
+.quant-item,
+.ds4-option {
+  background: color-mix(in srgb, var(--glass-bg) 84%, transparent);
+}
+
+.logs-page {
+  min-width: 0;
+}
+
+.logs-container.glass-panel {
+  background: var(--glass-bg);
+  border-color: var(--glass-border);
+  color: var(--text-primary);
+}
+
+.logs-container,
+.logs-container table,
+.llm-log-card,
+.llm-log-detail,
+.llm-msg-text,
+.llm-log-prompt-content,
+.llm-log-response-content {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+[data-theme="light"] .logs-container.glass-panel,
+[data-theme="light"] .llm-log-card {
+  background: rgba(255, 255, 255, 0.9);
+}
+
+[data-theme="light"] .log-entry.error .log-message,
+[data-theme="light"] .request-error-content,
+[data-theme="light"] .llm-log-error-content {
+  color: #991b1b;
+}
+
+[data-theme="light"] .log-source.system {
+  color: #1f2937;
+}
+
+[data-theme="light"] .llm-log-badge.stream,
+[data-theme="light"] .llm-log-tps {
+  color: #5b21b6;
+}
+
+.llm-log-badge.backend {
+  color: var(--info);
+  background: var(--info-bg);
+}
+
+.request-logs-table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.request-backend-chip {
+  min-height: 24px;
+  padding-inline: 7px;
+  color: var(--text-primary);
+  font-size: 0.8em;
+}
+
+.request-backend-local {
+  color: var(--text-secondary);
+  font-size: 0.85em;
+}
+
+.request-logs-table thead th {
+  background: var(--glass-bg-elevated-opaque);
+}
+
+.queue-section.glass-panel,
+.queue-empty.glass-panel {
+  overflow: hidden;
+}
+
+.queue-table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.queue-table-header,
+.queue-table-row {
+  min-width: 840px;
+}
+
+.queue-table-row {
+  background: transparent;
+}
+
+.queue-table-row:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.process-card.glass-panel {
+  height: 100%;
+}
+
+.docs-layout,
+.api-docs-layout {
+  min-width: 0;
+}
+
+.docs-sidebar.glass-panel {
+  align-self: start;
+}
+
+.docs-nav-item.glass-btn {
+  width: 100%;
+  justify-content: flex-start;
+  box-shadow: none;
+}
+
+.docs-content.glass-panel,
+.api-endpoint-detail.glass-panel,
+.api-endpoints-list.glass-panel {
+  background: var(--glass-bg);
+}
+
+.docs-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.docs-table {
+  min-width: 560px;
+}
+
+.endpoint-item {
+  border: 1px solid transparent;
+}
+
+.endpoint-item:hover,
+.endpoint-item.active {
+  border-color: var(--glass-border);
+  background: color-mix(in srgb, var(--accent) 9%, var(--glass-bg));
+}
+
+.param-field .glass-input {
+  max-width: 100%;
+}
+
+@media (max-width: 700px) {
+  .page-header {
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .page-header,
+  .page-header .header-actions,
+  .page-header .page-header-actions,
+  .logs-actions {
+    width: 100%;
+  }
+
+  .page-header .header-actions,
+  .page-header .page-header-actions,
+  .logs-actions {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .settings-tabs,
+  .logs-tabs,
+  .api-tabs {
+    display: grid;
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  .settings-tabs .glass-btn,
+  .logs-tabs .glass-btn,
+  .api-tabs .glass-btn {
+    width: 100%;
+  }
+
+  .search-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .search-bar .glass-btn {
+    width: 100%;
+  }
+
+  .logs-filter,
+  .logs-filter-select {
+    width: 100%;
+    max-width: none;
+  }
+
+  .filter-input-row,
+  .model-override-add,
+  .model-override-row {
+    flex-wrap: wrap;
+  }
+
+  .backend-card > div:first-child {
+    align-items: flex-start !important;
+    flex-direction: column;
+  }
+
+  .backend-card > div:first-child > div:last-child {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .docs-layout,
+  .api-docs-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+    overflow-y: auto;
+  }
+
+  .docs-sidebar {
+    position: static;
+  }
+
+  .docs-nav {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .docs-content.glass-panel,
+  .api-endpoint-detail.glass-panel,
+  .api-endpoints-list.glass-panel {
+    padding: 16px;
+  }
+}
+
+@media (max-width: 420px) {
+  .scheme-segmented,
+  .docs-nav {
+    grid-template-columns: 1fr;
+  }
+
+  .page-section.glass-panel,
+  .create-preset-form.glass-panel,
+  .queue-section.glass-panel,
+  .process-card.glass-panel {
+    padding: 14px;
+  }
+}

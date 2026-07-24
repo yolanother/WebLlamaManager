@@ -2,11 +2,13 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Lists, creates, edits, deletes, and activates llama.cpp and DS4 presets.
+// Lists, creates, edits, deletes, and activates llama.cpp and DS4 presets in
+// responsive glass panels.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_BASE, formatBytes, formatModelName } from '../api.js';
 import { SearchableSelect } from '../components/SearchableSelect.jsx';
+import '../styles/pages.css';
 
 // Presets Page
 // A fresh, empty preset draft. `engine` selects which field set the create form
@@ -145,7 +147,7 @@ function PresetsPage({ stats }) {
       <div className="page-header">
         <h2>Presets</h2>
         <div className="page-header-actions">
-          <button className="btn-primary" onClick={() => setShowCreateForm(!showCreateForm)}>
+          <button className="btn-primary glass-btn" onClick={() => setShowCreateForm(!showCreateForm)}>
             {showCreateForm ? 'Cancel' : '+ Create Preset'}
           </button>
         </div>
@@ -157,39 +159,47 @@ function PresetsPage({ stats }) {
 
       {/* Create Preset Form */}
       {showCreateForm && (
-        <div className="create-preset-form">
+        <div className="create-preset-form glass-panel">
           <h3>Create Preset</h3>
           <div className="form-grid">
             <div className="form-group">
-              <label>Preset ID</label>
+              <label htmlFor="preset-id">Preset ID</label>
               <input
+                id="preset-id"
                 type="text"
+                className="glass-input"
                 placeholder="my-preset"
                 value={newPreset.id}
                 onChange={(e) => setNewPreset(p => ({ ...p, id: e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '-') }))}
               />
             </div>
             <div className="form-group">
-              <label>Name</label>
+              <label htmlFor="preset-name">Name</label>
               <input
+                id="preset-name"
                 type="text"
+                className="glass-input"
                 placeholder="My Custom Preset"
                 value={newPreset.name}
                 onChange={(e) => setNewPreset(p => ({ ...p, name: e.target.value }))}
               />
             </div>
             <div className="form-group full-width">
-              <label>Description</label>
+              <label htmlFor="preset-description">Description</label>
               <input
+                id="preset-description"
                 type="text"
+                className="glass-input"
                 placeholder="Optional description"
                 value={newPreset.description}
                 onChange={(e) => setNewPreset(p => ({ ...p, description: e.target.value }))}
               />
             </div>
             <div className="form-group full-width">
-              <label>Engine</label>
+              <label htmlFor="preset-engine">Engine</label>
               <select
+                id="preset-engine"
+                className="glass-input"
                 value={newPreset.engine}
                 onChange={(e) => setNewPreset(p => ({ ...p, engine: e.target.value, modelPath: '' }))}
               >
@@ -204,7 +214,7 @@ function PresetsPage({ stats }) {
               )}
             </div>
             <div className="form-group full-width">
-              <label>Model</label>
+              <span className="form-label">Model</span>
               {newPreset.engine === 'ds4' ? (
                 <SearchableSelect
                   value={newPreset.modelPath}
@@ -224,9 +234,11 @@ function PresetsPage({ stats }) {
               )}
             </div>
             <div className="form-group">
-              <label>{newPreset.engine === 'ds4' ? 'Context (--ctx, 0 = default)' : 'Context Size (0 = default)'}</label>
+              <label htmlFor="preset-context">{newPreset.engine === 'ds4' ? 'Context (--ctx, 0 = default)' : 'Context Size (0 = default)'}</label>
               <input
+                id="preset-context"
                 type="number"
+                className="glass-input"
                 value={newPreset.context}
                 onChange={(e) => setNewPreset(p => ({ ...p, context: parseInt(e.target.value) || 0 }))}
               />
@@ -236,44 +248,54 @@ function PresetsPage({ stats }) {
             {newPreset.engine === 'llama' && (
               <>
                 <div className="form-group">
-                  <label>Temperature</label>
+                  <label htmlFor="preset-temperature">Temperature</label>
                   <input
+                    id="preset-temperature"
                     type="number"
+                    className="glass-input"
                     step="0.1"
                     value={newPreset.config.temp}
                     onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, temp: parseFloat(e.target.value) || 0.7 } }))}
                   />
                 </div>
                 <div className="form-group">
-                  <label>Top P</label>
+                  <label htmlFor="preset-top-p">Top P</label>
                   <input
+                    id="preset-top-p"
                     type="number"
+                    className="glass-input"
                     step="0.1"
                     value={newPreset.config.topP}
                     onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, topP: parseFloat(e.target.value) || 1.0 } }))}
                   />
                 </div>
                 <div className="form-group">
-                  <label>Top K</label>
+                  <label htmlFor="preset-top-k">Top K</label>
                   <input
+                    id="preset-top-k"
                     type="number"
+                    className="glass-input"
                     value={newPreset.config.topK}
                     onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, topK: parseInt(e.target.value) || 0 } }))}
                   />
                 </div>
                 <div className="form-group full-width">
-                  <label>Extra Switches</label>
+                  <label htmlFor="preset-llama-switches">Extra Switches</label>
                   <input
+                    id="preset-llama-switches"
                     type="text"
+                    className="glass-input"
                     placeholder="--jinja"
                     value={newPreset.config.extraSwitches}
                     onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, extraSwitches: e.target.value } }))}
                   />
                 </div>
                 <div className="form-group full-width">
-                  <label>Chat Template Kwargs (JSON)</label>
+                  <label htmlFor="preset-chat-template-kwargs">Chat Template Kwargs (JSON)</label>
                   <input
+                    id="preset-chat-template-kwargs"
                     type="text"
+                    className="glass-input"
                     placeholder='{"reasoning_effort": "high"}'
                     value={newPreset.config.chatTemplateKwargs}
                     onChange={(e) => setNewPreset(p => ({ ...p, config: { ...p.config, chatTemplateKwargs: e.target.value } }))}
@@ -286,9 +308,11 @@ function PresetsPage({ stats }) {
             {newPreset.engine === 'ds4' && (
               <>
                 <div className="form-group">
-                  <label>Power (%)</label>
+                  <label htmlFor="preset-ds4-power">Power (%)</label>
                   <input
+                    id="preset-ds4-power"
                     type="number"
+                    className="glass-input"
                     min="1"
                     max="100"
                     value={newPreset.ds4.power}
@@ -296,27 +320,33 @@ function PresetsPage({ stats }) {
                   />
                 </div>
                 <div className="form-group">
-                  <label>KV Disk Cache Size (MB, 0 = off)</label>
+                  <label htmlFor="preset-ds4-kv-size">KV Disk Cache Size (MB, 0 = off)</label>
                   <input
+                    id="preset-ds4-kv-size"
                     type="number"
+                    className="glass-input"
                     min="0"
                     value={newPreset.ds4.kvDiskSpaceMb}
                     onChange={(e) => setNewPreset(p => ({ ...p, ds4: { ...p.ds4, kvDiskSpaceMb: parseInt(e.target.value) || 0 } }))}
                   />
                 </div>
                 <div className="form-group full-width">
-                  <label>KV Disk Cache Dir</label>
+                  <label htmlFor="preset-ds4-kv-dir">KV Disk Cache Dir</label>
                   <input
+                    id="preset-ds4-kv-dir"
                     type="text"
+                    className="glass-input"
                     placeholder="/path/to/kv-cache (optional)"
                     value={newPreset.ds4.kvDiskDir}
                     onChange={(e) => setNewPreset(p => ({ ...p, ds4: { ...p.ds4, kvDiskDir: e.target.value } }))}
                   />
                 </div>
                 <div className="form-group full-width">
-                  <label>Extra Switches</label>
+                  <label htmlFor="preset-ds4-switches">Extra Switches</label>
                   <input
+                    id="preset-ds4-switches"
                     type="text"
+                    className="glass-input"
                     placeholder="--rocm --cors"
                     value={newPreset.ds4.extraSwitches}
                     onChange={(e) => setNewPreset(p => ({ ...p, ds4: { ...p.ds4, extraSwitches: e.target.value } }))}
@@ -326,8 +356,8 @@ function PresetsPage({ stats }) {
             )}
           </div>
           <div className="form-actions">
-            <button className="btn-secondary" onClick={() => setShowCreateForm(false)}>Cancel</button>
-            <button className="btn-primary" onClick={createPreset} disabled={loading.create}>
+            <button className="btn-secondary glass-btn" onClick={() => setShowCreateForm(false)}>Cancel</button>
+            <button className="btn-primary glass-btn" onClick={createPreset} disabled={loading.create}>
               {loading.create ? 'Creating...' : 'Create Preset'}
             </button>
           </div>
@@ -335,7 +365,7 @@ function PresetsPage({ stats }) {
       )}
 
       {/* Presets Section */}
-      <section className="page-section">
+      <section className="page-section glass-panel">
         <h3>Presets</h3>
         <div className="presets-grid">
           {presets.map((preset) => {
@@ -381,7 +411,7 @@ function PresetsPage({ stats }) {
 
                 <div className="preset-actions">
                   <button
-                    className="btn-danger"
+                    className="btn-danger glass-btn"
                     onClick={() => deletePreset(preset.id)}
                   >
                     Delete

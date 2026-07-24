@@ -3,10 +3,11 @@
 // LICENSE file in the repository root.
 //
 // Manages local model inventory, load state, deletion, and the dedicated
-// embedding model selection.
+// embedding model selection in responsive glass panels.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_BASE, formatBytes } from '../api.js';
+import '../styles/pages.css';
 
 /**
  * Embedding model selector — lets the user choose a local GGUF to serve on
@@ -25,10 +26,10 @@ function EmbeddingModelSelector() {
     const r = await fetch(`${API_BASE}/embed/model`); setCurrent(await r.json());
   };
   return (
-    <div className="card">
+    <div className="card glass-panel">
       <h3>Embedding model</h3>
       <p className="hint">Served on a dedicated port for <code>/api/v1/embeddings</code>. Current: <strong>{current?.model || 'none'}</strong></p>
-      <select defaultValue="" onChange={e => e.target.value && choose(e.target.value)}>
+      <select className="glass-input" defaultValue="" onChange={e => e.target.value && choose(e.target.value)}>
         <option value="" disabled>Select a downloaded model…</option>
         {models.map(m => { const v = m.path || m.name; return <option key={v} value={v}>{m.alias || m.name}</option>; })}
       </select>
@@ -165,7 +166,7 @@ function ModelsPage({ stats }) {
 
       {/* Loaded Models */}
       {serverModels.length > 0 && (
-        <section className="page-section">
+        <section className="page-section glass-panel">
           <h3>Loaded Models</h3>
           <div className="models-grid">
             {serverModels.map((model) => {
@@ -179,7 +180,7 @@ function ModelsPage({ stats }) {
                   {alias && <div className="model-path">{model.id}</div>}
                   <div className="model-actions">
                     <button
-                      className="btn-secondary"
+                      className="btn-secondary glass-btn"
                       onClick={() => unloadModel(model.id)}
                       disabled={loading[model.id]}
                     >
@@ -194,7 +195,7 @@ function ModelsPage({ stats }) {
       )}
 
       {/* Local Models */}
-      <section className="page-section">
+      <section className="page-section glass-panel">
         <h3>Local Models</h3>
         {localModels.length === 0 ? (
           <div className="empty-state">
@@ -215,6 +216,7 @@ function ModelsPage({ stats }) {
                       <div className="alias-edit">
                         <input
                           type="text"
+                          className="glass-input"
                           value={aliasInput}
                           onChange={(e) => setAliasInput(e.target.value)}
                           placeholder="Enter alias..."
@@ -224,8 +226,8 @@ function ModelsPage({ stats }) {
                             if (e.key === 'Escape') { setEditingAlias(null); setAliasInput(''); }
                           }}
                         />
-                        <button className="btn-small" onClick={() => saveAlias(model.name)}>Save</button>
-                        <button className="btn-small btn-secondary" onClick={() => { setEditingAlias(null); setAliasInput(''); }}>Cancel</button>
+                        <button className="btn-small glass-btn" onClick={() => saveAlias(model.name)}>Save</button>
+                        <button className="btn-small btn-secondary glass-btn" onClick={() => { setEditingAlias(null); setAliasInput(''); }}>Cancel</button>
                       </div>
                     ) : (
                       <>
@@ -254,7 +256,7 @@ function ModelsPage({ stats }) {
                   <div className="model-actions">
                     {isLoaded ? (
                       <button
-                        className="btn-secondary"
+                        className="btn-secondary glass-btn"
                         onClick={() => unloadModel(model.name)}
                         disabled={loading[model.name] || !isHealthy}
                       >
@@ -262,7 +264,7 @@ function ModelsPage({ stats }) {
                       </button>
                     ) : (
                       <button
-                        className="btn-primary"
+                        className="btn-primary glass-btn"
                         onClick={() => loadModel(model.name)}
                         disabled={loading[model.name] || !isHealthy || model.incomplete}
                       >
