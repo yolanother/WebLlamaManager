@@ -6317,6 +6317,7 @@ input::placeholder {
   --glass-well:
     color-mix(in srgb, var(--glass-bg-elevated) 64%, transparent);
   --control-contrast: #07111f;
+  --ambient-image: url('/backgrounds/glass-dark.webp');
 }
 
 [data-theme="light"] {
@@ -6329,6 +6330,7 @@ input::placeholder {
   --chart-grid:
     color-mix(in srgb, var(--text-secondary) 30%, transparent);
   --control-contrast: #ffffff;
+  --ambient-image: url('/backgrounds/glass-light.webp');
 }
 
 html {
@@ -6339,10 +6341,14 @@ html {
 body {
   min-width: 0;
   min-height: 100vh;
+  /* Layer order: tinted radials float above the generated ambient artwork
+     (--ambient-image, per-scheme; site themes may override or set to none),
+     with --bg-primary as the base coat behind everything. */
   background:
     radial-gradient(circle at 16% 8%, var(--ambient-accent) 0, transparent 34rem),
     radial-gradient(circle at 88% 18%, var(--ambient-info) 0, transparent 30rem),
     radial-gradient(circle at 52% 92%, var(--ambient-success) 0, transparent 38rem),
+    var(--ambient-image, none) center / cover no-repeat,
     var(--bg-primary);
   background-attachment: fixed;
   color: var(--text-primary);
