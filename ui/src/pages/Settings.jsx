@@ -2,14 +2,20 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Provides general configuration, site themes, model mappings, remote backends,
-// and llama.cpp update controls.
+// Provides appearance, general configuration, model mappings, remote backends,
+// and llama.cpp update controls in glass-aligned settings panels.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { API_BASE } from '../api.js';
 import { resolveLlamaUpdateView } from '../llama-update-policy.js';
 import { DEFAULT_THEME_ID } from '../theme/manifest.js';
-import { useSiteTheme, selectSiteTheme } from '../theme/siteTheme.js';
+import {
+  getColorScheme,
+  selectSiteTheme,
+  setColorScheme,
+  useSiteTheme,
+} from '../theme/siteTheme.js';
+import '../styles/pages.css';
 
 /**
  * Settings section that lets the user select a host-architecture "site theme"
@@ -17,7 +23,7 @@ import { useSiteTheme, selectSiteTheme } from '../theme/siteTheme.js';
  * discovered in the runtime manifest; renders nothing until the manifest has
  * loaded and only when at least one theme is available. Selecting a theme
  * applies it instantly and persists it (localStorage `siteTheme`).
- * @returns {(JSX.Element|null)} The section, or `null` when no themes exist.
+ * @returns {(JSX.Element|null)} The site-theme field, or `null` when no themes exist.
  */
 function SiteThemeSection() {
   const { themes, selectedId, ready } = useSiteTheme();
@@ -25,7 +31,7 @@ function SiteThemeSection() {
   if (!ready || themes.length === 0) return null;
 
   return (
-    <section className="page-section">
+    <div className="appearance-site-theme">
       <h3>Site Theme</h3>
       <div className="settings-grid">
         <div className="setting-item">
@@ -36,6 +42,7 @@ function SiteThemeSection() {
           </p>
           <select
             id="siteTheme"
+            className="glass-input"
             value={selectedId}
             onChange={(e) => selectSiteTheme(e.target.value)}
           >
@@ -46,6 +53,53 @@ function SiteThemeSection() {
           </select>
         </div>
       </div>
+    </div>
+  );
+}
+
+function AppearanceSection() {
+  const [scheme, setScheme] = useState(() => getColorScheme());
+  const options = [
+    { value: 'dark', label: 'Dark' },
+    { value: 'light', label: 'Light' },
+    { value: 'system', label: 'System' },
+  ];
+
+  const selectScheme = (value) => {
+    setColorScheme(value);
+    setScheme(value);
+  };
+
+  return (
+    <section className="page-section glass-panel appearance-section">
+      <div className="appearance-section__header">
+        <h3>Appearance</h3>
+        <p>Choose the interface color scheme and optional host-provided site theme.</p>
+      </div>
+      <div className="scheme-setting">
+        <span id="color-scheme-label">Color scheme</span>
+        <div
+          className="scheme-segmented"
+          role="group"
+          aria-labelledby="color-scheme-label"
+        >
+          {options.map(({ value, label }) => (
+            <button
+              key={value}
+              type="button"
+              className={`glass-btn scheme-option ${scheme === value ? 'active' : ''}`}
+              aria-pressed={scheme === value}
+              onClick={() => selectScheme(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <p className="setting-hint">
+          System follows your operating system preference and updates automatically.
+        </p>
+      </div>
+      <SiteThemeSection />
     </section>
   );
 }
@@ -144,10 +198,10 @@ function SettingsPage() {
         <div className="header-actions">
           {activeTab === 'general' && (
             <>
-              <button className="btn-secondary" onClick={restartServer}>
+              <button className="btn-secondary glass-btn" onClick={restartServer}>
                 Restart Server
               </button>
-              <button className="btn-primary" onClick={saveSettings} disabled={saving}>
+              <button className="btn-primary glass-btn" onClick={saveSettings} disabled={saving}>
                 {saving ? 'Saving...' : 'Save Settings'}
               </button>
             </>
@@ -162,14 +216,16 @@ function SettingsPage() {
       )}
 
       <div className="settings-tabs">
-        <button className={`tab-btn ${activeTab === 'general' ? 'active' : ''}`} onClick={() => setActiveTab('general')}>General</button>
-        <button className={`tab-btn ${activeTab === 'hosts' ? 'active' : ''}`} onClick={() => setActiveTab('hosts')}>Remote Hosts</button>
-        <button className={`tab-btn ${activeTab === 'mapping' ? 'active' : ''}`} onClick={() => setActiveTab('mapping')}>Model Mapping</button>
+        <button className={`tab-btn glass-btn ${activeTab === 'general' ? 'active' : ''}`} onClick={() => setActiveTab('general')}>General</button>
+        <button className={`tab-btn glass-btn ${activeTab === 'hosts' ? 'active' : ''}`} onClick={() => setActiveTab('hosts')}>Remote Hosts</button>
+        <button className={`tab-btn glass-btn ${activeTab === 'mapping' ? 'active' : ''}`} onClick={() => setActiveTab('mapping')}>Model Mapping</button>
       </div>
 
       {activeTab === 'general' && (
         <>
-      <section className="page-section">
+      <AppearanceSection />
+
+      <section className="page-section glass-panel">
         <h3>HuggingFace</h3>
         <div className="settings-grid">
           <div className="setting-item">
@@ -184,6 +240,7 @@ function SettingsPage() {
             <input
               type="password"
               id="hfToken"
+              className="glass-input"
               autoComplete="off"
               placeholder={settings?.hasHfToken ? 'Enter a new token to replace the current one' : 'hf_...'}
               value={settings?.hfToken || ''}
@@ -193,7 +250,7 @@ function SettingsPage() {
         </div>
       </section>
 
-      <section className="page-section">
+      <section className="page-section glass-panel">
         <h3>Model Loading</h3>
         <div className="settings-grid">
           <div className="setting-item">
@@ -204,6 +261,7 @@ function SettingsPage() {
             </p>
             <select
               id="contextSize"
+              className="glass-input"
               value={settings?.contextSize || 8192}
               onChange={(e) => updateSetting('contextSize', parseInt(e.target.value))}
             >
@@ -225,6 +283,7 @@ function SettingsPage() {
             </p>
             <select
               id="modelsMax"
+              className="glass-input"
               value={settings?.modelsMax || 2}
               onChange={(e) => updateSetting('modelsMax', parseInt(e.target.value))}
             >
@@ -242,6 +301,7 @@ function SettingsPage() {
             <input
               type="number"
               id="gpuLayers"
+              className="glass-input"
               value={settings?.gpuLayers || 99}
               onChange={(e) => updateSetting('gpuLayers', parseInt(e.target.value))}
               min={0}
@@ -251,7 +311,7 @@ function SettingsPage() {
         </div>
       </section>
 
-      <section className="page-section">
+      <section className="page-section glass-panel">
         <h3>Performance Options</h3>
         <div className="settings-grid">
           <div className="setting-item checkbox">
@@ -298,7 +358,7 @@ function SettingsPage() {
         </div>
       </section>
 
-      <section className="page-section">
+      <section className="page-section glass-panel">
         <h3>Inference Defaults</h3>
         <div className="settings-grid">
           <div className="setting-item">
@@ -308,6 +368,7 @@ function SettingsPage() {
             </p>
             <select
               id="defaultReasoningEffort"
+              className="glass-input"
               value={settings?.defaultReasoningEffort || ''}
               onChange={(e) => updateSetting('defaultReasoningEffort', e.target.value || null)}
             >
@@ -326,6 +387,7 @@ function SettingsPage() {
             </p>
             <select
               id="defaultBigModel"
+              className="glass-input"
               value={settings?.defaultBigModel || ''}
               onChange={(e) => updateSetting('defaultBigModel', e.target.value || null)}
             >
@@ -343,6 +405,7 @@ function SettingsPage() {
             </p>
             <select
               id="defaultSmallModel"
+              className="glass-input"
               value={settings?.defaultSmallModel || ''}
               onChange={(e) => updateSetting('defaultSmallModel', e.target.value || null)}
             >
@@ -364,6 +427,7 @@ function SettingsPage() {
               <div key={pattern} className="model-override-row">
                 <span className="model-override-pattern">{pattern}</span>
                 <select
+                  className="glass-input"
                   value={effort}
                   onChange={(e) => {
                     const updated = { ...settings.modelReasoningEffort };
@@ -376,7 +440,7 @@ function SettingsPage() {
                   <option value="high">High</option>
                 </select>
                 <button
-                  className="btn btn-sm btn-danger"
+                  className="btn btn-sm btn-danger glass-btn"
                   onClick={() => {
                     const updated = { ...settings.modelReasoningEffort };
                     delete updated[pattern];
@@ -392,6 +456,7 @@ function SettingsPage() {
           <div className="model-override-add">
             <input
               type="text"
+              className="glass-input"
               placeholder="Model pattern (e.g. gpt-oss*)"
               id="newOverridePattern"
               onKeyDown={(e) => {
@@ -405,7 +470,7 @@ function SettingsPage() {
               }}
             />
             <button
-              className="btn btn-sm"
+              className="btn btn-sm glass-btn"
               onClick={() => {
                 const input = document.getElementById('newOverridePattern');
                 const pattern = input.value.trim();
@@ -421,7 +486,7 @@ function SettingsPage() {
         </div>
       </section>
 
-      <section className="page-section">
+      <section className="page-section glass-panel">
         <h3>Logging</h3>
         <div className="settings-grid">
           <div className="setting-item checkbox">
@@ -445,6 +510,7 @@ function SettingsPage() {
             <input
               type="number"
               id="maxConcurrentRequests"
+              className="glass-input"
               min="1"
               max="32"
               value={settings?.maxConcurrentRequests || 1}
@@ -459,6 +525,7 @@ function SettingsPage() {
             <input
               type="number"
               id="localStallMs"
+              className="glass-input"
               min="0"
               max="3600"
               value={Math.round((settings?.localStallMs ?? 60000) / 1000)}
@@ -468,7 +535,7 @@ function SettingsPage() {
         </div>
       </section>
 
-      <section className="page-section">
+      <section className="page-section glass-panel">
         <h3>Dashboard</h3>
         <div className="settings-grid">
           <div className="setting-item">
@@ -479,6 +546,7 @@ function SettingsPage() {
             <input
               type="number"
               id="fullscreenInterval"
+              className="glass-input"
               value={Math.round((settings?.fullscreenInterval || 30000) / 1000)}
               onChange={(e) => updateSetting('fullscreenInterval', parseInt(e.target.value) * 1000)}
               min={5}
@@ -488,11 +556,9 @@ function SettingsPage() {
         </div>
       </section>
 
-      <SiteThemeSection />
-
       <LlamaCppUpdateSection />
 
-      <section className="page-section">
+      <section className="page-section glass-panel">
         <h3>Current Configuration</h3>
         <pre className="settings-preview">
           {JSON.stringify(settings, null, 2)}
@@ -623,7 +689,7 @@ function ModelMappingSection({ setMessage }) {
   };
 
   return (
-    <section className="page-section">
+    <section className="page-section glass-panel">
       <h3>Model Mapping</h3>
       <p className="setting-hint" style={{ marginBottom: '12px' }}>
         Map a local model id (what clients request) to the model name on a remote host. Pick from the list or
@@ -635,12 +701,12 @@ function ModelMappingSection({ setMessage }) {
       ) : (
         <>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', gap: '8px' }}>
-            <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={refreshRemote} disabled={refreshing}>
+            <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={refreshRemote} disabled={refreshing}>
               {refreshing ? 'Refreshing…' : '↻ Refresh remote models'}
             </button>
             <div style={{ display: 'flex', gap: '8px' }}>
-              <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={addRow}>+ Add Mapping</button>
-              <button className="btn-primary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save Mappings'}</button>
+              <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={addRow}>+ Add Mapping</button>
+              <button className="btn-primary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save Mappings'}</button>
             </div>
           </div>
 
@@ -654,6 +720,7 @@ function ModelMappingSection({ setMessage }) {
             </datalist>
           ))}
 
+          <div className="model-map-table-wrap">
           <table className="model-map-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ textAlign: 'left', color: 'var(--text-secondary)', fontSize: '0.8em' }}>
@@ -670,23 +737,24 @@ function ModelMappingSection({ setMessage }) {
               {rows.map(r => (
                 <tr key={r.rowId}>
                   <td style={{ padding: '4px 6px' }}>
-                    <input list="mapping-local-models" value={r.localKey} placeholder="local model id or *" onChange={e => updateRow(r.rowId, { localKey: e.target.value })} style={{ width: '100%' }} />
+                    <input className="glass-input" list="mapping-local-models" value={r.localKey} placeholder="local model id or *" onChange={e => updateRow(r.rowId, { localKey: e.target.value })} style={{ width: '100%' }} />
                   </td>
                   <td style={{ padding: '4px 6px' }}>
-                    <select value={r.backendId} onChange={e => updateRow(r.rowId, { backendId: e.target.value })} style={{ width: '100%' }}>
+                    <select className="glass-input" value={r.backendId} onChange={e => updateRow(r.rowId, { backendId: e.target.value })} style={{ width: '100%' }}>
                       {backends.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
                     </select>
                   </td>
                   <td style={{ padding: '4px 6px' }}>
-                    <input list={`mapping-remote-${r.backendId}`} value={r.remoteValue} placeholder="remote model id" onChange={e => updateRow(r.rowId, { remoteValue: e.target.value })} style={{ width: '100%' }} />
+                    <input className="glass-input" list={`mapping-remote-${r.backendId}`} value={r.remoteValue} placeholder="remote model id" onChange={e => updateRow(r.rowId, { remoteValue: e.target.value })} style={{ width: '100%' }} />
                   </td>
                   <td style={{ padding: '4px 6px' }}>
-                    <button className="btn-secondary" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => removeRow(r.rowId)} title="Remove mapping">×</button>
+                    <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => removeRow(r.rowId)} title="Remove mapping">×</button>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          </div>
         </>
       )}
     </section>
@@ -882,7 +950,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
   };
 
   return (
-    <section className="page-section">
+    <section className="page-section glass-panel">
       <h3>Remote Backends</h3>
       <p className="setting-hint" style={{ marginBottom: '16px' }}>
         Configure remote OpenAI-compatible API endpoints for load balancing. When the local server is busy, requests can be offloaded to these backends.
@@ -911,6 +979,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
               </p>
               <select
                 id="offloadPolicy"
+                className="glass-input"
                 value={backendsConfig.offloadPolicy || 'overflow'}
                 onChange={(e) => updateRouting('offloadPolicy', e.target.value)}
               >
@@ -929,6 +998,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
                   <input
                     type="number"
                     id="thresholdQueueDepth"
+                    className="glass-input"
                     value={backendsConfig.offloadThresholdQueueDepth ?? 2}
                     onChange={(e) => updateRouting('offloadThresholdQueueDepth', parseInt(e.target.value))}
                     min={0} max={100}
@@ -940,6 +1010,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
                   <input
                     type="number"
                     id="thresholdWaitMs"
+                    className="glass-input"
                     value={backendsConfig.offloadThresholdWaitMs ?? 5000}
                     onChange={(e) => updateRouting('offloadThresholdWaitMs', parseInt(e.target.value))}
                     min={0} max={300000} step={1000}
@@ -1001,7 +1072,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
               ? { bg: 'var(--success-bg, #1a3a2a)', color: 'var(--success, #4ade80)', text: 'Tested' }
               : { bg: 'var(--error-bg, #3a1a1a)', color: 'var(--error, #f87171)', text: 'Untested' };
             return (
-              <div key={b.id} className="backend-card" style={{ border: '1px solid var(--border)', borderRadius: '8px', padding: '16px', marginBottom: '12px', background: 'var(--card-bg, #1a1a2e)' }}>
+              <div key={b.id} className="backend-card">
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
                     <strong style={{ fontSize: '1.1em' }}>{b.name}</strong>
@@ -1032,13 +1103,13 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
                       <input type="checkbox" checked={b.enabled} onChange={(e) => toggleBackend(b.id, e.target.checked)} />
                       {' '}Enabled
                     </label>
-                    <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={() => testBackend(b.id)}>
+                    <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={() => testBackend(b.id)}>
                       {test?.testing ? 'Testing...' : 'Test'}
                     </button>
-                    <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={() => setEditingId(editingId === b.id ? null : b.id)}>
+                    <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={() => setEditingId(editingId === b.id ? null : b.id)}>
                       {editingId === b.id ? 'Close' : 'Edit'}
                     </button>
-                    <button className="btn-secondary" style={{ padding: '4px 12px', fontSize: '0.85em', color: 'var(--error, #f87171)' }} onClick={() => deleteBackend(b.id, b.name)}>
+                    <button className="btn-secondary glass-btn destructive-action" style={{ padding: '4px 12px', fontSize: '0.85em', color: 'var(--error, #f87171)' }} onClick={() => deleteBackend(b.id, b.name)}>
                       Delete
                     </button>
                   </div>
@@ -1093,16 +1164,16 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
 
           {/* Add Backend */}
           {showAddForm ? (
-            <div style={{ border: '1px solid var(--border)', borderRadius: '8px', padding: '16px', marginTop: '12px', background: 'var(--card-bg, #1a1a2e)' }}>
+            <div className="backend-add-form glass-panel">
               <h4 style={{ marginBottom: '12px' }}>Add New Backend</h4>
               <BackendFormFields values={newBackend} onChange={setNewBackend} localModels={localModels} remoteModels={[]} />
               <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
-                <button className="btn-primary" onClick={addBackend}>Add Backend & Test</button>
-                <button className="btn-secondary" onClick={() => setShowAddForm(false)}>Cancel</button>
+                <button className="btn-primary glass-btn" onClick={addBackend}>Add Backend & Test</button>
+                <button className="btn-secondary glass-btn" onClick={() => setShowAddForm(false)}>Cancel</button>
               </div>
             </div>
           ) : (
-            <button className="btn-secondary" onClick={() => setShowAddForm(true)} style={{ marginTop: '8px' }}>
+            <button className="btn-secondary glass-btn" onClick={() => setShowAddForm(true)} style={{ marginTop: '8px' }}>
               + Add Backend
             </button>
           )}
@@ -1116,6 +1187,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
 function BackendFormFields({ values, onChange, localModels = [], remoteModels: remoteModelsProp = [] }) {
   const update = (key, value) => onChange({ ...values, [key]: value });
   const updateCost = (key, value) => onChange({ ...values, costs: { ...values.costs, [key]: value } });
+  const fieldPrefix = React.useId();
 
   // Local copy of remoteModels — initialised from prop, can be refreshed
   // independently of running a full backend test. This breaks the
@@ -1182,35 +1254,35 @@ function BackendFormFields({ values, onChange, localModels = [], remoteModels: r
   return (
     <div className="settings-grid">
       <div className="setting-item">
-        <label>Name</label>
-        <input type="text" value={values.name} onChange={(e) => update('name', e.target.value)} placeholder="e.g. OpenRouter" />
+        <label htmlFor={`${fieldPrefix}-name`}>Name</label>
+        <input id={`${fieldPrefix}-name`} className="glass-input" type="text" value={values.name} onChange={(e) => update('name', e.target.value)} placeholder="e.g. OpenRouter" />
       </div>
       <div className="setting-item">
-        <label>URL</label>
-        <input type="text" value={values.url} onChange={(e) => update('url', e.target.value)} placeholder="e.g. https://openrouter.ai/api/v1" />
+        <label htmlFor={`${fieldPrefix}-url`}>URL</label>
+        <input id={`${fieldPrefix}-url`} className="glass-input" type="text" value={values.url} onChange={(e) => update('url', e.target.value)} placeholder="e.g. https://openrouter.ai/api/v1" />
       </div>
       <div className="setting-item">
-        <label>API Key Env Variable</label>
+        <label htmlFor={`${fieldPrefix}-api-key-env`}>API Key Env Variable</label>
         <p className="setting-hint">Name of the environment variable holding the API key (set in .env). Leave blank for unauthenticated backends.</p>
-        <input type="text" value={values.apiKeyEnvVar} onChange={(e) => update('apiKeyEnvVar', e.target.value)} placeholder="e.g. BACKEND_OPENROUTER_API_KEY" />
+        <input id={`${fieldPrefix}-api-key-env`} className="glass-input" type="text" value={values.apiKeyEnvVar} onChange={(e) => update('apiKeyEnvVar', e.target.value)} placeholder="e.g. BACKEND_OPENROUTER_API_KEY" />
       </div>
       <div className="setting-item">
-        <label>Priority (1-100, lower = preferred)</label>
-        <input type="number" value={values.priority} onChange={(e) => update('priority', parseInt(e.target.value))} min={1} max={100} />
+        <label htmlFor={`${fieldPrefix}-priority`}>Priority (1-100, lower = preferred)</label>
+        <input id={`${fieldPrefix}-priority`} className="glass-input" type="number" value={values.priority} onChange={(e) => update('priority', parseInt(e.target.value))} min={1} max={100} />
       </div>
       <div className="setting-item">
-        <label>Shared Resource Weight (0-100)</label>
+        <label htmlFor={`${fieldPrefix}-shared-weight`}>Shared Resource Weight (0-100)</label>
         <p className="setting-hint">0 = dedicated resource, 100 = heavily shared with other users/tasks.</p>
-        <input type="range" value={values.sharedResourceWeight} onChange={(e) => update('sharedResourceWeight', parseInt(e.target.value))} min={0} max={100} />
+        <input id={`${fieldPrefix}-shared-weight`} type="range" value={values.sharedResourceWeight} onChange={(e) => update('sharedResourceWeight', parseInt(e.target.value))} min={0} max={100} />
         <span style={{ fontSize: '0.85em', color: 'var(--text-muted)' }}>{values.sharedResourceWeight}</span>
       </div>
       <div className="setting-item">
-        <label>Max Concurrent Requests</label>
-        <input type="number" value={values.maxConcurrentRequests} onChange={(e) => update('maxConcurrentRequests', parseInt(e.target.value))} min={1} max={100} />
+        <label htmlFor={`${fieldPrefix}-max-concurrent`}>Max Concurrent Requests</label>
+        <input id={`${fieldPrefix}-max-concurrent`} className="glass-input" type="number" value={values.maxConcurrentRequests} onChange={(e) => update('maxConcurrentRequests', parseInt(e.target.value))} min={1} max={100} />
       </div>
       <div className="setting-item">
-        <label>Timeout (ms)</label>
-        <input type="number" value={values.timeoutMs} onChange={(e) => update('timeoutMs', parseInt(e.target.value))} min={5000} max={600000} step={1000} />
+        <label htmlFor={`${fieldPrefix}-timeout`}>Timeout (ms)</label>
+        <input id={`${fieldPrefix}-timeout`} className="glass-input" type="number" value={values.timeoutMs} onChange={(e) => update('timeoutMs', parseInt(e.target.value))} min={5000} max={600000} step={1000} />
       </div>
 
       {/* Cost section */}
@@ -1219,16 +1291,16 @@ function BackendFormFields({ values, onChange, localModels = [], remoteModels: r
         <p className="setting-hint">Set to 0 for free/self-hosted backends.</p>
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
           <div>
-            <label style={{ fontSize: '0.85em' }}>Input</label>
-            <input type="number" value={values.costs?.inputTokenCostPer1M || 0} onChange={(e) => updateCost('inputTokenCostPer1M', parseFloat(e.target.value))} min={0} step={0.01} style={{ width: '100px' }} />
+            <label htmlFor={`${fieldPrefix}-input-cost`} style={{ fontSize: '0.85em' }}>Input</label>
+            <input id={`${fieldPrefix}-input-cost`} className="glass-input" type="number" value={values.costs?.inputTokenCostPer1M || 0} onChange={(e) => updateCost('inputTokenCostPer1M', parseFloat(e.target.value))} min={0} step={0.01} style={{ width: '100px' }} />
           </div>
           <div>
-            <label style={{ fontSize: '0.85em' }}>Output</label>
-            <input type="number" value={values.costs?.outputTokenCostPer1M || 0} onChange={(e) => updateCost('outputTokenCostPer1M', parseFloat(e.target.value))} min={0} step={0.01} style={{ width: '100px' }} />
+            <label htmlFor={`${fieldPrefix}-output-cost`} style={{ fontSize: '0.85em' }}>Output</label>
+            <input id={`${fieldPrefix}-output-cost`} className="glass-input" type="number" value={values.costs?.outputTokenCostPer1M || 0} onChange={(e) => updateCost('outputTokenCostPer1M', parseFloat(e.target.value))} min={0} step={0.01} style={{ width: '100px' }} />
           </div>
           <div>
-            <label style={{ fontSize: '0.85em' }}>Currency</label>
-            <input type="text" value={values.costs?.currency || 'USD'} onChange={(e) => updateCost('currency', e.target.value)} style={{ width: '60px' }} />
+            <label htmlFor={`${fieldPrefix}-currency`} style={{ fontSize: '0.85em' }}>Currency</label>
+            <input id={`${fieldPrefix}-currency`} className="glass-input" type="text" value={values.costs?.currency || 'USD'} onChange={(e) => updateCost('currency', e.target.value)} style={{ width: '60px' }} />
           </div>
         </div>
       </div>
@@ -1263,8 +1335,8 @@ function BackendEditForm({ backend, localModels, remoteModels, onSave, onCancel 
     <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--border)' }}>
       <BackendFormFields values={values} onChange={setValues} localModels={localModels} remoteModels={remoteModels} />
       <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
-        <button className="btn-primary" onClick={() => onSave(values)}>Save Changes</button>
-        <button className="btn-secondary" onClick={onCancel}>Cancel</button>
+        <button className="btn-primary glass-btn" onClick={() => onSave(values)}>Save Changes</button>
+        <button className="btn-secondary glass-btn" onClick={onCancel}>Cancel</button>
       </div>
     </div>
   );
@@ -1347,7 +1419,7 @@ function LlamaCppUpdateSection() {
   };
 
   return (
-    <section className="page-section">
+    <section className="page-section glass-panel">
       <h3>llama.cpp Updates</h3>
       <div className="setting-item">
         {updateView.packageManaged ? (
@@ -1361,7 +1433,7 @@ function LlamaCppUpdateSection() {
               Pull the latest llama.cpp changes from GitHub and rebuild. This will stop any running llama server during the update.
             </p>
             <button
-              className={`btn-secondary ${updating ? 'disabled' : ''}`}
+              className={`btn-secondary glass-btn ${updating ? 'disabled' : ''}`}
               onClick={startUpdate}
               disabled={updating}
             >

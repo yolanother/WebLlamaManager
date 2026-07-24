@@ -3,12 +3,13 @@
 // LICENSE file in the repository root.
 //
 // Displays manager, request, and LLM logs with filtering, detail inspection,
-// copying, and clearing controls.
+// copying, and clearing controls in readable glass surfaces for both schemes.
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { API_BASE, copyTextToClipboard } from '../api.js';
 import { CodeBlock, parseMessageWithCodeBlocks } from '../components/CodeBlock.jsx';
+import '../styles/pages.css';
 
 // Logs Page
 function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs }) {
@@ -332,19 +333,19 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
         <h2>Logs</h2>
         <div className="logs-tabs">
           <button
-            className={`tab-btn ${activeTab === 'server' ? 'active' : ''}`}
+            className={`tab-btn glass-btn ${activeTab === 'server' ? 'active' : ''}`}
             onClick={() => setActiveTab('server')}
           >
             Server Logs
           </button>
           <button
-            className={`tab-btn ${activeTab === 'requests' ? 'active' : ''}`}
+            className={`tab-btn glass-btn ${activeTab === 'requests' ? 'active' : ''}`}
             onClick={() => setActiveTab('requests')}
           >
             Request Logs
           </button>
           <button
-            className={`tab-btn ${activeTab === 'llm' ? 'active' : ''}`}
+            className={`tab-btn glass-btn ${activeTab === 'llm' ? 'active' : ''}`}
             onClick={() => setActiveTab('llm')}
           >
             LLM Log
@@ -356,15 +357,15 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
             placeholder="Filter logs..."
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            className="logs-filter"
+            className="logs-filter glass-input"
           />
           {activeTab === 'server' ? (
             <>
-              <button className="btn-secondary" onClick={clearLogs}>
+              <button className="btn-secondary glass-btn" onClick={clearLogs}>
                 Clear
               </button>
               <button
-                className={`btn-secondary ${showFiltersPanel ? 'active' : ''}`}
+                className={`btn-secondary glass-btn ${showFiltersPanel ? 'active' : ''}`}
                 onClick={() => setShowFiltersPanel(!showFiltersPanel)}
                 title="Manage server-side log filters"
               >
@@ -372,13 +373,13 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
               </button>
             </>
           ) : activeTab === 'requests' ? (
-            <button className="btn-secondary" onClick={handleClearRequestLogs}>
+            <button className="btn-secondary glass-btn" onClick={handleClearRequestLogs}>
               Clear
             </button>
           ) : (
             <>
               <select
-                className="logs-filter-select"
+                className="logs-filter-select glass-input"
                 value={llmEndpointFilter}
                 onChange={(e) => setLlmEndpointFilter(e.target.value)}
                 title="Filter by request type. Embeddings have no conversation, so they are hidden by default."
@@ -388,7 +389,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                 <option value="embeddings">Embeddings{llmEmbeddingCount ? ` (${llmEmbeddingCount})` : ''}</option>
               </select>
               <select
-                className="logs-filter-select"
+                className="logs-filter-select glass-input"
                 value={llmModelFilter}
                 onChange={(e) => setLlmModelFilter(e.target.value)}
                 title="Filter by model"
@@ -399,7 +400,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                 ))}
               </select>
               <select
-                className="logs-filter-select"
+                className="logs-filter-select glass-input"
                 value={llmBackendFilter}
                 onChange={(e) => setLlmBackendFilter(e.target.value)}
                 title="Filter by backend / host"
@@ -411,14 +412,14 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
               </select>
               {(llmModelFilter || llmBackendFilter || llmEndpointFilter !== 'conversations') && (
                 <button
-                  className="btn-secondary"
+                  className="btn-secondary glass-btn"
                   onClick={() => { setLlmModelFilter(''); setLlmBackendFilter(''); setLlmEndpointFilter('conversations'); }}
                   title="Reset endpoint/model/backend filters"
                 >
                   Clear filters
                 </button>
               )}
-              <button className="btn-secondary" onClick={handleClearLlmLogs}>
+              <button className="btn-secondary glass-btn" onClick={handleClearLlmLogs}>
                 Clear
               </button>
             </>
@@ -435,7 +436,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
       </div>
 
       {activeTab === 'server' && showFiltersPanel && (
-        <div className="filters-panel">
+        <div className="filters-panel glass-panel">
           <div className="filters-section">
             <h4>Server-side Log Filters</h4>
             <p className="hint">Matching log lines are ignored at the server and won't appear in logs.</p>
@@ -443,13 +444,14 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
             <div className="filter-input-row">
               <input
                 type="text"
+                className="glass-input"
                 placeholder="Add regex pattern (e.g., GET /api.*200)"
                 value={newFilterPattern}
                 onChange={(e) => setNewFilterPattern(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && newFilterPattern && addFilter(newFilterPattern)}
               />
               <button
-                className="btn-primary"
+                className="btn-primary glass-btn"
                 onClick={() => addFilter(newFilterPattern)}
                 disabled={!newFilterPattern}
               >
@@ -489,7 +491,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
 
       {activeTab === 'server' ? (
         <div
-          className="logs-container"
+          className="logs-container glass-panel"
           ref={logsContainerRef}
           onScroll={handleScroll}
         >
@@ -521,7 +523,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
         </div>
       ) : activeTab === 'requests' ? (
         <div
-          className="logs-container"
+          className="logs-container glass-panel"
           ref={logsContainerRef}
           onScroll={handleScroll}
         >
@@ -577,9 +579,9 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                           <td className="request-duration">{log.duration}ms</td>
                           <td className="request-model">{log.model || '-'}</td>
                           <td className="request-backend">{log.backend && log.backend !== 'local' ? (
-                            <span style={{ display: 'inline-block', padding: '1px 6px', borderRadius: '3px', fontSize: '0.8em', background: '#2d1b69', color: '#a78bfa' }}>{log.backend}</span>
+                            <span className="glass-chip request-backend-chip">{log.backend}</span>
                           ) : (
-                            <span style={{ color: 'var(--text-muted)', fontSize: '0.85em' }}>local</span>
+                            <span className="request-backend-local">local</span>
                           )}</td>
                         </tr>
                         {isExpanded && (
@@ -620,7 +622,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
           )}
         </div>
       ) : (
-        <div className="logs-container llm-logs-container">
+        <div className="logs-container glass-panel llm-logs-container">
           {filteredLlmLogs.length === 0 ? (
             <div className="logs-empty">
               {llmEndpointFilter === 'conversations' && llmEmbeddingCount > 0 ? (
@@ -657,7 +659,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                         <span className="llm-log-tps">{log.tokensPerSecond} t/s</span>
                       )}
                       <span className={`llm-log-endpoint ${log.endpoint}`}>{log.endpoint}</span>
-                      {log.backend && log.backend !== 'local' && <span className="llm-log-badge" style={{ background: 'var(--info-bg, #1a2a3a)', color: 'var(--info, #60a5fa)' }}>{log.backend}</span>}
+                      {log.backend && log.backend !== 'local' && <span className="llm-log-badge backend">{log.backend}</span>}
                       {log.stream && <span className="llm-log-badge stream">stream</span>}
                       {log.retries > 0 && <span className="llm-log-badge retry">{log.retries} {log.retries === 1 ? 'retry' : 'retries'}</span>}
                       {isError && <span className="llm-log-badge error">{log.status || 'ERR'}</span>}
@@ -715,7 +717,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                             Response
                             {log.response && (
                               <button
-                                className="copy-field-btn"
+                                className="copy-field-btn glass-btn"
                                 onClick={(e) => { e.stopPropagation(); handleCopyField(log.response, `resp-${log.id}`); }}
                               >{copiedField === `resp-${log.id}` ? 'Copied' : 'Copy'}</button>
                             )}
@@ -748,7 +750,7 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                               Error
                               {log.error && (
                                 <button
-                                  className="copy-field-btn"
+                                  className="copy-field-btn glass-btn"
                                   onClick={(e) => { e.stopPropagation(); handleCopyField(log.error, `error-${log.id}`); }}
                                 >{copiedField === `error-${log.id}` ? 'Copied' : 'Copy'}</button>
                               )}
@@ -768,14 +770,14 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
                             <div className="llm-log-section-title">
                               {log.requestBody ? 'Full Request Body' : 'Request (reconstructed)'}
                               <button
-                                className="copy-field-btn"
+                                className="copy-field-btn glass-btn"
                                 onClick={(e) => { e.stopPropagation(); handleCopyField(JSON.stringify(displayBody, null, 2), `body-${log.id}`); }}
                               >{copiedField === `body-${log.id}` ? 'Copied' : 'Copy'}</button>
                             </div>
                             <pre className="llm-log-request-body">{JSON.stringify(displayBody, null, 2)}</pre>
                             <div className="llm-log-resubmit-row">
                               <button
-                                className="btn-secondary resubmit-btn"
+                                className="btn-secondary glass-btn resubmit-btn"
                                 onClick={(e) => { e.stopPropagation(); handleResubmit(log); }}
                                 disabled={resubmitting[log.id] === 'loading'}
                               >

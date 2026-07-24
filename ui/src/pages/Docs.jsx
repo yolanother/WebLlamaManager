@@ -3,10 +3,11 @@
 // LICENSE file in the repository root.
 //
 // Presents setup, integration, API usage, and feature documentation with
-// copyable examples.
+// copyable examples in responsive glass navigation and content panels.
 
 import React, { useState, useEffect } from 'react';
 import { API_BASE, copyTextToClipboard } from '../api.js';
+import '../styles/pages.css';
 
 // Documentation Page
 function DocsPage() {
@@ -88,7 +89,7 @@ function DocsPage() {
       <div className="docs-code-header">
         <span>{language}</span>
         <button
-          className={`docs-copy-btn ${copiedCode === id ? 'copied' : ''}`}
+          className={`docs-copy-btn glass-btn ${copiedCode === id ? 'copied' : ''}`}
           onClick={() => copyCode(code, id)}
         >
           {copiedCode === id ? 'Copied!' : 'Copy'}
@@ -109,12 +110,12 @@ function DocsPage() {
   return (
     <div className="page docs-page">
       <div className="docs-layout">
-        <nav className="docs-sidebar">
+        <nav className="docs-sidebar glass-panel">
           <div className="docs-nav">
             {sections.map(section => (
               <button
                 key={section.id}
-                className={`docs-nav-item ${activeSection === section.id ? 'active' : ''}`}
+                className={`docs-nav-item glass-btn ${activeSection === section.id ? 'active' : ''}`}
                 onClick={() => setActiveSection(section.id)}
               >
                 {section.title}
@@ -123,7 +124,7 @@ function DocsPage() {
           </div>
         </nav>
 
-        <div className="docs-content">
+        <div className="docs-content glass-panel">
           {activeSection === 'overview' && (
             <section className="docs-section">
               <h2>Overview</h2>

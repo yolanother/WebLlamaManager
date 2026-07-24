@@ -3,10 +3,11 @@
 // LICENSE file in the repository root.
 //
 // Displays managed system processes and their resource usage and control
-// actions.
+// actions in responsive glass panels.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_BASE } from '../api.js';
+import '../styles/pages.css';
 
 // Processes Page
 function ProcessesPage() {
@@ -60,7 +61,7 @@ function ProcessesPage() {
     <div className="page processes-page">
       <div className="page-header">
         <h2>Server Processes</h2>
-        <button className="btn-secondary" onClick={fetchProcesses}>
+        <button className="btn-secondary glass-btn" onClick={fetchProcesses}>
           Refresh
         </button>
       </div>
@@ -78,7 +79,7 @@ function ProcessesPage() {
         <>
           {/* Main Router Process */}
           {mainProcess && (
-            <section className="page-section">
+            <section className="page-section glass-panel">
               <h3>Router Process (Port {llamaPort})</h3>
               <div className="process-card main">
                 <div className="process-header">
@@ -121,7 +122,7 @@ function ProcessesPage() {
                 </div>
                 <div className="process-actions">
                   <button
-                    className="btn-danger btn-small"
+                    className="btn-danger btn-small glass-btn"
                     onClick={() => killProcess(mainProcess.pid)}
                     disabled={killing[mainProcess.pid]}
                   >
@@ -134,7 +135,7 @@ function ProcessesPage() {
 
           {/* Worker Processes */}
           {workerProcesses.length > 0 && (
-            <section className="page-section">
+            <section className="page-section glass-panel">
               <h3>Worker Processes ({workerProcesses.length})</h3>
               <p className="section-hint">Workers handle individual model instances in router mode</p>
               <div className="processes-grid">
@@ -172,7 +173,7 @@ function ProcessesPage() {
                     )}
                     <div className="process-actions">
                       <button
-                        className="btn-danger btn-small"
+                        className="btn-danger btn-small glass-btn"
                         onClick={() => killProcess(proc.pid)}
                         disabled={killing[proc.pid]}
                       >
@@ -186,7 +187,7 @@ function ProcessesPage() {
           )}
 
           {/* Summary */}
-          <section className="page-section">
+          <section className="page-section glass-panel">
             <h3>Summary</h3>
             <div className="process-summary">
               <div className="summary-item">

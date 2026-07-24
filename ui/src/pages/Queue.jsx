@@ -3,12 +3,13 @@
 // LICENSE file in the repository root.
 //
 // Displays active and pending requests and provides request cancellation and
-// queue management controls.
+// queue management controls in responsive glass table panels.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { API_BASE } from '../api.js';
 import { parseMessageWithCodeBlocks } from '../components/CodeBlock.jsx';
 import { StatCard } from '../components/util.jsx';
+import '../styles/pages.css';
 
 // Queue Management Page
 function QueuePage({ stats, activeRequestsMap }) {
@@ -245,7 +246,7 @@ function QueuePage({ stats, activeRequestsMap }) {
             Concurrency: {queueData.concurrency} | Total queued: {queueData.totalQueued}
           </span>
           {pendingItems.length > 0 && (
-            <button className="btn-warning" onClick={flushAll}>
+            <button className="btn-warning glass-btn" onClick={flushAll}>
               Flush All Pending ({pendingItems.length})
             </button>
           )}
@@ -260,7 +261,7 @@ function QueuePage({ stats, activeRequestsMap }) {
       </div>
 
       {activeItems.length > 0 && (
-        <div className="queue-section">
+        <div className="queue-section glass-panel">
           <h3>Active Requests</h3>
           <div className="queue-table">
             <div className="queue-table-header">
@@ -326,7 +327,7 @@ function QueuePage({ stats, activeRequestsMap }) {
                     <span className="queue-col-actions" onClick={e => e.stopPropagation()}>
                       {item.activeRequestId ? (
                         <button
-                          className="btn-danger-sm"
+                          className="btn-danger-sm glass-btn"
                           onClick={() => killActive(item.activeRequestId)}
                           disabled={cancelling.has(`active-${item.activeRequestId}`)}
                           title="Kill this request"
@@ -347,7 +348,7 @@ function QueuePage({ stats, activeRequestsMap }) {
       )}
 
       {pendingItems.length > 0 && (
-        <div className="queue-section">
+        <div className="queue-section glass-panel">
           <h3>Pending Requests</h3>
           <div className="queue-table">
             <div className="queue-table-header">
@@ -398,7 +399,7 @@ function QueuePage({ stats, activeRequestsMap }) {
                   <span className={`queue-col-elapsed ${item.elapsed > 60000 ? 'elapsed-warning' : ''}`}>{formatElapsed(item.elapsed)}</span>
                   <span className="queue-col-actions">
                     <button
-                      className="btn-danger-sm"
+                      className="btn-danger-sm glass-btn"
                       onClick={onCancel}
                       disabled={cancelling.has(cancelKey)}
                       title={hasActive ? 'Abort this queued request' : 'Cancel this pending request'}
@@ -414,7 +415,7 @@ function QueuePage({ stats, activeRequestsMap }) {
       )}
 
       {queueData.items.length === 0 && (
-        <div className="queue-empty">
+        <div className="queue-empty glass-panel">
           <span className="queue-empty-icon">&#x2705;</span>
           <p>Queue is empty — no active or pending requests</p>
         </div>

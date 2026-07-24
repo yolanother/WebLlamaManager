@@ -3,11 +3,12 @@
 // LICENSE file in the repository root.
 //
 // Documents manager and OpenAI-compatible endpoints and provides an interactive
-// request builder.
+// request builder in responsive glass navigation and detail panels.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_BASE, copyTextToClipboard } from '../api.js';
 import { SearchableSelect } from '../components/SearchableSelect.jsx';
+import '../styles/pages.css';
 
 // API Documentation Page
 function ApiDocsPage() {
@@ -433,13 +434,13 @@ function ApiDocsPage() {
 
       <div className="api-tabs">
         <button
-          className={`api-tab ${activeTab === 'manager' ? 'active' : ''}`}
+          className={`api-tab glass-btn ${activeTab === 'manager' ? 'active' : ''}`}
           onClick={() => { setActiveTab('manager'); setActiveEndpoint(null); setResponse(null); }}
         >
           Manager API
         </button>
         <button
-          className={`api-tab ${activeTab === 'openai' ? 'active' : ''}`}
+          className={`api-tab glass-btn ${activeTab === 'openai' ? 'active' : ''}`}
           onClick={() => { setActiveTab('openai'); setActiveEndpoint(null); setResponse(null); }}
         >
           OpenAI API (v1)
@@ -448,7 +449,7 @@ function ApiDocsPage() {
 
       <div className="api-docs-layout">
         {/* Endpoints List */}
-        <div className="api-endpoints-list">
+        <div className="api-endpoints-list glass-panel">
           <h3>{activeTab === 'manager' ? 'Manager Endpoints' : 'OpenAI-Compatible Endpoints'}</h3>
           {activeTab === 'openai' && (
             <p className="api-base-url">Base URL: <code>/api/v1</code></p>
@@ -470,7 +471,7 @@ function ApiDocsPage() {
         </div>
 
         {/* Endpoint Details & Testing */}
-        <div className="api-endpoint-detail">
+        <div className="api-endpoint-detail glass-panel">
           {activeEndpoint ? (
             <>
               <div className="endpoint-header">
@@ -497,6 +498,7 @@ function ApiDocsPage() {
                         <p className="param-description">{param.description}</p>
                         {param.type === 'boolean' ? (
                           <select
+                            className="glass-input"
                             value={params[param.name] ?? ''}
                             onChange={(e) => handleParamChange(param.name, e.target.value, 'boolean')}
                           >
@@ -506,6 +508,7 @@ function ApiDocsPage() {
                           </select>
                         ) : param.type === 'json' ? (
                           <textarea
+                            className="glass-input"
                             value={params[param.name] ?? ''}
                             onChange={(e) => handleParamChange(param.name, e.target.value, 'json')}
                             placeholder={`Enter JSON...`}
@@ -521,6 +524,7 @@ function ApiDocsPage() {
                           />
                         ) : (
                           <input
+                            className="glass-input"
                             type={param.type === 'number' ? 'number' : 'text'}
                             value={params[param.name] ?? ''}
                             onChange={(e) => handleParamChange(param.name, e.target.value, param.type)}
@@ -539,7 +543,7 @@ function ApiDocsPage() {
                   <h4>
                     curl Example
                     <button
-                      className={`curl-copy-btn ${copiedCurl ? 'copied' : ''}`}
+                      className={`curl-copy-btn glass-btn ${copiedCurl ? 'copied' : ''}`}
                       onClick={copyCurl}
                     >
                       {copiedCurl ? 'Copied!' : 'Copy'}
@@ -554,7 +558,7 @@ function ApiDocsPage() {
               {/* Test Button */}
               <div className="test-section">
                 <button
-                  className="btn-primary"
+                  className="btn-primary glass-btn"
                   onClick={() => testEndpoint(activeEndpoint)}
                   disabled={loading}
                 >
