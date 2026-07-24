@@ -45,6 +45,7 @@ import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots } from './slot-reaper.js';
 import { resolveDefaultModel, defaultModelListEntries, ds4PresetForModel, validateDefaultModelTarget, BIG_ALIAS, SMALL_ALIAS } from './default-models.js';
+import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
@@ -7656,16 +7657,6 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
 app.post('/api/v1/chat/completions', async (req, res) => {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
-  // Resolve default-big/default-small aliases to the configured real target before
-  // routing, and forward the resolved name to the backend so the alias never reaches
-  // llama.cpp as an unknown model name. rawModel keeps the pre-resolution name so the
-  // engine seam can tell an alias request from a direct model request.
-  const rawModel = req.body.model || 'default';
-  const requestedModel = resolveDefaultModel(rawModel, config);
-  if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
-
-  console.log(`[chat/completions] Request for model: ${requestedModel}`);
-
   // Normalize messages: accept stringified JSON arrays for compatibility
   if (typeof req.body.messages === 'string') {
     try {
@@ -7677,6 +7668,36 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   if (!Array.isArray(req.body.messages)) {
     return res.status(400).json({ error: { message: 'messages must be an array', type: 'invalid_request_error' } });
   }
+
+  injectBaseChatPrompt(req.body, req.headers);
+  if (req.body.model === 'auto' || req.body.model === 'default-router') {
+    const choice = await routeAutoModel(req.body, {
+      config,
+      listModels: async () => {
+        const r = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/models`);
+        if (!r.ok) throw new Error(`model catalog returned ${r.status}`);
+        return r.json();
+      },
+      complete: async (model, messages, { signal, ...opts }) => {
+        const r = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/chat/completions`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, signal, body: JSON.stringify({ model, messages, ...opts }),
+        });
+        if (!r.ok) throw new Error(`router completion returned ${r.status}`);
+        return r.json();
+      },
+    });
+    res.setHeader('x-llama-router-choice', choice);
+  }
+
+  // Resolve default-big/default-small aliases to the configured real target before
+  // routing, and forward the resolved name to the backend so the alias never reaches
+  // llama.cpp as an unknown model name. rawModel keeps the pre-resolution name so the
+  // engine seam can tell an alias request from a direct model request.
+  const rawModel = req.body.model || 'default';
+  const requestedModel = resolveDefaultModel(rawModel, config);
+  if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
+
+  console.log(`[chat/completions] Request for model: ${requestedModel}`);
 
   // ── Engine activation for a ds4-backed default-big ───────────────────────────
   // If the alias-resolved model names a ds4 preset and ds4 isn't already active,
