@@ -6903,10 +6903,12 @@ tbody tr:hover td,
   box-shadow: var(--shadow-raised);
 }
 
+/* Overflow containment belongs to OUR containers only. Do not put
+   max-width on recharts' own wrapper/responsive-container: their inline
+   pixel width resolves the percentage circularly against the measuring
+   parent and Chromium collapses them to 0px — every chart goes blank. */
 .chart-container,
-.chart-container-wide,
-.recharts-responsive-container,
-.recharts-wrapper {
+.chart-container-wide {
   min-width: 0;
   max-width: 100%;
 }
