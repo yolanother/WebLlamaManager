@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { API_BASE } from '../api.js';
+import { ArtifactWorkbench } from '../components/chat/ArtifactWorkbench.jsx';
 import { Composer } from '../components/chat/Composer.jsx';
 import { ConversationSidebar } from '../components/chat/ConversationSidebar.jsx';
 import { MessageList } from '../components/chat/MessageList.jsx';
@@ -16,6 +17,14 @@ import {
   buildMessageContent,
   classifyUrl,
 } from '../components/chat/attachments.js';
+import {
+  assembleArtifactEditMessages,
+  createArtifact,
+  extractArtifacts,
+  moveArtifactVersion,
+  parseArtifactEditResponse,
+  pushArtifactVersion,
+} from '../components/chat/artifacts.js';
 import { useChatStream } from '../components/chat/useChatStream.js';
 import '../styles/chat.css';
 
@@ -34,6 +43,7 @@ function makeConversation() {
     title: 'New conversation',
     model: 'auto',
     messages: [],
+    artifacts: [],
     createdAt: now,
     updatedAt: now,
   };
@@ -49,6 +59,7 @@ function loadConversations() {
       title: conversation.title || 'New conversation',
       model: conversation.model || 'auto',
       messages: Array.isArray(conversation.messages) ? conversation.messages : [],
+      artifacts: Array.isArray(conversation.artifacts) ? conversation.artifacts : [],
     }));
   } catch {
     return [];
@@ -96,7 +107,10 @@ function ChatPage({ stats }) {
   const [prompt, setPrompt] = useState('');
   const [attachments, setAttachments] = useState([]);
   const [editing, setEditing] = useState(null);
+  const [activeArtifactId, setActiveArtifactId] = useState(null);
+  const [artifactContextEnabled, setArtifactContextEnabled] = useState(false);
   const [pageError, setPageError] = useState('');
+  const [pageNotice, setPageNotice] = useState('');
   const [streamConversationId, setStreamConversationId] = useState(null);
   const {
     isStreaming,
@@ -109,6 +123,10 @@ function ChatPage({ stats }) {
   const activeConversation = useMemo(
     () => conversations.find((conversation) => conversation.id === activeConversationId),
     [activeConversationId, conversations],
+  );
+  const activeArtifact = useMemo(
+    () => activeConversation?.artifacts?.find((artifact) => artifact.id === activeArtifactId),
+    [activeArtifactId, activeConversation],
   );
   const healthy = !stats
     || stats.llama?.status === 'ok'
@@ -139,6 +157,19 @@ function ChatPage({ stats }) {
       localStorage.setItem(ACTIVE_CONVERSATION_KEY, activeConversationId);
     }
   }, [activeConversationId]);
+
+  useEffect(() => {
+    if (activeArtifactId && activeConversation && !activeArtifact) {
+      setActiveArtifactId(null);
+      setArtifactContextEnabled(false);
+    }
+  }, [activeArtifact, activeArtifactId, activeConversation]);
+
+  useEffect(() => {
+    if (!pageNotice) return undefined;
+    const timeout = setTimeout(() => setPageNotice(''), 3600);
+    return () => clearTimeout(timeout);
+  }, [pageNotice]);
 
   const fetchModels = useCallback(async () => {
     try {
@@ -315,27 +346,83 @@ function ChatPage({ stats }) {
     .filter((attachment) => attachment.status === 'ready')
     .map(({ source, status, ...attachment }) => attachment);
 
-  const runAssistant = useCallback(async (conversationId, baseMessages, model) => {
+  const runAssistant = useCallback(async (
+    conversationId,
+    baseMessages,
+    model,
+    artifactEdit = null,
+  ) => {
     setStreamConversationId(conversationId);
     try {
+      const requestMessages = baseMessages.map((message) => ({
+        role: message.role,
+        content: message.requestContent ?? message.content,
+      }));
       const result = await streamChat({
         model: model || 'auto',
-        messages: baseMessages.map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
+        messages: artifactEdit
+          ? assembleArtifactEditMessages(requestMessages, artifactEdit)
+          : requestMessages,
       });
-      if (!result.content && !result.stopped) return;
-      const assistant = {
+      const timestamp = new Date().toISOString();
+      const assistantBase = {
         id: makeId(),
         role: 'assistant',
-        content: result.content || 'Response stopped.',
+        requestContent: result.content,
+        ...(artifactEdit ? { artifactEditId: artifactEdit.id } : {}),
         routedModel: result.routedModel,
         stopped: result.stopped,
-        timestamp: new Date().toISOString(),
+        timestamp,
         stats: result.stats,
       };
-      updateConversation(conversationId, { messages: [...baseMessages, assistant] });
+
+      if (artifactEdit) {
+        const parsed = parseArtifactEditResponse(result.content);
+        if (parsed) {
+          const assistant = {
+            ...assistantBase,
+            content: parsed.summary || `Updated ${artifactEdit.title}.`,
+            artifactIds: [artifactEdit.id],
+            artifactUpdate: true,
+          };
+          updateConversation(conversationId, (conversation) => ({
+            messages: [...baseMessages, assistant],
+            artifacts: (conversation.artifacts || []).map((artifact) => {
+              if (artifact.id !== artifactEdit.id) return artifact;
+              return {
+                ...pushArtifactVersion(artifact, parsed.content, {
+                  source: 'agent',
+                  createdAt: timestamp,
+                }),
+                language: parsed.language || artifact.language,
+              };
+            }),
+          }));
+        } else {
+          setPageNotice('No file update detected.');
+          updateConversation(conversationId, {
+            messages: [...baseMessages, {
+              ...assistantBase,
+              content: result.content,
+            }],
+          });
+        }
+      } else {
+        const extracted = extractArtifacts(result.content);
+        const newArtifacts = extracted.artifacts.map((candidate) => createArtifact({
+          ...candidate,
+          id: makeId(),
+        }, { createdAt: timestamp }));
+        const assistant = {
+          ...assistantBase,
+          content: extracted.displayContent,
+          ...(newArtifacts.length ? { artifactIds: newArtifacts.map((artifact) => artifact.id) } : {}),
+        };
+        updateConversation(conversationId, (conversation) => ({
+          messages: [...baseMessages, assistant],
+          artifacts: [...(conversation.artifacts || []), ...newArtifacts],
+        }));
+      }
     } catch (error) {
       updateConversation(conversationId, {
         messages: [...baseMessages, {
@@ -384,9 +471,16 @@ function ChatPage({ stats }) {
     setAttachments([]);
     setEditing(null);
     setPageError('');
-    runAssistant(activeConversation.id, nextMessages, activeConversation.model);
+    runAssistant(
+      activeConversation.id,
+      nextMessages,
+      activeConversation.model,
+      artifactContextEnabled ? activeArtifact : null,
+    );
   }, [
     activeConversation,
+    activeArtifact,
+    artifactContextEnabled,
     attachments,
     editing,
     isStreaming,
@@ -400,23 +494,12 @@ function ChatPage({ stats }) {
     const index = activeConversation.messages.findIndex((item) => item.id === message.id);
     if (index < 0) return;
     const baseMessages = activeConversation.messages.slice(0, index);
+    const artifactEdit = message.artifactEditId
+      ? activeConversation.artifacts?.find((artifact) => artifact.id === message.artifactEditId)
+      : null;
     updateConversation(activeConversation.id, { messages: baseMessages });
-    runAssistant(activeConversation.id, baseMessages, activeConversation.model);
+    runAssistant(activeConversation.id, baseMessages, activeConversation.model, artifactEdit);
   }, [activeConversation, isStreaming, runAssistant, updateConversation]);
-
-  const regenerateLatest = useCallback(() => {
-    if (!activeConversation || isStreaming || activeConversation.messages.length === 0) return;
-    const lastMessage = activeConversation.messages.at(-1);
-    if (lastMessage?.role === 'assistant') {
-      regenerateMessage(lastMessage);
-    } else {
-      runAssistant(
-        activeConversation.id,
-        activeConversation.messages,
-        activeConversation.model,
-      );
-    }
-  }, [activeConversation, isStreaming, regenerateMessage, runAssistant]);
 
   const editMessage = useCallback((message) => {
     if (!activeConversation || isStreaming) return;
@@ -444,6 +527,8 @@ function ChatPage({ stats }) {
     setPrompt('');
     setAttachments([]);
     setEditing(null);
+    setActiveArtifactId(null);
+    setArtifactContextEnabled(false);
     if (window.innerWidth < 1200) setRailOpen(false);
   }, [isStreaming, stop]);
 
@@ -466,25 +551,40 @@ function ChatPage({ stats }) {
         title: conversation.title || 'Imported conversation',
         model: conversation.model || 'auto',
         messages: Array.isArray(conversation.messages) ? conversation.messages : [],
+        artifacts: Array.isArray(conversation.artifacts) ? conversation.artifacts : [],
         createdAt: conversation.createdAt || new Date().toISOString(),
         updatedAt: conversation.updatedAt || new Date().toISOString(),
       }));
       setConversations((current) => [...normalized, ...current]);
-      if (normalized[0]) setActiveConversationId(normalized[0].id);
+      if (normalized[0]) {
+        setActiveConversationId(normalized[0].id);
+        setActiveArtifactId(null);
+        setArtifactContextEnabled(false);
+      }
       setPageError('');
     } catch (error) {
       setPageError(`Import failed: ${error.message}`);
     }
   }, []);
 
+  const updateArtifact = useCallback((artifactId, updater) => {
+    if (!activeConversation) return;
+    updateConversation(activeConversation.id, (conversation) => ({
+      artifacts: (conversation.artifacts || []).map((artifact) => (
+        artifact.id === artifactId ? updater(artifact) : artifact
+      )),
+    }));
+  }, [activeConversation, updateConversation]);
+
+  const closeArtifact = useCallback(() => {
+    setActiveArtifactId(null);
+    setArtifactContextEnabled(false);
+    requestAnimationFrame(() => document.getElementById('chat-prompt')?.focus());
+  }, []);
+
   if (!activeConversation) {
     return <div className="chat-page-shell" aria-busy="true" />;
   }
-
-  const lastMessage = activeConversation.messages.at(-1);
-  const canRegenerate = Boolean(
-    lastMessage && (lastMessage.role === 'assistant' || lastMessage.role === 'user'),
-  );
 
   return (
     <div className="chat-page-shell">
@@ -502,79 +602,107 @@ function ChatPage({ stats }) {
           setPrompt('');
           setAttachments([]);
           setEditing(null);
+          setActiveArtifactId(null);
+          setArtifactContextEnabled(false);
         }}
       />
-      <section className="chat-stage" aria-label="Chat">
-        <header className="chat-stage-header">
-          <button
-            type="button"
-            className="chat-icon-btn"
-            aria-label="Open conversations"
-            onClick={() => setRailOpen(true)}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4 6h16M4 12h16M4 18h10" />
-            </svg>
-          </button>
-          <div className="chat-stage-title">
-            <strong>{activeConversation.title}</strong>
-            <span>{activeConversation.messages.length} messages</span>
-          </div>
-          <button
-            type="button"
-            className="chat-icon-btn"
-            aria-label="New conversation"
-            onClick={createConversation}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-          </button>
-        </header>
-        {pageError && (
-          <div className="chat-page-error" role="alert">
-            <span>{pageError}</span>
-            <button type="button" onClick={() => setPageError('')}>Dismiss</button>
-          </div>
+      <main className={`chat-main ${activeArtifact ? 'has-workbench' : ''}`}>
+        <section className="chat-stage" aria-label="Chat">
+          <header className="chat-stage-header">
+            <button
+              type="button"
+              className="chat-icon-btn"
+              aria-label="Open conversations"
+              onClick={() => setRailOpen(true)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 6h16M4 12h16M4 18h10" />
+              </svg>
+            </button>
+            <div className="chat-stage-title">
+              <strong>{activeConversation.title}</strong>
+              <span>{activeConversation.messages.length} messages</span>
+            </div>
+            <button
+              type="button"
+              className="chat-icon-btn"
+              aria-label="New conversation"
+              onClick={createConversation}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </button>
+          </header>
+          {pageError && (
+            <div className="chat-page-error" role="alert">
+              <span>{pageError}</span>
+              <button type="button" onClick={() => setPageError('')}>Dismiss</button>
+            </div>
+          )}
+          <MessageList
+            artifacts={activeConversation.artifacts || []}
+            messages={activeConversation.messages}
+            streamingMessage={streamingMessage}
+            routedModel={routedModel}
+            isStreaming={isStreaming && streamConversationId === activeConversation.id}
+            onEdit={editMessage}
+            onOpenArtifact={(id) => {
+              setActiveArtifactId(id);
+              setArtifactContextEnabled(true);
+            }}
+            onRegenerate={regenerateMessage}
+            onSuggestion={setPrompt}
+            onDropFiles={(files) => {
+              addImages(files.filter((file) => file.type.startsWith('image/')));
+              addVideoFiles(files.filter((file) => file.type.startsWith('video/')));
+            }}
+          />
+          <Composer
+            artifactContext={artifactContextEnabled ? activeArtifact : null}
+            attachments={attachments}
+            disabled={!healthy}
+            editing={editing}
+            isStreaming={isStreaming}
+            model={activeConversation.model || 'auto'}
+            models={models}
+            onCancelEdit={cancelEdit}
+            onChange={setPrompt}
+            onDismissArtifactContext={() => setArtifactContextEnabled(false)}
+            onImageFiles={addImages}
+            onLongText={addLongText}
+            onModelChange={(model) => updateConversation(activeConversation.id, { model })}
+            onRemoveAttachment={(id) => setAttachments((current) => (
+              current.filter((attachment) => attachment.id !== id)
+            ))}
+            onRetryAttachment={retryAttachment}
+            onStop={stop}
+            onSubmit={submit}
+            onUrl={addVideoUrl}
+            onVideoFiles={addVideoFiles}
+            value={prompt}
+          />
+        </section>
+        {activeArtifact && (
+          <ArtifactWorkbench
+            artifact={activeArtifact}
+            onClose={closeArtifact}
+            onCommit={(content) => updateArtifact(
+              activeArtifact.id,
+              (artifact) => pushArtifactVersion(artifact, content, { source: 'user' }),
+            )}
+            onNavigate={(delta) => updateArtifact(
+              activeArtifact.id,
+              (artifact) => moveArtifactVersion(artifact, delta),
+            )}
+            onRename={(title) => updateArtifact(
+              activeArtifact.id,
+              (artifact) => ({ ...artifact, title }),
+            )}
+          />
         )}
-        <MessageList
-          messages={activeConversation.messages}
-          streamingMessage={streamingMessage}
-          routedModel={routedModel}
-          isStreaming={isStreaming && streamConversationId === activeConversation.id}
-          onEdit={editMessage}
-          onRegenerate={regenerateMessage}
-          onSuggestion={setPrompt}
-          onDropFiles={(files) => {
-            addImages(files.filter((file) => file.type.startsWith('image/')));
-            addVideoFiles(files.filter((file) => file.type.startsWith('video/')));
-          }}
-        />
-        <Composer
-          attachments={attachments}
-          canRegenerate={canRegenerate}
-          disabled={!healthy}
-          editing={editing}
-          isStreaming={isStreaming}
-          model={activeConversation.model || 'auto'}
-          models={models}
-          onCancelEdit={cancelEdit}
-          onChange={setPrompt}
-          onImageFiles={addImages}
-          onLongText={addLongText}
-          onModelChange={(model) => updateConversation(activeConversation.id, { model })}
-          onRegenerate={regenerateLatest}
-          onRemoveAttachment={(id) => setAttachments((current) => (
-            current.filter((attachment) => attachment.id !== id)
-          ))}
-          onRetryAttachment={retryAttachment}
-          onStop={stop}
-          onSubmit={submit}
-          onUrl={addVideoUrl}
-          onVideoFiles={addVideoFiles}
-          value={prompt}
-        />
-      </section>
+      </main>
+      {pageNotice && <div className="chat-toast glass-panel" role="status">{pageNotice}</div>}
     </div>
   );
 }
