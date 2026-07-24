@@ -1,0 +1,202 @@
+/*
+ * Copyright (c) Llama Manager contributors.
+ * Use of this source code is governed by the LICENSE file in the repository root.
+ *
+ * Themeable skeuomorphic-glass design tokens and reusable foundation primitives
+ * for frosted surfaces, layered depth, and tactile controls in dark and light
+ * color schemes. Site themes may override any custom property without
+ * `!important`.
+ */
+
+:root {
+  --glass-bg: rgba(22, 25, 34, 0.55);
+  --glass-bg-elevated: rgba(31, 35, 47, 0.72);
+  --glass-bg-opaque: rgb(22, 25, 34);
+  --glass-bg-elevated-opaque: rgb(31, 35, 47);
+  --glass-border: rgba(255, 255, 255, 0.16);
+  --glass-highlight: rgba(255, 255, 255, 0.14);
+  --glass-blur: 18px;
+  --glass-saturate: 140%;
+
+  --shadow-raised:
+    0 1px 2px rgba(0, 0, 0, 0.36),
+    0 8px 24px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 var(--glass-highlight);
+  --shadow-floating:
+    0 2px 5px rgba(0, 0, 0, 0.34),
+    0 18px 48px rgba(0, 0, 0, 0.38),
+    inset 0 1px 0 var(--glass-highlight);
+  --shadow-pressed:
+    inset 0 2px 5px rgba(0, 0, 0, 0.48),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --control-height: 44px;
+
+  --glass-sheen: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.12) 0%,
+    rgba(255, 255, 255, 0.035) 42%,
+    rgba(255, 255, 255, 0) 100%
+  );
+}
+
+[data-theme="light"] {
+  --bg-primary: #f1f5f9;
+  --bg-secondary: #f8fafc;
+  --bg-tertiary: #e2e8f0;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --success: #15803d;
+  --warning: #b45309;
+  --error: #b91c1c;
+  --border: #cbd5e1;
+
+  --glass-bg: rgba(255, 255, 255, 0.82);
+  --glass-bg-elevated: rgba(255, 255, 255, 0.94);
+  --glass-bg-opaque: rgb(255, 255, 255);
+  --glass-bg-elevated-opaque: rgb(255, 255, 255);
+  --glass-border: rgba(15, 23, 42, 0.18);
+  --glass-highlight: rgba(255, 255, 255, 0.6);
+
+  --shadow-raised:
+    0 1px 2px rgba(15, 23, 42, 0.1),
+    0 8px 24px rgba(15, 23, 42, 0.12),
+    inset 0 1px 0 var(--glass-highlight);
+  --shadow-floating:
+    0 2px 5px rgba(15, 23, 42, 0.1),
+    0 18px 48px rgba(15, 23, 42, 0.16),
+    inset 0 1px 0 var(--glass-highlight);
+  --shadow-pressed:
+    inset 0 2px 5px rgba(15, 23, 42, 0.2),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.72);
+
+  --glass-sheen: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.92) 0%,
+    rgba(255, 255, 255, 0.28) 45%,
+    rgba(255, 255, 255, 0) 100%
+  );
+}
+
+.glass-panel {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-raised);
+  -webkit-backdrop-filter:
+    blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  backdrop-filter:
+    blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+}
+
+.glass-panel--floating {
+  background: var(--glass-bg-elevated);
+  box-shadow: var(--shadow-floating);
+}
+
+.glass-btn {
+  min-height: var(--control-height);
+  color: var(--text-primary);
+  background: var(--glass-sheen), var(--glass-bg-elevated);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-raised);
+  cursor: pointer;
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    color 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.glass-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--glass-border));
+}
+
+.glass-btn:active:not(:disabled) {
+  box-shadow: var(--shadow-pressed);
+}
+
+.glass-btn:focus-visible,
+.glass-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.glass-btn:disabled {
+  cursor: not-allowed;
+}
+
+.glass-input {
+  min-height: var(--control-height);
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  box-shadow:
+    inset 0 1px 3px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 var(--glass-highlight);
+  -webkit-backdrop-filter:
+    blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  backdrop-filter:
+    blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.glass-input::placeholder {
+  color: var(--text-secondary);
+}
+
+.glass-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding-inline: 10px;
+  color: var(--text-primary);
+  background: var(--glass-sheen), var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .glass-panel,
+  .glass-input,
+  .glass-chip {
+    background-color: var(--glass-bg-opaque);
+  }
+
+  .glass-panel--floating,
+  .glass-btn {
+    background-color: var(--glass-bg-elevated-opaque);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .glass-btn,
+  .glass-input {
+    transition: none;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-bg: var(--glass-bg-opaque);
+    --glass-bg-elevated: var(--glass-bg-elevated-opaque);
+    --glass-blur: 0px;
+    --glass-saturate: 100%;
+  }
+}

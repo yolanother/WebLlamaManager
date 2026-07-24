@@ -5,6 +5,7 @@
 }
 
 :root {
+  color-scheme: dark;
   --bg-primary: #0f0f0f;
   --bg-secondary: #1a1a1a;
   --bg-tertiary: #252525;
@@ -16,6 +17,10 @@
   --warning: #f59e0b;
   --error: #ef4444;
   --border: #333333;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
 }
 
 body {

@@ -8,8 +8,11 @@
  * the theme's `theme.css`), swaps the header logo, and persists the selection
  * in localStorage under `siteTheme`. Exposes a framework-friendly external
  * store via `useSiteTheme()` / `useSiteThemeLogo()` (React `useSyncExternalStore`)
- * plus imperative `initSiteTheme()` / `selectSiteTheme()` entry points. All DOM
- * and localStorage access is isolated here; pure logic lives in ./manifest.js.
+ * plus imperative `initSiteTheme()` / `selectSiteTheme()` entry points. Also
+ * owns the persisted light/dark/system color-scheme preference and keeps the
+ * concrete `data-theme` attribute synchronized with system changes. All DOM
+ * and localStorage access is isolated here; pure logic lives in ./manifest.js
+ * and ./colorScheme.js.
  */
 
 import { useSyncExternalStore } from 'react';
@@ -23,12 +26,27 @@ import {
   themeCssHref,
   themeLogoUrl,
 } from './manifest.js';
+import {
+  COLOR_SCHEME_STORAGE_KEY,
+  DEFAULT_COLOR_SCHEME,
+  normalizeColorScheme,
+  resolveColorScheme,
+} from './colorScheme.js';
 
 /** DOM id of the injected theme stylesheet <link>. */
 const THEME_LINK_ID = 'site-theme-css';
 
+/** Media query used when the selected color-scheme preference is `system`. */
+const COLOR_SCHEME_MEDIA_QUERY = '(prefers-color-scheme: dark)';
+
 /** Internal mutable state; never exposed directly (see {@link getSnapshot}). */
 const state = { themes: [], selectedId: DEFAULT_THEME_ID, ready: false };
+
+/** Current persisted color-scheme preference. */
+let colorScheme = DEFAULT_COLOR_SCHEME;
+
+/** Lazily-created system color-scheme media query listener target. */
+let colorSchemeMedia = null;
 
 /** Immutable snapshot handed to subscribers; replaced wholesale on change. */
 let snapshot = { themes: [], selectedId: DEFAULT_THEME_ID, ready: false };
@@ -93,6 +111,78 @@ function setStored(id) {
 }
 
 /**
+ * Read and normalize the persisted color-scheme preference.
+ * @returns {'dark'|'light'|'system'} The stored preference or dark default.
+ */
+function getStoredColorScheme() {
+  try {
+    return normalizeColorScheme(localStorage.getItem(COLOR_SCHEME_STORAGE_KEY));
+  } catch {
+    return DEFAULT_COLOR_SCHEME;
+  }
+}
+
+/**
+ * Persist a normalized color-scheme preference when storage is available.
+ * @param {'dark'|'light'|'system'} preference - Preference to persist.
+ */
+function setStoredColorScheme(preference) {
+  try {
+    localStorage.setItem(COLOR_SCHEME_STORAGE_KEY, preference);
+  } catch {
+    /* storage unavailable (private mode / SSR) — preference remains in memory */
+  }
+}
+
+/**
+ * Return whether the browser currently reports a dark system preference.
+ * Defaults to dark when matchMedia is unavailable to preserve the legacy UI.
+ * @returns {boolean} Whether the system prefers dark colors.
+ */
+function systemPrefersDark() {
+  if (typeof window === 'undefined' || !window.matchMedia) return true;
+  return (
+    colorSchemeMedia || window.matchMedia(COLOR_SCHEME_MEDIA_QUERY)
+  ).matches;
+}
+
+/**
+ * Apply the current preference as a concrete `data-theme` document attribute.
+ */
+function applyColorSchemeToDom() {
+  if (typeof document === 'undefined') return;
+  const resolved = resolveColorScheme(colorScheme, systemPrefersDark());
+  document.documentElement.setAttribute('data-theme', resolved);
+}
+
+/**
+ * Respond to operating-system color-scheme changes while following `system`.
+ */
+function handleSystemColorSchemeChange() {
+  if (colorScheme === 'system') applyColorSchemeToDom();
+}
+
+/**
+ * Install the system color-scheme listener once. Supports legacy MediaQueryList
+ * implementations for older embedded dashboard browsers.
+ */
+function listenForSystemColorScheme() {
+  if (
+    colorSchemeMedia ||
+    typeof window === 'undefined' ||
+    !window.matchMedia
+  ) {
+    return;
+  }
+  colorSchemeMedia = window.matchMedia(COLOR_SCHEME_MEDIA_QUERY);
+  if (colorSchemeMedia.addEventListener) {
+    colorSchemeMedia.addEventListener('change', handleSystemColorSchemeChange);
+  } else if (colorSchemeMedia.addListener) {
+    colorSchemeMedia.addListener(handleSystemColorSchemeChange);
+  }
+}
+
+/**
  * Apply a theme to the live document: toggle `data-site-theme` on <html> and
  * inject/update/remove the theme stylesheet <link>. Safe to call repeatedly.
  * @param {string} id - Theme id to apply ({@link DEFAULT_THEME_ID} to reset).
@@ -129,6 +219,10 @@ function applyThemeToDom(id) {
  * @returns {Promise<void>} Resolves once the manifest has been loaded/applied.
  */
 export async function initSiteTheme() {
+  colorScheme = getStoredColorScheme();
+  listenForSystemColorScheme();
+  applyColorSchemeToDom();
+
   const stored = getStored();
   if (stored && stored !== DEFAULT_THEME_ID) {
     // Optimistic apply: the css href only needs the id, so we can theme the
@@ -152,6 +246,27 @@ export async function initSiteTheme() {
   state.ready = true;
   applyThemeToDom(selectedId);
   emit();
+}
+
+/**
+ * Return the active color-scheme preference. `system` is returned as a
+ * preference rather than its currently resolved light/dark value.
+ * @returns {'dark'|'light'|'system'} The active preference.
+ */
+export function getColorScheme() {
+  return colorScheme;
+}
+
+/**
+ * Select, apply, and persist a color-scheme preference. Invalid values safely
+ * fall back to the dark default.
+ * @param {'dark'|'light'|'system'} preference - Preference to activate.
+ */
+export function setColorScheme(preference) {
+  colorScheme = normalizeColorScheme(preference);
+  setStoredColorScheme(colorScheme);
+  listenForSystemColorScheme();
+  applyColorSchemeToDom();
 }
 
 /**
