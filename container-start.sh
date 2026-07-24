@@ -99,6 +99,10 @@ CMD=(
 # --slot-save-path is propagated by the router to every per-model child server,
 # enabling POST /slots/{id}?action=save|restore for conversation KV persistence.
 [ -n "$SLOT_SAVE_PATH" ] && CMD+=(--slot-save-path "$SLOT_SAVE_PATH")
+# Per-model overrides the router cannot auto-detect (e.g. the gemma-4 MTP draft
+# model). The manager writes this INI; each [model] section merges onto the
+# router's auto-generated preset (--model/--mmproj/--ctx-size preserved).
+[ -n "${MODELS_PRESET:-}" ] && [ -f "$MODELS_PRESET" ] && CMD+=(--models-preset "$MODELS_PRESET")
 
 printf 'Command:'
 printf ' %q' "${CMD[@]}"
