@@ -1,8 +1,9 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import siteThemes from './vite-plugin-site-themes.js';
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), siteThemes()],
   publicDir: 'public',
   server: {
     host: '0.0.0.0',
