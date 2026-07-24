@@ -50,6 +50,7 @@ import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watch
 import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import { aggregateRequestStats } from './request-stats.js';
+import { createMediaRouter } from './media.js';
 import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
@@ -220,6 +221,8 @@ const UI_BUILD_PATH = join(PROJECT_ROOT, 'ui', 'dist');
 if (existsSync(UI_BUILD_PATH)) {
   app.use(express.static(UI_BUILD_PATH));
 }
+
+app.use('/api/media', createMediaRouter({ dataDir: RUNTIME_PATHS.dataDir }));
 
 // Configuration
 const CONFIG_PATH = RUNTIME_PATHS.configPath;
