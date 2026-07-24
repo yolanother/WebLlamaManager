@@ -228,15 +228,17 @@ verify_release() {
 
   iso_name="$(basename "$(ls -1 "$PUBLIC_DIR"/images/*.iso 2>/dev/null | head -1)" 2>/dev/null || true)"
   if [ -n "$iso_name" ]; then
-    code="$(curl -sS -o /dev/null -w '%{http_code}' -r 0-1023 "$PUBLIC_BASE_URL/images/$iso_name" || echo 000)"
+    # The site serves image artifacts under /downloads/ (nginx aliases it to the
+    # images/ snapshot); /images/ is not a public route.
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -r 0-1023 "$PUBLIC_BASE_URL/downloads/$iso_name" || echo 000)"
     if [ "$code" = "206" ]; then log "OK  ISO range request -> 206 ($iso_name)"; else log "FAIL ISO range -> $code" ERROR; ok=false; fi
   else
     log "FAIL no ISO found under $PUBLIC_DIR/images" ERROR; ok=false
   fi
 
   local vdir; vdir="$(mktemp -d)"
-  if curl -fsS -o "$vdir/SHA256SUMS" "$PUBLIC_BASE_URL/images/SHA256SUMS" \
-      && curl -fsS -o "$vdir/SHA256SUMS.asc" "$PUBLIC_BASE_URL/images/SHA256SUMS.asc" \
+  if curl -fsS -o "$vdir/SHA256SUMS" "$PUBLIC_BASE_URL/downloads/SHA256SUMS" \
+      && curl -fsS -o "$vdir/SHA256SUMS.asc" "$PUBLIC_BASE_URL/downloads/SHA256SUMS.asc" \
       && gpg --homedir "$vhome" --batch --verify "$vdir/SHA256SUMS.asc" "$vdir/SHA256SUMS" 2>&1 | grep -qi 'good signature'; then
     log "OK  SHA256SUMS.asc verifies against the published key"
   else
@@ -253,3 +255,27 @@ if verify_release; then
 else
   die "Post-publish verification failed (release is live locally + synced; investigate the site)."
 fi
+
+# ---------------------------------------------------------------------------
+# Step 5 — Prune superseded release snapshots on thromgar (disk guard)
+# ---------------------------------------------------------------------------
+# Each release adds a full immutable snapshot (~14 GB for images); without
+# pruning the live host's disk fills within a handful of releases. Keep the
+# newest KEEP_RELEASE_SNAPSHOTS per kind, and never remove whatever the stable
+# symlink currently points at. Runs only after a fully verified release.
+KEEP_RELEASE_SNAPSHOTS="${KEEP_RELEASE_SNAPSHOTS:-2}"
+log "Pruning thromgar release snapshots (keeping newest $KEEP_RELEASE_SNAPSHOTS per kind)"
+ssh -o BatchMode=yes "$THROMGAR_HOST" "
+  set -e
+  for kind in images apt; do
+    dir='$THROMGAR_PATH/releases/'\"\$kind\"
+    [ -d \"\$dir\" ] || continue
+    keep_target=\$(readlink '$THROMGAR_PATH/'\"\$kind\" 2>/dev/null | xargs -r basename)
+    ls -1 \"\$dir\" | sort -r | awk -v k=$KEEP_RELEASE_SNAPSHOTS 'NR>k' | while read -r snap; do
+      [ -n \"\$snap\" ] || continue
+      [ \"\$snap\" = \"\$keep_target\" ] && continue
+      rm -rf \"\$dir/\$snap\" && echo \"pruned \$kind/\$snap\"
+    done
+  done
+" 2>&1 | while read -r line; do log "thromgar: $line"; done \
+  || log "Snapshot pruning failed (non-fatal); prune manually before disk fills" WARN
