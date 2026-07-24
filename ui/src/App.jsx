@@ -2395,6 +2395,41 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             />
           )}
         </div>
+
+        {/* Uniform per-local-server tiles: llama.cpp router, embeddings, and
+            ds4 — one shape each, differing only by the models they serve and
+            their state. ds4 shows a memory-gated "enable" affordance and is
+            never auto-started. */}
+        {Array.isArray(stats?.servers) && stats.servers.length > 0 && (
+          <>
+            <h4 className="server-registry-title">Servers</h4>
+            <div className="status-grid status-grid-compact server-registry-grid">
+              {stats.servers.map((srv) => {
+                const stateLabel = {
+                  running: 'Running', degraded: 'Degraded', idle: 'Idle',
+                  available: 'Available', 'insufficient-memory': 'Needs memory', down: 'Down',
+                }[srv.state] || srv.state;
+                const status = srv.state === 'running' ? 'success'
+                  : (srv.state === 'down' || srv.state === 'degraded' || srv.state === 'insufficient-memory') ? 'error'
+                  : 'warning';
+                const icon = srv.type === 'ds4' ? '\u{1F9EC}' : srv.role === 'embeddings' ? '\u{1F9EE}' : '\u{1F680}';
+                const models = Array.isArray(srv.models) ? srv.models : [];
+                const modelSummary = models.length
+                  ? `${models.slice(0, 3).map((m) => formatModelName({ id: m })).join(', ')}${models.length > 3 ? ` +${models.length - 3}` : ''}`
+                  : 'no models';
+                // ds4 that is not running surfaces its enable-gate reason so the
+                // operator sees exactly why it can or cannot be turned on.
+                const sub = (srv.id === 'ds4' && srv.enable && !srv.running)
+                  ? srv.enable.reason
+                  : `${modelSummary}${srv.port ? ` :${srv.port}` : ''}`;
+                return (
+                  <StatCard key={srv.id} label={srv.displayName} value={stateLabel}
+                    subValue={sub} icon={icon} status={status} />
+                );
+              })}
+            </div>
+          </>
+        )}
       </section>
 
       {/* All-models modal — full list with per-model loaded/unloaded status */}
