@@ -1,0 +1,6 @@
+[submodule "site"]
+	path = site
+	url = git@github.com:yolanother/llama-manager-web.git
+[submodule "distribution/ubuntu-respin"]
+	path = distribution/ubuntu-respin
+	url = git@github.com:yolanother/llama-manager-ubuntu-respin.git
