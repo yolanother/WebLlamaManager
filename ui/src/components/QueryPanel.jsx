@@ -1,11 +1,12 @@
-// Llama Manager — quick query panel.
+// Llama Manager — floating glass quick query panel.
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Provides the persistent model picker and streaming prompt panel displayed
-// alongside routed pages.
+// Provides the themeable floating glass model picker and streaming prompt panel
+// displayed alongside routed pages.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useLocation } from 'react-router-dom';
 import { API_BASE, copyTextToClipboard, formatModelName } from '../api.js';
 import { parseMessageWithCodeBlocks } from './CodeBlock.jsx';
 import { SearchableSelect } from './SearchableSelect.jsx';
@@ -291,14 +292,14 @@ function QueryPanel({ stats }) {
   return (
     <div className={`query-panel ${isOpen ? 'open' : ''}`}>
       <button
-        className={`query-fab ${isOpen ? 'open' : ''}`}
+        className={`query-fab glass-btn ${isOpen ? 'open' : ''}`}
         onClick={() => setIsOpen(!isOpen)}
         title={isOpen ? 'Close chat' : 'Test query'}
       >
         <span className="fab-icon">{isOpen ? '✕' : '💬'}</span>
       </button>
 
-      <div className="query-container">
+      <div className="query-container glass-panel glass-panel--floating">
         <div className="query-header">
           <h3>Query Panel</h3>
           <div className="query-controls">
@@ -316,7 +317,7 @@ function QueryPanel({ stats }) {
               disabled={!isHealthy || models.length === 0}
               storageKey="queryPanelModel"
             />
-            <button className="btn-ghost btn-small" onClick={clearChat} title="Clear chat">
+            <button className="btn-ghost btn-small glass-btn" onClick={clearChat} title="Clear chat">
               🗑️
             </button>
           </div>
@@ -340,7 +341,7 @@ function QueryPanel({ stats }) {
                 </span>
                 <div className="message-actions">
                   <button
-                    className={`btn-icon ${copiedId === msg.id ? 'copied' : ''}`}
+                    className={`btn-icon glass-btn ${copiedId === msg.id ? 'copied' : ''}`}
                     onClick={() => copyToClipboard(msg.content, msg.id)}
                     title="Copy to clipboard"
                   >
@@ -390,6 +391,7 @@ function QueryPanel({ stats }) {
 
         <form className="query-input" onSubmit={handleSubmit}>
           <textarea
+            className="glass-input"
             ref={textareaRef}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
@@ -400,7 +402,7 @@ function QueryPanel({ stats }) {
           />
           <button
             type="submit"
-            className="btn-primary"
+            className="btn-primary glass-btn"
             disabled={!isHealthy || isLoading || !prompt.trim()}
           >
             {isLoading ? '...' : '→'}

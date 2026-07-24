@@ -1,10 +1,10 @@
 /*
- * Llama Manager — dashboard and appliance kiosk presentation.
+ * Llama Manager — global skeuomorphic-glass chrome and dashboard presentation.
  * Copyright (c) Llama Manager project. See the LICENSE file in the repository
  * root for license terms.
  *
- * Defines the complete browser UI layout and responsive presentation, including
- * the full-screen appliance dashboard and its local System Login escape hatch.
+ * Defines themeable ambient backgrounds, shared glass controls and surfaces,
+ * the responsive dashboard, and the full-screen appliance presentation.
  */
 
 /* CSS Variables */
@@ -6291,4 +6291,929 @@ input::placeholder {
   font-size: 12px;
   padding: 4px 0;
   border-bottom: 1px solid var(--border);
+}
+
+/* ── Global skeuomorphic-glass chrome ───────────────────────────────────────
+ * This late layer intentionally preserves the legacy selector API while
+ * remapping shared surfaces and controls onto theme/glass.css primitives.
+ * Runtime site themes continue to retint the UI by overriding the base vars.
+ */
+:root {
+  --ambient-accent:
+    color-mix(in srgb, var(--accent) 22%, transparent);
+  --ambient-success:
+    color-mix(in srgb, var(--success) 14%, transparent);
+  --ambient-info:
+    color-mix(in srgb, var(--info) 12%, transparent);
+  --chart-grid:
+    color-mix(in srgb, var(--text-secondary) 24%, transparent);
+  --glass-divider:
+    color-mix(in srgb, var(--glass-border) 72%, transparent);
+  --glass-well:
+    color-mix(in srgb, var(--glass-bg-elevated) 64%, transparent);
+  --control-contrast: #07111f;
+}
+
+[data-theme="light"] {
+  --ambient-accent:
+    color-mix(in srgb, var(--accent) 14%, transparent);
+  --ambient-success:
+    color-mix(in srgb, var(--success) 10%, transparent);
+  --ambient-info:
+    color-mix(in srgb, var(--info) 8%, transparent);
+  --chart-grid:
+    color-mix(in srgb, var(--text-secondary) 30%, transparent);
+  --control-contrast: #ffffff;
+}
+
+html {
+  min-width: 0;
+  background: var(--bg-primary);
+}
+
+body {
+  min-width: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 16% 8%, var(--ambient-accent) 0, transparent 34rem),
+    radial-gradient(circle at 88% 18%, var(--ambient-info) 0, transparent 30rem),
+    radial-gradient(circle at 52% 92%, var(--ambient-success) 0, transparent 38rem),
+    var(--bg-primary);
+  background-attachment: fixed;
+  color: var(--text-primary);
+}
+
+.app-layout,
+.main-content {
+  min-width: 0;
+  background: transparent;
+}
+
+.page {
+  min-width: 0;
+  background: transparent;
+  scrollbar-gutter: stable;
+}
+
+/* Scrollbars read as recessed tracks rather than opaque rails. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--bg-primary) 72%, transparent);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--glass-sheen), var(--glass-bg-elevated);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--accent) 52%, var(--glass-bg-elevated));
+}
+
+* {
+  scrollbar-color:
+    color-mix(in srgb, var(--text-secondary) 52%, transparent)
+    color-mix(in srgb, var(--bg-primary) 72%, transparent);
+}
+
+/* Shared raised surfaces. Blur belongs to container panels, never table rows. */
+.card,
+.stat-card,
+.resource-card,
+.chart-card,
+.chart-card-wide,
+.token-stat-card,
+.preset-card,
+.create-preset-form,
+.model-card,
+.search-result,
+.no-quants-state,
+.quant-item,
+.empty-state,
+.filters-panel,
+.logs-container,
+.request-logs-table,
+.queue-table,
+.process-card,
+.process-summary,
+.api-endpoints-list,
+.api-endpoint-detail,
+.docs-content,
+.models-modal,
+.ds4-download-section,
+.ds4-option,
+.server-status-strip,
+.downloads-dropdown,
+.message-stats-tooltip,
+.query-container {
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-raised);
+  -webkit-backdrop-filter:
+    blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  backdrop-filter:
+    blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+}
+
+.chart-card-wide,
+.models-modal,
+.downloads-dropdown,
+.message-stats-tooltip,
+.query-container {
+  background: var(--glass-bg-elevated);
+  box-shadow: var(--shadow-floating);
+}
+
+.card,
+.stat-card,
+.resource-card,
+.chart-card,
+.chart-card-wide,
+.token-stat-card,
+.model-card,
+.search-result,
+.quant-item,
+.process-card,
+.ds4-option {
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.card:hover,
+.stat-card:hover,
+.resource-card:hover,
+.chart-card:hover,
+.chart-card-wide:hover,
+.model-card:hover,
+.search-result:hover,
+.quant-item:hover,
+.process-card:hover,
+.ds4-option:hover {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--glass-border));
+  box-shadow:
+    0 2px 4px color-mix(in srgb, var(--bg-primary) 34%, transparent),
+    0 12px 30px color-mix(in srgb, var(--bg-primary) 30%, transparent),
+    inset 0 1px 0 var(--glass-highlight);
+}
+
+/* Shared tactile controls. No hover transform means surrounding layout is stable. */
+body button,
+.searchable-select-trigger {
+  color: var(--text-primary);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--glass-sheen), var(--glass-bg-elevated);
+  box-shadow: var(--shadow-raised);
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    color 200ms ease,
+    box-shadow 200ms ease;
+}
+
+body button:hover:not(:disabled),
+.searchable-select-trigger:hover {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--glass-border));
+}
+
+body button:active:not(:disabled),
+.searchable-select-trigger:active {
+  box-shadow: var(--shadow-pressed);
+}
+
+body button:focus-visible,
+.searchable-select-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn-primary,
+.btn-primary.glass-btn,
+.query-fab,
+.query-fab.glass-btn {
+  color: var(--control-contrast);
+  background:
+    var(--glass-sheen),
+    color-mix(in srgb, var(--accent) 96%, var(--glass-bg-elevated));
+  border-color: color-mix(in srgb, var(--accent) 78%, var(--glass-highlight));
+}
+
+.btn-primary:hover:not(:disabled),
+.btn-primary.glass-btn:hover:not(:disabled),
+.query-fab:hover:not(:disabled),
+.query-fab.glass-btn:hover:not(:disabled) {
+  background:
+    var(--glass-sheen),
+    color-mix(in srgb, var(--accent-hover) 96%, var(--glass-bg-elevated));
+}
+
+.btn-danger,
+.btn-danger.glass-btn {
+  color: var(--control-contrast);
+  background:
+    var(--glass-sheen),
+    color-mix(in srgb, var(--error) 96%, var(--glass-bg-elevated));
+  border-color: color-mix(in srgb, var(--error) 76%, var(--glass-highlight));
+}
+
+.btn-danger:hover:not(:disabled),
+.btn-danger.glass-btn:hover:not(:disabled) {
+  background:
+    var(--glass-sheen),
+    color-mix(in srgb, var(--error) 88%, var(--bg-primary));
+}
+
+.btn-warning,
+.btn-warning.glass-btn,
+.persistent-flush-btn,
+.persistent-flush-btn.glass-btn {
+  color: var(--control-contrast);
+  background:
+    var(--glass-sheen),
+    color-mix(in srgb, var(--warning) 96%, var(--glass-bg-elevated));
+  border-color: color-mix(in srgb, var(--warning) 76%, var(--glass-highlight));
+}
+
+.btn-warning:hover:not(:disabled),
+.btn-warning.glass-btn:hover:not(:disabled),
+.persistent-flush-btn:hover:not(:disabled),
+.persistent-flush-btn.glass-btn:hover:not(:disabled) {
+  background:
+    var(--glass-sheen),
+    color-mix(in srgb, var(--warning) 88%, var(--bg-primary));
+}
+
+.btn-secondary,
+.btn-ghost,
+.btn-icon,
+.downloads-btn,
+.view-all-models-btn,
+.models-modal-close,
+.download-clear-btn,
+.download-copy-btn,
+.request-stats-window,
+.model-breakdown-toggle {
+  color: var(--text-primary);
+  background: var(--glass-sheen), var(--glass-bg-elevated);
+  border-color: var(--glass-border);
+}
+
+.btn-ghost {
+  color: var(--text-secondary);
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-danger,
+.btn-warning,
+.glass-btn:not(.query-fab) {
+  min-height: 40px;
+}
+
+.btn-icon.glass-btn {
+  min-height: 24px;
+}
+
+/* Inputs are recessed glass wells; checkbox/radio/range geometry is preserved. */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+body select,
+body textarea,
+.searchable-select-trigger,
+.searchable-select-dropdown,
+.searchable-select-search {
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  box-shadow:
+    inset 0 1px 3px color-mix(in srgb, var(--bg-primary) 42%, transparent),
+    inset 0 1px 0 var(--glass-highlight);
+  -webkit-backdrop-filter:
+    blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  backdrop-filter:
+    blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    box-shadow 200ms ease;
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus,
+body select:focus,
+body textarea:focus,
+.searchable-select-trigger.open,
+.searchable-select-search:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow:
+    inset 0 1px 3px color-mix(in srgb, var(--bg-primary) 42%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+input::placeholder,
+textarea::placeholder,
+.searchable-select-trigger .placeholder,
+.searchable-select-search::placeholder {
+  color: var(--text-secondary);
+  opacity: 1;
+}
+
+/* Tables sit inside one glass container; rows use opaque/tinted fills only. */
+table {
+  width: 100%;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--glass-bg) 66%, transparent);
+  border: 1px solid var(--glass-divider);
+  border-radius: var(--radius-md);
+}
+
+thead,
+.queue-table-header {
+  background: color-mix(in srgb, var(--glass-bg-elevated) 86%, transparent);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+th,
+.queue-table-header {
+  color: var(--text-secondary);
+  border-color: var(--glass-divider);
+}
+
+td,
+.queue-table-row,
+.request-logs-table tbody td,
+.docs-table th,
+.docs-table td,
+.model-breakdown-table th,
+.model-breakdown-table td {
+  border-color: var(--glass-divider);
+}
+
+tbody tr:hover td,
+.queue-table-row:hover,
+.request-logs-table tbody tr:hover,
+.model-breakdown-table tr:hover td {
+  background: color-mix(in srgb, var(--accent) 7%, var(--glass-well));
+}
+
+/* Status chips remain legible without solid theme-breaking color blocks. */
+.badge,
+.mode-badge,
+.engine-badge,
+.ds4-tag,
+.model-backend-pill {
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+.badge.success,
+.mode-badge.success {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+}
+
+.badge.warning,
+.mode-badge.single {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+}
+
+.badge.error {
+  color: var(--error);
+  background: color-mix(in srgb, var(--error) 16%, transparent);
+}
+
+.badge.info {
+  color: var(--info);
+  background: color-mix(in srgb, var(--info) 16%, transparent);
+}
+
+/* Floating global status chrome. */
+.stats-header,
+.stats-header.glass-panel {
+  top: 12px;
+  margin: 12px 18px 0;
+  padding: 9px 16px;
+  background: var(--glass-bg-elevated);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-floating);
+}
+
+.stats-header-items {
+  min-width: 0;
+  gap: 10px;
+}
+
+.stats-header-item {
+  min-width: 48px;
+  padding: 5px 8px;
+  border: 1px solid var(--glass-divider);
+  border-radius: var(--radius-md);
+  background: var(--glass-sheen), var(--glass-well);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 2px 8px color-mix(in srgb, var(--bg-primary) 22%, transparent);
+}
+
+.stats-header-label,
+.stats-header-mode {
+  color: var(--text-secondary);
+}
+
+.stats-header-status {
+  min-height: 34px;
+  padding: 5px 10px;
+  border: 1px solid var(--glass-divider);
+  border-radius: 999px;
+  background: var(--glass-well);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+.downloads-dropdown,
+.downloads-dropdown.glass-panel {
+  border-radius: var(--radius-lg);
+}
+
+.downloads-dropdown-header,
+.download-details,
+.download-output-header {
+  background: color-mix(in srgb, var(--glass-bg-elevated) 82%, transparent);
+  border-color: var(--glass-divider);
+}
+
+/* Dashboard front door: raised hero and a responsive overview bento. */
+.dashboard-glass {
+  isolation: isolate;
+}
+
+.dashboard-glass > *,
+.dashboard-overview-grid > *,
+.dashboard .charts-grid > *,
+.dashboard .charts-grid-wide > * {
+  min-width: 0;
+}
+
+.dashboard-hero,
+.dashboard-hero.glass-panel {
+  gap: 18px;
+  padding: 18px 22px;
+  margin-bottom: 22px;
+  border-radius: var(--radius-xl);
+}
+
+.dashboard-hero h2 {
+  font-size: clamp(1.5rem, 2.4vw, 2rem);
+  letter-spacing: -0.025em;
+}
+
+.dashboard-hero .header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.dashboard-overview-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.82fr) minmax(460px, 1.18fr);
+  align-items: start;
+  gap: 22px;
+}
+
+.dashboard-overview-section {
+  min-width: 0;
+}
+
+.dashboard-section h3 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  letter-spacing: -0.01em;
+}
+
+.dashboard-section h3::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: linear-gradient(90deg, var(--glass-border), transparent);
+}
+
+.dashboard-overview-section .resources-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.stat-card,
+.stat-card.glass-panel,
+.resource-card,
+.resource-card.glass-panel {
+  background:
+    var(--glass-sheen),
+    var(--glass-bg);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-raised);
+}
+
+.stat-card {
+  min-height: 92px;
+}
+
+.stat-card.success,
+.server-status-strip.success {
+  border-color: color-mix(in srgb, var(--success) 66%, var(--glass-border));
+}
+
+.stat-card.warning,
+.server-status-strip.warning {
+  border-color: color-mix(in srgb, var(--warning) 66%, var(--glass-border));
+}
+
+.stat-card.error,
+.server-status-strip.error {
+  border-color: color-mix(in srgb, var(--error) 66%, var(--glass-border));
+}
+
+.server-status-strip.glass-panel {
+  border-left-width: 3px;
+}
+
+.stat-icon,
+.power-display {
+  filter: drop-shadow(0 3px 6px color-mix(in srgb, var(--bg-primary) 42%, transparent));
+}
+
+.power-display,
+.token-stat-card,
+.token-stat-card.glass-panel {
+  background: var(--glass-sheen), var(--glass-well);
+  border: 1px solid var(--glass-divider);
+  box-shadow:
+    var(--shadow-pressed),
+    inset 0 1px 0 var(--glass-highlight);
+}
+
+.stat-label,
+.stat-sub,
+.resource-detail,
+.token-stat-label,
+.chart-empty,
+.chart-legend {
+  color: var(--text-secondary);
+}
+
+.chart-card,
+.chart-card.glass-panel,
+.chart-card-wide,
+.chart-card-wide.glass-panel {
+  overflow: hidden;
+  background:
+    var(--glass-sheen),
+    var(--glass-bg);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-raised);
+}
+
+.chart-container,
+.chart-container-wide,
+.recharts-responsive-container,
+.recharts-wrapper {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.dashboard .recharts-cartesian-grid line {
+  stroke: var(--chart-grid);
+}
+
+.dashboard .recharts-cartesian-axis-tick-value {
+  fill: var(--text-secondary);
+}
+
+.chart-tooltip {
+  color: var(--text-primary);
+  background: var(--glass-bg-elevated-opaque);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-floating);
+}
+
+.chart-legend-dot.gpu {
+  background: var(--error);
+}
+
+.chart-legend-dot.cpu,
+.chart-legend-dot.gtt {
+  background: var(--warning);
+}
+
+.chart-legend-dot.vram {
+  background: var(--success);
+}
+
+.chart-legend-dot.system {
+  background: var(--info);
+}
+
+.model-breakdown-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: var(--radius-md);
+}
+
+/* Query panel: floating glass panel with tactile composer and action well. */
+.query-container,
+.query-container.glass-panel {
+  width: min(410px, calc(100vw - 32px));
+  max-height: min(620px, calc(100vh - 112px));
+  background: var(--glass-bg-elevated);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-floating);
+  transition:
+    opacity 200ms ease,
+    transform 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.query-header,
+.query-input {
+  background: color-mix(in srgb, var(--glass-bg-elevated) 78%, transparent);
+  border-color: var(--glass-divider);
+}
+
+.query-header {
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+.query-controls .searchable-select {
+  max-width: 190px;
+}
+
+.query-messages {
+  background:
+    linear-gradient(180deg, transparent, color-mix(in srgb, var(--accent) 4%, transparent));
+}
+
+.query-message.assistant .message-content {
+  background: var(--glass-sheen), var(--glass-well);
+  border: 1px solid var(--glass-divider);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+.query-message.user .message-content {
+  color: var(--control-contrast);
+  background:
+    var(--glass-sheen),
+    color-mix(in srgb, var(--accent) 96%, var(--glass-bg-elevated));
+  border: 1px solid color-mix(in srgb, var(--accent) 74%, var(--glass-highlight));
+  box-shadow: var(--shadow-raised);
+}
+
+.query-input textarea {
+  min-width: 0;
+  background: var(--glass-bg);
+  border-color: var(--glass-border);
+  box-shadow: var(--shadow-pressed);
+}
+
+.query-fab,
+.query-fab.glass-btn {
+  border: 1px solid color-mix(in srgb, var(--accent) 74%, var(--glass-highlight));
+  box-shadow: var(--shadow-floating);
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    color 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.query-fab:hover,
+.query-fab.open,
+.query-fab.glass-btn:hover,
+.query-fab.glass-btn.open {
+  transform: none;
+}
+
+.query-fab.open,
+.query-fab.glass-btn.open {
+  color: var(--text-primary);
+  background: var(--glass-sheen), var(--glass-bg-elevated);
+}
+
+/* Opaque fallbacks mirror the foundation pattern for every extended panel. */
+@supports not (backdrop-filter: blur(1px)) {
+  .card,
+  .stat-card,
+  .resource-card,
+  .chart-card,
+  .token-stat-card,
+  .preset-card,
+  .create-preset-form,
+  .model-card,
+  .search-result,
+  .no-quants-state,
+  .quant-item,
+  .empty-state,
+  .filters-panel,
+  .logs-container,
+  .request-logs-table,
+  .queue-table,
+  .process-card,
+  .process-summary,
+  .api-endpoints-list,
+  .api-endpoint-detail,
+  .docs-content,
+  .ds4-download-section,
+  .ds4-option,
+  .server-status-strip {
+    background-color: var(--glass-bg-opaque);
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  body select,
+  body textarea,
+  .searchable-select-trigger,
+  .searchable-select-search {
+    background-color: var(--glass-bg-opaque);
+  }
+
+  .stats-header,
+  .chart-card-wide,
+  .models-modal,
+  .downloads-dropdown,
+  .message-stats-tooltip,
+  .query-container,
+  .searchable-select-dropdown {
+    background-color: var(--glass-bg-elevated-opaque);
+  }
+}
+
+@media (max-width: 1180px) {
+  .dashboard-overview-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-overview-section .resources-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1024px) {
+  .dashboard .charts-grid,
+  .dashboard .charts-grid-wide {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-overview-section .resources-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 768px) {
+  body {
+    background:
+      radial-gradient(circle at 12% 5%, var(--ambient-accent) 0, transparent 24rem),
+      radial-gradient(circle at 90% 36%, var(--ambient-info) 0, transparent 22rem),
+      var(--bg-primary);
+  }
+
+  .stats-header {
+    top: 8px;
+    margin: 8px 10px 0;
+    padding: 7px 9px;
+    gap: 8px;
+    overflow-x: auto;
+  }
+
+  .stats-header-items {
+    gap: 6px;
+  }
+
+  .stats-header-item {
+    min-width: 43px;
+    padding: 4px 6px;
+  }
+
+  .dashboard-hero {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 16px;
+  }
+
+  .dashboard-hero .header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .dashboard-overview-section .resources-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .charts-grid,
+  .charts-grid-wide {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chart-card,
+  .chart-card-wide,
+  .resource-card,
+  .stat-card {
+    padding: 16px;
+  }
+
+  .chart-card h4,
+  .chart-card-wide h4 {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .chart-card h4 .chart-value,
+  .chart-card-wide h4 .chart-value {
+    margin-left: 0;
+  }
+
+  .query-panel {
+    right: 12px;
+    bottom: 12px;
+    left: 12px;
+  }
+
+  .query-container {
+    right: 0;
+    width: calc(100vw - 24px);
+    max-height: calc(100vh - 96px);
+  }
+}
+
+@media (max-width: 480px) {
+  .page {
+    padding: 14px 12px;
+  }
+
+  .dashboard-hero .header-actions > button {
+    flex: 1 1 auto;
+  }
+
+  .dashboard-section,
+  .analytics-section {
+    margin-bottom: 22px;
+  }
+
+  .server-status-strip {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .history-summary {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .query-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .query-controls {
+    width: 100%;
+  }
+
+  .query-controls .searchable-select {
+    max-width: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body button,
+  input,
+  select,
+  textarea,
+  .card,
+  .stat-card,
+  .resource-card,
+  .chart-card,
+  .chart-card-wide,
+  .query-container,
+  .query-fab {
+    transition: none;
+  }
 }

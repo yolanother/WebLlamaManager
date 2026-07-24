@@ -1,9 +1,9 @@
-// Llama Manager — compact live statistics header.
+// Llama Manager — floating glass live statistics header.
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Renders compact health and resource indicators plus active and recent download
-// status.
+// Renders a themeable floating glass bar with compact health, resource, and
+// active/recent download indicators.
 
 import React, { useState, useEffect, useRef } from 'react';
 import { copyTextToClipboard } from '../api.js';
@@ -81,7 +81,7 @@ function StatsHeader({ stats }) {
   if (!stats) return null;
 
   return (
-    <div className="stats-header">
+    <div className="stats-header glass-panel glass-panel--floating">
       <div className="stats-header-items">
         <div className="stats-header-item" title="CPU Usage">
           <ProgressRing
@@ -161,7 +161,7 @@ function StatsHeader({ stats }) {
         {hasDownloads && (
           <div className="stats-header-downloads" ref={dropdownRef}>
             <button
-              className={`downloads-btn ${hasErrors ? 'has-errors' : ''} ${activeDownloads.length > 0 ? 'active' : ''}`}
+              className={`downloads-btn glass-btn ${hasErrors ? 'has-errors' : ''} ${activeDownloads.length > 0 ? 'active' : ''}`}
               onClick={() => setShowDownloads(!showDownloads)}
               title={`${activeDownloads.length} active, ${recentDownloads.length} recent downloads`}
             >
@@ -173,7 +173,7 @@ function StatsHeader({ stats }) {
             </button>
 
             {showDownloads && (
-              <div className="downloads-dropdown">
+              <div className="downloads-dropdown glass-panel glass-panel--floating">
                 <div className="downloads-dropdown-header">
                   <span>Downloads</span>
                 </div>
@@ -198,7 +198,7 @@ function StatsHeader({ stats }) {
                           )}
                           {(download.status === 'completed' || download.status === 'failed') && (
                             <button
-                              className="download-clear-btn"
+                              className="download-clear-btn glass-btn"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 clearDownload(download.id);
@@ -231,7 +231,7 @@ function StatsHeader({ stats }) {
                                 <div className="download-output-header">
                                   <span>Output</span>
                                   <button
-                                    className="download-copy-btn"
+                                    className="download-copy-btn glass-btn"
                                     onClick={() => copyToClipboard(download.output, download.id)}
                                   >
                                     {copiedId === download.id ? 'Copied!' : 'Copy'}
