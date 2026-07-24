@@ -18,6 +18,8 @@ import 'highlight.js/styles/github-dark.css';
 import './App.css';
 import { resolveLlamaUpdateView } from './llama-update-policy.js';
 import { isLocalKioskHost, requestSystemLogin } from './kiosk-control.js';
+import { DEFAULT_THEME_ID } from './theme/manifest.js';
+import { useSiteTheme, useSiteThemeLogo, selectSiteTheme } from './theme/siteTheme.js';
 
 const API_BASE = '/api';
 
@@ -479,12 +481,13 @@ function Sidebar({ stats }) {
   // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
   // is the real signal — otherwise the chat/status would show "not running").
   const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
+  const logoSrc = useSiteThemeLogo('/favicon/favicon-32x32.png');
 
   return (
     <nav className="sidebar">
       <div className="sidebar-header">
         <div className="sidebar-title">
-          <img src="/favicon/favicon-32x32.png" alt="Llama" className="sidebar-logo" />
+          <img src={logoSrc} alt="Llama" className="sidebar-logo" />
           <h1>Llama Manager</h1>
         </div>
         <div className={`status-indicator ${isHealthy ? 'healthy' : stats?.mode ? 'starting' : 'stopped'}`}>
@@ -5414,6 +5417,45 @@ function ProcessesPage() {
   );
 }
 
+/**
+ * Settings section that lets the user select a host-architecture "site theme"
+ * for previewing/testing platform branding. Lists "Default" plus every theme
+ * discovered in the runtime manifest; renders nothing until the manifest has
+ * loaded and only when at least one theme is available. Selecting a theme
+ * applies it instantly and persists it (localStorage `siteTheme`).
+ * @returns {(JSX.Element|null)} The section, or `null` when no themes exist.
+ */
+function SiteThemeSection() {
+  const { themes, selectedId, ready } = useSiteTheme();
+
+  if (!ready || themes.length === 0) return null;
+
+  return (
+    <section className="page-section">
+      <h3>Site Theme</h3>
+      <div className="settings-grid">
+        <div className="setting-item">
+          <label htmlFor="siteTheme">Site theme</label>
+          <p className="setting-hint">
+            Preview a platform-branded appearance. Themes are supplied by the host build;
+            "Default" is always available. Applied instantly and remembered on this device.
+          </p>
+          <select
+            id="siteTheme"
+            value={selectedId}
+            onChange={(e) => selectSiteTheme(e.target.value)}
+          >
+            <option value={DEFAULT_THEME_ID}>Default</option>
+            {themes.map((t) => (
+              <option key={t.id} value={t.id}>{t.label}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 // Settings Page
 function SettingsPage() {
   const [settings, setSettings] = useState(null);
@@ -5851,6 +5893,8 @@ function SettingsPage() {
           </div>
         </div>
       </section>
+
+      <SiteThemeSection />
 
       <LlamaCppUpdateSection />
 
