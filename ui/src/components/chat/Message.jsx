@@ -2,13 +2,14 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Renders right-aligned user chips, full-width sanitized assistant Markdown,
-// multimodal previews, routed-model metadata, and per-message actions.
+// Renders messenger bubbles with sanitized Markdown, multimodal previews,
+// compact artifact cards, attached metadata, and per-message actions.
 
 import { Fragment, useState } from 'react';
 
 import { copyTextToClipboard, formatModelName } from '../../api.js';
 import { CodeBlock } from '../CodeBlock.jsx';
+import { countLines, getArtifactVersion } from './artifacts.js';
 import { formatMediaTime } from './attachments.js';
 
 function safeHref(value) {
@@ -267,13 +268,113 @@ function ActionIcon({ type }) {
   return <path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6" />;
 }
 
+function MessageActions({
+  copied,
+  isUser,
+  message,
+  onCopy,
+  onEdit,
+  onRegenerate,
+}) {
+  return (
+    <div className="chat-message-tools">
+      <button type="button" onClick={onCopy} aria-label="Copy message" title="Copy">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><ActionIcon type="copy" /></svg>
+        <span>{copied ? 'Copied' : 'Copy'}</span>
+      </button>
+      {isUser && onEdit && (
+        <button type="button" onClick={() => onEdit(message)} aria-label="Edit message" title="Edit">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><ActionIcon type="edit" /></svg>
+          <span>Edit</span>
+        </button>
+      )}
+      {!isUser && onRegenerate && (
+        <button type="button" onClick={() => onRegenerate(message)} aria-label="Regenerate response" title="Regenerate">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><ActionIcon type="regenerate" /></svg>
+          <span>Regenerate</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Compact launcher for an editable code or Markdown artifact.
+ */
+function ArtifactCard({ artifact, isUpdate = false, onOpen }) {
+  const version = getArtifactVersion(artifact);
+  return (
+    <button
+      type="button"
+      className="chat-artifact-card glass-chip"
+      onClick={() => onOpen?.(artifact.id)}
+      aria-label={`Open ${artifact.title} artifact`}
+    >
+      <span className="chat-artifact-icon" aria-hidden="true">&lt;/&gt;</span>
+      <span className="chat-artifact-copy">
+        <strong>{artifact.title}</strong>
+        <small>
+          {isUpdate ? 'Updated · ' : ''}
+          {artifact.language || 'text'} · {countLines(version.content)} lines
+        </small>
+      </span>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+    </button>
+  );
+}
+
+function AssistantMeta({ message }) {
+  const stats = message.stats || {};
+  const items = [];
+  const model = message.routedModel || stats.model;
+  if (model) {
+    items.push(
+      <span className="glass-chip chat-route-badge" key="model">
+        {formatModelName({ id: model })}
+      </span>,
+    );
+  }
+  if (Number(stats.tokensPerSecond) > 0) {
+    items.push(<span key="speed">{stats.tokensPerSecond} tok/s</span>);
+  }
+  if (Number(stats.completionTokens) > 0) {
+    items.push(<span key="tokens">{stats.completionTokens} tokens</span>);
+  }
+  if (Number(stats.duration) > 0) {
+    items.push(<span key="duration">{(stats.duration / 1000).toFixed(1)}s</span>);
+  }
+  if (message.stopped) items.push(<span key="stopped">Stopped</span>);
+  if (items.length === 0) return null;
+
+  return (
+    <div className="chat-message-stats">
+      {items.map((item, index) => (
+        <Fragment key={item.key || index}>
+          {index > 0 && <span aria-hidden="true">·</span>}
+          {item}
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
 /**
  * One persisted or currently streaming chat message.
  */
-function Message({ message, isStreaming = false, onEdit, onRegenerate }) {
+function Message({
+  artifacts = [],
+  isStreaming = false,
+  message,
+  onEdit,
+  onOpenArtifact,
+  onRegenerate,
+  spacing = 'role-change',
+}) {
   const [copied, setCopied] = useState(false);
   const isUser = message.role === 'user';
   const displayText = contentToText(message);
+  const hasArtifacts = artifacts.length > 0;
+  const hasRichContent = hasArtifacts || /(^|\n)```|^\s*\|.+\|\s*$/m.test(displayText);
   const copy = async () => {
     await copyTextToClipboard(displayText || String(message.content || ''));
     setCopied(true);
@@ -282,69 +383,76 @@ function Message({ message, isStreaming = false, onEdit, onRegenerate }) {
 
   return (
     <article
-      className={`chat-message-row ${isUser ? 'is-user' : 'is-assistant'} ${isStreaming ? 'is-streaming' : ''}`}
+      className={[
+        'chat-message-row',
+        isUser ? 'is-user' : 'is-assistant',
+        isStreaming ? 'is-streaming' : '',
+        hasRichContent ? 'has-rich-content' : '',
+        spacing === 'same-role' ? 'is-same-role' : 'is-role-change',
+      ].filter(Boolean).join(' ')}
       aria-live={isUser ? undefined : 'polite'}
     >
-      <div className="chat-message-topline">
-        {!isUser && (
-          <div className="chat-assistant-label">
-            <span className="chat-assistant-mark">L</span>
-            <span>Assistant</span>
-            {message.routedModel && (
-              <span className="glass-chip chat-route-badge">
-                {formatModelName({ id: message.routedModel })}
-              </span>
-            )}
-            {message.stopped && <span className="chat-stopped-label">Stopped</span>}
-          </div>
-        )}
-        <div className="chat-message-tools">
-          <button type="button" onClick={copy} aria-label="Copy message" title="Copy">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><ActionIcon type="copy" /></svg>
-            <span>{copied ? 'Copied' : 'Copy'}</span>
-          </button>
-          {isUser && onEdit && (
-            <button type="button" onClick={() => onEdit(message)} aria-label="Edit message" title="Edit">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><ActionIcon type="edit" /></svg>
-              <span>Edit</span>
-            </button>
-          )}
-          {!isUser && !isStreaming && onRegenerate && (
-            <button type="button" onClick={() => onRegenerate(message)} aria-label="Regenerate response" title="Regenerate">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><ActionIcon type="regenerate" /></svg>
-              <span>Regenerate</span>
-            </button>
-          )}
-        </div>
-      </div>
       {isUser ? (
-        <div className="chat-user-bubble glass-chip">
-          <UserAttachments message={message} />
-          {displayText && <div className="chat-user-text">{displayText}</div>}
-        </div>
+        <>
+          <div className="chat-user-bubble">
+            <UserAttachments message={message} />
+            {displayText && <div className="chat-user-text">{displayText}</div>}
+          </div>
+          <MessageActions
+            copied={copied}
+            isUser
+            message={message}
+            onCopy={copy}
+            onEdit={onEdit}
+          />
+        </>
       ) : (
-        <div className="chat-assistant-content">
-          {message.content ? <Markdown content={message.content} /> : (
-            isStreaming && (
-              <span className="chat-thinking" aria-label="Assistant is thinking">
-                <i /><i /><i />
-              </span>
-            )
-          )}
-          {isStreaming && message.content && <span className="chat-stream-caret" aria-hidden="true" />}
-        </div>
-      )}
-      {!isUser && message.stats && !isStreaming && (
-        <div className="chat-message-stats">
-          {message.stats.tokensPerSecond} tok/s
-          <span>·</span>
-          {message.stats.completionTokens} tokens
-          <span>·</span>
-          {(message.stats.duration / 1000).toFixed(1)}s
-        </div>
+        <>
+          <span className="chat-assistant-mark" aria-hidden="true">✦</span>
+          <div className="chat-assistant-group">
+            <div className="chat-assistant-bubble">
+              <div className="chat-assistant-content">
+                {displayText ? <Markdown content={displayText} /> : (
+                  isStreaming ? (
+                    <span className="chat-thinking" aria-label="Assistant is thinking">
+                      <i /><i /><i />
+                    </span>
+                  ) : !hasArtifacts && (
+                    <div className="chat-empty-response">
+                      <span>Empty response.</span>
+                      {onRegenerate && (
+                        <button type="button" onClick={() => onRegenerate(message)}>
+                          Regenerate?
+                        </button>
+                      )}
+                    </div>
+                  )
+                )}
+                {artifacts.map((artifact) => (
+                  <ArtifactCard
+                    artifact={artifact}
+                    isUpdate={message.artifactUpdate}
+                    key={artifact.id}
+                    onOpen={onOpenArtifact}
+                  />
+                ))}
+                {isStreaming && displayText && <span className="chat-stream-caret" aria-hidden="true" />}
+              </div>
+              {!isStreaming && <AssistantMeta message={message} />}
+            </div>
+            {!isStreaming && (
+              <MessageActions
+                copied={copied}
+                message={message}
+                onCopy={copy}
+                onRegenerate={onRegenerate}
+              />
+            )}
+          </div>
+        </>
       )}
     </article>
   );
 }
 
-export { Markdown, Message, contentToText };
+export { ArtifactCard, Markdown, Message, contentToText };
