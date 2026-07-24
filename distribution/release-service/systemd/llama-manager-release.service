@@ -1,0 +1,19 @@
+# Copyright (c) 2026 DoubTech. Use of this file is governed by the LICENSE file
+# in the repository root.
+#
+# systemd --user oneshot service that runs the Llama Manager release commit
+# watcher a single time. It is triggered on a schedule by the paired timer
+# (llama-manager-release.timer); the watcher decides — via a 10-minute quiet
+# window — whether a new app-main commit warrants invoking the signed release
+# runner. Runs as the invoking user (yolan) with rootless podman; no root.
+[Unit]
+Description=Llama Manager automatic release watcher (one tick)
+Documentation=file:///home/yolan/workspace/ai/llama-server/distribution/release-service/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/yolan/workspace/ai/llama-server/distribution/release-service/watch-main.sh
+# The build can be long-running when the quiet window fires; don't let systemd
+# kill an in-flight ISO build.
+TimeoutStartSec=0

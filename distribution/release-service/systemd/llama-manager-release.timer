@@ -1,0 +1,21 @@
+# Copyright (c) 2026 DoubTech. Use of this file is governed by the LICENSE file
+# in the repository root.
+#
+# systemd --user timer that drives the Llama Manager release watcher. It fires a
+# few minutes after login/boot and then every two minutes, so a new commit on the
+# app's main branch is noticed promptly while the watcher's own quiet-window logic
+# debounces bursts into a single build. Persistent=true replays a missed tick
+# after the machine was off. Enable with:
+#   systemctl --user enable --now llama-manager-release.timer
+[Unit]
+Description=Periodic tick for the Llama Manager automatic release watcher
+Documentation=file:///home/yolan/workspace/ai/llama-server/distribution/release-service/README.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+Persistent=true
+Unit=llama-manager-release.service
+
+[Install]
+WantedBy=timers.target
