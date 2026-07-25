@@ -129,6 +129,15 @@ function Composer({
           placeholder={disabled ? 'Start a model to begin chatting' : 'Message Llama Manager'}
           onChange={(event) => onChange(event.target.value)}
           onPaste={(event) => {
+            // Clipboard media first: Cmd/Ctrl+V of a copied image or screenshot
+            // attaches directly — no file picker round-trip.
+            const pastedFiles = [...(event.clipboardData.files || [])]
+              .filter((file) => file.type.startsWith('image/') || file.type.startsWith('video/'));
+            if (pastedFiles.length) {
+              event.preventDefault();
+              chooseFiles(pastedFiles);
+              return;
+            }
             const pasted = event.clipboardData.getData('text/plain');
             const classification = classifyPaste(pasted);
             if (classification.type === 'attachment-url') {

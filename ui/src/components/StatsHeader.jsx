@@ -126,21 +126,26 @@ function StatsHeader({ stats }) {
             </div>
 
             {(stats.guard || stats.gpu.temperature > 0) && (() => {
-              // Reflect the guard's whole-box thermal state (hottest sensor),
-              // NOT just the GPU reading — otherwise a cool GPU makes this gauge
-              // read "fine" while the guard reports Critical from the CPU.
+              // One compact tile per sensor (GPU + CPU) so a cool GPU can't
+              // mask a hot CPU. Each tile carries its own severity color; the
+              // CPU tile only renders when the guard reports a CPU reading.
               const guard = stats.guard;
-              const sev = guard ? guardSeverity(guard) : sensorSeverity(stats.gpu.temperature, null);
-              const displayC = guard?.maxTempC != null ? guard.maxTempC : stats.gpu.temperature;
-              const title = guard
-                ? `Thermal: ${sev} — ${Math.round(displayC)}°C (gpu ${Math.round(guard.gpuC ?? stats.gpu.temperature)} / cpu ${Math.round(guard.cpuC ?? 0)})`
-                : 'GPU Temperature';
-              return (
-                <div className="stats-header-item temp" title={title}>
-                  <span className="stats-header-temp" style={{ color: severityColor(sev) }}>{Math.round(displayC)}°</span>
-                  <span className="stats-header-label">Temp</span>
+              const gpuC = guard?.gpuC ?? stats.gpu.temperature;
+              const cpuC = guard?.cpuC ?? null;
+              const tiles = [
+                gpuC > 0 ? { label: 'GPU°', value: gpuC, sev: sensorSeverity(gpuC, guard) } : null,
+                cpuC != null && cpuC > 0 ? { label: 'CPU°', value: cpuC, sev: sensorSeverity(cpuC, guard) } : null,
+              ].filter(Boolean);
+              return tiles.map((tile) => (
+                <div
+                  key={tile.label}
+                  className="stats-header-item temp"
+                  title={`${tile.label.slice(0, 3)} temperature: ${Math.round(tile.value)}°C (${tile.sev})`}
+                >
+                  <span className="stats-header-temp" style={{ color: severityColor(tile.sev) }}>{Math.round(tile.value)}°</span>
+                  <span className="stats-header-label">{tile.label.slice(0, 3)}</span>
                 </div>
-              );
+              ));
             })()}
           </>
         )}

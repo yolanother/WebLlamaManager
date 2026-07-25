@@ -288,11 +288,17 @@ input::placeholder {
 }
 
 .stats-header-temp {
+  /* Match the 36px ProgressRing footprint of sibling tiles so the temp tiles
+     don't render as odd-sized outliers in the stats strip. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 36px;
   font-size: 14px;
   font-weight: 600;
-  /* Color is set inline from the thermal guard severity (see App.jsx) so this
-     compact gauge always agrees with the guard's Normal/Throttled/Critical
-     state. This is only a neutral fallback if no severity is provided. */
+  /* Color is set inline from the thermal guard severity (see StatsHeader) so
+     this compact gauge always agrees with the guard's Normal/Throttled/
+     Critical state. This is only a neutral fallback if no severity is given. */
   color: var(--text-primary);
   font-family: monospace;
 }
