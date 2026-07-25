@@ -287,13 +287,24 @@ input::placeholder {
   height: 36px;
 }
 
-.stats-header-temp {
-  /* Match the 36px ProgressRing footprint of sibling tiles so the temp tiles
-     don't render as odd-sized outliers in the stats strip. */
+/* Combined GPU/CPU thermal tile: two stacked sensor rows filling the same
+   overall footprint as the 36px-ring + label sibling tiles. */
+.stats-header-temp-stack {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   justify-content: center;
-  height: 36px;
+  gap: 3px;
+  min-height: 52px;
+}
+
+.stats-header-temp-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.stats-header-temp {
   font-size: 14px;
   font-weight: 600;
   /* Color is set inline from the thermal guard severity (see StatsHeader) so

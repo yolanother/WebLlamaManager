@@ -132,20 +132,24 @@ function StatsHeader({ stats }) {
               const guard = stats.guard;
               const gpuC = guard?.gpuC ?? stats.gpu.temperature;
               const cpuC = guard?.cpuC ?? null;
-              const tiles = [
-                gpuC > 0 ? { label: 'GPU°', value: gpuC, sev: sensorSeverity(gpuC, guard) } : null,
-                cpuC != null && cpuC > 0 ? { label: 'CPU°', value: cpuC, sev: sensorSeverity(cpuC, guard) } : null,
+              const rows = [
+                gpuC > 0 ? { label: 'GPU', value: gpuC, sev: sensorSeverity(gpuC, guard) } : null,
+                cpuC != null && cpuC > 0 ? { label: 'CPU', value: cpuC, sev: sensorSeverity(cpuC, guard) } : null,
               ].filter(Boolean);
-              return tiles.map((tile) => (
-                <div
-                  key={tile.label}
-                  className="stats-header-item temp"
-                  title={`${tile.label.slice(0, 3)} temperature: ${Math.round(tile.value)}°C (${tile.sev})`}
-                >
-                  <span className="stats-header-temp" style={{ color: severityColor(tile.sev) }}>{Math.round(tile.value)}°</span>
-                  <span className="stats-header-label">{tile.label.slice(0, 3)}</span>
+              if (!rows.length) return null;
+              const title = rows.map((r) => `${r.label} ${Math.round(r.value)}°C (${r.sev})`).join(' · ');
+              return (
+                <div className="stats-header-item temp" title={`Temperature — ${title}`}>
+                  <div className="stats-header-temp-stack">
+                    {rows.map((row) => (
+                      <div key={row.label} className="stats-header-temp-row">
+                        <span className="stats-header-temp" style={{ color: severityColor(row.sev) }}>{Math.round(row.value)}°</span>
+                        <span className="stats-header-label">{row.label}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              ));
+              );
             })()}
           </>
         )}
