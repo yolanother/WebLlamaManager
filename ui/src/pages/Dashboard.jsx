@@ -12,6 +12,7 @@ import {
 } from 'recharts';
 import { API_BASE, formatBytes, formatUptime, formatModelName } from '../api.js';
 import { isLocalKioskHost, requestSystemLogin } from '../kiosk-control.js';
+import { useVisiblePolling } from '../hooks/useVisiblePolling.js';
 import {
   StatCard,
   ProgressRing,
@@ -64,6 +65,58 @@ const DASHBOARD_MODEL_SPEED_COLORS = [
   'var(--info)',
 ];
 
+const MODEL_LINE_COLORS = [
+  'var(--accent)',
+  'var(--success)',
+  'var(--warning)',
+  'var(--error)',
+  'var(--info)',
+];
+
+const formatPercentTick = value => `${value}%`;
+const formatThousandsTick = value => value >= 1000 ? `${(value / 1000).toFixed(0)}k` : value;
+
+function ModelMetricTooltip({ active, payload, label, dataKey, unit = '', color }) {
+  if (!active || !payload?.length) return null;
+  const datum = payload[0].payload;
+  return (
+    <div className="chart-tooltip">
+      <div className="chart-tooltip-time">{datum.fullModel}</div>
+      <div className="chart-tooltip-row">
+        <span className="chart-tooltip-dot" style={{ background: color }} />
+        <span className="chart-tooltip-label">{label}:</span>
+        <span className="chart-tooltip-value">{datum[dataKey]}{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+function setJsonStateIfChanged(setState, lastJsonRef, value) {
+  const nextJson = JSON.stringify(value);
+  if (lastJsonRef.current === nextJson) return;
+  lastJsonRef.current = nextJson;
+  setState(value);
+}
+
+const MemoizedRenderBoundary = React.memo(
+  function MemoizedRenderBoundary({ children }) {
+    return children;
+  },
+  (previous, next) => (
+    previous.dependencies.length === next.dependencies.length
+    && previous.dependencies.every((value, index) => Object.is(value, next.dependencies[index]))
+  ),
+);
+
+const MemoTemperatureChart = React.memo(TemperatureChart);
+const MemoModelTpsRankChart = React.memo(ModelTpsRankChart);
+const MemoModelPerformanceBreakdown = React.memo(ModelPerformanceBreakdown);
+const MemoModelRequestStatsTable = React.memo(ModelRequestStatsTable);
+const MemoUsageChart = React.memo(UsageChart);
+const MemoPowerChart = React.memo(PowerChart);
+const MemoMemoryChart = React.memo(MemoryChart);
+const MemoTokensChart = React.memo(TokensChart);
+
 // Dashboard Page
 //
 // When `kiosk` is true the component renders its glanceable, auto-paging
@@ -84,6 +137,12 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const [showAllModels, setShowAllModels] = useState(false);
   const [systemLoginError, setSystemLoginError] = useState('');
+  const serverModelsJsonRef = useRef(JSON.stringify([]));
+  const analyticsJsonRef = useRef(JSON.stringify(null));
+  const historyJsonRef = useRef(JSON.stringify(null));
+  const crashJsonRef = useRef(JSON.stringify(null));
+  const modelBreakdownJsonRef = useRef(JSON.stringify(null));
+  const requestStatsJsonRef = useRef(JSON.stringify(null));
   const fullscreenTimerRef = useRef(null);
   const FULLSCREEN_PAGES = 3;
 
@@ -104,7 +163,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     try {
       const res = await fetch(`${API_BASE}/models`);
       const data = await res.json();
-      setServerModels(data.serverModels || []);
+      setJsonStateIfChanged(setServerModels, serverModelsJsonRef, data.serverModels || []);
     } catch (err) {
       console.error('Failed to fetch models:', err);
     }
@@ -114,7 +173,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     try {
       const res = await fetch(`${API_BASE}/analytics?minutes=5`);
       const data = await res.json();
-      setAnalytics(data);
+      setJsonStateIfChanged(setAnalytics, analyticsJsonRef, data);
     } catch (err) {
       console.error('Failed to fetch analytics:', err);
     }
@@ -123,7 +182,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const fetchModelBreakdown = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/analytics/models`);
-      setModelBreakdown(await res.json());
+      setJsonStateIfChanged(setModelBreakdown, modelBreakdownJsonRef, await res.json());
     } catch (err) {
       console.error('Failed to fetch model breakdown:', err);
     }
@@ -132,7 +191,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const fetchRequestStats = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/analytics/request-stats?window=${requestStatsWindow}`);
-      setRequestStats(await res.json());
+      setJsonStateIfChanged(setRequestStats, requestStatsJsonRef, await res.json());
     } catch (err) {
       console.error('Failed to fetch request stats:', err);
     }
@@ -144,39 +203,20 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
         fetch(`${API_BASE}/analytics/history?range=${historyRange}`),
         fetch(`${API_BASE}/analytics/crashes?range=${historyRange}`)
       ]);
-      setHistoryData(await histRes.json());
-      setCrashData(await crashRes.json());
+      setJsonStateIfChanged(setHistoryData, historyJsonRef, await histRes.json());
+      setJsonStateIfChanged(setCrashData, crashJsonRef, await crashRes.json());
     } catch (err) {
       console.error('Failed to fetch history:', err);
     }
   }, [historyRange]);
 
-  useEffect(() => {
-    fetchModels();
-    fetchAnalytics();
-    fetchHistory();
-    fetchModelBreakdown();
-    fetchRequestStats();
-    const modelsInterval = setInterval(fetchModels, 10000);
-    const analyticsInterval = setInterval(fetchAnalytics, 2000);
-    const historyInterval = setInterval(fetchHistory, 60000);
-    // Breakdown aggregates the full analytics history file — refresh slowly.
-    const breakdownInterval = setInterval(fetchModelBreakdown, 30000);
-    // Request stats aggregate the per-request store — equally slow refresh.
-    const requestStatsInterval = setInterval(fetchRequestStats, 30000);
-    return () => {
-      clearInterval(modelsInterval);
-      clearInterval(analyticsInterval);
-      clearInterval(historyInterval);
-      clearInterval(breakdownInterval);
-      clearInterval(requestStatsInterval);
-    };
-  }, [fetchModels, fetchAnalytics, fetchHistory, fetchModelBreakdown, fetchRequestStats]);
-
-  // Refetch history when range changes
-  useEffect(() => {
-    fetchHistory();
-  }, [historyRange, fetchHistory]);
+  useVisiblePolling(fetchModels, 10000);
+  useVisiblePolling(fetchAnalytics, 5000);
+  useVisiblePolling(fetchHistory, 60000, { refreshKey: historyRange });
+  // Breakdown aggregates the full analytics history file — refresh slowly.
+  useVisiblePolling(fetchModelBreakdown, 30000);
+  // Request stats aggregate the per-request store — equally slow refresh.
+  useVisiblePolling(fetchRequestStats, 30000, { refreshKey: requestStatsWindow });
 
   // Fullscreen mode
   const enterFullscreen = useCallback(() => {
@@ -340,18 +380,36 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const allModels = serverModels.length > 0 ? serverModels : (stats?.context?.models || []);
   // Just the loaded models, for inline display in the compact Models card.
   const loadedModels = allModels.filter(m => modelStatusValue(m) === 'loaded');
+  const statusTilesSignature = JSON.stringify([
+    stats?.mode,
+    stats?.activeModel,
+    stats?.preset,
+    stats?.lastUsedModel,
+    stats?.embed,
+    stats?.servers,
+    serverModels,
+  ]);
+  const resourceTilesSignature = JSON.stringify([
+    stats?.cpu,
+    stats?.memory,
+    stats?.gpu,
+    stats?.context,
+    stats?.guard,
+  ]);
 
   // Thermal-guard state — folded into the status strip's right side.
   const guardActive = !!(stats?.guard && stats.guard.state && stats.guard.state !== 'normal');
 
   // Prepare history chart data
-  const historyPoints = (historyData?.points || []).map(p => ({
-    ...p,
-    time: formatHistoryTime(p.ts, historyRange)
-  }));
+  const historyPoints = React.useMemo(() => (
+    (historyData?.points || []).map(p => ({
+      ...p,
+      time: formatHistoryTime(p.ts, historyRange)
+    }))
+  ), [historyData, historyRange]);
 
   // Compute percentage breakdown for request health chart (0-100% stacked)
-  const requestHealthPoints = historyPoints.map(p => {
+  const requestHealthPoints = React.useMemo(() => historyPoints.map(p => {
     const total = (p.rOk || 0) + (p.rErr || 0) + (p.rRt || 0) + (p.rRs || 0);
     if (total === 0) return { time: p.time, pctOk: 100, pctErr: 0, pctRt: 0, pctRs: 0, pctOf: 0 };
     return {
@@ -362,7 +420,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
       pctRt: Math.round((p.rRt || 0) / total * 1000) / 10,
       pctRs: Math.round((p.rRs || 0) / total * 1000) / 10
     };
-  });
+  }), [historyPoints]);
 
   // Bucket request volume into regular intervals for readability
   const requestVolumeData = React.useMemo(() => {
@@ -388,12 +446,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   }, [historyData, historyRange]);
 
   // Build error code breakdown data from summary
-  const errorCodeData = historyData?.summary?.statusCodes
-    ? Object.entries(historyData.summary.statusCodes)
-        .filter(([code]) => parseInt(code) >= 400 || isNaN(parseInt(code)))
-        .map(([code, count]) => ({ code, count }))
-        .sort((a, b) => b.count - a.count)
-    : [];
+  const errorCodeData = React.useMemo(() => (
+    historyData?.summary?.statusCodes
+      ? Object.entries(historyData.summary.statusCodes)
+          .filter(([code]) => parseInt(code) >= 400 || isNaN(parseInt(code)))
+          .map(([code, count]) => ({ code, count }))
+          .sort((a, b) => b.count - a.count)
+      : []
+  ), [historyData]);
 
   // Build cumulative request growth data
   const requestGrowthData = React.useMemo(() => {
@@ -405,20 +465,24 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   }, [historyPoints]);
 
   // Build model usage bar chart data
-  const modelUsageData = historyData?.summary?.modelCounts
-    ? Object.entries(historyData.summary.modelCounts)
-        .map(([model, count]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, count, fullModel: model }))
-        .sort((a, b) => b.count - a.count)
-    : [];
+  const modelUsageData = React.useMemo(() => (
+    historyData?.summary?.modelCounts
+      ? Object.entries(historyData.summary.modelCounts)
+          .map(([model, count]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, count, fullModel: model }))
+          .sort((a, b) => b.count - a.count)
+      : []
+  ), [historyData]);
+  const modelTpsData = React.useMemo(() => (
+    Object.entries(historyData?.summary?.modelAvgTps || {})
+      .map(([model, tps]) => ({
+        model: model.length > 30 ? model.slice(0, 27) + '...' : model,
+        tps,
+        fullModel: model,
+      }))
+      .sort((a, b) => b.tps - a.tps)
+  ), [historyData]);
 
   // Build model usage over time (top 5 models as line series)
-  const MODEL_LINE_COLORS = [
-    'var(--accent)',
-    'var(--success)',
-    'var(--warning)',
-    'var(--error)',
-    'var(--info)',
-  ];
   const modelUsageOverTime = React.useMemo(() => {
     const points = historyData?.points || [];
     if (points.length === 0) return { data: [], models: [] };
@@ -505,11 +569,13 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   }, [historyData, historyRange]);
 
   // Build crash-by-model bar chart data
-  const crashByModelData = crashData?.summary?.byModel
-    ? Object.entries(crashData.summary.byModel)
-        .map(([model, count]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, count, fullModel: model }))
-        .sort((a, b) => b.count - a.count)
-    : [];
+  const crashByModelData = React.useMemo(() => (
+    crashData?.summary?.byModel
+      ? Object.entries(crashData.summary.byModel)
+          .map(([model, count]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, count, fullModel: model }))
+          .sort((a, b) => b.count - a.count)
+      : []
+  ), [crashData]);
 
   // Fullscreen rendering — 2 dense pages
   if (showFullscreen) {
@@ -584,8 +650,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
         </div>
 
-        {/* Page 1: Live status + 5-min charts */}
-        <div className={`fullscreen-page ${fullscreenPage === 0 ? 'active' : ''}`}>
+        {/* Only mount the active page so hidden ResponsiveContainers never
+            measure a display:none parent and repeatedly re-layout at -1px. */}
+        {fullscreenPage === 0 && (
+        <div className="fullscreen-page active">
           <div className="fullscreen-top-bar">
             <div className="fullscreen-status-row">
               <StatCard label="Status" value={isHealthy ? 'Running' : 'Stopped'} status={isHealthy ? 'success' : 'error'} icon="&#x1F7E2;" />
@@ -622,29 +690,32 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 <span style={{ color: severityColor(sensorSeverity(stats?.gpu?.temperature, stats?.guard)) }}>GPU: {stats?.gpu?.temperature?.toFixed(0) || 0}°C</span>
                 {stats?.cpu?.temperature ? <> / <span style={{ color: severityColor(sensorSeverity(stats.cpu.temperature, stats?.guard)) }}>CPU: {stats.cpu.temperature}°C</span></> : ''}
               </span></h4>
-              <TemperatureChart data={analytics?.temperature || []} height={200} />
+              <MemoTemperatureChart data={analytics?.temperature || []} height={200} />
             </div>
             <div className="chart-card glass-panel">
               <h4>GPU / CPU Usage <span className="chart-value">GPU: {stats?.gpu?.usage?.toFixed(0) || 0}%{stats?.cpu?.usage != null ? ` / CPU: ${stats.cpu.usage.toFixed(0)}%` : ''}</span></h4>
-              <UsageChart data={analytics?.usage || []} height={200} />
+              <MemoUsageChart data={analytics?.usage || []} height={200} />
             </div>
             <div className="chart-card glass-panel">
               <h4>Power <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span></h4>
-              <PowerChart data={analytics?.power || []} height={200} />
+              <MemoPowerChart data={analytics?.power || []} height={200} />
             </div>
             <div className="chart-card glass-panel">
               <h4>Memory <span className="chart-value">{stats?.gpu?.isAPU ? `GTT: ${stats?.gpu?.gtt?.usage?.toFixed(0) || 0}%` : `VRAM: ${stats?.gpu?.vram?.usage?.toFixed(0) || 0}%`}</span></h4>
-              <MemoryChart data={analytics?.memory || []} primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'} height={200} />
+              <MemoMemoryChart data={analytics?.memory || []} primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'} height={200} />
             </div>
             <div className="chart-card glass-panel">
               <h4>Generation Speed <span className="chart-value">{analytics?.tokenStats?.averageTokensPerSecond?.toFixed(1) || 0} tok/s</span></h4>
-              <TokensChart data={analytics?.tokens || []} height={200} />
+              <MemoTokensChart data={analytics?.tokens || []} height={200} />
             </div>
           </div>
         </div>
+        )}
 
         {/* Page 2: All historical charts */}
-        <div className={`fullscreen-page ${fullscreenPage === 1 ? 'active' : ''}`}>
+        {fullscreenPage === 1 && (
+        <MemoizedRenderBoundary dependencies={[historyData, historyRange]}>
+        <div className="fullscreen-page active">
           <div className="fullscreen-top-bar">
             <div className="fullscreen-history-header">
               <h3>Historical Analytics</h3>
@@ -767,9 +838,13 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </div>
           </div>
         </div>
+        </MemoizedRenderBoundary>
+        )}
 
         {/* Page 3: Model Analytics */}
-        <div className={`fullscreen-page ${fullscreenPage === 2 ? 'active' : ''}`}>
+        {fullscreenPage === 2 && (
+        <MemoizedRenderBoundary dependencies={[historyData, crashData, historyRange]}>
+        <div className="fullscreen-page active">
           <div className="fullscreen-top-bar">
             <div className="fullscreen-history-header">
               <h3>Model Analytics</h3>
@@ -866,14 +941,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             <div className="chart-card glass-panel">
               <h4>Generation Speed by Model</h4>
               <div className="chart-container" style={{ height: 200 }}>
-                {(() => {
-                  const modelTps = historyData?.summary?.modelAvgTps || {};
-                  const data = Object.entries(modelTps)
-                    .map(([model, tps]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, tps, fullModel: model }))
-                    .sort((a, b) => b.tps - a.tps);
-                  return data.length > 0 ? (
+                {modelTpsData.length > 0 ? (
                     <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={data} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
+                      <BarChart data={modelTpsData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
                         <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                         <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} />
                         <YAxis dataKey="model" type="category" tick={{ fill: 'var(--text-primary)', fontSize: 11 }} width={150} tickLine={false} axisLine={false} />
@@ -881,12 +951,13 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                         <Bar dataKey="tps" name="Avg tok/s" fill={DASHBOARD_CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
                       </BarChart>
                     </ResponsiveContainer>
-                  ) : <div className="chart-empty">No per-model speed data in this time range</div>;
-                })()}
+                  ) : <div className="chart-empty">No per-model speed data in this time range</div>}
               </div>
             </div>
           </div>
         </div>
+        </MemoizedRenderBoundary>
+        )}
 
         {/* Persistent bottom bar — active request + page indicator */}
         <div className="fullscreen-persistent-bar">
@@ -967,6 +1038,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             ) : null}
           </div>
         </div>
+        <MemoizedRenderBoundary dependencies={[statusTilesSignature]}>
         <div className="status-grid status-grid-compact">
           <StatCard
             label="Mode"
@@ -1020,6 +1092,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             />
           )}
         </div>
+        </MemoizedRenderBoundary>
 
         {/* Uniform per-local-server tiles: llama.cpp router, embeddings, and
             ds4 — one shape each, differing only by the models they serve and
@@ -1112,6 +1185,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
       {/* System Resources */}
       <section className="dashboard-section dashboard-overview-section">
         <h3>System Resources</h3>
+        <MemoizedRenderBoundary dependencies={[resourceTilesSignature]}>
         <div className="resources-grid">
           <div className="resource-card glass-panel">
             <ProgressRing
@@ -1245,6 +1319,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             </div>
           </div>
         </div>
+        </MemoizedRenderBoundary>
       </section>
       </div>
 
@@ -1293,7 +1368,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 {stats?.cpu?.temperature ? <> / <span style={{ color: severityColor(sensorSeverity(stats.cpu.temperature, stats?.guard)) }}>CPU: {stats.cpu.temperature}°C</span></> : ''}
               </span>
             </h4>
-            <TemperatureChart data={analytics?.temperature || []} />
+            <MemoTemperatureChart data={analytics?.temperature || []} />
             <div className="chart-legend">
               <div className="chart-legend-item">
                 <span className="chart-legend-dot gpu"></span>
@@ -1315,7 +1390,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 {stats?.cpu?.usage != null && ` / CPU: ${stats.cpu.usage.toFixed(0)}%`}
               </span>
             </h4>
-            <UsageChart data={analytics?.usage || []} />
+            <MemoUsageChart data={analytics?.usage || []} />
             <div className="chart-legend">
               <div className="chart-legend-item">
                 <span className="chart-legend-dot gpu"></span>
@@ -1338,7 +1413,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               Power Consumption
               <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span>
             </h4>
-            <PowerChart data={analytics?.power || []} />
+            <MemoPowerChart data={analytics?.power || []} />
           </div>
 
           {/* Memory Chart */}
@@ -1352,7 +1427,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 }
               </span>
             </h4>
-            <MemoryChart
+            <MemoMemoryChart
               data={analytics?.memory || []}
               primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'}
             />
@@ -1380,7 +1455,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 {analytics?.tokenStats?.averageTokensPerSecond?.toFixed(1) || 0} tok/s avg
               </span>
             </h4>
-            <TokensChart data={analytics?.tokens || []} />
+            <MemoTokensChart data={analytics?.tokens || []} />
             <div className="token-stats-grid">
               <div className="token-stat-card glass-panel">
                 <div className="token-stat-value">{analytics?.tokenStats?.totalRequests || 0}</div>
@@ -1405,7 +1480,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               Model Speed Ranking
               <span className="chart-value">avg tok/s · all time</span>
             </h4>
-            <ModelTpsRankChart
+            <MemoModelTpsRankChart
               modelBreakdown={modelBreakdown}
               window="all"
               height={Math.max(220, ((modelBreakdown?.models || []).filter(m => (m.windows?.all?.tps || 0) > 0).length * 32) + 50)}
@@ -1413,6 +1488,11 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
 
           {/* Context Usage Chart */}
+          <MemoizedRenderBoundary dependencies={[
+            analytics?.context,
+            stats?.context?.usedContext,
+            stats?.context?.totalContext,
+          ]}>
           <div className="chart-card glass-panel">
             <h4>
               Context Usage
@@ -1436,7 +1516,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                     <XAxis dataKey="timestamp" hide />
-                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : v} />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={formatThousandsTick} />
                     <Tooltip content={<ChartTooltip unit=" tokens" />} />
                     <Area type="monotone" dataKey="totalContext" name="Total" stroke={DASHBOARD_CHART_COLORS.contextTotal} fill="url(#gradCtxTotal)" strokeWidth={1} strokeDasharray="4 2" dot={false} />
                     <Area type="monotone" dataKey="usedContext" name="Used" stroke={DASHBOARD_CHART_COLORS.contextUsed} fill="url(#gradCtxUsed)" strokeWidth={2} dot={false} />
@@ -1445,8 +1525,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               ) : <div className="chart-empty">No context data yet</div>}
             </div>
           </div>
+          </MemoizedRenderBoundary>
 
           {/* Request Queue Chart */}
+          <MemoizedRenderBoundary dependencies={[
+            analytics?.queue,
+            stats?.queue?.active,
+            stats?.queue?.pending,
+          ]}>
           <div className="chart-card glass-panel">
             <h4>
               Request Queue
@@ -1479,10 +1565,19 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               ) : <div className="chart-empty">No queue data yet</div>}
             </div>
           </div>
+          </MemoizedRenderBoundary>
         </div>
       </section>
 
       {/* Historical Analytics */}
+      <MemoizedRenderBoundary dependencies={[
+        historyData,
+        crashData,
+        modelBreakdown,
+        requestStats,
+        requestStatsWindow,
+        historyRange,
+      ]}>
       <section className="dashboard-section analytics-section">
         <div className="section-header-row">
           <h3>Historical Analytics</h3>
@@ -1525,7 +1620,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             Average tok/s by Time Window
             <span className="chart-value">all models · weighted by request count</span>
           </h4>
-          <ModelPerformanceBreakdown modelBreakdown={modelBreakdown} />
+          <MemoModelPerformanceBreakdown modelBreakdown={modelBreakdown} />
         </div>
 
         <div className="chart-card-wide glass-panel model-breakdown-card">
@@ -1533,7 +1628,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             Request Statistics by Model
             <span className="chart-value">per-request · click a model for slot breakdown</span>
           </h4>
-          <ModelRequestStatsTable
+          <MemoModelRequestStatsTable
             requestStats={requestStats}
             window={requestStatsWindow}
             onWindowChange={setRequestStatsWindow}
@@ -1642,7 +1737,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                     <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : v} />
+                    <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={formatThousandsTick} />
                     <Tooltip content={<HistoryTooltip unit=" tokens" range={historyRange} />} />
                     <Area type="monotone" dataKey="cxT" name="Total" stroke={DASHBOARD_CHART_COLORS.contextTotal} fill="url(#gradHistCtxTotal)" strokeWidth={1} strokeDasharray="4 2" dot={false} animationDuration={500} />
                     <Area type="monotone" dataKey="cxU" name="Used" stroke={DASHBOARD_CHART_COLORS.contextUsed} fill="url(#gradHistCtxUsed)" strokeWidth={2} dot={false} animationDuration={500} />
@@ -1757,7 +1852,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <AreaChart data={requestHealthPoints} margin={{ top: 5, right: 5, left: -20, bottom: 5 }} stackOffset="none">
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                     <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
-                    <YAxis domain={[0, 100]} tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `${v}%`} />
+                    <YAxis domain={[0, 100]} tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={formatPercentTick} />
                     <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
                     <Area type="monotone" dataKey="pctOk" name="Local" stroke={DASHBOARD_CHART_COLORS.requestOk} fill={DASHBOARD_CHART_COLORS.requestOk} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
                     <Area type="monotone" dataKey="pctOf" name="Offloaded" stroke={DASHBOARD_CHART_COLORS.offloaded} fill={DASHBOARD_CHART_COLORS.offloaded} fillOpacity={0.6} strokeWidth={0} dot={false} stackId="pct" animationDuration={500} />
@@ -1809,20 +1904,11 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                     <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <YAxis type="category" dataKey="model" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} width={180} />
-                    <Tooltip content={({ active, payload }) => {
-                      if (!active || !payload?.length) return null;
-                      const d = payload[0].payload;
-                      return (
-                        <div className="chart-tooltip">
-                          <div className="chart-tooltip-time">{d.fullModel}</div>
-                          <div className="chart-tooltip-row">
-                            <span className="chart-tooltip-dot" style={{ background: DASHBOARD_CHART_COLORS.tokens }} />
-                            <span className="chart-tooltip-label">Requests:</span>
-                            <span className="chart-tooltip-value">{d.count}</span>
-                          </div>
-                        </div>
-                      );
-                    }} />
+                    <Tooltip content={<ModelMetricTooltip
+                      label="Requests"
+                      dataKey="count"
+                      color={DASHBOARD_CHART_COLORS.tokens}
+                    />} />
                     <Bar dataKey="count" name="Requests" fill={DASHBOARD_CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
                   </BarChart>
                 </ResponsiveContainer>
@@ -1871,36 +1957,22 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           <div className="chart-card-wide glass-panel">
             <h4>Generation Speed by Model <span className="chart-value">avg tok/s</span></h4>
             <div className="chart-container-wide">
-              {(() => {
-                const modelTps = historyData?.summary?.modelAvgTps || {};
-                const data = Object.entries(modelTps)
-                  .map(([model, tps]) => ({ model: model.length > 30 ? model.slice(0, 27) + '...' : model, tps, fullModel: model }))
-                  .sort((a, b) => b.tps - a.tps);
-                return data.length > 0 ? (
+              {modelTpsData.length > 0 ? (
                   <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={data} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
+                    <BarChart data={modelTpsData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }} layout="vertical">
                       <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                       <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} />
                       <YAxis dataKey="model" type="category" tick={{ fill: 'var(--text-primary)', fontSize: 11 }} width={180} tickLine={false} axisLine={false} />
-                      <Tooltip content={({ active, payload }) => {
-                        if (!active || !payload?.length) return null;
-                        const d = payload[0].payload;
-                        return (
-                          <div className="chart-tooltip">
-                            <div className="chart-tooltip-time">{d.fullModel}</div>
-                            <div className="chart-tooltip-row">
-                              <span className="chart-tooltip-dot" style={{ background: DASHBOARD_CHART_COLORS.tokens }} />
-                              <span className="chart-tooltip-label">Avg Speed:</span>
-                              <span className="chart-tooltip-value">{d.tps} tok/s</span>
-                            </div>
-                          </div>
-                        );
-                      }} />
+                      <Tooltip content={<ModelMetricTooltip
+                        label="Avg Speed"
+                        dataKey="tps"
+                        unit=" tok/s"
+                        color={DASHBOARD_CHART_COLORS.tokens}
+                      />} />
                       <Bar dataKey="tps" name="Avg tok/s" fill={DASHBOARD_CHART_COLORS.tokens} radius={[0, 4, 4, 0]} animationDuration={500} />
                     </BarChart>
                   </ResponsiveContainer>
-                ) : <div className="chart-empty">No per-model speed data in this time range</div>;
-              })()}
+                ) : <div className="chart-empty">No per-model speed data in this time range</div>}
             </div>
           </div>
 
@@ -1914,20 +1986,11 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
                     <XAxis type="number" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} allowDecimals={false} />
                     <YAxis type="category" dataKey="model" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} width={180} />
-                    <Tooltip content={({ active, payload }) => {
-                      if (!active || !payload?.length) return null;
-                      const d = payload[0].payload;
-                      return (
-                        <div className="chart-tooltip">
-                          <div className="chart-tooltip-time">{d.fullModel}</div>
-                          <div className="chart-tooltip-row">
-                            <span className="chart-tooltip-dot" style={{ background: 'var(--info)' }} />
-                            <span className="chart-tooltip-label">Crashes:</span>
-                            <span className="chart-tooltip-value">{d.count}</span>
-                          </div>
-                        </div>
-                      );
-                    }} />
+                    <Tooltip content={<ModelMetricTooltip
+                      label="Crashes"
+                      dataKey="count"
+                      color="var(--info)"
+                    />} />
                     <Bar dataKey="count" name="Crashes" fill="var(--error)" radius={[0, 4, 4, 0]} animationDuration={500} />
                   </BarChart>
                 </ResponsiveContainer>
@@ -1936,6 +1999,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
           </div>
         </div>
       </section>
+      </MemoizedRenderBoundary>
       <ActiveRequestPanel request={activeRequest} />
     </div>
   );
