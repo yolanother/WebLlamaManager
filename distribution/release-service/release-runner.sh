@@ -194,7 +194,10 @@ else
 fi
 
 log "Rsyncing $PUBLIC_DIR/ to $THROMGAR_HOST:$THROMGAR_PATH/"
-rsync -a --info=progress2 "$PUBLIC_DIR/" "$THROMGAR_HOST:$THROMGAR_PATH/" \
+# --chmod normalizes perms DURING transfer (NAS-side publish writes 700 dirs /
+# 600 key files): if the run dies before the post-sync chmod, files must still
+# be world-readable for nginx or the live site 404s (seen 2026-07-25).
+rsync -a --info=progress2 --chmod=Da+rx,Fa+r "$PUBLIC_DIR/" "$THROMGAR_HOST:$THROMGAR_PATH/" \
   || die "rsync to thromgar failed (release is published locally; re-run to re-sync)"
 ssh -o BatchMode=yes "$THROMGAR_HOST" "chmod -R a+rX '$THROMGAR_PATH'" \
   || die "chmod on thromgar failed"
