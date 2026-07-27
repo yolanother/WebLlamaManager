@@ -271,7 +271,9 @@ ssh -o BatchMode=yes "$THROMGAR_HOST" "
     dir='$THROMGAR_PATH/releases/'\"\$kind\"
     [ -d \"\$dir\" ] || continue
     keep_target=\$(readlink '$THROMGAR_PATH/'\"\$kind\" 2>/dev/null | xargs -r basename)
-    ls -1 \"\$dir\" | sort -r | awk -v k=$KEEP_RELEASE_SNAPSHOTS 'NR>k' | while read -r snap; do
+    # Only timestamped snapshot dirs are prune candidates — platform subtrees
+    # like releases/images/nvidia-spark/ must never be counted or removed here.
+    ls -1 \"\$dir\" | grep -E '^[0-9]{8}T[0-9]{6}Z' | sort -r | awk -v k=$KEEP_RELEASE_SNAPSHOTS 'NR>k' | while read -r snap; do
       [ -n \"\$snap\" ] || continue
       [ \"\$snap\" = \"\$keep_target\" ] && continue
       rm -rf \"\$dir/\$snap\" && echo \"pruned \$kind/\$snap\"
