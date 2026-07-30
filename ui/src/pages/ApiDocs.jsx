@@ -467,7 +467,7 @@ function ApiDocsPage() {
           </div>
         </div>
 
-        <div className="guide-example-grid" aria-label="Multimodal examples">
+        <div className="guide-example-grid" role="group" aria-label="Multimodal examples">
           {guideExamples.map(example => (
             <button
               key={example.id}
