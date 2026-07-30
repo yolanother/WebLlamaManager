@@ -471,7 +471,7 @@ function ApiDocsPage() {
         </div>
       </nav>
 
-      <div className="api-tabs api-primary-tabs" role="tablist" aria-label="API groups">
+      <div className="api-tabs api-document-tabs" role="tablist" aria-label="API groups">
         <button
           id="api-tab-manager"
           type="button"
@@ -507,6 +507,17 @@ function ApiDocsPage() {
         aria-labelledby={`api-tab-${activeTab}`}
         tabIndex={0}
       >
+        <div className="api-tab-scope">
+          <p>
+            {activeTab === 'manager'
+              ? 'Llama Manager-specific administration, runtime, media, and configuration endpoints.'
+              : 'OpenAI-compatible model and inference endpoints for SDK and HTTP clients.'}
+          </p>
+          {activeTab === 'openai' && (
+            <p className="api-base-url">Preferred SDK base URL: <code>/v1</code></p>
+          )}
+        </div>
+
         {activeTab === 'openai' && (
           <details className="multimodal-guide-disclosure glass-panel">
             <summary>
@@ -600,9 +611,6 @@ function ApiDocsPage() {
         <div className="api-docs-layout" id="api-tester">
           <aside className="api-endpoints-list glass-panel" aria-label="Endpoints">
             <h3>{activeTab === 'manager' ? 'Manager endpoints' : 'OpenAI-compatible endpoints'}</h3>
-            {activeTab === 'openai' && (
-              <p className="api-base-url">Preferred SDK base URL: <code>/v1</code></p>
-            )}
             <div className="endpoints-list">
               {endpoints.map(endpoint => (
                 <button

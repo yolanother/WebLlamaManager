@@ -22,6 +22,13 @@ test('API group tabs precede and own the active panel', () => {
   assert.match(source, /id=\{`api-panel-\$\{activeTab\}`\}[\s\S]*aria-labelledby=\{`api-tab-\$\{activeTab\}`\}/);
 });
 
+test('API inventories use conventional document tabs with clear scope descriptions', () => {
+  assert.match(source, /className="api-tabs api-document-tabs"[\s\S]*role="tablist"/);
+  assert.match(source, /Llama Manager-specific administration, runtime, media, and configuration endpoints\./);
+  assert.match(source, /OpenAI-compatible model and inference endpoints for SDK and HTTP clients\./);
+  assert.match(source, /activeTab === 'openai'[\s\S]*Preferred SDK base URL:[\s\S]*<code>\/v1<\/code>/);
+});
+
 test('roving API tabs support arrow, Home, and End keys', () => {
   assert.match(source, /function handleApiTabKeyDown\(event\)/);
   assert.match(source, /ArrowLeft[\s\S]*ArrowRight[\s\S]*Home[\s\S]*End/);
