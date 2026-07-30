@@ -47,6 +47,16 @@ test('slot affinity keeps a stable lineage and invalidates displaced reverse own
   assert.equal(registry.get('gemma', 'lineage_c').slotId, 0);
 });
 
+test('slot affinity invalidates every in-memory lineage owned by a scope', () => {
+  const registry = new SlotAffinityRegistry();
+  registry.assign({ model: 'gemma', lineageKey: 'lineage_a', scopeId: 'scope_a', slotCount: 2 });
+  registry.assign({ model: 'gemma', lineageKey: 'lineage_b', scopeId: 'scope_b', slotCount: 2 });
+
+  assert.equal(registry.invalidateScope('scope_a'), 1);
+  assert.equal(registry.get('gemma', 'lineage_a'), null);
+  assert.equal(registry.get('gemma', 'lineage_b').slotId, 1);
+});
+
 test('prepared handles are scope-bound, bounded, expiring, and never expose raw slot ids', () => {
   let now = 1_000;
   let id = 0;

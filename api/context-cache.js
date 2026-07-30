@@ -129,6 +129,9 @@ function publicPreparedRecord(record) {
     scopeId: _scopeId,
     internalSlotId: _internalSlotId,
     abortController: _abortController,
+    requestHash: _requestHash,
+    lineageKey: _lineageKey,
+    preparationBody: _preparationBody,
     ...safe
   } = record;
   return { ...safe };
@@ -334,11 +337,11 @@ export class SlotAffinityRegistry {
    * Reuse or assign a server-owned slot for a stable conversation lineage.
    * Assignment is round-robin within each resolved model's slot pool.
    *
-   * @param {{model:string,lineageKey:string,slotCount:number}} input Assignment input.
+   * @param {{model:string,lineageKey:string,scopeId?:string,slotCount:number}} input Assignment input.
    * @returns {{slotId:number,hit:boolean,displacedLineage:string|null}} Result.
    * @throws {TypeError} If model, lineage, or slot count is invalid.
    */
-  assign({ model, lineageKey, slotCount } = {}) {
+  assign({ model, lineageKey, scopeId, slotCount } = {}) {
     if (!model || !lineageKey || !Number.isInteger(slotCount) || slotCount < 1) {
       throw new TypeError('model, lineageKey, and a positive integer slotCount are required');
     }
@@ -366,6 +369,7 @@ export class SlotAffinityRegistry {
     const record = {
       model,
       lineageKey,
+      scopeId: scopeId || null,
       slotId,
       lastUsedAt: this.now(),
       hits: 0,
@@ -392,6 +396,21 @@ export class SlotAffinityRegistry {
     const slotKey = this.#slotMapKey(model, record.slotId);
     if (this.bySlot.get(slotKey) === key) this.bySlot.delete(slotKey);
     return true;
+  }
+
+  /**
+   * Remove every in-memory lineage owned by an authorization-derived scope.
+   * @param {string} scopeId Opaque scope id.
+   * @param {string} [model] Optional resolved-model filter.
+   * @returns {number} Number of lineages invalidated.
+   */
+  invalidateScope(scopeId, model) {
+    let invalidated = 0;
+    for (const record of [...this.byLineage.values()]) {
+      if (record.scopeId !== scopeId || (model && record.model !== model)) continue;
+      if (this.invalidate(record.model, record.lineageKey)) invalidated++;
+    }
+    return invalidated;
   }
 
   /** Return aggregate map hits/misses without claiming verified KV reuse. */

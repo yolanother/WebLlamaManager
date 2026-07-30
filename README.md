@@ -169,6 +169,12 @@ On top of that:
   so clients get retargeted centrally — `POST /api/settings`.
 - **Offload**: when the box is busy, hot, or running DS4, requests for other models
   are forwarded to configured remote backends (`/api/backends`).
+- **Realtime context management**: local llama.cpp models expose exact rendered
+  input counts, stable conversation affinity, scope-safe prepared KV leases,
+  durable restore/invalidation, and verified cache telemetry. Use
+  `request_priority: "realtime"` for latency-sensitive turns and
+  `routing: "local_only"` when remote egress is forbidden. See
+  [`docs/Designs/ConversationContextCache.md`](docs/Designs/ConversationContextCache.md).
 
 See [`docs/features-overview.md`](docs/features-overview.md) for the full picture.
 
@@ -250,6 +256,11 @@ llama-server/
 | `/models/unload` | POST | Unload a model |
 | `/v1/chat/completions` | POST | Chat completions (OpenAI-compatible) |
 | `/v1/completions` | POST | Text completions |
+| `/v1/chat/completions/input_tokens` | POST | Exact local chat-template input count |
+| `/v1/responses/input_tokens` | POST | Exact local Responses input count |
+| `/v1/context/prepare` | POST | Count or schedule cancellable KV prefill |
+| `/v1/context/:id` | GET / DELETE | Inspect or invalidate an owned prepared lease |
+| `/v1/context/cache` | DELETE | Delete caller-scoped memory and disk cache state |
 | `/health` | GET | Health check |
 
 ### Embeddings (OpenAI-compatible)

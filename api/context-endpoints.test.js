@@ -8,7 +8,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { requestExactInputTokens } from './context-endpoints.js';
+import {
+  contextPrefixRequestHash,
+  requestExactInputTokens,
+  requestRenderedPrefix,
+} from './context-endpoints.js';
 
 test('requestExactInputTokens proxies the native endpoint with resolved model and strips slot controls', async () => {
   let captured;
@@ -44,4 +48,34 @@ test('requestExactInputTokens proxies the native endpoint with resolved model an
     requested_model: 'voice-fast', resolved_model: 'gemma-real', engine: 'llama',
     context_cache_contract: 1,
   });
+});
+
+test('contextPrefixRequestHash ignores output controls but changes with prefix material', () => {
+  const base = { model: 'a', messages: [{ role: 'user', content: 'hello' }], max_tokens: 10, stream: true };
+  assert.equal(
+    contextPrefixRequestHash(base, 'resolved'),
+    contextPrefixRequestHash({ ...base, max_tokens: 100, stream: false }, 'resolved'),
+  );
+  assert.notEqual(
+    contextPrefixRequestHash(base, 'resolved'),
+    contextPrefixRequestHash({ ...base, messages: [{ role: 'user', content: 'changed' }] }, 'resolved'),
+  );
+});
+
+test('requestRenderedPrefix hashes the exact upstream template without returning prompt text', async () => {
+  const result = await requestRenderedPrefix({
+    baseUrl: 'http://llama:5251',
+    resolvedModel: 'gemma-real',
+    body: { messages: [{ role: 'user', content: 'secret' }], tools: [{ type: 'function' }] },
+    fetchImpl: async (_url, options) => {
+      const body = JSON.parse(options.body);
+      assert.equal(body.model, 'gemma-real');
+      return new Response(JSON.stringify({ prompt: '<bos>rendered secret prompt' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+  assert.equal(result.prefix_hash.startsWith('prefix_'), true);
+  assert.equal('prompt' in result, false);
 });

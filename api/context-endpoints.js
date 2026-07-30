@@ -6,7 +6,7 @@
 // and KV preparation. Manager-only identity, prepared-handle, and raw slot
 // controls are removed before proxying so actual slot ownership remains local.
 
-import { CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
+import { canonicalHash, CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
 
 const COUNT_PATHS = Object.freeze({
   chat: '/v1/chat/completions/input_tokens',
@@ -23,6 +23,13 @@ const MANAGER_ONLY_FIELDS = new Set([
   'request_priority',
   'priority_class',
   'routing',
+  'mode',
+  'allow_model_load',
+]);
+
+const PREFIX_FIELDS = Object.freeze([
+  'messages', 'input', 'prompt', 'tools', 'tool_choice', 'response_format',
+  'chat_template', 'chat_template_kwargs', 'reasoning_format',
 ]);
 
 /** Error returned when a native context operation fails upstream. */
@@ -57,6 +64,54 @@ export function managerControlledContextBody(body = {}, resolvedModel) {
   }
   safe.model = resolvedModel;
   return safe;
+}
+
+/**
+ * Hash only request fields that can change rendered input, excluding output
+ * controls such as streaming and maximum generated tokens.
+ * @param {Record<string, unknown>} body Original request body.
+ * @param {string} resolvedModel Concrete model identity.
+ * @returns {string} Opaque request-prefix hash used for handle validation.
+ */
+export function contextPrefixRequestHash(body = {}, resolvedModel) {
+  const material = { model: resolvedModel };
+  for (const field of PREFIX_FIELDS) {
+    if (body?.[field] !== undefined) material[field] = body[field];
+  }
+  return `request_${canonicalHash(material).slice(0, 40)}`;
+}
+
+/**
+ * Ask llama.cpp to render the exact chat template and return only its hash.
+ * Raw rendered prompt text never leaves this trusted helper.
+ *
+ * @param {Object} input Render operation inputs.
+ * @returns {Promise<{prefix_hash:string}>} Exact rendered-prefix fingerprint.
+ */
+export async function requestRenderedPrefix({
+  baseUrl,
+  resolvedModel,
+  body,
+  fetchImpl = fetch,
+  signal,
+} = {}) {
+  if (!baseUrl || !resolvedModel) throw new TypeError('baseUrl and resolvedModel are required');
+  const response = await fetchImpl(`${String(baseUrl).replace(/\/+$/, '')}/apply-template`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(managerControlledContextBody(body, resolvedModel)),
+    signal,
+  });
+  if (!response.ok) {
+    const details = (await response.text().catch(() => '')).slice(0, 1000);
+    throw new ContextUpstreamError('exact chat-template rendering failed', response.status, details);
+  }
+  const data = await response.json();
+  const prompt = typeof data?.prompt === 'string' ? data.prompt : data?.content;
+  if (typeof prompt !== 'string') {
+    throw new ContextUpstreamError('exact chat-template rendering returned an invalid response', 502);
+  }
+  return { prefix_hash: `prefix_${canonicalHash(prompt).slice(0, 40)}` };
 }
 
 /**

@@ -12,10 +12,10 @@ The v1 contract adds three related surfaces:
 
 - exact counting through `POST /api/v1/chat/completions/input_tokens` and
   `POST /api/v1/responses/input_tokens`;
-- stable conversation affinity through `prompt_cache_key` (with
-  `conversation_cache_key` accepted as a compatibility alias); and
+- stable conversation affinity through `conversation_cache_key` (with
+  `prompt_cache_key` accepted as a compatibility alias); and
 - optional background preparation through `POST /api/v1/context/prepare`, with
-  status/release at `/api/v1/context/prepared/{id}`.
+  status/release at `/api/v1/context/{id}`.
 
 Every optimization is optional for correctness. Missing, stale, displaced,
 expired, or unsupported state falls back to an ordinary uncached request unless
@@ -59,7 +59,7 @@ has a separate SHA-256 hash.
 A stable conversation lineage combines:
 
 ```text
-authorization-derived scope + resolved model + prompt_cache_key
+authorization-derived scope + resolved model + conversation_cache_key
 ```
 
 The lineage chooses a slot; the exact prefix hash proves whether a prepared
@@ -67,6 +67,13 @@ handle describes the submitted input. A changed prefix may still use the same
 slot because llama.cpp compares the submitted prompt and safely reuses only the
 common prefix. A model/template/tokenizer/projector mismatch invalidates the
 handle or disk state before reuse.
+
+For compatible clients that omit the extension, multi-message chats derive a
+fallback identity from leading system/developer instructions plus the first user
+message. Appending turns cannot change that hash, fixing the former per-turn
+round-robin drift. One-shot prompts remain unpinned so llama.cpp may select by
+native prompt similarity. Applications that can have identical conversation
+heads should send an explicit key to avoid intentional fallback collisions.
 
 Slot ownership is bidirectional. Assigning `(model, slot)` to a new lineage
 invalidates the old lineage immediately, so stale map entries are never counted
@@ -100,11 +107,26 @@ Defaults:
 | Conversation key | 200 characters |
 | Prefill model policy | already resident only |
 
-Prefill starts only when the local queue has no active or pending realtime work.
-The arrival of any user-facing local generation aborts active preparation before
-it joins the queue. Socket abort is best effort at llama.cpp batch boundaries;
-the conformance target is no more than 25 ms of manager-added p95 queue delay
-and no more than 5% p95 end-to-end TTFT regression under contention.
+Prefill is admitted as bounded `background` work and waits until the local lane
+is available. Queued `realtime` and `interactive` work skips it. Arrival of a
+`realtime` request cooperatively aborts active background work; the lane remains
+serialized until llama.cpp acknowledges the socket abort. A bounded high-priority
+burst then admits old background work, preventing starvation. Socket abort is
+best effort at llama.cpp batch boundaries. The hard conformance target is at most
+150 ms realtime p95 queue wait under contention; the manager design budget is
+25 ms added delay and no more than 5% p95 end-to-end TTFT regression.
+
+Requests select `realtime | interactive | background` with
+`request_priority` or `X-Llama-Priority`; absence remains FIFO-compatible
+`interactive`. At most eight background requests may wait. A ninth receives
+HTTP 429 without affecting interactive or realtime admission.
+
+`routing: "local_only"` or `X-Llama-Routing: local_only` is an egress guarantee,
+not a preference. Every overflow, thermal, model-switch, protect-resident, and
+estimated-latency offload is suppressed. A stalled lane returns the explicit
+`LOCAL_ONLY_BUSY` 503; combining the pin with an explicit remote model prefix
+returns `LOCAL_ONLY_REMOTE_CONFLICT`. Telemetry distinguishes local, offloaded,
+offload-suppressed, queued-deep, and rejected outcomes.
 
 ## Persistence, retention, and deletion
 
@@ -144,6 +166,21 @@ TTFT, queue wait, engine prompt time, prompt tokens, cached tokens, and scheduli
 outcome for first turn, growing history, interleaved conversations, changed RAG
 suffixes, reload/restore, and realtime-vs-prefill contention.
 
+Run the executable conformance benchmark against a development server with:
+
+```bash
+node scripts/benchmark-context-cache.mjs --model <local-model-id> --samples 20
+```
+
+The emitted JSON includes the exact model, sample counts, cold and growing p50/p95
+TTFT, verified reused-prefix tokens, realtime queue wait, prepared status, and an
+explicit `go | no-go` decision. CI unit coverage verifies identity stability,
+cross-scope denial, reverse slot ownership, restart reconciliation, safe deletion,
+warm-slot detection, exact upstream proxying, per-engine capability declarations,
+priority/preemption/fairness, local-only parsing, and the benchmark gate. Hardware
+results are recorded after each llama.cpp/model update; a missing measurement is
+never reported as a performance win.
+
 ## Alternatives rejected
 
 - Approximate role/text flattening: it cannot match the generation template,
@@ -154,4 +191,3 @@ suffixes, reload/restore, and realtime-vs-prefill contention.
   work; native zero-output evaluation exists.
 - Treating a map hit as a cache hit: only upstream cached-token evidence proves
   KV reuse.
-
