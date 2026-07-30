@@ -3,7 +3,8 @@
 // LICENSE file in the repository root.
 //
 // Classifies pasted content and assembles deterministic OpenAI-compatible
-// message parts without depending on browser APIs, React, or network access.
+// image, audio, text, and video message parts without depending on browser
+// APIs, React, or network access.
 
 const LONG_TEXT_THRESHOLD = 8000;
 const VIDEO_EXTENSIONS = /\.(?:avi|m4v|mkv|mov|mp4|mpeg|mpg|ogv|webm)$/i;
@@ -60,6 +61,55 @@ function classifyPaste(value) {
 }
 
 /**
+ * Partition browser files into the media kinds supported by chat attachments.
+ *
+ * @param {Array<{type?: string}>} files browser file-like objects
+ * @returns {{audios: Array<object>, images: Array<object>, videos: Array<object>}}
+ */
+function partitionMediaFiles(files = []) {
+  return {
+    audios: files.filter((file) => file?.type?.startsWith('audio/')),
+    images: files.filter((file) => file?.type?.startsWith('image/')),
+    videos: files.filter((file) => file?.type?.startsWith('video/')),
+  };
+}
+
+/**
+ * Convert a successful media-ingest response into a serializable attachment.
+ *
+ * @param {{
+ *   media?: object,
+ *   source?: object,
+ *   frames?: Array<object>,
+ *   segmentDataUrls?: Array<string>,
+ * }} input resolved server media and fetched binary assets
+ * @returns {object} ready audio/video attachment state
+ */
+function buildReadyMediaAttachment({
+  media = {},
+  source = {},
+  frames = [],
+  segmentDataUrls = [],
+} = {}) {
+  const common = {
+    kind: media.kind === 'audio' ? 'audio' : 'video',
+    filename: media.filename || source.file?.name || source.url,
+    mediaId: media.id,
+    mime: media.mime,
+    size: media.size,
+    durationSec: media.durationSec || media.audio?.durationSec || 0,
+  };
+  if (common.kind === 'audio') {
+    return {
+      ...common,
+      segments: segmentDataUrls.map((dataUrl) => ({ dataUrl, format: 'wav' })),
+      status: 'ready',
+    };
+  }
+  return { ...common, frames, status: 'ready' };
+}
+
+/**
  * Format seconds as an unbounded MM:SS timestamp.
  *
  * @param {number} seconds duration or frame offset
@@ -107,6 +157,43 @@ function videoParts(attachment) {
 }
 
 /**
+ * Resolve the OpenAI audio format from explicit segment metadata or its MIME.
+ *
+ * @param {object} segment ingested audio segment
+ * @returns {'wav'|'mp3'} supported OpenAI audio format
+ */
+function audioFormat(segment) {
+  if (segment?.format === 'mp3' || segment?.format === 'wav') return segment.format;
+  return /^data:audio\/(?:mpeg|mp3);/i.test(segment?.dataUrl || '') ? 'mp3' : 'wav';
+}
+
+/**
+ * Convert an ingested audio attachment into standard OpenAI audio parts.
+ *
+ * @param {object} attachment ready audio attachment with base64 data URLs
+ * @returns {Array<object>} descriptive marker followed by audio content parts
+ */
+function audioParts(attachment) {
+  const durationSec = Math.max(0, Number(attachment.durationSec) || 0);
+  const parts = [{
+    type: 'text',
+    text: `[audio: ${attachment.filename || 'audio'}, duration ${formatMediaTime(durationSec)}]`,
+  }];
+
+  (attachment.segments || []).forEach((segment) => {
+    const dataUrl = String(segment?.dataUrl || '');
+    const data = dataUrl.includes(',') ? dataUrl.slice(dataUrl.indexOf(',') + 1) : dataUrl;
+    if (!data) return;
+    parts.push({
+      type: 'input_audio',
+      input_audio: { data, format: audioFormat(segment) },
+    });
+  });
+
+  return parts;
+}
+
+/**
  * Assemble user content in the server's multimodal video-frame contract.
  * Plain text remains a string for compatibility with existing conversations.
  *
@@ -133,6 +220,8 @@ function buildMessageContent({ text = '', attachments = [] } = {}) {
       parts.push(textAttachmentPart(attachment));
     } else if (attachment.kind === 'video') {
       parts.push(...videoParts(attachment));
+    } else if (attachment.kind === 'audio') {
+      parts.push(...audioParts(attachment));
     }
   });
 
@@ -142,7 +231,9 @@ function buildMessageContent({ text = '', attachments = [] } = {}) {
 export {
   LONG_TEXT_THRESHOLD,
   buildMessageContent,
+  buildReadyMediaAttachment,
   classifyPaste,
   classifyUrl,
   formatMediaTime,
+  partitionMediaFiles,
 };

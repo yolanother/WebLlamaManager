@@ -2,8 +2,8 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Renders image previews, video metadata, upload progress, ingest errors, retry,
-// and removal controls for pending multimodal composer inputs.
+// Renders image previews, audio/video metadata, upload progress, ingest errors,
+// retry, and removal controls for pending multimodal composer inputs.
 
 import { formatMediaTime } from './attachments.js';
 
@@ -12,6 +12,7 @@ import { formatMediaTime } from './attachments.js';
  */
 function AttachmentChip({ attachment, onRemove, onRetry }) {
   const isImage = attachment.kind === 'image';
+  const isAudio = attachment.kind === 'audio';
   const isBusy = attachment.status === 'uploading';
   const isError = attachment.status === 'error';
 
@@ -20,6 +21,10 @@ function AttachmentChip({ attachment, onRemove, onRetry }) {
       <div className="chat-attachment-preview" aria-hidden="true">
         {isImage && attachment.dataUrl ? (
           <img src={attachment.dataUrl} alt="" />
+        ) : isAudio ? (
+          <svg viewBox="0 0 24 24">
+            <path d="M9 18V6l10-2v12M9 9l10-2M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm10-2a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+          </svg>
         ) : attachment.kind === 'text' ? (
           <svg viewBox="0 0 24 24">
             <path d="M6 3h8l4 4v14H6zM14 3v5h5M9 12h6M9 16h6" />
@@ -43,6 +48,7 @@ function AttachmentChip({ attachment, onRemove, onRetry }) {
           {!isBusy && !isError && attachment.kind === 'video' && (
             `${formatMediaTime(attachment.durationSec)} · ${attachment.frames?.length || 0} frames`
           )}
+          {!isBusy && !isError && isAudio && formatMediaTime(attachment.durationSec)}
           {!isBusy && !isError && attachment.kind === 'text' && (
             `${attachment.text?.length.toLocaleString() || 0} characters`
           )}

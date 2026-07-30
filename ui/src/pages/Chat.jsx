@@ -15,7 +15,9 @@ import { MessageList } from '../components/chat/MessageList.jsx';
 import { contentToText } from '../components/chat/Message.jsx';
 import {
   buildMessageContent,
+  buildReadyMediaAttachment,
   classifyUrl,
+  partitionMediaFiles,
 } from '../components/chat/attachments.js';
 import {
   assembleArtifactEditMessages,
@@ -78,7 +80,7 @@ function fileToDataUrl(file) {
 async function responseToDataUrl(url) {
   if (url.startsWith('data:')) return url;
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`Could not fetch video frame (HTTP ${response.status}).`);
+  if (!response.ok) throw new Error(`Could not fetch media asset (HTTP ${response.status}).`);
   return fileToDataUrl(await response.blob());
 }
 
@@ -240,7 +242,7 @@ function ChatPage({ stats }) {
     try {
       let endpoint;
       let options;
-      if (source.type === 'video-file') {
+      if (source.type === 'audio-file' || source.type === 'video-file') {
         endpoint = `${API_BASE}/media/upload`;
         const form = new FormData();
         form.append('file', source.file);
@@ -267,16 +269,15 @@ function ChatPage({ stats }) {
       const frames = await Promise.all((media.frames || []).map(async (url) => ({
         dataUrl: await responseToDataUrl(url),
       })));
-      replaceAttachment(id, {
-        kind: 'video',
-        filename: media.filename || source.file?.name || source.url,
-        mediaId: media.id,
-        mime: media.mime,
-        size: media.size,
-        durationSec: media.durationSec || 0,
+      const segmentDataUrls = media.kind === 'audio'
+        ? await Promise.all((media.audio?.segments || []).map(responseToDataUrl))
+        : [];
+      replaceAttachment(id, buildReadyMediaAttachment({
+        media,
+        source,
         frames,
-        status: 'ready',
-      });
+        segmentDataUrls,
+      }));
     } catch (error) {
       replaceAttachment(id, {
         status: 'error',
@@ -285,6 +286,21 @@ function ChatPage({ stats }) {
       });
     }
   }, [replaceAttachment]);
+
+  const addAudioFiles = useCallback((files) => {
+    files.forEach((file) => {
+      const id = makeId();
+      const source = { type: 'audio-file', file };
+      setAttachments((current) => [...current, {
+        id,
+        kind: 'audio',
+        filename: file.name,
+        status: 'uploading',
+        source,
+      }]);
+      ingestMedia(id, source);
+    });
+  }, [ingestMedia]);
 
   const addVideoFiles = useCallback((files) => {
     files.forEach((file) => {
@@ -654,8 +670,10 @@ function ChatPage({ stats }) {
             onRegenerate={regenerateMessage}
             onSuggestion={setPrompt}
             onDropFiles={(files) => {
-              addImages(files.filter((file) => file.type.startsWith('image/')));
-              addVideoFiles(files.filter((file) => file.type.startsWith('video/')));
+              const { audios, images, videos } = partitionMediaFiles(files);
+              addAudioFiles(audios);
+              addImages(images);
+              addVideoFiles(videos);
             }}
           />
           <Composer
@@ -669,6 +687,7 @@ function ChatPage({ stats }) {
             onCancelEdit={cancelEdit}
             onChange={setPrompt}
             onDismissArtifactContext={() => setArtifactContextEnabled(false)}
+            onAudioFiles={addAudioFiles}
             onImageFiles={addImages}
             onLongText={addLongText}
             onModelChange={(model) => updateConversation(activeConversation.id, { model })}

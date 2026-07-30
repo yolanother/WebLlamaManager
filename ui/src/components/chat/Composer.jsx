@@ -2,18 +2,20 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Provides an auto-growing editor, smart paste, attachment menu and dialog,
-// pending attachment chips, in-composer model selection, and stream controls.
+// Provides an auto-growing editor, smart paste, image/audio/video attachment
+// controls, pending attachment chips, in-composer model selection, and stream
+// controls.
 
 import { useEffect, useRef, useState } from 'react';
 
 import { AttachmentChip } from './AttachmentChip.jsx';
-import { classifyPaste } from './attachments.js';
+import { classifyPaste, partitionMediaFiles } from './attachments.js';
 import { ModelPicker } from './ModelPicker.jsx';
 
 function ComposerIcon({ type }) {
   if (type === 'plus') return <path d="M12 5v14M5 12h14" />;
   if (type === 'image') return <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m3 16 5-5 4 4 3-3 6 6M15 8h.01" /></>;
+  if (type === 'audio') return <path d="M9 18V6l10-2v12M9 9l10-2M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm10-2a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />;
   if (type === 'video') return <><rect x="3" y="5" width="14" height="14" rx="2" /><path d="m17 10 4-2v8l-4-2" /></>;
   if (type === 'link') return <path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1m3 6a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" />;
   if (type === 'stop') return <rect x="6" y="6" width="12" height="12" rx="2" />;
@@ -34,6 +36,7 @@ function Composer({
   onCancelEdit,
   onChange,
   onDismissArtifactContext,
+  onAudioFiles,
   onImageFiles,
   onLongText,
   onModelChange,
@@ -49,6 +52,7 @@ function Composer({
   const [linkOpen, setLinkOpen] = useState(false);
   const [linkValue, setLinkValue] = useState('');
   const textareaRef = useRef(null);
+  const audioInputRef = useRef(null);
   const imageInputRef = useRef(null);
   const videoInputRef = useRef(null);
   const menuRef = useRef(null);
@@ -78,8 +82,8 @@ function Composer({
   };
 
   const chooseFiles = (files) => {
-    const images = files.filter((file) => file.type.startsWith('image/'));
-    const videos = files.filter((file) => file.type.startsWith('video/'));
+    const { audios, images, videos } = partitionMediaFiles(files);
+    if (audios.length) onAudioFiles(audios);
     if (images.length) onImageFiles(images);
     if (videos.length) onVideoFiles(videos);
   };
@@ -129,10 +133,13 @@ function Composer({
           placeholder={disabled ? 'Start a model to begin chatting' : 'Message Llama Manager'}
           onChange={(event) => onChange(event.target.value)}
           onPaste={(event) => {
-            // Clipboard media first: Cmd/Ctrl+V of a copied image or screenshot
-            // attaches directly — no file picker round-trip.
+            // Clipboard media attaches directly — no file picker round-trip.
             const pastedFiles = [...(event.clipboardData.files || [])]
-              .filter((file) => file.type.startsWith('image/') || file.type.startsWith('video/'));
+              .filter((file) => (
+                file.type.startsWith('audio/')
+                || file.type.startsWith('image/')
+                || file.type.startsWith('video/')
+              ));
             if (pastedFiles.length) {
               event.preventDefault();
               chooseFiles(pastedFiles);
@@ -181,6 +188,13 @@ function Composer({
                     <span><strong>Image</strong><small>PNG, JPEG, WebP, and more</small></span>
                   </button>
                   <button type="button" onClick={() => {
+                    audioInputRef.current?.click();
+                    setMenuOpen(false);
+                  }}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><ComposerIcon type="audio" /></svg>
+                    <span><strong>Audio</strong><small>WAV, MP3, and more</small></span>
+                  </button>
+                  <button type="button" onClick={() => {
                     videoInputRef.current?.click();
                     setMenuOpen(false);
                   }}>
@@ -197,6 +211,18 @@ function Composer({
                 </div>
               )}
             </div>
+            <input
+              type="file"
+              hidden
+              multiple
+              accept="audio/*"
+              aria-label="Attach audio"
+              ref={audioInputRef}
+              onChange={(event) => {
+                chooseFiles([...event.target.files]);
+                event.target.value = '';
+              }}
+            />
             <input
               type="file"
               hidden

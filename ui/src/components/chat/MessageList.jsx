@@ -165,7 +165,7 @@ function MessageList({
           <svg viewBox="0 0 24 24">
             <path d="M12 16V4m0 0L7 9m5-5 5 5M5 14v6h14v-6" />
           </svg>
-          <strong>Drop images or videos to attach</strong>
+          <strong>Drop images, audio, or videos to attach</strong>
         </div>
       )}
       {!nearBottom && messages.length > 0 && (
