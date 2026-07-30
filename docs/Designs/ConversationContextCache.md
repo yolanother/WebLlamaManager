@@ -145,6 +145,11 @@ misrepresent that storage property.
 Quota exhaustion, expiry, restore failure, or deletion always degrades to cold
 correct generation and cannot deny unrelated realtime traffic.
 
+Completed generations enqueue slot snapshots on the same bounded background
+lane before releasing ownership. Already-queued user requests skip ahead; a new
+realtime request aborts an active save. This preserves the slot-overwrite barrier
+without putting disk persistence on the realtime critical path.
+
 ## Capabilities and observability
 
 Each model entry gains a versioned `context_management` object separate from

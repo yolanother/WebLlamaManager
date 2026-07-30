@@ -480,7 +480,7 @@ async function maybeRestoreSlot(model, slotAssignment) {
  * @param {string} model - The requested model id.
  * @param {{slotId:number,key:string}|null} slotAssignment - From lookupOrAssignSlot.
  */
-async function saveSlotAfterRequest(model, slotAssignment) {
+async function saveSlotAfterRequest(model, slotAssignment, signal) {
   if (!slotCacheCfg().enabled) return;
   if (!slotAssignment || slotAssignment.slotId == null || !slotAssignment.key) return;
   const filename = slotCacheFilename(slotAssignment.key);
@@ -489,7 +489,7 @@ async function saveSlotAfterRequest(model, slotAssignment) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filename, model }),
-      signal: AbortSignal.timeout(60000)
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(60000)]) : AbortSignal.timeout(60000)
     });
     if (!r.ok) return; // 501 (no --slot-save-path) or slot busy — skip silently
     const j = await r.json().catch(() => ({}));
@@ -506,6 +506,22 @@ async function saveSlotAfterRequest(model, slotAssignment) {
     });
     console.log(`[slot-cache] SAVE model=${model} slot=${slotAssignment.slotId} file=${filename} n_saved=${j.n_saved} bytes=${j.n_written || 0}`);
   } catch { /* best-effort */ }
+}
+
+/** Queue a durable slot snapshot as cancellable background work. */
+async function scheduleSlotSave(model, slotAssignment) {
+  const controller = new AbortController();
+  let queueId = null;
+  try {
+    queueId = await llamaQueue.acquire({
+      model,
+      endpoint: 'slot-cache/save',
+      priority: 'background',
+      onPreempt: reason => controller.abort(reason),
+    });
+    await saveSlotAfterRequest(model, slotAssignment, controller.signal);
+  } catch { /* quota, cancellation, and unsupported persistence all fail cold */ }
+  finally { if (queueId != null) llamaQueue.release(queueId); }
 }
 
 // === Pre-tokenization queue =========================================================
@@ -8180,6 +8196,14 @@ async function handleChatCompletions(req, res) {
   };
   res.on('finish', () => cleanupActive(res.statusCode >= 400 ? 'error' : 'complete'));
   res.on('close', () => cleanupActive('client_disconnect'));
+  // Enqueue persistence before the queue-release finish listener runs. The
+  // snapshot waits at background priority, so already-queued user work goes
+  // first and a newly arriving realtime request aborts an active save.
+  res.on('finish', () => {
+    if (!routing.remote && res.statusCode < 400 && slotAssignment?.slotId != null) {
+      scheduleSlotSave(requestedModel, slotAssignment).catch(() => {});
+    }
+  });
 
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
@@ -8462,11 +8486,6 @@ async function handleChatCompletions(req, res) {
           try { active.abortController?.abort('realtime_request'); } catch { /* best effort */ }
         }
       } : null,
-      beforeRelease: async () => {
-        if (res.statusCode < 400 && slotAssignment && slotAssignment.slotId != null) {
-          await saveSlotAfterRequest(requestedModel, slotAssignment);
-        }
-      },
       onWait: isStreaming ? ({ position, pending, waitedMs }) => {
         flushSseHeaders();
         const pos = position != null ? position + 1 : '?';
