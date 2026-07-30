@@ -39,6 +39,17 @@ export function benchmarkDecision({ coldP95, warmP95, realtimeQueueP95 }) {
 }
 
 /**
+ * Build a streaming benchmark request pinned to local execution. Context-cache
+ * measurements are invalid when ordinary routing policy offloads a sample.
+ *
+ * @param {Record<string,unknown>} body Scenario-specific chat request.
+ * @returns {Record<string,unknown>} Local-only streaming request body.
+ */
+export function localBenchmarkChatBody(body = {}) {
+  return { ...body, routing: 'local_only', stream: true };
+}
+
+/**
  * Poll one opaque prepared-context lease until it is ready for strict reuse.
  * Terminal non-ready states reject so benchmarks cannot silently measure a
  * cold fallback and mislabel it as prepared-prefix performance.
