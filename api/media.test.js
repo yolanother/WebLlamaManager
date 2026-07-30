@@ -401,6 +401,57 @@ test('image and short-video frame extraction remains byte-for-byte unchanged', a
   }
 });
 
+test('silent video ingestion keeps frames and omits audio without failing', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-test-'));
+  const calls = [];
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'silent-video-id',
+      spawnImpl(command, args) {
+        calls.push({ command, args });
+        if (command === 'ffprobe') {
+          return mockChildProcess({
+            stdout: args.includes('-select_streams') ? '' : '2\n',
+          });
+        }
+        if (args.includes('-vn')) {
+          return mockChildProcess({ code: 1, stderr: 'Output file does not contain any stream' });
+        }
+        const outputPath = args.at(-1);
+        mkdirSync(dirname(outputPath), { recursive: true });
+        writeFileSync(outputPath, Buffer.from('jpeg'));
+        return mockChildProcess();
+      },
+    });
+    const boundary = 'llama-silent-video-boundary';
+    const uploadBody = multipartFileBody(
+      boundary,
+      'silent.mp4',
+      'video/mp4',
+      Buffer.from('\x00\x00\x00\x18ftypisom\x00\x00\x00\x00', 'binary'),
+    );
+    const uploaded = await invokeRoute(routes, 'POST', '/upload', {
+      body: uploadBody,
+      headers: {
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+        'content-length': String(uploadBody.length),
+      },
+    });
+
+    assert.equal(uploaded.statusCode, 200);
+    assert.equal(uploaded.body.kind, 'video');
+    assert.deepEqual(uploaded.body.frames, [
+      '/api/media/silent-video-id/frames/0.jpg',
+      '/api/media/silent-video-id/frames/1.jpg',
+    ]);
+    assert.equal(uploaded.body.audio, undefined);
+    assert.equal(calls.filter(call => call.command === 'ffmpeg' && call.args.includes('-vn')).length, 0);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('audio upload reports a 501 with an installation hint when ffmpeg is missing', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-test-'));
   try {

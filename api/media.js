@@ -603,7 +603,12 @@ export function createMediaRouter({
       ffmpegTimeoutMs,
     });
     let audio;
-    if (kind !== 'image') {
+    const hasAudio = kind === 'audio' || (kind === 'video' && await probeHasAudioStream({
+      sourcePath,
+      spawnImpl,
+      ffmpegTimeoutMs,
+    }));
+    if (hasAudio) {
       const segments = planSegments(extracted.durationSec);
       const audioDir = join(item.dir, 'audio');
       await mkdir(audioDir, { recursive: true });
@@ -652,6 +657,23 @@ async function requiredProcess(binary, args, options) {
     const mapped = mapProcessError(binary, error);
     throw new MediaPipelineError(mapped.status, mapped.body, error);
   }
+}
+
+/**
+ * Check whether a video source contains at least one audio stream.
+ *
+ * @param {{sourcePath:string, spawnImpl:Function, ffmpegTimeoutMs:number}} options Probe options.
+ * @returns {Promise<boolean>} True when ffprobe reports an audio stream.
+ */
+async function probeHasAudioStream({ sourcePath, spawnImpl, ffmpegTimeoutMs }) {
+  const probe = await requiredProcess('ffprobe', [
+    '-v', 'error',
+    '-select_streams', 'a:0',
+    '-show_entries', 'stream=index',
+    '-of', 'csv=p=0',
+    sourcePath,
+  ], { spawnImpl, timeoutMs: ffmpegTimeoutMs });
+  return Boolean(probe.stdout.trim());
 }
 
 async function extractFrames({ sourcePath, framesDir, kind, spawnImpl, ffmpegTimeoutMs }) {
