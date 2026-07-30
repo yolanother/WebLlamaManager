@@ -29,6 +29,14 @@ The strict opaque-handle contract remained valid and the request stayed correct;
 production deployment assumes one manager owns a router's slots. Run the suite
 with sole slot ownership when comparing engine builds.
 
+A later interleaved-session audit made the same boundary visible: every audited
+turn was correctly pinned by the manager, while direct requests bypassing the
+manager occupied and overwrote other physical router slots. llama.cpp reported
+zero reused tokens rather than reusing an incompatible prefix, preserving
+correctness at the cost of latency. The benchmark therefore reports manager
+affinity hits separately from verified engine-level reused tokens. Engine reuse
+results are valid only when all slot-using traffic passes through one manager.
+
 ## Contamination check
 
 An earlier 20-sample run through the busy primary manager reported a 7,958 ms

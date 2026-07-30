@@ -271,10 +271,19 @@ async function run() {
 
   const interleavedTtft = [];
   const interleavedReused = [];
+  let interleavedAffinityHits = 0;
+  const interleavedReset = await fetch(`${options.baseUrl}/context/cache`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', ...scopeHeaders },
+    body: JSON.stringify({ model }),
+  });
+  if (!interleavedReset.ok) {
+    throw new Error(`interleaved isolation failed: ${interleavedReset.status} ${await interleavedReset.text()}`);
+  }
   const sessions = ['a', 'b'].map(name => ({
     key: `benchmark-interleaved-${name}-${randomUUID()}`,
     messages: [
-      { role: 'system', content: `Retain the history for session ${name}.` },
+      { role: 'system', content: `Retain the history for session ${name}. ${`session-${name}-context `.repeat(16)}` },
       { role: 'user', content: `Initialize session ${name}.` },
     ],
   }));
@@ -292,6 +301,7 @@ async function run() {
     }, scopeHeaders);
     interleavedTtft.push(result.ttftMs);
     interleavedReused.push(result.cachedTokens);
+    if (result.cacheKind === 'affinity' || result.cacheKind === 'disk_restore') interleavedAffinityHits++;
     session.messages.push({ role: 'assistant', content: result.text || 'ok' });
   }
 
@@ -367,6 +377,11 @@ async function run() {
     prepared_discarded_decode_tokens: summarizeSamples(discardedDecodeTokens),
     interleaved_ttft_ms: summarizeSamples(interleavedTtft),
     interleaved_reused_prefix_tokens: summarizeSamples(interleavedReused),
+    interleaved_affinity: {
+      hits: interleavedAffinityHits,
+      samples: interleavedTtft.length,
+      all_pinned: interleavedAffinityHits === interleavedTtft.length,
+    },
     changing_rag_ttft_ms: summarizeSamples(ragTtft),
     changing_rag_reused_prefix_tokens: summarizeSamples(ragReused),
     scope_invalidation: {
