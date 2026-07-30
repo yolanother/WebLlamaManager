@@ -434,7 +434,8 @@
                           "n_ctx": {"type": "integer", "nullable": true, "description": "Runtime context size (from --ctx-size or server config)"},
                           "displayName": {"type": "string"},
                           "status": {"type": "string", "enum": ["loaded", "loading", "available", "unknown"]},
-                          "alias": {"type": "string", "nullable": true, "description": "User-defined model alias"}
+                          "alias": {"type": "string", "nullable": true, "description": "User-defined model alias"},
+                          "context_management": {"$ref": "#/components/schemas/ContextManagementCapabilities"}
                         }
                       }
                     }
@@ -467,6 +468,72 @@
             "description": "Chat completion response"
           }
         }
+      }
+    },
+    "/api/v1/chat/completions/input_tokens": {
+      "post": {
+        "operationId": "countChatInputTokens",
+        "summary": "Count exact rendered chat input tokens",
+        "description": "Uses the resolved local llama.cpp model's production chat template, tools, tokenizer, and multimodal parser. DS4 and remote engines return 501 instead of an approximation.",
+        "tags": ["Context Management"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatCompletionRequest"}}}},
+        "responses": {
+          "200": {"description": "Exact input token count", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InputTokenCount"}}}},
+          "501": {"description": "Exact counting is unsupported by the selected engine"}
+        }
+      }
+    },
+    "/api/v1/responses/input_tokens": {
+      "post": {
+        "operationId": "countResponsesInputTokens",
+        "summary": "Count exact rendered Responses input tokens",
+        "description": "Exact local count using the concrete model. No approximate remote or DS4 emulation is performed.",
+        "tags": ["Context Management"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["model", "input"]}}}},
+        "responses": {
+          "200": {"description": "Exact input token count", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InputTokenCount"}}}},
+          "501": {"description": "Exact counting is unsupported by the selected engine"}
+        }
+      }
+    },
+    "/api/v1/context/prepare": {
+      "post": {
+        "operationId": "prepareContext",
+        "summary": "Create an exact prepared-context lease",
+        "description": "Creates a scope-bound opaque lease. count mode renders and counts exactly; prefill mode additionally schedules cancellable KV preparation on the background lane. llama.cpp b9820 requires one internal decode token, which is discarded and never returned as conversation output. Prefill does not load a nonresident model unless allow_model_load is true.",
+        "tags": ["Context Management"],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"allOf": [{"$ref": "#/components/schemas/ChatCompletionRequest"}, {"type": "object", "properties": {"mode": {"type": "string", "enum": ["count", "prefill"], "default": "count"}, "allow_model_load": {"type": "boolean", "default": false}, "conversation_cache_key": {"type": "string", "maxLength": 200}}}]}}}},
+        "responses": {
+          "201": {"description": "Counted lease is ready", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PreparedContext"}}}},
+          "202": {"description": "Prefill lease was queued", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PreparedContext"}}}},
+          "501": {"description": "Prepared contexts are unsupported by the selected engine"}
+        }
+      }
+    },
+    "/api/v1/context/cache": {
+      "delete": {
+        "operationId": "invalidateContextCacheScope",
+        "summary": "Invalidate caller-owned context cache state",
+        "description": "Deletes prepared leases, in-memory affinity, attributable disk slot dumps, and resident owned slots in the Authorization-derived scope. A live slot erase can be reported as deferred when its model is not resident or the engine is unavailable; the next cold assignment still erases before use. Anonymous callers share one trusted local scope.",
+        "tags": ["Context Management"],
+        "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"model": {"type": "string"}}}}}},
+        "responses": {"200": {"description": "Deletion counts by cache layer"}}
+      }
+    },
+    "/api/v1/context/{id}": {
+      "get": {
+        "operationId": "getPreparedContext",
+        "summary": "Get prepared-context status",
+        "tags": ["Context Management"],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "Owned lease status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PreparedContext"}}}}, "404": {"description": "Missing or owned by another scope"}}
+      },
+      "delete": {
+        "operationId": "deletePreparedContext",
+        "summary": "Invalidate a prepared-context lease",
+        "tags": ["Context Management"],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {"204": {"description": "Lease and attributable cache state invalidated"}, "404": {"description": "Missing or owned by another scope"}}
       }
     },
     "/api/v1/completions": {
@@ -824,6 +891,56 @@
           "llamaPort": {"type": "integer"}
         }
       },
+      "ContextManagementCapabilities": {
+        "type": "object",
+        "required": ["version", "engine", "exact_input_tokens", "prepared_context", "priority_classes", "routing"],
+        "properties": {
+          "version": {"type": "integer", "const": 1},
+          "engine": {"type": "string", "enum": ["llama", "ds4", "remote", "embedding"]},
+          "exact_input_tokens": {"type": "boolean"},
+          "exact_render": {"type": "boolean"},
+          "conversation_affinity": {"type": "boolean"},
+          "cache_prompt": {"type": "boolean"},
+          "persisted_kv": {"type": "boolean"},
+          "prepared_context": {"type": "boolean"},
+          "idle_prefill": {"type": "boolean"},
+          "zero_decode_prefill": {"type": "boolean"},
+          "discarded_prefill_decode_tokens": {"type": "integer"},
+          "priority_classes": {"type": "object"},
+          "routing": {"type": "object"},
+          "limits": {"type": "object"}
+        }
+      },
+      "InputTokenCount": {
+        "type": "object",
+        "required": ["input_tokens", "requested_model", "resolved_model", "engine", "context_cache_contract"],
+        "properties": {
+          "object": {"type": "string", "example": "response.input_tokens"},
+          "input_tokens": {"type": "integer", "minimum": 0},
+          "requested_model": {"type": "string"},
+          "resolved_model": {"type": "string"},
+          "engine": {"type": "string"},
+          "context_cache_contract": {"type": "integer", "const": 1}
+        }
+      },
+      "PreparedContext": {
+        "type": "object",
+        "required": ["id", "status", "requestedModel", "resolvedModel", "engine", "expiresAt"],
+        "properties": {
+          "id": {"type": "string", "description": "Opaque scope-bound handle; never a llama.cpp slot id"},
+          "status": {"type": "string", "enum": ["queued", "tokenizing", "prefilling", "ready", "skipped", "cancelled", "expired", "invalidated", "unsupported", "failed"]},
+          "requestedModel": {"type": "string"},
+          "resolvedModel": {"type": "string"},
+          "engine": {"type": "string"},
+          "mode": {"type": "string", "enum": ["count", "prefill"]},
+          "inputTokens": {"type": "integer", "minimum": 0},
+          "prefixHash": {"type": "string"},
+          "compatibilityHash": {"type": "string"},
+          "expiresAt": {"type": "integer"},
+          "preparationOutcome": {"type": "string"},
+          "discardedDecodeTokens": {"type": "integer", "description": "Internal engine decode tokens consumed and discarded during prefill; never returned as model output"}
+        }
+      },
       "ChatCompletionRequest": {
         "type": "object",
         "required": ["model", "messages"],
@@ -845,7 +962,12 @@
           "stream": {"type": "boolean"},
           "top_p": {"type": "number"},
           "frequency_penalty": {"type": "number"},
-          "presence_penalty": {"type": "number"}
+          "presence_penalty": {"type": "number"},
+          "conversation_cache_key": {"type": "string", "maxLength": 200, "description": "Opaque stable conversation identity scoped by Authorization; prompt_cache_key is accepted as an alias"},
+          "prepared_context_id": {"type": "string", "description": "Opaque handle returned by /api/v1/context/prepare"},
+          "context_cache_strict": {"type": "boolean", "default": false, "description": "Return 409 instead of cold fallback when a prepared handle cannot be reused"},
+          "request_priority": {"type": "string", "enum": ["realtime", "interactive", "background"], "default": "interactive", "description": "May also be supplied as X-Llama-Priority"},
+          "routing": {"type": "string", "enum": ["auto", "local_only"], "default": "auto", "description": "local_only suppresses every remote offload path; a stalled local lane returns an explicit 503. May also be supplied as X-Llama-Routing"}
         }
       },
       "CompletionRequest": {
@@ -868,6 +990,7 @@
     {"name": "Monitoring", "description": "System and process monitoring"},
     {"name": "Settings", "description": "Configuration management"},
     {"name": "Download", "description": "Model download from HuggingFace"},
-    {"name": "OpenAI API", "description": "OpenAI-compatible inference endpoints"}
+    {"name": "OpenAI API", "description": "OpenAI-compatible inference endpoints"},
+    {"name": "Context Management", "description": "Exact counting, prepared contexts, cache lifecycle, priority, and routing contracts"}
   ]
 }

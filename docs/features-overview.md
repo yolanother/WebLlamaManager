@@ -59,6 +59,31 @@ Request enrichment happens transparently:
 - **Sampling defaults** — model-specific recommended `temp/top_p/top_k/min_p`
   (e.g. Gemma 4, Qwen 3.6) are filled in only when the caller left them unset.
 
+### Realtime conversation context contract
+
+Local llama.cpp models advertise a versioned `context_management` capability
+object and provide exact production-template counts at
+`chat/completions/input_tokens` and `responses/input_tokens`. Stable
+`conversation_cache_key` values keep growing histories on a useful slot lineage;
+clients without the extension receive a stable hashed conversation-head fallback
+starting on the first user turn. Cold assignments erase the manager-owned slot
+before use, preventing stale KV reuse across lineages or authorization scopes.
+
+`context/prepare` creates an opaque, Authorization-scoped lease. `mode: "count"`
+only renders/counts; `mode: "prefill"` queues KV work at background priority and
+is cancelled when realtime work arrives. llama.cpp b9820 requires one internal
+decode token to retain reusable KV; the manager discards it and advertises this
+limit without emitting client output. Status and deletion use
+`context/{id}`; `DELETE context/cache` removes every attributable memory and disk
+record in the caller scope. Raw token and llama.cpp slot ids are never public.
+
+Chat extensions `request_priority: "realtime" | "interactive" | "background"`
+and `routing: "local_only"` control the single local lane. Realtime skips queued
+lower-priority work and preempts background work. `local_only` suppresses every
+remote offload path and returns a machine-readable local-busy error instead of
+silently sending prompt data elsewhere. Full rationale and limits are in
+[ConversationContextCache.md](Designs/ConversationContextCache.md).
+
 ## 4. Model aliasing & preferred big/small models
 
 Two request-time aliases let clients pin a stable name while the operator retargets
