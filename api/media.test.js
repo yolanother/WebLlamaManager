@@ -302,6 +302,140 @@ test('audio upload normalizes sound without attempting video frame extraction', 
   }
 });
 
+test('image and short-video frame extraction remains byte-for-byte unchanged', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-test-'));
+  const ids = ['image-id', 'short-video-id'];
+  const calls = [];
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => ids.shift(),
+      spawnImpl(command, args) {
+        calls.push({ command, args });
+        if (command === 'ffprobe') return mockChildProcess({ stdout: '2\n' });
+        const outputPath = args.at(-1);
+        mkdirSync(dirname(outputPath), { recursive: true });
+        writeFileSync(outputPath, args.includes('-vn') ? Buffer.from('wav') : Buffer.from('unchanged-jpeg'));
+        return mockChildProcess();
+      },
+    });
+
+    const imageBoundary = 'llama-image-boundary';
+    const imageBody = multipartFileBody(
+      imageBoundary,
+      'still.jpg',
+      'image/jpeg',
+      Buffer.from([0xff, 0xd8, 0xff, 0xdb]),
+    );
+    const imageUpload = await invokeRoute(routes, 'POST', '/upload', {
+      body: imageBody,
+      headers: {
+        'content-type': `multipart/form-data; boundary=${imageBoundary}`,
+        'content-length': String(imageBody.length),
+      },
+    });
+    assert.deepEqual(imageUpload.body.frames, ['/api/media/image-id/frames/0.jpg']);
+    assert.equal(imageUpload.body.audio, undefined);
+
+    const videoBoundary = 'llama-short-video-boundary';
+    const videoBody = multipartFileBody(
+      videoBoundary,
+      'short.mp4',
+      'video/mp4',
+      Buffer.from('\x00\x00\x00\x18ftypisom\x00\x00\x00\x00', 'binary'),
+    );
+    const videoUpload = await invokeRoute(routes, 'POST', '/upload', {
+      body: videoBody,
+      headers: {
+        'content-type': `multipart/form-data; boundary=${videoBoundary}`,
+        'content-length': String(videoBody.length),
+      },
+    });
+    assert.deepEqual(videoUpload.body.frames, [
+      '/api/media/short-video-id/frames/0.jpg',
+      '/api/media/short-video-id/frames/1.jpg',
+    ]);
+
+    const imageFrame = await invokeRoute(routes, 'GET', '/:id/frames/:n.jpg', {
+      params: { id: 'image-id', n: '0' },
+    });
+    const videoFrame = await invokeRoute(routes, 'GET', '/:id/frames/:n.jpg', {
+      params: { id: 'short-video-id', n: '1' },
+    });
+    assert.deepEqual(imageFrame.payload, Buffer.from('unchanged-jpeg'));
+    assert.deepEqual(videoFrame.payload, Buffer.from('unchanged-jpeg'));
+
+    const frameCalls = calls.filter(call => call.command === 'ffmpeg' && !call.args.includes('-vn'));
+    assert.deepEqual(frameCalls.map(call => call.args), [
+      [
+        '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+        '-i', join(dataDir, 'media', 'image-id', 'source.jpg'),
+        '-frames:v', '1',
+        '-vf', "scale=w='if(gte(iw,ih),min(iw,768),-2)':h='if(lt(iw,ih),min(ih,768),-2)'",
+        '-q:v', '4',
+        join(dataDir, 'media', 'image-id', 'frames', '0.jpg'),
+      ],
+      [
+        '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+        '-ss', '0.666667',
+        '-i', join(dataDir, 'media', 'short-video-id', 'source.mp4'),
+        '-frames:v', '1',
+        '-an',
+        '-vf', "scale=w='if(gte(iw,ih),min(iw,768),-2)':h='if(lt(iw,ih),min(ih,768),-2)'",
+        '-q:v', '4',
+        join(dataDir, 'media', 'short-video-id', 'frames', '0.jpg'),
+      ],
+      [
+        '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+        '-ss', '1.333333',
+        '-i', join(dataDir, 'media', 'short-video-id', 'source.mp4'),
+        '-frames:v', '1',
+        '-an',
+        '-vf', "scale=w='if(gte(iw,ih),min(iw,768),-2)':h='if(lt(iw,ih),min(ih,768),-2)'",
+        '-q:v', '4',
+        join(dataDir, 'media', 'short-video-id', 'frames', '1.jpg'),
+      ],
+    ]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('audio upload reports a 501 with an installation hint when ffmpeg is missing', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-test-'));
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'missing-ffmpeg-id',
+      spawnImpl(command) {
+        if (command === 'ffprobe') return mockChildProcess({ stdout: '10\n' });
+        const missing = Object.assign(new Error('spawn ffmpeg ENOENT'), { code: 'ENOENT' });
+        return mockChildProcess({ error: missing });
+      },
+    });
+    const boundary = 'llama-missing-ffmpeg-boundary';
+    const uploadBody = multipartFileBody(
+      boundary,
+      'voice.wav',
+      'audio/wav',
+      Buffer.from('RIFF\x24\x00\x00\x00WAVEfmt ', 'binary'),
+    );
+    const uploaded = await invokeRoute(routes, 'POST', '/upload', {
+      body: uploadBody,
+      headers: {
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+        'content-length': String(uploadBody.length),
+      },
+    });
+
+    assert.equal(uploaded.statusCode, 501);
+    assert.equal(uploaded.body.error, 'ffmpeg not installed');
+    assert.match(uploaded.body.hint, /install ffmpeg/i);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('missing yt-dlp and ffmpeg processes map to graceful 501 responses', async () => {
   for (const binary of ['yt-dlp', 'ffmpeg', 'ffprobe']) {
     const missing = Object.assign(new Error(`spawn ${binary} ENOENT`), { code: 'ENOENT' });
