@@ -55,6 +55,7 @@ import { slotCacheFilename, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import { aggregateRequestStats } from './request-stats.js';
 import { createMediaRouter } from './media.js';
+import { createAudioTranscriptionHandler } from './audio-transcriptions.js';
 import { expandMessages } from './multimodal-expand.js';
 import {
   ContextUpstreamError,
@@ -264,6 +265,12 @@ const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
 const EMBED_PORT = process.env.EMBED_PORT || 5252;
 const LLAMA_UI_URL = process.env.LLAMA_UI_URL || null; // Optional override for llama.cpp UI URL
+const handleAudioTranscription = createAudioTranscriptionHandler({
+  resolveModelCapabilities,
+  chatCompletionsUrl: `http://127.0.0.1:${API_PORT}/api/v1/chat/completions`,
+});
+app.post('/api/v1/audio/transcriptions', handleAudioTranscription);
+app.post('/v1/audio/transcriptions', handleAudioTranscription);
 
 // Python venv for huggingface CLI (created by install.sh)
 const VENV_PATH = join(PROJECT_ROOT, '.venv');

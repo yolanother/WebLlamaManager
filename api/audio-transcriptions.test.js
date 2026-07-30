@@ -8,7 +8,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, writeFile } from 'node:fs/promises';
+import { access, readFile, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { createAudioTranscriptionHandler } from './audio-transcriptions.js';
 
@@ -131,4 +131,138 @@ test('OpenAI multipart shape returns JSON text from normalized input_audio and c
   assert.match(completionBodies[0].messages[0].content[0].text, /Ada, Charles/);
   await assert.rejects(access(temporarySourcePath), { code: 'ENOENT' });
   await assert.rejects(access(temporaryOutputPath), { code: 'ENOENT' });
+});
+
+test('text response_format returns a UTF-8 text/plain body', async () => {
+  const boundary = 'text-response-boundary';
+  const body = multipartBody(boundary, {
+    model: 'gemma-audio',
+    response_format: 'text',
+  }, {
+    filename: 'voice.wav',
+    mime: 'audio/wav',
+    data: Buffer.from('RIFF-demo-WAVE'),
+  });
+  const handler = createAudioTranscriptionHandler({
+    resolveModelCapabilities: () => ({ audio: true }),
+    probeDurationImpl: async () => 5,
+    extractAudioImpl: async ({ outputPath }) => writeFile(outputPath, Buffer.from('wav')),
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: 'Plain transcript.' } }] }),
+    }),
+  });
+
+  const response = await invoke(handler, body, boundary);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.contentType, 'text/plain; charset=utf-8');
+  assert.equal(response.body, 'Plain transcript.');
+});
+
+test('verbose_json reports approximate multi-window boundaries and chronological transcripts', async () => {
+  const boundary = 'verbose-response-boundary';
+  const body = multipartBody(boundary, {
+    model: 'gemma-audio',
+    response_format: 'verbose_json',
+    language: 'fr',
+  }, {
+    filename: 'long.ogg',
+    mime: 'audio/ogg',
+    data: Buffer.from('OggS-demo'),
+  });
+  const extractedWindows = [];
+  const transcriptQueue = ['premier', 'deuxième', 'troisième'];
+  const handler = createAudioTranscriptionHandler({
+    resolveModelCapabilities: () => ({ audio: true }),
+    probeDurationImpl: async () => 1_250,
+    extractAudioImpl: async options => {
+      extractedWindows.push({ startSec: options.startSec, endSec: options.endSec });
+      await writeFile(options.outputPath, Buffer.from(`wav-${options.startSec}`));
+    },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: transcriptQueue.shift() } }] }),
+    }),
+  });
+
+  const response = await invoke(handler, body, boundary);
+
+  assert.deepEqual(extractedWindows, [
+    { startSec: 0, endSec: 600 },
+    { startSec: 600, endSec: 1_200 },
+    { startSec: 1_200, endSec: 1_250 },
+  ]);
+  assert.deepEqual(response.body, {
+    task: 'transcribe',
+    language: 'fr',
+    duration: 1_250,
+    text: 'premier deuxième troisième',
+    segments: [
+      { id: 0, start: 0, end: 600, text: 'premier' },
+      { id: 1, start: 600, end: 1_200, text: 'deuxième' },
+      { id: 2, start: 1_200, end: 1_250, text: 'troisième' },
+    ],
+  });
+});
+
+test('missing multipart file is rejected with a clear 400 error', async () => {
+  const boundary = 'missing-file-boundary';
+  const body = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\ngemma-audio\r\n--${boundary}--\r\n`,
+  );
+  const handler = createAudioTranscriptionHandler({
+    resolveModelCapabilities: () => assert.fail('capabilities must not be checked without a file'),
+    fetchImpl: async () => assert.fail('backend must not be called without a file'),
+  });
+
+  const response = await invoke(handler, body, boundary);
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.body.error.type, 'invalid_request_error');
+  assert.match(response.body.error.message, /multipart field "file" is required/i);
+});
+
+test('model without an audio encoder is rejected before normalization', async () => {
+  const boundary = 'non-audio-model-boundary';
+  const body = multipartBody(boundary, {
+    model: 'text-only-model',
+  }, {
+    filename: 'voice.wav',
+    mime: 'audio/wav',
+    data: Buffer.from('RIFF-demo-WAVE'),
+  });
+  const handler = createAudioTranscriptionHandler({
+    resolveModelCapabilities: model => {
+      assert.equal(model, 'text-only-model');
+      return { vision: false, audio: false, source: 'mmproj' };
+    },
+    probeDurationImpl: async () => assert.fail('non-audio model must not probe the upload'),
+    extractAudioImpl: async () => assert.fail('non-audio model must not normalize the upload'),
+    fetchImpl: async () => assert.fail('non-audio model must not call chat completions'),
+  });
+
+  const response = await invoke(handler, body, boundary);
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.body.error.code, 'model_not_audio_capable');
+  assert.match(response.body.error.message, /text-only-model/);
+  assert.match(response.body.error.message, /no audio encoder/i);
+});
+
+test('both transcription aliases mount the shared handler before the SPA catch-all', async () => {
+  const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
+  const catchAllIndex = source.indexOf("app.get('*'");
+
+  assert.match(source, /import \{ createAudioTranscriptionHandler \} from '\.\/audio-transcriptions\.js';/);
+  assert.match(source, /const handleAudioTranscription = createAudioTranscriptionHandler\(\{/);
+  for (const registration of [
+    "app.post('/api/v1/audio/transcriptions', handleAudioTranscription);",
+    "app.post('/v1/audio/transcriptions', handleAudioTranscription);",
+  ]) {
+    assert.ok(source.includes(registration), registration);
+    assert.ok(source.indexOf(registration) < catchAllIndex, `${registration} must precede SPA fallback`);
+  }
 });

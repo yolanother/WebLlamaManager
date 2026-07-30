@@ -91,7 +91,7 @@ export function createAudioTranscriptionHandler({
         );
       }
       const responseFormat = fields.response_format?.trim() || 'json';
-      if (responseFormat !== 'json') {
+      if (!['json', 'text', 'verbose_json'].includes(responseFormat)) {
         throw new AudioTranscriptionError(
           400,
           `Unsupported response_format "${responseFormat}"`,
@@ -129,7 +129,25 @@ export function createAudioTranscriptionHandler({
         }));
       }
 
-      res.json({ text: concatenateTranscripts(transcripts) });
+      const text = concatenateTranscripts(transcripts);
+      if (responseFormat === 'text') {
+        res.type('text/plain; charset=utf-8').send(text);
+      } else if (responseFormat === 'verbose_json') {
+        res.json({
+          task: 'transcribe',
+          language: fields.language?.trim() || 'unknown',
+          duration: durationSec,
+          text,
+          segments: windows.map((window, index) => ({
+            id: window.index,
+            start: window.startSec,
+            end: window.endSec,
+            text: transcripts[index],
+          })),
+        });
+      } else {
+        res.json({ text });
+      }
     } catch (error) {
       sendTranscriptionError(res, error);
     } finally {
