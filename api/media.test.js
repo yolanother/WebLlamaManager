@@ -431,6 +431,7 @@ test('audio upload reports a 501 with an installation hint when ffmpeg is missin
     assert.equal(uploaded.statusCode, 501);
     assert.equal(uploaded.body.error, 'ffmpeg not installed');
     assert.match(uploaded.body.hint, /install ffmpeg/i);
+    assert.match(uploaded.body.hint, /audio extraction/i);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

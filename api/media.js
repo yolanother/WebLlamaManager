@@ -232,7 +232,7 @@ export function mapProcessError(binary, error) {
           status: 501,
           body: {
             error: 'ffmpeg not installed',
-            hint: 'Install ffmpeg (including ffprobe) on the server to enable media frame extraction.',
+            hint: 'Install ffmpeg (including ffprobe) on the server to enable media frame and audio extraction.',
           },
         };
   }
