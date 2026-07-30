@@ -160,7 +160,9 @@ correct generation and cannot deny unrelated realtime traffic.
 Completed generations enqueue slot snapshots on the same bounded background
 lane before releasing ownership. Already-queued user requests skip ahead; a new
 realtime request aborts an active save. This preserves the slot-overwrite barrier
-without putting disk persistence on the realtime critical path.
+without putting disk persistence on the realtime critical path. Background
+starvation prevention may interleave work after a bounded interactive burst, but
+it never allows background work to bypass a queued realtime request.
 
 ## Capabilities and observability
 
