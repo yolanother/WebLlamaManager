@@ -12,6 +12,7 @@ import {
   MULTIMODAL_CONTENT_PARTS,
   OPENAI_BASE_URL,
 } from './api-spec.js';
+import { buildOpenApiDocument } from '../scripts/gen-openapi.mjs';
 
 const CURRENT_ENDPOINT_KEYS = [
   'POST /api/media/upload',
@@ -189,4 +190,31 @@ test('catalog describes the dual OpenAI surface and full multimodal contract', (
   assert.match(youtubeExample.curl, /video_url/);
   assert.match(youtubeExample.python, /video_url/);
   assert.match(youtubeExample.javascript, /video_url/);
+});
+
+test('OpenAPI generator emits a structurally complete OpenAPI 3.1 document', () => {
+  const document = buildOpenApiDocument();
+  const operationCount = Object.values(document.paths)
+    .flatMap(pathItem => Object.values(pathItem))
+    .length;
+
+  assert.equal(document.openapi, '3.1.0');
+  assert.ok(document.info.title);
+  assert.equal(document.info['x-openai-base-url'], OPENAI_BASE_URL);
+  assert.ok(Object.keys(document.paths).length > 24);
+  assert.equal(operationCount, ENDPOINTS.length);
+  assert.equal(document.components.schemas.ContentPart.oneOf.length, 5);
+
+  for (const endpoint of ENDPOINTS) {
+    const operation = document.paths[endpoint.path]?.[endpoint.method.toLowerCase()];
+    assert.ok(operation, `missing generated operation for ${endpoint.method} ${endpoint.path}`);
+    assert.equal(operation.summary, endpoint.summary);
+    assert.ok(operation.responses['200']);
+    assert.deepEqual(
+      operation['x-codeSamples'].map(sample => sample.lang),
+      ['cURL', 'Python', 'JavaScript'],
+    );
+  }
+
+  assert.deepEqual(JSON.parse(JSON.stringify(document)), document);
 });
