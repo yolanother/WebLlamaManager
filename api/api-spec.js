@@ -203,7 +203,9 @@ function makeExample(method, path, summary, body = null) {
   const curlBody = hasBody
     ? ` -H 'Content-Type: application/json' -d '${serializedBody}'`
     : '';
-  const pythonArgs = hasBody ? `, json=${serializedBody}` : '';
+  const python = hasBody
+    ? `import json\nimport requests\n\npayload = json.loads(r'''${serializedBody}''')\nresponse = requests.${method.toLowerCase()}('${url}', json=payload)\nprint(response.json())`
+    : `import requests\n\nresponse = requests.${method.toLowerCase()}('${url}')\nprint(response.json())`;
   const javascriptOptions = hasBody
     ? `, {\n  method: '${method}',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify(${serializedBody})\n}`
     : method === 'GET' ? '' : `, { method: '${method}' }`;
@@ -212,7 +214,7 @@ function makeExample(method, path, summary, body = null) {
     title: `${summary} example`,
     body,
     curl: `curl -s -X ${method} '${url}'${curlBody}`,
-    python: `import requests\n\nresponse = requests.${method.toLowerCase()}('${url}'${pythonArgs})\nprint(response.json())`,
+    python,
     javascript: `const response = await fetch('${url}'${javascriptOptions});\nconsole.log(await response.json());`,
   };
 }

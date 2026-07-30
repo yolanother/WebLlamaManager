@@ -189,6 +189,7 @@ test('catalog describes the dual OpenAI surface and full multimodal contract', (
   assert.ok(youtubeExample, 'chat completions needs a worked YouTube video_url example');
   assert.match(youtubeExample.curl, /video_url/);
   assert.match(youtubeExample.python, /video_url/);
+  assert.match(youtubeExample.python, /json\.loads/, 'JSON booleans need valid Python decoding');
   assert.match(youtubeExample.javascript, /video_url/);
 });
 
