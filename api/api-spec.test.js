@@ -1,5 +1,5 @@
 // Llama Manager API specification contract tests.
-// Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
+// Copyright (c) Llama Manager project. Use of this file is governed by the LICENSE file in the repository root.
 //
 // These tests keep the public endpoint catalog complete and ensure every entry
 // remains useful to people and agents consuming generated API documentation.

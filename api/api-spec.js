@@ -1,5 +1,5 @@
 // Llama Manager single-source HTTP API specification.
-// Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
+// Copyright (c) Llama Manager project. Use of this file is governed by the LICENSE file in the repository root.
 //
 // This module catalogs every public HTTP operation exposed by the manager and
 // supplies the summaries, schemas, parameters, and runnable examples consumed

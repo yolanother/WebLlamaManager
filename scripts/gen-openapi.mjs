@@ -1,5 +1,5 @@
 // Llama Manager OpenAPI 3.1 generator.
-// Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
+// Copyright (c) Llama Manager project. Use of this file is governed by the LICENSE file in the repository root.
 //
 // This script converts the single-source endpoint catalog into a complete,
 // deterministic OpenAPI document. Run it without arguments to write JSON to
