@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { contextCapabilities } from './context-capabilities.js';
+import { contextCapabilities, modelSupportsSlotOperations } from './context-capabilities.js';
 
 test('llama advertises exact context management and bounded limits', () => {
   const capabilities = contextCapabilities('llama', { slotCacheEnabled: true });
@@ -28,4 +28,27 @@ test('unsupported engines explicitly disable local context operations', () => {
   assert.equal(capabilities.prepared_context, false);
   assert.equal(capabilities.persisted_kv, false);
   assert.equal(capabilities.routing.local_only, true);
+});
+
+test('multimodal llama children advertise exact counting but disable unsupported slot operations', () => {
+  const capabilities = contextCapabilities('llama', {
+    slotCacheEnabled: true,
+    slotOperationsSupported: false,
+  });
+
+  assert.equal(capabilities.exact_input_tokens, true);
+  assert.equal(capabilities.exact_render, true);
+  assert.equal(capabilities.conversation_affinity, false);
+  assert.equal(capabilities.cache_prompt, false);
+  assert.equal(capabilities.persisted_kv, false);
+  assert.equal(capabilities.prepared_context, false);
+  assert.equal(capabilities.idle_prefill, false);
+  assert.equal(capabilities.priority_classes.realtime, true);
+});
+
+test('modelSupportsSlotOperations rejects concrete multimodal and mmproj children', () => {
+  assert.equal(modelSupportsSlotOperations({ architecture: { input_modalities: ['text'] } }), true);
+  assert.equal(modelSupportsSlotOperations({ architecture: { input_modalities: ['text', 'image'] } }), false);
+  assert.equal(modelSupportsSlotOperations({ status: { args: ['llama-server', '--mmproj', '/models/mmproj.gguf'] } }), false);
+  assert.equal(modelSupportsSlotOperations(null), false);
 });

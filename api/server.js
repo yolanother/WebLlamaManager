@@ -73,8 +73,8 @@ import {
   validateConversationCacheKey,
 } from './context-cache.js';
 import { DurableSlotCacheRegistry } from './slot-cache-registry.js';
-import { eraseSlotForColdAssignment } from './slot-ownership.js';
-import { contextCapabilities } from './context-capabilities.js';
+import { eraseSlotForColdAssignment, fetchModelSlotsWhenReady } from './slot-ownership.js';
+import { contextCapabilities, modelSupportsSlotOperations } from './context-capabilities.js';
 import { PriorityRequestQueue } from './request-queue.js';
 import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
 import {
@@ -320,6 +320,33 @@ const STALL_WATCHDOG_INTERVAL = 5_000;
 // turns grow and fixes the former per-turn prefix-key drift. The initial user turn is
 // pinned so its KV state cannot be selected from a slot owned by another scope.
 const slotAffinity = new SlotAffinityRegistry({ maxLineages: 256 });
+const modelSlotCapabilityCache = new Map();
+
+/** Cache one router descriptor's concrete slot-operation support. */
+function rememberModelSlotCapability(model) {
+  const supported = modelSupportsSlotOperations(model);
+  if (model?.id) modelSlotCapabilityCache.set(model.id, { supported, checkedAt: Date.now() });
+  return supported;
+}
+
+/**
+ * Resolve whether the concrete router child implements llama.cpp `/slots`.
+ * Multimodal/mmproj children return 501 for those operations; lookup failures
+ * disable affinity safely without affecting ordinary generation.
+ */
+async function modelHasSlotOperations(modelId) {
+  const cached = modelSlotCapabilityCache.get(modelId);
+  if (cached && Date.now() - cached.checkedAt < 30_000) return cached.supported;
+  try {
+    const response = await fetch(`http://localhost:${LLAMA_PORT}/models`, { signal: AbortSignal.timeout(3000) });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    const descriptor = (payload.data || []).find(model => model.id === modelId);
+    return rememberModelSlotCapability(descriptor);
+  } catch {
+    return false;
+  }
+}
 
 // Slot count for the loaded llama-server (cached). Discovered by hitting /slots.
 // Default 4 (matches the n_parallel we observed) until we can probe.
@@ -441,14 +468,13 @@ async function maybeRestoreSlot(model, slotAssignment) {
   if (!rec) return false;
   try {
     // Probe the assigned slot's current state to decide cold-vs-warm.
-    let slotState = null;
-    try {
-      const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
-      if (r.ok) {
-        const arr = await r.json();
-        if (Array.isArray(arr)) slotState = arr.find(s => s.id === slotAssignment.slotId) || null;
-      }
-    } catch { /* treat as cold */ }
+    const slots = await fetchModelSlotsWhenReady({
+      baseUrl: `http://localhost:${LLAMA_PORT}`,
+      model,
+      signal: AbortSignal.timeout(MODEL_LOAD_WAIT_MS),
+      waitForReady: readyModel => waitForModelReady(readyModel, { label: 'slot-cache' }),
+    });
+    const slotState = slots?.find(slot => slot.id === slotAssignment.slotId) || null;
     if (!shouldRestoreSlot({ savedFile: rec, slotState })) return false;
     const rr = await fetch(`http://localhost:${LLAMA_PORT}/slots/${slotAssignment.slotId}?action=restore`, {
       method: 'POST',
@@ -6979,7 +7005,10 @@ async function handleModels(req, res) {
             displayName: m.id,
             status: m.status?.value || 'unknown',
             alias: aliases[m.id] || null,
-            context_management: contextCapabilities('llama', { slotCacheEnabled: slotCacheCfg().enabled }),
+            context_management: contextCapabilities('llama', {
+              slotCacheEnabled: slotCacheCfg().enabled,
+              slotOperationsSupported: rememberModelSlotCapability(m),
+            }),
           });
           seenNorm.add(norm(m.id));
         }
@@ -7002,7 +7031,10 @@ async function handleModels(req, res) {
         status: 'available',
         alias: aliases[lm.name] || null,
         size: lm.size || 0,
-        context_management: contextCapabilities('llama', { slotCacheEnabled: slotCacheCfg().enabled }),
+        context_management: contextCapabilities('llama', {
+          slotCacheEnabled: slotCacheCfg().enabled,
+          slotOperationsSupported: false,
+        }),
       });
     }
 
@@ -7010,9 +7042,13 @@ async function handleModels(req, res) {
     // Advertise the configured default-big/default-small aliases so clients can
     // discover them (only those with a configured target are listed).
     for (const entry of defaultModelListEntries(config, Math.floor(Date.now() / 1000))) {
+      const aliasTarget = byId.get(entry.aliasTarget);
       data.data.push({
         ...entry,
-        context_management: contextCapabilities(entry.engine, { slotCacheEnabled: slotCacheCfg().enabled }),
+        context_management: contextCapabilities(entry.engine, {
+          slotCacheEnabled: slotCacheCfg().enabled,
+          slotOperationsSupported: aliasTarget?.context_management?.conversation_affinity === true,
+        }),
       });
     }
     // Append the dedicated embedding model so it is selectable by the orchestrator.
@@ -7259,6 +7295,16 @@ app.post('/api/v1/context/prepare', async (req, res) => {
   if (currentEngine === ENGINE_TYPES.DS4) {
     return res.status(501).json({ error: { message: 'prepared contexts are unsupported by DS4', code: 'CONTEXT_PREPARE_UNSUPPORTED' } });
   }
+  const slotOperationsSupported = await modelHasSlotOperations(resolvedModel);
+  if (mode === 'prefill' && !slotOperationsSupported) {
+    return res.status(501).json({
+      error: {
+        message: 'KV prefill is unsupported by this concrete llama.cpp model child',
+        type: 'not_supported_error',
+        code: 'CONTEXT_PREFILL_UNSUPPORTED',
+      },
+    });
+  }
 
   if (mode === 'prefill' && req.body?.allow_model_load !== true && !(await isLocalModelResident(resolvedModel))) {
     const skipped = preparedContexts.create({
@@ -7306,7 +7352,7 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       compatibilityHash,
       requestHash,
       preparationBody: mode === 'prefill' ? req.body : null,
-      capabilities: { exact_count: true, exact_render: true, kv_prefill: true },
+      capabilities: { exact_count: true, exact_render: true, kv_prefill: slotOperationsSupported },
     });
 
     if (mode === 'prefill') {
@@ -8160,7 +8206,19 @@ async function handleChatCompletions(req, res) {
   // we only re-prompt-process the trailing user turn. id_slot is a hint —
   // llama.cpp may pick differently if our slot is busy.
   let slotAssignment = null;
-  if (!routing.remote && Array.isArray(req.body.messages)) {
+  const slotOperationsSupported = !routing.remote && Array.isArray(req.body.messages)
+    ? await modelHasSlotOperations(requestedModel)
+    : false;
+  if (!slotOperationsSupported && req.body?.prepared_context_id && req.body?.context_cache_strict === true) {
+    return res.status(501).json({
+      error: {
+        message: 'prepared contexts are unsupported by this concrete model child',
+        type: 'not_supported_error',
+        code: 'CONTEXT_PREFILL_UNSUPPORTED',
+      },
+    });
+  }
+  if (slotOperationsSupported) {
     try {
       const preparedId = req.body?.prepared_context_id;
       if (preparedId) {
@@ -9521,7 +9579,10 @@ async function handleModel(req, res) {
       displayName: m.id,
       status: m.status?.value || 'unknown',
       alias: aliases[m.id] || null,
-      context_management: contextCapabilities('llama', { slotCacheEnabled: slotCacheCfg().enabled }),
+      context_management: contextCapabilities('llama', {
+        slotCacheEnabled: slotCacheCfg().enabled,
+        slotOperationsSupported: rememberModelSlotCapability(m),
+      }),
     });
   } catch (error) {
     console.error('[v1/models/:model] Error:', error.message);

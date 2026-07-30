@@ -3,8 +3,11 @@
 // LICENSE file in the repository root.
 //
 // Clears server-owned llama.cpp slots before assigning them to a cold
-// conversation lineage. This fail-closed boundary prevents stale KV state from
-// a prior lineage or authorization scope from participating in prompt reuse.
+// conversation lineage and waits through transient router child loading before
+// inspecting slots for durable restore. These boundaries prevent stale KV state
+// from a prior lineage or authorization scope from participating in reuse.
+
+import { classifyUpstreamFailure } from './upstream-retry.js';
 
 /** Error raised when Llama Manager cannot establish clean slot ownership. */
 export class SlotOwnershipError extends Error {
@@ -58,4 +61,50 @@ export async function eraseSlotForColdAssignment({
     throw new SlotOwnershipError(`cannot establish clean cache slot ownership (${response.status})${detail ? `: ${detail}` : ''}`);
   }
   return true;
+}
+
+/**
+ * Fetch one concrete model child's slots, waiting once when the router reports
+ * that the child is still loading. A model-specific `/slots` request triggers
+ * lazy child loading; durable restore must not race that startup and silently
+ * fall back cold.
+ *
+ * @param {Object} input Slot probe inputs.
+ * @param {string} input.baseUrl llama.cpp/router base URL.
+ * @param {string} input.model Concrete model whose slots are requested.
+ * @param {typeof fetch} [input.fetchImpl] Injectable fetch implementation.
+ * @param {(model:string)=>Promise<boolean>} input.waitForReady Model-ready waiter.
+ * @param {AbortSignal} [input.signal] Optional cancellation signal.
+ * @returns {Promise<Array<Record<string,unknown>>|null>} Slot rows, or null when unavailable.
+ */
+export async function fetchModelSlotsWhenReady({
+  baseUrl,
+  model,
+  fetchImpl = fetch,
+  waitForReady,
+  signal,
+} = {}) {
+  if (!baseUrl || !model || typeof waitForReady !== 'function') {
+    throw new TypeError('baseUrl, model, and waitForReady are required');
+  }
+  const url = `${String(baseUrl).replace(/\/+$/, '')}/slots?model=${encodeURIComponent(model)}`;
+  let response;
+  try {
+    response = await fetchImpl(url, { signal });
+  } catch {
+    return null;
+  }
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    if (classifyUpstreamFailure({ status: response.status, text: detail }).kind !== 'proxy') return null;
+    if (!(await waitForReady(model))) return null;
+    try {
+      response = await fetchImpl(url, { signal });
+    } catch {
+      return null;
+    }
+  }
+  if (!response.ok) return null;
+  const payload = await response.json().catch(() => null);
+  return Array.isArray(payload) ? payload : null;
 }

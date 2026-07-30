@@ -170,6 +170,12 @@ Each model entry gains a versioned `context_management` object separate from
 the multimodal epic's `modalities` field. It reports exact input counting,
 stable affinity, cache-prompt support, disk restore, prepared handles, true
 prefill, and whether the feature is local or unsupported for the active engine.
+Capabilities are resolved from each concrete router descriptor. A text-capable
+multimodal/mmproj child still advertises exact count and render support, but it
+does not advertise affinity, persisted KV, prepared contexts, or idle prefill
+because current llama.cpp children return `501` for `/slots` actions in that
+configuration. Ordinary generation remains available without manager slot
+pinning; strict prepared use returns `CONTEXT_PREFILL_UNSUPPORTED` explicitly.
 
 Telemetry distinguishes:
 
@@ -191,14 +197,20 @@ Run the executable conformance benchmark against a development server with:
 node scripts/benchmark-context-cache.mjs --model <local-model-id> --samples 20
 ```
 
-The emitted JSON includes the exact model, sample counts, cold and growing p50/p95
-TTFT, verified reused-prefix tokens, realtime queue wait, prepared status, and an
-explicit `go | no-go` decision. CI unit coverage verifies identity stability,
+The emitted JSON includes the exact model, sample counts, cold, growing,
+prepared, interleaved, and changing-RAG p50/p95 TTFT, verified reused-prefix
+tokens, scope-invalidation evidence, realtime queue wait, prepared status, and
+an explicit `go | no-go` decision. `--exercise-reload <model>` adds an
+operator-gated unload/durable-restore probe on a maintenance server. CI unit
+coverage verifies identity stability,
 cross-scope denial, reverse slot ownership, restart reconciliation, safe deletion,
 warm-slot detection, exact upstream proxying, per-engine capability declarations,
 priority/preemption/fairness, local-only parsing, and the benchmark gate. Hardware
 results are recorded after each llama.cpp/model update; a missing measurement is
 never reported as a performance win.
+
+The first recorded hardware result and its isolation caveats are in
+[ConversationContextCache-2026-07-30.md](../Benchmarks/ConversationContextCache-2026-07-30.md).
 
 ## Alternatives rejected
 
