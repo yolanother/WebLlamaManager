@@ -2,9 +2,10 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Fetches the server's OpenAPI document as the sole endpoint inventory, renders
-// its copyable code samples, explains the multimodal content-part contract, and
-// provides a live request tester that preserves the user's JSON request bytes.
+// Fetches the server's OpenAPI document as the sole endpoint inventory, organizes
+// Manager and OpenAI operations in accessible tabs, explains the multimodal
+// content-part contract, and provides a live request tester that preserves the
+// user's JSON request bytes.
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { SearchableSelect } from '../components/SearchableSelect.jsx';
@@ -320,6 +321,27 @@ function ApiDocsPage() {
   const guideExamples = useMemo(() => createGuideExamples(chatEndpoint), [chatEndpoint]);
   const activeGuide = guideExamples.find(example => example.id === activeGuideId) || guideExamples[0];
 
+  /** Changes the API group and clears tester state that belongs to the prior group. */
+  const selectApiTab = useCallback((tab) => {
+    setActiveTab(tab);
+    setActiveEndpoint(null);
+    setResponse(null);
+  }, []);
+
+  /** Implements the standard roving-keyboard behavior for the two API group tabs. */
+  function handleApiTabKeyDown(event) {
+    let nextTab = null;
+    if (event.key === 'ArrowLeft') nextTab = activeTab === 'manager' ? 'openai' : 'manager';
+    if (event.key === 'ArrowRight') nextTab = activeTab === 'openai' ? 'manager' : 'openai';
+    if (event.key === 'Home') nextTab = 'manager';
+    if (event.key === 'End') nextTab = 'openai';
+    if (!nextTab) return;
+
+    event.preventDefault();
+    selectApiTab(nextTab);
+    window.requestAnimationFrame(() => document.getElementById(`api-tab-${nextTab}`)?.focus());
+  }
+
   /** Selects an operation and initializes its path/query fields and example body. */
   const selectEndpoint = useCallback((endpoint, bodyOverride = undefined) => {
     setActiveEndpoint(endpoint);
@@ -449,7 +471,49 @@ function ApiDocsPage() {
         </div>
       </nav>
 
-      <section className="multimodal-guide glass-panel" aria-labelledby="multimodal-guide-heading">
+      <div className="api-tabs api-primary-tabs" role="tablist" aria-label="API groups">
+        <button
+          id="api-tab-manager"
+          type="button"
+          role="tab"
+          aria-controls="api-panel-manager"
+          aria-selected={activeTab === 'manager'}
+          tabIndex={activeTab === 'manager' ? 0 : -1}
+          className={`api-tab ${activeTab === 'manager' ? 'active' : ''}`}
+          onClick={() => selectApiTab('manager')}
+          onKeyDown={handleApiTabKeyDown}
+        >
+          Manager API ({managerEndpoints.length})
+        </button>
+        <button
+          id="api-tab-openai"
+          type="button"
+          role="tab"
+          aria-controls="api-panel-openai"
+          aria-selected={activeTab === 'openai'}
+          tabIndex={activeTab === 'openai' ? 0 : -1}
+          className={`api-tab ${activeTab === 'openai' ? 'active' : ''}`}
+          onClick={() => selectApiTab('openai')}
+          onKeyDown={handleApiTabKeyDown}
+        >
+          OpenAI API ({openaiEndpoints.length})
+        </button>
+      </div>
+
+      <section
+        className="api-tab-panel"
+        id={`api-panel-${activeTab}`}
+        role="tabpanel"
+        aria-labelledby={`api-tab-${activeTab}`}
+        tabIndex={0}
+      >
+        {activeTab === 'openai' && (
+          <details className="multimodal-guide-disclosure glass-panel">
+            <summary>
+              <span>Multimodal request guide</span>
+              <span>Images, audio, video, and YouTube</span>
+            </summary>
+            <section className="multimodal-guide" aria-labelledby="multimodal-guide-heading">
         <div className="multimodal-guide-header">
           <div>
             <p className="api-eyebrow">Content-part guide</p>
@@ -515,28 +579,9 @@ function ApiDocsPage() {
             <code>input_audio</code>; <code>audio_url</code> supports remote audio.
           </span>
         </div>
-      </section>
-
-      <div className="api-tabs" role="tablist" aria-label="API groups">
-        <button
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'manager'}
-          className={`api-tab glass-btn ${activeTab === 'manager' ? 'active' : ''}`}
-          onClick={() => { setActiveTab('manager'); setActiveEndpoint(null); setResponse(null); }}
-        >
-          Manager API ({managerEndpoints.length})
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'openai'}
-          className={`api-tab glass-btn ${activeTab === 'openai' ? 'active' : ''}`}
-          onClick={() => { setActiveTab('openai'); setActiveEndpoint(null); setResponse(null); }}
-        >
-          OpenAI API ({openaiEndpoints.length})
-        </button>
-      </div>
+            </section>
+          </details>
+        )}
 
       {specLoading ? (
         <div className="api-spec-state glass-panel" role="status">
@@ -728,6 +773,7 @@ function ApiDocsPage() {
           </main>
         </div>
       )}
+      </section>
     </div>
   );
 }

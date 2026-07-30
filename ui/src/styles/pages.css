@@ -430,7 +430,7 @@
 }
 
 .api-resource-links.glass-panel,
-.multimodal-guide.glass-panel,
+.multimodal-guide-disclosure.glass-panel,
 .api-spec-state.glass-panel {
   padding: clamp(16px, 2vw, 24px);
   margin-bottom: 20px;
@@ -482,6 +482,9 @@
 }
 
 .docs-resource-link:focus-visible,
+.api-tab:focus-visible,
+.api-tab-panel:focus-visible,
+.multimodal-guide-disclosure > summary:focus-visible,
 .endpoint-item:focus-visible,
 .code-sample-tab:focus-visible,
 .guide-example-button:focus-visible,
@@ -492,9 +495,75 @@
   outline-offset: 2px;
 }
 
+.api-primary-tabs {
+  margin: 0 0 16px;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-soft);
+}
+
+.api-primary-tabs .api-tab {
+  min-width: 180px;
+  min-height: 44px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+
+.api-primary-tabs .api-tab + .api-tab {
+  border-left: 1px solid var(--glass-border);
+}
+
+.api-primary-tabs .api-tab:hover:not(.active) {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+.api-primary-tabs .api-tab.active {
+  color: var(--control-contrast);
+  background: var(--accent);
+  box-shadow: inset 0 -3px 0 color-mix(in srgb, #fff 35%, transparent);
+}
+
+.api-tab-panel {
+  display: flow-root;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 1px;
+}
+
+.multimodal-guide-disclosure.glass-panel {
+  padding: 0;
+  overflow: hidden;
+}
+
+.multimodal-guide-disclosure > summary {
+  min-height: 56px;
+  padding: 12px 16px;
+  cursor: pointer;
+}
+
+.multimodal-guide-disclosure > summary span:first-child {
+  margin: 0 18px 0 8px;
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.multimodal-guide-disclosure > summary span:nth-child(2) {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
 .multimodal-guide {
   display: grid;
   gap: 18px;
+  padding: clamp(16px, 2vw, 24px);
+  border-top: 1px solid var(--glass-border);
 }
 
 .multimodal-guide-header {
@@ -843,6 +912,17 @@
     display: grid;
     grid-template-columns: 1fr;
     width: 100%;
+  }
+
+  .api-primary-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0;
+  }
+
+  .api-primary-tabs .api-tab {
+    width: auto;
+    min-width: 0;
+    padding-inline: 10px;
   }
 
   .settings-tabs .glass-btn,
