@@ -73,7 +73,7 @@ import {
   validateConversationCacheKey,
 } from './context-cache.js';
 import { DurableSlotCacheRegistry } from './slot-cache-registry.js';
-import { eraseSlotForColdAssignment } from './slot-ownership.js';
+import { eraseSlotForColdAssignment, fetchModelSlotsWhenReady } from './slot-ownership.js';
 import { contextCapabilities, modelSupportsSlotOperations } from './context-capabilities.js';
 import { PriorityRequestQueue } from './request-queue.js';
 import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
@@ -468,14 +468,13 @@ async function maybeRestoreSlot(model, slotAssignment) {
   if (!rec) return false;
   try {
     // Probe the assigned slot's current state to decide cold-vs-warm.
-    let slotState = null;
-    try {
-      const r = await fetch(`http://localhost:${LLAMA_PORT}/slots?model=${encodeURIComponent(model)}`, { signal: AbortSignal.timeout(3000) });
-      if (r.ok) {
-        const arr = await r.json();
-        if (Array.isArray(arr)) slotState = arr.find(s => s.id === slotAssignment.slotId) || null;
-      }
-    } catch { /* treat as cold */ }
+    const slots = await fetchModelSlotsWhenReady({
+      baseUrl: `http://localhost:${LLAMA_PORT}`,
+      model,
+      signal: AbortSignal.timeout(MODEL_LOAD_WAIT_MS),
+      waitForReady: readyModel => waitForModelReady(readyModel, { label: 'slot-cache' }),
+    });
+    const slotState = slots?.find(slot => slot.id === slotAssignment.slotId) || null;
     if (!shouldRestoreSlot({ savedFile: rec, slotState })) return false;
     const rr = await fetch(`http://localhost:${LLAMA_PORT}/slots/${slotAssignment.slotId}?action=restore`, {
       method: 'POST',
