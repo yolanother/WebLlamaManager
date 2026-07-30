@@ -73,7 +73,11 @@ import {
   validateConversationCacheKey,
 } from './context-cache.js';
 import { DurableSlotCacheRegistry } from './slot-cache-registry.js';
-import { eraseSlotForColdAssignment, fetchModelSlotsWhenReady } from './slot-ownership.js';
+import {
+  eraseSlotForColdAssignment,
+  fetchModelSlotsWhenReady,
+  restoreModelSlotWhenReady,
+} from './slot-ownership.js';
 import { contextCapabilities, modelSupportsSlotOperations } from './context-capabilities.js';
 import { PriorityRequestQueue } from './request-queue.js';
 import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
@@ -476,20 +480,20 @@ async function maybeRestoreSlot(model, slotAssignment) {
     });
     const slotState = slots?.find(slot => slot.id === slotAssignment.slotId) || null;
     if (!shouldRestoreSlot({ savedFile: rec, slotState })) return false;
-    const rr = await fetch(`http://localhost:${LLAMA_PORT}/slots/${slotAssignment.slotId}?action=restore`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename: rec.filename, model }),
-      signal: AbortSignal.timeout(60000)
+    const restored = await restoreModelSlotWhenReady({
+      baseUrl: `http://localhost:${LLAMA_PORT}`,
+      model,
+      slotId: slotAssignment.slotId,
+      filename: rec.filename,
+      signal: AbortSignal.timeout(MODEL_LOAD_WAIT_MS),
+      waitForReady: readyModel => waitForModelReady(readyModel, { label: 'slot-cache' }),
     });
-    if (rr.ok) {
-      const j = await rr.json().catch(() => ({}));
-      console.log(`[slot-cache] RESTORE model=${model} slot=${slotAssignment.slotId} file=${rec.filename} n_restored=${j?.n_restored ?? '?'}`);
+    if (restored) {
+      console.log(`[slot-cache] RESTORE model=${model} slot=${slotAssignment.slotId} file=${rec.filename} n_restored=${restored.n_restored ?? '?'}`);
       return true;
     }
     // Restore failed (missing/stale dump, ctx mismatch). Drop the dangling record.
-    const txt = await rr.text().catch(() => '');
-    console.warn(`[slot-cache] restore failed slot=${slotAssignment.slotId} file=${rec.filename}: ${rr.status} ${txt.slice(0, 120)}`);
+    console.warn(`[slot-cache] restore failed slot=${slotAssignment.slotId} file=${rec.filename}`);
     slotCacheRegistry.invalidate({
       scopeId: slotAssignment.scopeId,
       resolvedModel: model,
