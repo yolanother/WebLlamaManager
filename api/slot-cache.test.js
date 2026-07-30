@@ -86,6 +86,18 @@ test('shouldRestoreSlot: saved file + warm slot (has cached tokens) => skip', ()
   assert.equal(shouldRestoreSlot({ savedFile: { filename: 'x' }, slotState: { n_prompt_tokens: 1200, is_processing: false } }), false);
 });
 
+test('shouldRestoreSlot: b9820 warm slot with processed tokens but zero prompt tokens => skip', () => {
+  assert.equal(shouldRestoreSlot({
+    savedFile: { filename: 'x' },
+    slotState: {
+      n_prompt_tokens: 0,
+      n_prompt_tokens_processed: 1200,
+      n_prompt_tokens_cache: 0,
+      is_processing: false,
+    },
+  }), false);
+});
+
 test('shouldRestoreSlot: saved file + busy slot => skip (do not disturb in-flight)', () => {
   assert.equal(shouldRestoreSlot({ savedFile: { filename: 'x' }, slotState: { n_prompt_tokens: 0, is_processing: true } }), false);
 });

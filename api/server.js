@@ -50,11 +50,29 @@ import { resolveDefaultModel, defaultModelListEntries, ds4PresetForModel, valida
 import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
-import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-cache.js';
+import { slotCacheFilename, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import { aggregateRequestStats } from './request-stats.js';
 import { createMediaRouter } from './media.js';
 import { expandMessages } from './multimodal-expand.js';
+import {
+  ContextUpstreamError,
+  managerControlledContextBody,
+  requestExactInputTokens,
+} from './context-endpoints.js';
+import {
+  canonicalHash,
+  compatibilityFingerprint,
+  deriveConversationCacheIdentity,
+  conversationLineageKey,
+  deriveCacheScope,
+  PreparedContextStore,
+  SlotAffinityRegistry,
+  validateConversationCacheKey,
+} from './context-cache.js';
+import { DurableSlotCacheRegistry } from './slot-cache-registry.js';
+import { PriorityRequestQueue } from './request-queue.js';
+import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
 import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
@@ -278,96 +296,7 @@ let activeLocalModel = null; // model currently being processed/loaded on local 
 let loadedModelsSnapshot = [];
 let idleShutdown = false;   // true when server was stopped due to idle timeout
 
-// Request concurrency limiter for llama.cpp upstream requests
-class RequestQueue {
-  constructor(concurrency = 1) {
-    this.concurrency = concurrency;
-    this.running = 0;
-    this.queue = [];
-    this.queuedCount = 0; // total requests that had to wait
-    this._nextId = 1;
-    this.activeItems = new Map(); // id -> { id, model, endpoint, startTime }
-  }
-
-  setConcurrency(n) {
-    this.concurrency = Math.max(1, n);
-    this._drain();
-  }
-
-  async acquire(meta = {}) {
-    const id = this._nextId++;
-    const item = { id, ...meta, enqueuedAt: Date.now(), status: 'active' };
-    if (this.running < this.concurrency) {
-      this.running++;
-      item.startedAt = Date.now();
-      this.activeItems.set(id, item);
-      return id;
-    }
-    this.queuedCount++;
-    item.status = 'pending';
-    return new Promise((resolve, reject) => {
-      item._resolve = resolve;
-      item._reject = reject;
-      this.queue.push(item);
-    });
-  }
-
-  flush() {
-    const count = this.queue.length;
-    for (const entry of this.queue) {
-      entry._reject(new Error('Queue flushed'));
-    }
-    this.queue = [];
-    return count;
-  }
-
-  cancel(id) {
-    const idx = this.queue.findIndex(e => e.id === id);
-    if (idx >= 0) {
-      const entry = this.queue.splice(idx, 1)[0];
-      entry._reject(new Error('Request cancelled'));
-      return true;
-    }
-    return false;
-  }
-
-  release(id) {
-    this.running--;
-    if (id) this.activeItems.delete(id);
-    this._drain();
-  }
-
-  _drain() {
-    while (this.queue.length > 0 && this.running < this.concurrency) {
-      this.running++;
-      const item = this.queue.shift();
-      item.status = 'active';
-      item.startedAt = Date.now();
-      this.activeItems.set(item.id, item);
-      item._resolve(item.id);
-    }
-  }
-
-  get pending() { return this.queue.length; }
-  get active() { return this.running; }
-
-  // Get all items (active + pending) for the queue management UI
-  getItems() {
-    const active = [...this.activeItems.values()].map(i => ({
-      id: i.id, model: i.model || 'unknown', endpoint: i.endpoint || '',
-      enqueuedAt: i.enqueuedAt, startedAt: i.startedAt, status: 'active',
-      elapsed: Date.now() - (i.startedAt || i.enqueuedAt)
-    }));
-    const pending = this.queue.map(i => ({
-      id: i.id, model: i.model || 'unknown', endpoint: i.endpoint || '',
-      enqueuedAt: i.enqueuedAt, startedAt: null, status: 'pending',
-      elapsed: Date.now() - i.enqueuedAt
-    }));
-    return [...active, ...pending];
-  }
-}
-
-const llamaQueue = new RequestQueue(1); // default: 1 concurrent request
+const llamaQueue = new PriorityRequestQueue(1); // default: 1 concurrent request
 
 // Timestamp of the most recent LOCAL request completion (slot release). Used by the
 // queue-admission policy to tell a deep-but-DRAINING queue (completions still happening)
@@ -381,50 +310,17 @@ let lastLocalCompletionAt = Date.now();
 const DEFAULT_LOCAL_STALL_MS = 60_000;
 const STALL_WATCHDOG_INTERVAL = 5_000;
 
-// === Prefix cache router (Phase 1: sticky-slot routing) ============================
-//
-// llama.cpp's per-slot KV cache automatically matches a request's prompt prefix
-// against whatever the slot last processed and re-uses the matching tokens —
-// only the diff at the tail is re-prompt-processed. When two requests for the
-// same conversation land on different slots, that benefit is lost.
-//
-// We exploit this by hashing the conversation prefix (everything except the
-// last user turn) and remembering which slot last served that prefix for a
-// given model. Subsequent requests for the same prefix are pinned to that
-// slot via the `id_slot` field on the chat completion body — llama.cpp then
-// auto-matches the cached prefix and only processes the new tail. Up to
-// n_parallel distinct conversations cache hot at once.
-//
-// Key shape: `${model}|${sha1(prefixJson).slice(0,16)}`
-// Value:     { slotId, lastUsedAt, hits, misses }
-const conversationSlotMap = new Map();
-const CONVERSATION_MAP_MAX = 256; // LRU cap; bigger than n_parallel since we evict naturally
-
-// Compute a stable hash of the prefix (all messages except the trailing user
-// turn). Returns null if there's no useful prefix to hash on (e.g. the request
-// is just a single user message — nothing to cache).
-function conversationPrefixKey(model, messages) {
-  if (!Array.isArray(messages) || messages.length < 2) return null;
-  // Slice off the trailing run of user messages so we hash on the durable prefix.
-  let cutoff = messages.length;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === 'user') cutoff = i;
-    else break;
-  }
-  if (cutoff <= 0) return null;
-  const prefix = messages.slice(0, cutoff);
-  try {
-    // crypto is already imported up top; use sha1 for speed (not security)
-    const h = createHash('sha1').update(JSON.stringify(prefix)).digest('hex').slice(0, 16);
-    return `${model}|${h}`;
-  } catch { return null; }
-}
+// === Conversation affinity ========================================================
+// Stable caller identities remain opaque and are scoped by Authorization. Clients
+// without the extension use a hashed conversation head, which remains unchanged as
+// turns grow and fixes the former per-turn prefix-key drift. One-shot prompts are not
+// pinned, leaving llama.cpp free to use native prompt-similarity slot selection.
+const slotAffinity = new SlotAffinityRegistry({ maxLineages: 256 });
 
 // Slot count for the loaded llama-server (cached). Discovered by hitting /slots.
 // Default 4 (matches the n_parallel we observed) until we can probe.
 let llamaSlotCount = 4;
 let _slotCountProbed = false;
-let _slotRoundRobin = 0;
 async function probeSlotCount(model) {
   if (_slotCountProbed) return;
   try {
@@ -439,32 +335,21 @@ async function probeSlotCount(model) {
   } catch { /* ignore */ }
 }
 
-// Pick or assign a slot for a conversation. Returns { slotId, hit, key } or
-// null if not applicable. We assign slots via round-robin for misses; on a
-// hit we return the same slot the prefix was last seen on so llama.cpp's
-// per-slot auto-prefix-match kicks in.
-function lookupOrAssignSlot(model, messages) {
-  const key = conversationPrefixKey(model, messages);
-  if (!key) return null;
-  const existing = conversationSlotMap.get(key);
-  if (existing) {
-    existing.lastUsedAt = Date.now();
-    existing.hits = (existing.hits || 0) + 1;
-    // Move-to-front for LRU
-    conversationSlotMap.delete(key);
-    conversationSlotMap.set(key, existing);
-    return { slotId: existing.slotId, hit: true, key };
-  }
-  // New prefix: assign next slot in round-robin so we spread distinct
-  // conversations across slots and minimize evictions.
-  const slotId = _slotRoundRobin % llamaSlotCount;
-  _slotRoundRobin = (_slotRoundRobin + 1) >>> 0;
-  conversationSlotMap.set(key, { slotId, lastUsedAt: Date.now(), hits: 0, misses: 1 });
-  if (conversationSlotMap.size > CONVERSATION_MAP_MAX) {
-    const oldestKey = conversationSlotMap.keys().next().value;
-    conversationSlotMap.delete(oldestKey);
-  }
-  return { slotId, hit: false, key };
+/** Resolve and assign a scope-safe, stable conversation lineage. */
+function lookupOrAssignSlot(model, body, headers) {
+  const identity = deriveConversationCacheIdentity({
+    explicitKey: body?.conversation_cache_key ?? body?.prompt_cache_key,
+    messages: body?.messages,
+  });
+  if (!identity) return null;
+  const scope = deriveCacheScope(headers);
+  const lineageKey = conversationLineageKey({
+    scopeId: scope.id,
+    resolvedModel: model,
+    conversationCacheKey: identity.key,
+  });
+  const assignment = slotAffinity.assign({ model, lineageKey, slotCount: llamaSlotCount });
+  return { ...assignment, key: lineageKey, lineageKey, scopeId: scope.id, identitySource: identity.source };
 }
 
 // === Slot KV-cache disk persistence =================================================
@@ -483,33 +368,47 @@ function lookupOrAssignSlot(model, messages) {
 // dumps and this manager (running on the host) reads their sizes / evicts them.
 const SLOT_SAVE_DIR = RUNTIME_PATHS.slotCacheDir;
 const SLOT_CACHE_DEFAULTS = { enabled: true, maxBytes: 24 * 1024 * 1024 * 1024, maxCount: 64 };
-// conversation prefix key -> { filename, model, slotId, bytes, savedAt }
-const conversationSlotFiles = new Map();
 try { mkdirSync(SLOT_SAVE_DIR, { recursive: true }); } catch { /* best-effort */ }
+const slotCacheRegistry = new DurableSlotCacheRegistry({
+  directory: SLOT_SAVE_DIR,
+  maxBytes: SLOT_CACHE_DEFAULTS.maxBytes,
+  maxCount: SLOT_CACHE_DEFAULTS.maxCount,
+});
+try { slotCacheRegistry.load(); } catch { /* corrupt or inaccessible storage fails cold */ }
+const modelCompatibilityCache = new Map();
 
 /** Resolve the effective slot-cache config (config.slotCache overrides defaults). */
 function slotCacheCfg() {
   return { ...SLOT_CACHE_DEFAULTS, ...(config?.slotCache || {}) };
 }
 
-/**
- * Delete the oldest slot dumps until the on-disk cache is under both the byte
- * and count caps. The just-saved `keepFilename` is never evicted. Best-effort:
- * unlink failures are ignored (the in-memory record is still dropped).
- * @param {string} [keepFilename] - A filename that must survive this pass.
- */
-function enforceSlotDiskBound(keepFilename) {
-  const cfg = slotCacheCfg();
-  const files = [...conversationSlotFiles.values()];
-  const toEvict = planSlotEviction({ files, maxBytes: cfg.maxBytes, maxCount: cfg.maxCount, keep: keepFilename });
-  if (!toEvict.length) return;
-  const evictSet = new Set(toEvict);
-  for (const [key, rec] of conversationSlotFiles) {
-    if (!evictSet.has(rec.filename)) continue;
-    try { unlinkSync(join(SLOT_SAVE_DIR, rec.filename)); } catch { /* already gone */ }
-    conversationSlotFiles.delete(key);
-  }
-  console.log(`[slot-cache] evicted ${toEvict.length} dump(s) to stay under cap (max ${cfg.maxCount} files / ${Math.round(cfg.maxBytes / 1e9)}GB)`);
+/** Resolve a short-lived fingerprint of live model/template/tokenizer properties. */
+async function modelCompatibilityHash(model) {
+  const cached = modelCompatibilityCache.get(model);
+  if (cached && Date.now() - cached.checkedAt < 60_000) return cached.hash;
+  let props = null;
+  try {
+    const response = await fetch(`http://localhost:${LLAMA_PORT}/props?model=${encodeURIComponent(model)}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (response.ok) props = await response.json();
+  } catch { /* a conservative model-only fingerprint still prevents cross-model reuse */ }
+  const hash = compatibilityFingerprint({
+    resolvedModel: model,
+    engine: ENGINE_TYPES.LLAMA,
+    template: props?.chat_template ?? props?.default_generation_settings?.chat_template ?? null,
+    tokenizer: props ? {
+      model: props['tokenizer.ggml.model'] ?? props?.tokenizer?.model ?? null,
+      vocabulary: props.n_vocab ?? props?.tokenizer?.n_vocab ?? null,
+      bos: props.bos_token ?? null,
+      eos: props.eos_token ?? null,
+    } : null,
+    projector: props?.modalities ?? props?.model_meta?.projector ?? null,
+    adapters: props?.adapters ?? null,
+    runtime: props?.default_generation_settings ?? null,
+  });
+  modelCompatibilityCache.set(model, { hash, checkedAt: Date.now() });
+  return hash;
 }
 
 /**
@@ -524,7 +423,12 @@ function enforceSlotDiskBound(keepFilename) {
 async function maybeRestoreSlot(model, slotAssignment) {
   if (!slotCacheCfg().enabled) return false;
   if (!slotAssignment || slotAssignment.slotId == null || !slotAssignment.key) return false;
-  const rec = conversationSlotFiles.get(slotAssignment.key);
+  const rec = slotCacheRegistry.find({
+    scopeId: slotAssignment.scopeId,
+    resolvedModel: model,
+    lineageKey: slotAssignment.lineageKey,
+    compatibilityHash: slotAssignment.compatibilityHash,
+  });
   if (!rec) return false;
   try {
     // Probe the assigned slot's current state to decide cold-vs-warm.
@@ -551,7 +455,11 @@ async function maybeRestoreSlot(model, slotAssignment) {
     // Restore failed (missing/stale dump, ctx mismatch). Drop the dangling record.
     const txt = await rr.text().catch(() => '');
     console.warn(`[slot-cache] restore failed slot=${slotAssignment.slotId} file=${rec.filename}: ${rr.status} ${txt.slice(0, 120)}`);
-    conversationSlotFiles.delete(slotAssignment.key);
+    slotCacheRegistry.invalidate({
+      scopeId: slotAssignment.scopeId,
+      resolvedModel: model,
+      lineageKey: slotAssignment.lineageKey,
+    });
   } catch { /* best-effort */ }
   return false;
 }
@@ -578,12 +486,17 @@ async function saveSlotAfterRequest(model, slotAssignment) {
     if (!r.ok) return; // 501 (no --slot-save-path) or slot busy — skip silently
     const j = await r.json().catch(() => ({}));
     if (!j || !(j.n_saved > 0)) return; // empty slot, nothing worth keeping
-    conversationSlotFiles.set(slotAssignment.key, {
-      filename, model, slotId: slotAssignment.slotId,
-      bytes: j.n_written || 0, savedAt: Date.now()
+    slotCacheRegistry.put({
+      filename,
+      scopeId: slotAssignment.scopeId,
+      lineageKey: slotAssignment.lineageKey,
+      resolvedModel: model,
+      compatibilityHash: slotAssignment.compatibilityHash,
+      prefixHash: slotAssignment.prefixHash,
+      slotId: slotAssignment.slotId,
+      savedAt: Date.now(),
     });
     console.log(`[slot-cache] SAVE model=${model} slot=${slotAssignment.slotId} file=${filename} n_saved=${j.n_saved} bytes=${j.n_written || 0}`);
-    enforceSlotDiskBound(filename);
   } catch { /* best-effort */ }
 }
 
@@ -631,7 +544,7 @@ function initBackendQueues() {
   backendQueues.clear();
   const dir = config?.backends?.directory || [];
   for (const backend of dir) {
-    backendQueues.set(backend.id, new RequestQueue(backend.maxConcurrentRequests || 5));
+    backendQueues.set(backend.id, new PriorityRequestQueue(backend.maxConcurrentRequests || 5));
     if (!backendStats.has(backend.id)) {
       backendStats.set(backend.id, {
         id: backend.id,
@@ -706,7 +619,7 @@ function estimateLocalProcessingMs(inputTokens) {
 }
 
 // Resolve which backend should handle a request
-function resolveBackend(requestedModel, endpoint, body) {
+function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = {}) {
   const backends = config.backends || {};
   if (!backends.enabled || !backends.directory?.length) {
     return { remote: false };
@@ -718,6 +631,9 @@ function resolveBackend(requestedModel, endpoint, body) {
     const prefix = requestedModel.substring(0, slashIdx);
     const explicitBackend = backends.directory.find(b => b.id === prefix && b.enabled && b.tested);
     if (explicitBackend) {
+      if (localOnly) {
+        return { remote: false, localOnly: true, offloadSuppressed: true, suppressionReason: 'explicit_remote_backend' };
+      }
       const remoteModel = requestedModel.substring(slashIdx + 1);
       return buildRemoteRouting(explicitBackend, remoteModel, endpoint);
     }
@@ -862,7 +778,12 @@ function resolveBackend(requestedModel, endpoint, body) {
   }
 
   if (!shouldOffload) {
-    return { remote: false };
+    return { remote: false, localOnly };
+  }
+
+  if (localOnly) {
+    console.log(`[routing] offload-suppressed(local_only): keeping "${requestedModel}" on the local lane`);
+    return { remote: false, localOnly: true, offloadSuppressed: true, suppressionReason: 'local_only' };
   }
 
   // Pick best backend (must be enabled, tested, have capacity, and have a model mapping)
@@ -2612,18 +2533,16 @@ async function getSystemStats() {
       stallMs: config?.localStallMs ?? DEFAULT_LOCAL_STALL_MS
     },
     prefixCache: (() => {
-      let hits = 0, misses = 0;
-      for (const v of conversationSlotMap.values()) {
-        hits += v.hits || 0;
-        misses += v.misses || 0;
-      }
+      const { entries, affinityHits, assignments } = slotAffinity.stats();
       return {
-        entries: conversationSlotMap.size,
+        entries,
         slots: llamaSlotCount,
         slotsDetected: _slotCountProbed,
-        hits,
-        misses,
-        hitRate: hits + misses > 0 ? Math.round((hits / (hits + misses)) * 1000) / 10 : null
+        affinityHits,
+        assignments,
+        hitRate: affinityHits + assignments > 0
+          ? Math.round((affinityHits / (affinityHits + assignments)) * 1000) / 10
+          : null
       };
     })(),
     activeModel: activeRequests.size > 0 ? [...activeRequests.values()][0]?.model : null,
@@ -7071,6 +6990,82 @@ async function handleModels(req, res) {
 app.get('/api/v1/models', handleModels);
 app.get('/v1/models', handleModels);
 
+/**
+ * Proxy an exact input-token request to the concrete local llama.cpp model.
+ * Remote and DS4 paths return explicit unsupported results because their
+ * tokenizer/template state is not available to this manager process.
+ * @param {'chat'|'responses'} kind OpenAI request family.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Completes the HTTP response.
+ */
+async function handleExactInputTokenRequest(kind, req, res) {
+  const rawModel = req.body?.model || 'default';
+  const resolvedModel = resolveDefaultModel(rawModel, config);
+  const endpoint = kind === 'chat' ? 'chat/completions' : 'responses';
+
+  if (currentEngine !== ENGINE_TYPES.LLAMA || ds4PresetForModel(config, resolvedModel)) {
+    res.status(501).json({
+      error: {
+        message: `exact ${kind} input counting is unsupported for the active DS4 engine`,
+        type: 'unsupported_feature',
+        code: 'exact_input_tokens_unsupported',
+      },
+      requested_model: rawModel,
+      resolved_model: resolvedModel,
+      engine: currentEngine,
+    });
+    return;
+  }
+
+  const routing = resolveBackend(resolvedModel, endpoint, req.body || {});
+  if (routing.remote) {
+    res.status(501).json({
+      error: {
+        message: `exact ${kind} input counting is not advertised by remote backend ${routing.backend.id}`,
+        type: 'unsupported_feature',
+        code: 'exact_input_tokens_unsupported',
+      },
+      requested_model: rawModel,
+      resolved_model: resolvedModel,
+      engine: 'remote',
+      backend: routing.backend.id,
+    });
+    return;
+  }
+
+  try {
+    await acquireLocalSlot(req, res, { model: resolvedModel, endpoint: `${endpoint}/input_tokens` });
+    await ensureModelServed(resolvedModel);
+    const result = await requestExactInputTokens({
+      kind,
+      baseUrl: `http://localhost:${LLAMA_PORT}`,
+      requestedModel: rawModel,
+      resolvedModel,
+      engine: ENGINE_TYPES.LLAMA,
+      body: req.body || {},
+      signal: req.signal,
+    });
+    res.json(result);
+  } catch (error) {
+    const status = error instanceof ContextUpstreamError ? error.status : (error.statusCode || 502);
+    res.status(status).json({
+      error: {
+        message: error.message || 'exact input counting failed',
+        type: status === 400 ? 'invalid_request_error' : 'upstream_error',
+        code: 'exact_input_tokens_failed',
+        ...(error.details ? { details: error.details } : {}),
+      },
+      requested_model: rawModel,
+      resolved_model: resolvedModel,
+      engine: ENGINE_TYPES.LLAMA,
+    });
+  }
+}
+
+app.post('/api/v1/chat/completions/input_tokens', (req, res) => handleExactInputTokenRequest('chat', req, res));
+app.post('/api/v1/responses/input_tokens', (req, res) => handleExactInputTokenRequest('responses', req, res));
+
 // Sanitize messages for llama.cpp chat templates that reject both content+thinking on tool_calls
 function sanitizeMessages(messages) {
   if (!Array.isArray(messages)) return messages;
@@ -7185,7 +7180,15 @@ async function waitForModelReady(model, { maxWait = MODEL_LOAD_WAIT_MS, pollInte
 // actually serializes GPU work. Returns { release, queueWait }. Safe to call once per
 // proxy handler invocation; subsequent fetchWithRetry calls within the same handler
 // share the held slot.
-async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait } = {}) {
+async function acquireLocalSlot(req, res, {
+  model,
+  endpoint,
+  activeReqId,
+  onWait,
+  priority = 'interactive',
+  onPreempt,
+  beforeRelease,
+} = {}) {
   const queueStart = Date.now();
 
   // Guard: smart queue admission. We must NOT fail requests just because the queue is busy.
@@ -7247,7 +7250,7 @@ async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait
 
   let slotId;
   try {
-    slotId = await llamaQueue.acquire({ model: model || endpoint, endpoint, activeReqId });
+    slotId = await llamaQueue.acquire({ model: model || endpoint, endpoint, activeReqId, priority, onPreempt });
   } finally {
     if (waitTimer) clearInterval(waitTimer);
   }
@@ -7268,6 +7271,7 @@ async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait
     }
   }
   let released = false;
+  let releasePending = false;
   const release = () => {
     if (released) return;
     released = true;
@@ -7285,8 +7289,15 @@ async function acquireLocalSlot(req, res, { model, endpoint, activeReqId, onWait
     // listeners would never trigger and the slot would leak. Check
     // destroyed/writableEnded synchronously after attaching listeners and
     // release immediately if we're already past the point of no return.
-    res.on('close', release);
-    res.on('finish', release);
+    res.on('finish', async () => {
+      if (released || releasePending) return;
+      releasePending = true;
+      try { await beforeRelease?.(); } catch { /* persistence is best effort */ }
+      release();
+    });
+    res.on('close', () => {
+      if (!releasePending) release();
+    });
     if (res.destroyed || res.writableEnded) {
       release();
     }
@@ -7677,6 +7688,12 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
 async function handleChatCompletions(req, res) {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
+  let requestPolicy;
+  try {
+    requestPolicy = managerRequestPolicy(req.body, req.headers);
+  } catch (error) {
+    return res.status(400).json({ error: { message: error.message, type: 'invalid_request_error', code: 'invalid_manager_policy' } });
+  }
   // Normalize messages: accept stringified JSON arrays for compatibility
   if (typeof req.body.messages === 'string') {
     try {
@@ -7753,7 +7770,7 @@ async function handleChatCompletions(req, res) {
   }
 
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
-  const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
+  const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(stripManagerRequestFields(req.body)));
 
   // ── ds4 engine active (EXCLUSIVE mode) ───────────────────────────────────────
   // ds4 owns the box: a request for the ds4 model is served locally on ds4-server
@@ -7768,7 +7785,19 @@ async function handleChatCompletions(req, res) {
       hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'chat/completions'),
     });
     if (decision.target === 'local-ds4') {
+      req.body = proxyBody;
       return proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime, mediaMetadata });
+    }
+    if (requestPolicy.localOnly) {
+      addLog('backends', `offload-suppressed(local_only): ds4 exclusive cannot locally serve '${requestedModel}'`);
+      return res.status(503).json({
+        error: {
+          message: `Local-only request cannot be served while DS4 exclusively owns the local engine`,
+          type: 'local_backend_unavailable',
+          code: 'LOCAL_ONLY_UNAVAILABLE',
+        },
+        _llama_manager: { routing: 'local_only', routing_outcome: 'rejected', offload_suppressed: true },
+      });
     }
     if (decision.target === 'reject') {
       const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
@@ -7782,7 +7811,7 @@ async function handleChatCompletions(req, res) {
     console.log(`[chat/completions] ds4 exclusive: offloading non-ds4 model '${requestedModel}' to ${backend.name} (${remoteModel})`);
   } else {
     // Resolve backend routing (local vs remote) the normal way.
-    routing = resolveBackend(requestedModel, 'chat/completions', req.body);
+    routing = resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly });
   }
 
   // Prefix-cache routing (local only): pin same-conversation requests to the
@@ -7791,7 +7820,11 @@ async function handleChatCompletions(req, res) {
   // llama.cpp may pick differently if our slot is busy.
   let slotAssignment = null;
   if (!routing.remote && Array.isArray(req.body.messages)) {
-    slotAssignment = lookupOrAssignSlot(requestedModel, req.body.messages);
+    try {
+      slotAssignment = lookupOrAssignSlot(requestedModel, req.body, req.headers);
+    } catch (error) {
+      return res.status(400).json({ error: { message: error.message, type: 'invalid_request_error', code: 'invalid_conversation_cache_key' } });
+    }
     if (slotAssignment && slotAssignment.slotId != null) {
       proxyBody.id_slot = slotAssignment.slotId;
       proxyBody.cache_prompt = true; // explicit; llama.cpp default is also true
@@ -7803,7 +7836,14 @@ async function handleChatCompletions(req, res) {
     if (!_slotCountProbed) probeSlotCount(requestedModel).catch(() => {});
   }
 
-  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: routing.remote ? routing.backend.id : 'local' });
+  const activeReqId = startActiveRequest({
+    model: requestedModel,
+    endpoint: 'chat/completions',
+    messages: req.body.messages,
+    backend: routing.remote ? routing.backend.id : 'local',
+    priority: requestPolicy.priority,
+    routing: requestPolicy.routing,
+  });
   // Record which llama.cpp slot we asked for, so the upstream probe can find
   // the right row instead of guessing.
   if (slotAssignment && slotAssignment.slotId != null) {
@@ -7850,17 +7890,6 @@ async function handleChatCompletions(req, res) {
   };
   res.on('finish', () => cleanupActive(res.statusCode >= 400 ? 'error' : 'complete'));
   res.on('close', () => cleanupActive('client_disconnect'));
-
-  // Slot KV-cache persistence: once a local request finishes successfully, the
-  // assigned slot holds the full prompt+completion KV — snapshot it to disk
-  // (async, best-effort) so a future model reload can restore instead of cold-
-  // prefilling. Fires first on 'finish', before another queued request can grab
-  // and overwrite the slot (queue-acquire + model-serve happens long after).
-  res.on('finish', () => {
-    if (!routing.remote && res.statusCode < 400 && slotAssignment && slotAssignment.slotId != null) {
-      saveSlotAfterRequest(requestedModel, slotAssignment).catch(() => {});
-    }
-  });
 
   // ===== REMOTE BACKEND PATH =====
   if (routing.remote) {
@@ -8124,6 +8153,19 @@ async function handleChatCompletions(req, res) {
   try {
     const slot = await acquireLocalSlot(req, res, {
       model: requestedModel, endpoint: 'chat/completions', activeReqId,
+      priority: requestPolicy.priority,
+      onPreempt: requestPolicy.priority === 'background' ? () => {
+        const active = activeRequests.get(activeReqId);
+        if (active) {
+          active.preemptedByRealtime = true;
+          try { active.abortController?.abort('realtime_request'); } catch { /* best effort */ }
+        }
+      } : null,
+      beforeRelease: async () => {
+        if (res.statusCode < 400 && slotAssignment && slotAssignment.slotId != null) {
+          await saveSlotAfterRequest(requestedModel, slotAssignment);
+        }
+      },
       onWait: isStreaming ? ({ position, pending, waitedMs }) => {
         flushSseHeaders();
         const pos = position != null ? position + 1 : '?';
@@ -8259,6 +8301,10 @@ async function handleChatCompletions(req, res) {
     // one request runs at a time), so swapping won't kill anyone else's
     // in-flight inference. Pending requests stay queued during the swap.
     await ensureModelServed(requestedModel);
+    if (slotAssignment) {
+      slotAssignment.compatibilityHash = await modelCompatibilityHash(requestedModel);
+      slotAssignment.prefixHash = canonicalHash(managerControlledContextBody(req.body, requestedModel));
+    }
     // If this conversation has a disk-saved slot dump and its assigned slot is
     // now cold (the child was reloaded since we saved), restore the KV cache
     // before proxying so llama.cpp matches the prefix and skips re-prefill.

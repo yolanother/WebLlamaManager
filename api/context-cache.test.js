@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import {
   canonicalHash,
   compatibilityFingerprint,
+  deriveConversationCacheIdentity,
   conversationLineageKey,
   deriveCacheScope,
   PreparedContextStore,
@@ -103,4 +104,30 @@ test('conversation keys are bounded opaque identifiers and canonical hashes igno
   assert.throws(() => validateConversationCacheKey('x'.repeat(201)), /between 1 and 200/);
   assert.throws(() => validateConversationCacheKey('bad\nkey'), /printable/);
   assert.equal(canonicalHash({ b: 2, a: 1 }), canonicalHash({ a: 1, b: 2 }));
+});
+
+test('fallback conversation identity stays stable as turns grow', () => {
+  const firstTurn = [
+    { role: 'system', content: 'You are concise.' },
+    { role: 'user', content: 'Start session 42.' },
+  ];
+  const tenthTurn = [
+    ...firstTurn,
+    { role: 'assistant', content: 'Ready.' },
+    { role: 'user', content: 'Next question.' },
+    { role: 'assistant', content: 'Answer.' },
+    { role: 'user', content: 'Keep going.' },
+  ];
+  const first = deriveConversationCacheIdentity({ messages: firstTurn });
+  const grown = deriveConversationCacheIdentity({ messages: tenthTurn });
+
+  assert.equal(first.source, 'conversation_head');
+  assert.equal(first.key, grown.key);
+  assert.notEqual(first.key, deriveConversationCacheIdentity({
+    messages: [{ role: 'system', content: 'You are concise.' }, { role: 'user', content: 'Different session.' }],
+  }).key);
+  assert.deepEqual(deriveConversationCacheIdentity({ explicitKey: 'caller-owned' }), {
+    key: 'caller-owned', source: 'explicit',
+  });
+  assert.equal(deriveConversationCacheIdentity({ messages: [{ role: 'user', content: 'one shot' }] }), null);
 });

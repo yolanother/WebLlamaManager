@@ -10,7 +10,8 @@
 // holds the PURE policy that the manager (api/server.js) uses to drive that:
 // deriving a stable on-disk filename for a conversation, deciding when a saved
 // slot should be restored (only into a cold slot, never disturbing a warm or
-// in-flight one), and bounding disk usage by evicting the oldest dumps. Pure so
+// in-flight one, including current llama.cpp processed-token counters), and
+// bounding disk usage by evicting the oldest dumps. Pure so
 // the policy is unit-testable without touching the filesystem or the router.
 
 import { createHash } from 'crypto';
@@ -75,5 +76,13 @@ export function shouldRestoreSlot({ savedFile, slotState }) {
   if (!savedFile) return false;
   if (!slotState) return true; // slot unknown => treat as cold
   if (slotState.is_processing) return false;
-  return (slotState.n_prompt_tokens || 0) === 0;
+  const residentTokens = Math.max(
+    Number(slotState.n_prompt_tokens) || 0,
+    Number(slotState.n_prompt_tokens_processed) || 0,
+    Number(slotState.n_prompt_tokens_cache) || 0,
+    Number(slotState.prompt_n) || 0,
+    Number(slotState.cache_n) || 0,
+    Number(slotState.tokens_cached) || 0,
+  );
+  return residentTokens === 0;
 }

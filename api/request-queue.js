@@ -1,0 +1,186 @@
+// Llama Manager — priority-aware request queue for inference backends.
+// Copyright (c) Llama Manager project. Use of this file is governed by the
+// LICENSE file in the repository root.
+//
+// This module serializes work against constrained inference lanes while letting
+// realtime requests skip queued lower-priority work, cooperatively preempting
+// background work, bounding background admission, and preventing starvation.
+
+/** Supported request priority classes, ordered from highest to lowest. */
+export const REQUEST_PRIORITIES = Object.freeze(['realtime', 'interactive', 'background']);
+
+/**
+ * Validate and normalize a caller-supplied request priority.
+ * @param {unknown} value Requested priority; nullish values use the compatible default.
+ * @returns {'realtime'|'interactive'|'background'} The normalized priority.
+ * @throws {TypeError} When a non-null value is not a supported priority.
+ */
+export function normalizeRequestPriority(value) {
+  if (value == null || value === '') return 'interactive';
+  if (typeof value !== 'string' || !REQUEST_PRIORITIES.includes(value.toLowerCase())) {
+    throw new TypeError('request priority must be realtime, interactive, or background');
+  }
+  return value.toLowerCase();
+}
+
+/**
+ * Queue work for a bounded-concurrency inference backend.
+ *
+ * Preemption is cooperative: when realtime work arrives, the queue invokes the
+ * active background item's callback. The owner must abort and release that item;
+ * the queue never violates its configured concurrency while cancellation settles.
+ */
+export class PriorityRequestQueue {
+  /**
+   * @param {number} concurrency Maximum simultaneously active items.
+   * @param {{maxBackgroundQueued?:number,maxHighPriorityBurst?:number}} options Queue policy.
+   */
+  constructor(concurrency = 1, { maxBackgroundQueued = 8, maxHighPriorityBurst = 8 } = {}) {
+    this.concurrency = Math.max(1, concurrency);
+    this.maxBackgroundQueued = Math.max(0, maxBackgroundQueued);
+    this.maxHighPriorityBurst = Math.max(1, maxHighPriorityBurst);
+    this.running = 0;
+    this.queue = [];
+    this.queuedCount = 0;
+    this._nextId = 1;
+    this._highPriorityBurst = 0;
+    this.activeItems = new Map();
+  }
+
+  /** Change concurrency and immediately drain eligible queued work. */
+  setConcurrency(value) {
+    this.concurrency = Math.max(1, value);
+    this._drain();
+  }
+
+  /**
+   * Acquire capacity for an item.
+   * @param {object} meta Metadata exposed in queue telemetry.
+   * @returns {Promise<number>} Queue item identifier used for release/cancel.
+   */
+  async acquire(meta = {}) {
+    const priority = normalizeRequestPriority(meta.priority);
+    if (priority === 'background') {
+      const pendingBackground = this.queue.filter(item => item.priority === 'background').length;
+      if (pendingBackground >= this.maxBackgroundQueued) {
+        const error = new Error(`background queue limit ${this.maxBackgroundQueued} reached`);
+        error.code = 'BACKGROUND_QUEUE_FULL';
+        error.statusCode = 429;
+        throw error;
+      }
+    }
+
+    const id = this._nextId++;
+    const item = { id, ...meta, priority, enqueuedAt: Date.now(), status: 'active' };
+    if (this.running < this.concurrency) {
+      this._activate(item);
+      return id;
+    }
+
+    this.queuedCount++;
+    item.status = 'pending';
+    const pending = new Promise((resolve, reject) => {
+      item._resolve = resolve;
+      item._reject = reject;
+      this.queue.push(item);
+    });
+    if (priority === 'realtime') this._requestBackgroundPreemption();
+    return pending;
+  }
+
+  /** Reject and remove all pending items. */
+  flush() {
+    const count = this.queue.length;
+    for (const entry of this.queue) entry._reject(new Error('Queue flushed'));
+    this.queue = [];
+    return count;
+  }
+
+  /** Cancel one pending item. Active items must be aborted by their owner. */
+  cancel(id) {
+    const index = this.queue.findIndex(item => item.id === id);
+    if (index < 0) return false;
+    const [entry] = this.queue.splice(index, 1);
+    entry._reject(new Error('Request cancelled'));
+    return true;
+  }
+
+  /** Release active capacity and start the next eligible item. */
+  release(id) {
+    if (id != null && !this.activeItems.has(id)) return;
+    if (id != null) this.activeItems.delete(id);
+    this.running = Math.max(0, this.running - 1);
+    this._drain();
+  }
+
+  /** Number of pending items. */
+  get pending() { return this.queue.length; }
+
+  /** Number of active items. */
+  get active() { return this.running; }
+
+  /** Return redacted queue state for operational displays. */
+  getItems() {
+    const publicItem = item => ({
+      id: item.id,
+      model: item.model || 'unknown',
+      endpoint: item.endpoint || '',
+      priority: item.priority,
+      enqueuedAt: item.enqueuedAt,
+      startedAt: item.startedAt || null,
+      status: item.status,
+      elapsed: Date.now() - (item.startedAt || item.enqueuedAt),
+      preemptRequested: !!item._preemptRequested,
+    });
+    return [...this.activeItems.values(), ...this.queue].map(publicItem);
+  }
+
+  /** Activate a queued item and resolve its acquisition promise. */
+  _activate(item) {
+    this.running++;
+    item.status = 'active';
+    item.startedAt = Date.now();
+    this.activeItems.set(item.id, item);
+    item._resolve?.(item.id);
+  }
+
+  /** Ask every running background item to abort once. */
+  _requestBackgroundPreemption() {
+    for (const item of this.activeItems.values()) {
+      if (item.priority !== 'background' || item._preemptRequested) continue;
+      item._preemptRequested = true;
+      try { item.onPreempt?.('realtime_request'); } catch { /* owner callbacks are isolated */ }
+    }
+  }
+
+  /** Pick the next item, enforcing priority ordering and bounded starvation. */
+  _nextIndex() {
+    const backgroundIndex = this.queue.findIndex(item => item.priority === 'background');
+    if (backgroundIndex >= 0 && this._highPriorityBurst >= this.maxHighPriorityBurst) {
+      this._highPriorityBurst = 0;
+      return backgroundIndex;
+    }
+    const realtimeIndex = this.queue.findIndex(item => item.priority === 'realtime');
+    if (realtimeIndex >= 0) {
+      this._highPriorityBurst++;
+      return realtimeIndex;
+    }
+    const interactiveIndex = this.queue.findIndex(item => item.priority === 'interactive');
+    if (interactiveIndex >= 0) {
+      this._highPriorityBurst++;
+      return interactiveIndex;
+    }
+    this._highPriorityBurst = 0;
+    return backgroundIndex;
+  }
+
+  /** Fill available capacity from the prioritized queue. */
+  _drain() {
+    while (this.queue.length > 0 && this.running < this.concurrency) {
+      const index = this._nextIndex();
+      if (index < 0) return;
+      const [item] = this.queue.splice(index, 1);
+      this._activate(item);
+    }
+  }
+}

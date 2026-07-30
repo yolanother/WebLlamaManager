@@ -56,6 +56,31 @@ export function validateConversationCacheKey(value) {
 }
 
 /**
+ * Resolve a stable conversation identity from an explicit extension or, for
+ * compatible clients, a hashed conversation head. The fallback intentionally
+ * uses only leading system/developer instructions and the first user message,
+ * so appending assistant/user turns cannot cause per-turn slot drift. One-shot
+ * prompts remain unpinned and use llama.cpp's native similarity selection.
+ *
+ * @param {{explicitKey?:unknown,messages?:unknown[]}} input Identity inputs.
+ * @returns {{key:string,source:'explicit'|'conversation_head'}|null} Stable identity.
+ * @throws {TypeError} When an explicit key is present but invalid.
+ */
+export function deriveConversationCacheIdentity({ explicitKey, messages } = {}) {
+  if (explicitKey != null && explicitKey !== '') {
+    return { key: validateConversationCacheKey(explicitKey), source: 'explicit' };
+  }
+  if (!Array.isArray(messages) || messages.length < 2) return null;
+  const firstUserIndex = messages.findIndex(message => message?.role === 'user');
+  if (firstUserIndex < 0) return null;
+  const leadingInstructions = messages
+    .slice(0, firstUserIndex)
+    .filter(message => message?.role === 'system' || message?.role === 'developer');
+  const head = [...leadingInstructions, messages[firstUserIndex]];
+  return { key: `auto_${canonicalHash(head).slice(0, 40)}`, source: 'conversation_head' };
+}
+
+/**
  * Fingerprint all serving inputs that can make token or KV state incompatible.
  * Callers should supply the resolved model and the live upstream template/props
  * when available; omitted properties remain explicit nulls in the fingerprint.
