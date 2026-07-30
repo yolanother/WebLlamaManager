@@ -8,6 +8,164 @@
 const HOST = 'http://localhost:5250';
 const GENERIC_OBJECT_SCHEMA = { type: 'object', additionalProperties: true };
 
+/** OpenAI SDK base URL advertised by Llama Manager documentation. */
+export const OPENAI_BASE_URL = 'http://<host>:5250/v1';
+
+/**
+ * Structured definitions for standard OpenAI multimodal content parts and the
+ * additive Llama Manager URL extensions accepted by chat completions.
+ */
+export const MULTIMODAL_CONTENT_PARTS = [
+  {
+    type: 'text',
+    standard: true,
+    description: 'OpenAI text content.',
+    schema: {
+      type: 'object',
+      required: ['type', 'text'],
+      properties: {
+        type: { const: 'text' },
+        text: { type: 'string' },
+      },
+      additionalProperties: false,
+    },
+    example: { type: 'text', text: 'Describe the attached media.' },
+  },
+  {
+    type: 'image_url',
+    standard: true,
+    description: 'OpenAI image content using an HTTPS URL or a base64 data URL.',
+    schema: {
+      type: 'object',
+      required: ['type', 'image_url'],
+      properties: {
+        type: { const: 'image_url' },
+        image_url: {
+          type: 'object',
+          required: ['url'],
+          properties: {
+            url: { type: 'string', description: 'HTTPS URL or data:image/... URL.' },
+            detail: { type: 'string', enum: ['auto', 'low', 'high'] },
+          },
+          additionalProperties: false,
+        },
+      },
+      additionalProperties: false,
+    },
+    example: { type: 'image_url', image_url: { url: 'https://example.com/cat.jpg' } },
+  },
+  {
+    type: 'input_audio',
+    standard: true,
+    description: 'OpenAI inline base64 audio, passed through to audio-capable models.',
+    schema: {
+      type: 'object',
+      required: ['type', 'input_audio'],
+      properties: {
+        type: { const: 'input_audio' },
+        input_audio: {
+          type: 'object',
+          required: ['data', 'format'],
+          properties: {
+            data: { type: 'string', contentEncoding: 'base64' },
+            format: { type: 'string', enum: ['wav', 'mp3'] },
+          },
+          additionalProperties: false,
+        },
+      },
+      additionalProperties: false,
+    },
+    example: { type: 'input_audio', input_audio: { data: '<base64>', format: 'wav' } },
+  },
+  {
+    type: 'video_url',
+    standard: false,
+    description: 'Llama Manager extension for direct video or YouTube ingestion and expansion.',
+    schema: {
+      type: 'object',
+      required: ['type', 'video_url'],
+      properties: {
+        type: { const: 'video_url' },
+        video_url: {
+          type: 'object',
+          required: ['url'],
+          properties: {
+            url: { type: 'string', format: 'uri' },
+            max_frames: { type: 'integer', minimum: 1, maximum: 16 },
+            include_audio: { type: 'boolean', default: true },
+            start: { type: 'number', minimum: 0, description: 'Optional start time in seconds.' },
+            end: { type: 'number', minimum: 0, description: 'Optional end time in seconds.' },
+          },
+          additionalProperties: false,
+        },
+      },
+      additionalProperties: false,
+    },
+    example: {
+      type: 'video_url',
+      video_url: {
+        url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+        max_frames: 16,
+        include_audio: true,
+        start: 0,
+        end: 600,
+      },
+    },
+  },
+  {
+    type: 'audio_url',
+    standard: false,
+    description: 'Llama Manager extension for server-side audio download and expansion.',
+    schema: {
+      type: 'object',
+      required: ['type', 'audio_url'],
+      properties: {
+        type: { const: 'audio_url' },
+        audio_url: {
+          type: 'object',
+          required: ['url'],
+          properties: { url: { type: 'string', format: 'uri' } },
+          additionalProperties: false,
+        },
+      },
+      additionalProperties: false,
+    },
+    example: { type: 'audio_url', audio_url: { url: 'https://example.com/talk.mp3' } },
+  },
+];
+
+/** JSON Schema union accepted for one multimodal message content part. */
+export const MULTIMODAL_CONTENT_PART_SCHEMA = {
+  oneOf: MULTIMODAL_CONTENT_PARTS.map(part => part.schema),
+};
+
+const CHAT_REQUEST_SCHEMA = {
+  type: 'object',
+  required: ['model', 'messages'],
+  properties: {
+    model: { type: 'string' },
+    messages: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['role', 'content'],
+        properties: {
+          role: { type: 'string', enum: ['system', 'user', 'assistant', 'tool'] },
+          content: {
+            oneOf: [
+              { type: 'string' },
+              { type: 'array', items: MULTIMODAL_CONTENT_PART_SCHEMA },
+            ],
+          },
+        },
+        additionalProperties: true,
+      },
+    },
+    stream: { type: 'boolean', default: false },
+  },
+  additionalProperties: true,
+};
+
 /**
  * Replaces documented path parameters with representative values for examples.
  *
@@ -59,6 +217,42 @@ function makeExample(method, path, summary, body = null) {
   };
 }
 
+const YOUTUBE_REQUEST_BODY = {
+  model: 'gemma-4',
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Summarize the visuals and speech in this video.' },
+      MULTIMODAL_CONTENT_PARTS.find(part => part.type === 'video_url').example,
+    ],
+  }],
+};
+
+/**
+ * Creates the worked YouTube example for one chat completion route.
+ *
+ * @param {string} path Chat completion route path.
+ * @returns {object} Complete multi-language example bundle.
+ */
+function youtubeChatExample(path) {
+  return {
+    ...makeExample('POST', path, 'Analyze a YouTube video', YOUTUBE_REQUEST_BODY),
+    title: 'Analyze a YouTube video with visuals and audio',
+  };
+}
+
+/**
+ * Returns shared documentation overrides for a chat completion alias.
+ *
+ * @param {string} path Chat completion route path used by its worked example.
+ * @returns {object} Endpoint description, request schema, and YouTube example.
+ */
+const CHAT_OPTIONS = path => ({
+  description: 'Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side.',
+  requestSchema: CHAT_REQUEST_SCHEMA,
+  examples: [youtubeChatExample(path)],
+});
+
 /**
  * Creates an endpoint entry with uniform defaults and inferred path parameters.
  *
@@ -99,6 +293,7 @@ const ROUTES = [
   ['POST', '/api/media/youtube', 'media', 'Ingest media from YouTube'],
   ['GET', '/api/media/{id}/file', 'media', 'Download an ingested source file'],
   ['GET', '/api/media/{id}/frames/{n}.jpg', 'media', 'Download an extracted video frame'],
+  ['GET', '/api/media/{id}/audio/{n}.wav', 'media', 'Download an extracted audio segment'],
   ['GET', '/api/media/{id}', 'media', 'Get ingested media metadata'],
 
   // Runtime settings and remote backends.
@@ -183,7 +378,7 @@ const ROUTES = [
 
   // OpenAI-, Anthropic-, and reranking-compatible inference APIs.
   ['GET', '/api/v1/models', 'openai', 'List OpenAI-compatible models'],
-  ['POST', '/api/v1/chat/completions', 'openai', 'Create a chat completion'],
+  ['POST', '/api/v1/chat/completions', 'openai', 'Create a chat completion', CHAT_OPTIONS('/api/v1/chat/completions')],
   ['POST', '/api/v1/completions', 'openai', 'Create a legacy text completion'],
   ['POST', '/api/v1/embeddings', 'openai', 'Create vector embeddings'],
   ['POST', '/api/embeddings', 'openai', 'Create vector embeddings through the convenience alias'],
@@ -196,6 +391,27 @@ const ROUTES = [
   ['POST', '/api/v1/messages/count_tokens', 'openai', 'Count Anthropic message tokens'],
   ['POST', '/api/v1/rerank', 'openai', 'Rerank documents'],
   ['POST', '/api/v1/reranking', 'openai', 'Rerank documents through the compatibility alias'],
+  ['POST', '/api/v1/audio/transcriptions', 'openai', 'Transcribe an audio file'],
+
+  // Bare OpenAI-compatible aliases used by stock SDKs with the documented
+  // http://<host>:5250/v1 base URL. The /api/v1 variants remain supported.
+  ['GET', '/v1/models', 'openai', 'List OpenAI-compatible models'],
+  ['GET', '/v1/models/{model}', 'openai', 'Get an OpenAI-compatible model'],
+  ['POST', '/v1/chat/completions', 'openai', 'Create a chat completion', CHAT_OPTIONS('/v1/chat/completions')],
+  ['POST', '/v1/completions', 'openai', 'Create a legacy text completion'],
+  ['POST', '/v1/embeddings', 'openai', 'Create vector embeddings'],
+  ['POST', '/v1/responses', 'openai', 'Create an OpenAI Responses API response'],
+  ['POST', '/v1/messages', 'openai', 'Create an Anthropic-compatible message'],
+  ['POST', '/v1/messages/count_tokens', 'openai', 'Count Anthropic message tokens'],
+  ['POST', '/v1/rerank', 'openai', 'Rerank documents'],
+  ['POST', '/v1/reranking', 'openai', 'Rerank documents through the compatibility alias'],
+  ['POST', '/v1/audio/transcriptions', 'openai', 'Transcribe an audio file'],
+
+  // Agent-readable documentation generated from this catalog.
+  ['GET', '/llms.txt', 'system', 'Get the concise agent-readable API index'],
+  ['GET', '/llms-full.txt', 'system', 'Get the complete agent-readable API reference'],
+  ['GET', '/api/llms.txt', 'system', 'Get the concise agent-readable API index through the API alias'],
+  ['GET', '/api/llms-full.txt', 'system', 'Get the complete agent-readable API reference through the API alias'],
 ];
 
 /**

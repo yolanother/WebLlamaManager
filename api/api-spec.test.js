@@ -7,7 +7,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { ENDPOINTS } from './api-spec.js';
+import {
+  ENDPOINTS,
+  MULTIMODAL_CONTENT_PARTS,
+  OPENAI_BASE_URL,
+} from './api-spec.js';
 
 const CURRENT_ENDPOINT_KEYS = [
   'POST /api/media/upload',
@@ -132,4 +136,57 @@ test('ENDPOINTS completely catalogs the current server with useful examples', ()
       assert.ok(example.javascript);
     }
   }
+});
+
+test('catalog describes the dual OpenAI surface and full multimodal contract', () => {
+  const endpointKeys = new Set(ENDPOINTS.map(endpoint => `${endpoint.method} ${endpoint.path}`));
+  const openAiOperations = [
+    ['GET', '/models'],
+    ['GET', '/models/{model}'],
+    ['POST', '/chat/completions'],
+    ['POST', '/completions'],
+    ['POST', '/embeddings'],
+    ['POST', '/responses'],
+    ['POST', '/messages'],
+    ['POST', '/messages/count_tokens'],
+    ['POST', '/rerank'],
+    ['POST', '/reranking'],
+    ['POST', '/audio/transcriptions'],
+  ];
+
+  assert.equal(OPENAI_BASE_URL, 'http://<host>:5250/v1');
+  for (const [method, suffix] of openAiOperations) {
+    assert.ok(endpointKeys.has(`${method} /v1${suffix}`), `missing bare /v1${suffix}`);
+    assert.ok(endpointKeys.has(`${method} /api/v1${suffix}`), `missing legacy /api/v1${suffix}`);
+  }
+  assert.ok(endpointKeys.has('GET /api/media/{id}/audio/{n}.wav'));
+  assert.ok(endpointKeys.has('GET /llms.txt'));
+  assert.ok(endpointKeys.has('GET /llms-full.txt'));
+  assert.ok(endpointKeys.has('GET /api/llms.txt'));
+  assert.ok(endpointKeys.has('GET /api/llms-full.txt'));
+
+  assert.deepEqual(
+    MULTIMODAL_CONTENT_PARTS.map(part => part.type),
+    ['text', 'image_url', 'input_audio', 'video_url', 'audio_url'],
+  );
+  assert.deepEqual(
+    MULTIMODAL_CONTENT_PARTS.filter(part => part.standard).map(part => part.type),
+    ['text', 'image_url', 'input_audio'],
+  );
+  const inputAudio = MULTIMODAL_CONTENT_PARTS.find(part => part.type === 'input_audio');
+  assert.deepEqual(inputAudio.schema.properties.input_audio.properties.format.enum, ['wav', 'mp3']);
+  const video = MULTIMODAL_CONTENT_PARTS.find(part => part.type === 'video_url');
+  assert.equal(video.schema.properties.video_url.properties.include_audio.default, true);
+  assert.ok(video.schema.properties.video_url.properties.max_frames);
+  assert.ok(video.schema.properties.video_url.properties.start);
+  assert.ok(video.schema.properties.video_url.properties.end);
+
+  const chat = ENDPOINTS.find(endpoint => endpoint.path === '/v1/chat/completions');
+  const youtubeExample = chat.examples.find(example =>
+    JSON.stringify(example.body).includes('youtube.com/watch'),
+  );
+  assert.ok(youtubeExample, 'chat completions needs a worked YouTube video_url example');
+  assert.match(youtubeExample.curl, /video_url/);
+  assert.match(youtubeExample.python, /video_url/);
+  assert.match(youtubeExample.javascript, /video_url/);
 });
