@@ -48,6 +48,7 @@ import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent
 import { findLeakedSlots } from './slot-reaper.js';
 import { resolveDefaultModel, defaultModelListEntries, ds4PresetForModel, validateDefaultModelTarget, BIG_ALIAS, SMALL_ALIAS } from './default-models.js';
 import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
+import { addModelCapabilityMetadata, createModelCapabilityResolver } from './model-capabilities.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
 import { slotCacheFilename, shouldRestoreSlot } from './slot-cache.js';
@@ -257,6 +258,7 @@ app.use('/api/media', createMediaRouter({ dataDir: RUNTIME_PATHS.dataDir }));
 // Configuration
 const CONFIG_PATH = RUNTIME_PATHS.configPath;
 const MODELS_DIR = RUNTIME_PATHS.modelsDir;
+const resolveModelCapabilities = createModelCapabilityResolver(MODELS_DIR);
 const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
@@ -635,9 +637,58 @@ function resolveModelMapping(mapping, requestedModel) {
   return null;
 }
 
-// Estimate input token count from request body (rough: ~4 chars per token)
+// Conservative queue/offload estimates. Image cost is a fixed placeholder,
+// while audio is charged by duration at the normalized 16 kHz mono PCM rate.
+const IMAGE_INPUT_TOKEN_ESTIMATE = 1024;
+const AUDIO_INPUT_TOKENS_PER_SECOND = 32;
+const NORMALIZED_AUDIO_BYTES_PER_SECOND = 32_000;
+const DEFAULT_AUDIO_DURATION_SECONDS = 30;
+const TEXT_CHARS_PER_TOKEN_ESTIMATE = 4;
+
+/**
+ * Estimate decoded bytes represented by an inline base64 payload.
+ *
+ * @param {*} value raw base64 or data-URL value.
+ * @returns {number} approximate decoded byte count, or zero when absent.
+ */
+function estimateBase64Bytes(value) {
+  if (typeof value !== 'string' || !value) return 0;
+  const commaIndex = value.indexOf(',');
+  const encoded = (commaIndex >= 0 ? value.slice(commaIndex + 1) : value).trim();
+  if (!encoded) return 0;
+  const padding = encoded.endsWith('==') ? 2 : encoded.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((encoded.length * 3) / 4) - padding);
+}
+
+/**
+ * Estimate audio duration from explicit metadata or normalized inline bytes.
+ * URL-only and malformed parts receive a documented nonzero fallback duration.
+ *
+ * @param {object} part OpenAI-compatible audio content part.
+ * @returns {number} estimated positive duration in seconds.
+ */
+function estimateAudioDurationSeconds(part) {
+  const descriptor = part?.input_audio || part?.audio_url || part?.audio || {};
+  const explicitDuration = Number(
+    descriptor.duration_seconds ?? descriptor.durationSec ?? part?.duration_seconds ?? part?.durationSec,
+  );
+  if (Number.isFinite(explicitDuration) && explicitDuration > 0) return explicitDuration;
+  const decodedBytes = estimateBase64Bytes(descriptor.data);
+  if (decodedBytes > 0) return Math.max(1, decodedBytes / NORMALIZED_AUDIO_BYTES_PER_SECOND);
+  return DEFAULT_AUDIO_DURATION_SECONDS;
+}
+
+/**
+ * Estimate request input tokens for queue admission and remote-offload sizing.
+ * Text uses the existing four-characters heuristic, while every image and audio
+ * part incurs a nonzero model-agnostic estimate.
+ *
+ * @param {object|null|undefined} body OpenAI-compatible request body.
+ * @returns {number} non-negative estimated input token count.
+ */
 function estimateInputTokens(body) {
   let chars = 0;
+  let multimodalTokens = 0;
   if (body?.messages && Array.isArray(body.messages)) {
     for (const msg of body.messages) {
       const content = msg.content;
@@ -645,13 +696,21 @@ function estimateInputTokens(body) {
       else if (Array.isArray(content)) {
         for (const c of content) {
           if (c.type === 'text') chars += (c.text || '').length;
+          if (c.type === 'image_url' || c.type === 'input_image' || c.type === 'image') {
+            multimodalTokens += IMAGE_INPUT_TOKEN_ESTIMATE;
+          }
+          if (c.type === 'input_audio' || c.type === 'audio_url' || c.type === 'audio') {
+            multimodalTokens += Math.ceil(
+              estimateAudioDurationSeconds(c) * AUDIO_INPUT_TOKENS_PER_SECOND,
+            );
+          }
         }
       }
     }
   } else if (body?.prompt) {
     chars = typeof body.prompt === 'string' ? body.prompt.length : JSON.stringify(body.prompt).length;
   }
-  return Math.ceil(chars / 4);
+  return Math.ceil(chars / TEXT_CHARS_PER_TOKEN_ESTIMATE) + multimodalTokens;
 }
 
 // Estimate how long a request will take locally based on recent performance
@@ -6976,6 +7035,7 @@ async function handleModels(req, res) {
           context_management: contextCapabilities(entry.engine, { slotCacheEnabled: slotCacheCfg().enabled }),
         });
       }
+      out.data = addModelCapabilityMetadata(out.data, resolveModelCapabilities);
       return res.json(out);
     }
 
@@ -7022,7 +7082,8 @@ async function handleModels(req, res) {
     }
 
     // 2) Downloaded models on disk that the router did not already report.
-    for (const lm of scanLocalModels()) {
+    const localModels = scanLocalModels();
+    for (const lm of localModels) {
       if (byId.has(lm.name) || seenNorm.has(norm(lm.name))) continue;
       byId.set(lm.name, {
         id: lm.name,
@@ -7071,6 +7132,7 @@ async function handleModels(req, res) {
         context_management: contextCapabilities('embedding'),
       });
     }
+    data.data = addModelCapabilityMetadata(data.data, resolveModelCapabilities, localModels);
     res.json(data);
   } catch (error) {
     console.error('[v1/models] Error fetching from llama.cpp:', error.message);

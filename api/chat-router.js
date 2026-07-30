@@ -87,20 +87,23 @@ export function lastUserText(body) {
 }
 
 /**
- * Detect image/video inputs across OpenAI content parts and optional attachment
- * metadata. Sampled video frame markers count as video as well as image input.
+ * Detect image, video, and audio inputs across OpenAI content parts and optional
+ * attachment metadata. Sampled video frame markers count as video as well as
+ * image input.
  *
  * @param {object|null|undefined} body chat-completions request body
- * @returns {{image:boolean, video:boolean, any:boolean}} attachment flags
+ * @returns {{image:boolean, video:boolean, audio:boolean, any:boolean}} attachment flags
  */
 export function attachmentPresence(body) {
   let image = false;
   let video = false;
+  let audio = false;
   for (const message of Array.isArray(body?.messages) ? body.messages : []) {
     for (const part of Array.isArray(message?.content) ? message.content : []) {
       const type = String(part?.type || '').toLowerCase();
       if (type === 'image_url' || type === 'input_image' || type === 'image') image = true;
       if (type === 'video_url' || type === 'input_video' || type === 'video') video = true;
+      if (type === 'input_audio' || type === 'audio_url' || type === 'audio') audio = true;
       if (type === 'text' && /\[frame\s+\d+\/\d+\s+@\s+\d{1,2}:\d{2}\]/i.test(part.text || '')) {
         video = true;
       }
@@ -113,13 +116,15 @@ export function attachmentPresence(body) {
     ].filter(Boolean).join(' ');
     if (/image/i.test(descriptor)) image = true;
     if (/video|youtu(?:\.be|be\.com)|\.(?:mp4|mov|webm|mkv)\b/i.test(descriptor)) video = true;
+    if (/audio|\.(?:wav|mp3|flac|ogg|m4a)\b/i.test(descriptor)) audio = true;
   }
-  return { image, video, any: image || video };
+  return { image, video, audio, any: image || video || audio };
 }
 
 /**
- * Determine whether a model record is vision-capable by built-in name heuristic
- * or an operator-provided exact id in `config.routerVisionModels`.
+ * Determine whether a model record is vision-capable. An operator override wins,
+ * then explicit mmproj modalities, with the built-in name heuristic reserved for
+ * records whose model directory has no projector metadata.
  *
  * @param {string|object} model model id or model record
  * @param {{routerVisionModels?: string[]}|null|undefined} config router configuration
@@ -135,25 +140,53 @@ export function isVisionModel(model, config = {}) {
       .map(value => value.trim().toLowerCase())
       .filter(Boolean),
   );
-  return VISION_MODEL_PATTERN.test(id)
-    || VISION_MODEL_PATTERN.test(aliasTarget)
-    || configured.has(id.toLowerCase())
-    || configured.has(aliasTarget.toLowerCase());
+  if (configured.has(id.toLowerCase()) || configured.has(aliasTarget.toLowerCase())) return true;
+  if (record?.capabilitySource === 'mmproj') {
+    return Array.isArray(record.modalities) && record.modalities.includes('image');
+  }
+  return VISION_MODEL_PATTERN.test(id) || VISION_MODEL_PATTERN.test(aliasTarget);
+}
+
+/**
+ * Determine whether a model record is audio-capable from projector modalities
+ * or an operator-provided exact id in `config.routerAudioModels`.
+ *
+ * @param {string|object} model model id or model record.
+ * @param {{routerAudioModels?: string[]}|null|undefined} config router configuration.
+ * @returns {boolean} whether the model is eligible for audio-bearing requests.
+ */
+export function isAudioModel(model, config = {}) {
+  const record = typeof model === 'string' ? { id: model } : model;
+  const id = typeof record?.id === 'string' ? record.id : '';
+  const aliasTarget = typeof record?.aliasTarget === 'string' ? record.aliasTarget : '';
+  const configured = new Set(
+    (Array.isArray(config?.routerAudioModels) ? config.routerAudioModels : [])
+      .filter(value => typeof value === 'string')
+      .map(value => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  return configured.has(id.toLowerCase())
+    || configured.has(aliasTarget.toLowerCase())
+    || (Array.isArray(record?.modalities) && record.modalities.includes('audio'));
 }
 
 /**
  * Produce the real classification candidate set, excluding embedding models and
- * restricting image-bearing requests to vision-capable model ids.
+ * restricting image/audio-bearing requests to models with both required
+ * capabilities.
  *
  * @param {object} body chat-completions request body
  * @param {Array<string|object>|{data?: Array<string|object>}} models model catalog
- * @param {{routerVisionModels?: string[]}} [config] router configuration
+ * @param {{routerVisionModels?: string[], routerAudioModels?: string[]}} [config] router configuration
  * @returns {Array<object>} eligible normalized model records
  */
 export function filterRoutingCandidates(body, models, config = {}) {
   const normalized = normalizeModels(models);
-  if (!attachmentPresence(body).image) return normalized;
-  return normalized.filter(model => isVisionModel(model, config));
+  const attachments = attachmentPresence(body);
+  return normalized.filter(model => (
+    (!attachments.image || isVisionModel(model, config))
+    && (!attachments.audio || isAudioModel(model, config))
+  ));
 }
 
 /**
@@ -268,20 +301,23 @@ export function fallbackModel(body) {
  * @param {{
  *   listModels: function(): Promise<Array<string|object>|{data?:Array<string|object>}>,
  *   complete: function(string, Array<object>, object): Promise<*>,
- *   config?: {routerVisionModels?: string[]},
+ *   config?: {routerVisionModels?: string[], routerAudioModels?: string[]},
  *   timeoutMs?: number
  * }} deps injectable catalog/completion dependencies
  * @returns {Promise<string>} selected model id or default alias
+ * @throws {Error} When an audio request has no known audio-capable fallback.
  */
 export async function routeAutoModel(body, deps) {
   if (!AUTO_MODEL_ALIASES.includes(body?.model)) return body?.model;
   const fallback = fallbackModel(body);
+  const attachments = attachmentPresence(body);
   const timeoutMs = Number.isFinite(deps?.timeoutMs) ? Math.max(0, deps.timeoutMs) : ROUTER_TIMEOUT_MS;
   const controller = new AbortController();
+  let candidates = [];
   let timer;
   try {
     const models = await deps.listModels();
-    const candidates = filterRoutingCandidates(body, models, deps.config);
+    candidates = filterRoutingCandidates(body, models, deps.config);
     if (!candidates.length) throw new Error('no eligible routing candidates');
     const messages = buildClassificationPrompt(body, candidates, deps.config);
     const completionWork = deps.complete('default-small', messages, {
@@ -302,6 +338,12 @@ export async function routeAutoModel(body, deps) {
     body.model = choice;
     return choice;
   } catch {
+    if (attachments.audio) {
+      const audioFallback = candidates.find(model => model.id === fallback) || candidates[0];
+      if (!audioFallback) throw new Error('no audio-capable routing candidate available');
+      body.model = audioFallback.id;
+      return audioFallback.id;
+    }
     body.model = fallback;
     return fallback;
   } finally {

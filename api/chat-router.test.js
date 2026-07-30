@@ -5,9 +5,11 @@ import assert from 'node:assert/strict';
 import {
   BASE_CHAT_PROMPT,
   VISION_MODEL_PATTERN,
+  attachmentPresence,
   buildClassificationPrompt,
   filterRoutingCandidates,
   injectBaseChatPrompt,
+  isVisionModel,
   parseRouterChoice,
   routeAutoModel,
 } from './chat-router.js';
@@ -96,6 +98,70 @@ test('filterRoutingCandidates accepts operator-configured vision model ids', () 
   );
 });
 
+test('projector metadata wins over the legacy vision-name fallback', () => {
+  assert.equal(isVisionModel({
+    id: 'gemma-without-vision',
+    modalities: ['text'],
+    capabilitySource: 'mmproj',
+  }), false);
+  assert.equal(isVisionModel({
+    id: 'plain-model-name',
+    modalities: ['text', 'image'],
+    capabilitySource: 'mmproj',
+  }), true);
+  assert.equal(isVisionModel({
+    id: 'gemma-without-projector-metadata',
+    modalities: ['text'],
+    capabilitySource: 'none',
+  }), true);
+});
+
+test('attachmentPresence recognizes inline and URL audio parts', () => {
+  const presence = attachmentPresence({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'input_audio', input_audio: { data: 'AAAA', format: 'wav' } },
+        { type: 'audio_url', audio_url: { url: 'https://example.test/speech.mp3' } },
+      ],
+    }],
+  });
+  assert.deepEqual(presence, { image: false, video: false, audio: true, any: true });
+});
+
+test('filterRoutingCandidates restricts audio requests to mmproj audio-capable models', () => {
+  const body = {
+    model: 'auto',
+    messages: [{
+      role: 'user',
+      content: [{ type: 'input_audio', input_audio: { data: 'AAAA', format: 'wav' } }],
+    }],
+  };
+  const models = [
+    { id: 'text-only', modalities: ['text'], capabilitySource: 'none' },
+    { id: 'vision-only', modalities: ['text', 'image'], capabilitySource: 'mmproj' },
+    { id: 'gemma-audio', modalities: ['text', 'image', 'audio'], capabilitySource: 'mmproj' },
+  ];
+  assert.deepEqual(
+    filterRoutingCandidates(body, models).map(model => model.id),
+    ['gemma-audio'],
+  );
+});
+
+test('filterRoutingCandidates accepts operator-configured audio model ids', () => {
+  const body = {
+    messages: [{
+      role: 'user',
+      content: [{ type: 'audio_url', audio_url: { url: 'https://example.test/speech.mp3' } }],
+    }],
+  };
+  assert.deepEqual(
+    filterRoutingCandidates(body, catalog, { routerAudioModels: ['qwen-coder-32b'] })
+      .map(model => model.id),
+    ['qwen-coder-32b'],
+  );
+});
+
 test('parseRouterChoice validates a JSON model id against real candidates', () => {
   const candidates = filterRoutingCandidates(textBody('Write code'), catalog);
   assert.equal(
@@ -147,6 +213,26 @@ test('routeAutoModel sends only vision-capable candidates for image requests', a
   assert.equal(choice, 'gemma-vision-27b');
   assert.match(classifierPrompt, /gemma-vision-27b/);
   assert.doesNotMatch(classifierPrompt, /qwen-coder-32b/);
+});
+
+test('routeAutoModel keeps classifier failure fallback on an audio-capable candidate', async () => {
+  const body = {
+    model: 'auto',
+    messages: [{
+      role: 'user',
+      content: [{ type: 'input_audio', input_audio: { data: 'AAAA', format: 'wav' } }],
+    }],
+  };
+  const models = [
+    { id: 'default-big', modalities: ['text'], capabilitySource: 'none' },
+    { id: 'gemma-audio', modalities: ['text', 'image', 'audio'], capabilitySource: 'mmproj' },
+  ];
+  const choice = await routeAutoModel(body, {
+    listModels: async () => models,
+    complete: async () => 'not json',
+  });
+  assert.equal(choice, 'gemma-audio');
+  assert.equal(body.model, 'gemma-audio');
 });
 
 test('routeAutoModel falls back to default-small for a short text request', async () => {
