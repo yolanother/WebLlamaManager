@@ -8,9 +8,13 @@
 // p50/p95 TTFT and queue wait plus the documented prefill go/no-go decision.
 
 import { randomUUID } from 'node:crypto';
-import { benchmarkDecision, summarizeSamples } from '../api/context-benchmark.js';
+import { benchmarkDecision, summarizeSamples, waitForPreparedContext } from '../api/context-benchmark.js';
 
-/** Parse the small set of supported command-line options. */
+/**
+ * Parse the supported command-line options.
+ * @param {string[]} argv Process arguments excluding node/script paths.
+ * @returns {{baseUrl:string,model:string|null,samples:number}} Benchmark options.
+ */
 function parseArguments(argv) {
   const options = { baseUrl: 'http://localhost:5250/api/v1', model: null, samples: 20 };
   for (let index = 0; index < argv.length; index++) {
@@ -21,12 +25,18 @@ function parseArguments(argv) {
   return options;
 }
 
-/** Read an SSE completion and capture first-token latency, queue wait, and text. */
-async function streamingChat(baseUrl, body) {
+/**
+ * Read an SSE completion and capture first-token latency, queue wait, and text.
+ * @param {string} baseUrl Llama Manager `/api/v1` base URL.
+ * @param {Record<string,unknown>} body OpenAI-compatible chat body.
+ * @param {Record<string,string>} [headers] Scope-preserving request headers.
+ * @returns {Promise<{ttftMs:number,queueWaitMs:number,cachedTokens:number,text:string}>} Sample.
+ */
+async function streamingChat(baseUrl, body, headers = {}) {
   const startedAt = performance.now();
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify({ ...body, stream: true }),
   });
   if (!response.ok) throw new Error(`chat failed: ${response.status} ${await response.text()}`);
@@ -64,7 +74,12 @@ async function streamingChat(baseUrl, body) {
   };
 }
 
-/** Resolve the first generation-capable model when none was specified. */
+/**
+ * Resolve the first generation-capable model when none was specified.
+ * @param {string} baseUrl Llama Manager `/api/v1` base URL.
+ * @param {string|null} requested Explicit model option.
+ * @returns {Promise<string>} Concrete or caller-selected model id.
+ */
 async function resolveModel(baseUrl, requested) {
   if (requested) return requested;
   const response = await fetch(`${baseUrl}/models`);
@@ -75,10 +90,11 @@ async function resolveModel(baseUrl, requested) {
   return model;
 }
 
-/** Run cold, growing, prepared, and contention scenarios. */
+/** Run cold, growing, prepared, and contention scenarios and print JSON. */
 async function run() {
   const options = parseArguments(process.argv.slice(2));
   const model = await resolveModel(options.baseUrl, options.model);
+  const scopeHeaders = { Authorization: 'Bearer llama-manager-local-context-benchmark' };
   const cold = [];
   const warm = [];
   const reused = [];
@@ -91,7 +107,7 @@ async function run() {
         { role: 'system', content: 'Answer with one short word.' },
         { role: 'user', content: `Cold benchmark request ${index}.` },
       ],
-    });
+    }, scopeHeaders);
     cold.push(result.ttftMs);
   }
 
@@ -106,7 +122,7 @@ async function run() {
       max_tokens: 1,
       conversation_cache_key: stableKey,
       messages: growingMessages,
-    });
+    }, scopeHeaders);
     growingMessages.push({ role: 'assistant', content: result.text || 'ok' });
     growingMessages.push({ role: 'user', content: `Conversation benchmark turn ${index + 1}.` });
     if (index >= 2) {
@@ -115,12 +131,46 @@ async function run() {
     }
   }
 
-  const prepareResponse = await fetch(`${options.baseUrl}/context/prepare`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, mode: 'prefill', messages: growingMessages }),
-  });
-  const prepared = await prepareResponse.json();
+  const preparedTtft = [];
+  const preparedReused = [];
+  const prefillLatency = [];
+  const discardedDecodeTokens = [];
+  for (let index = 0; index < options.samples; index++) {
+    const messages = [
+      { role: 'system', content: 'Answer with one short word.' },
+      { role: 'user', content: `Prepared benchmark request ${index}.` },
+    ];
+    const prepareResponse = await fetch(`${options.baseUrl}/context/prepare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...scopeHeaders },
+      body: JSON.stringify({
+        model,
+        mode: 'prefill',
+        conversation_cache_key: `benchmark-prepared-${randomUUID()}`,
+        messages,
+      }),
+    });
+    if (!prepareResponse.ok) {
+      throw new Error(`prepare failed: ${prepareResponse.status} ${await prepareResponse.text()}`);
+    }
+    const created = await prepareResponse.json();
+    const ready = created.status === 'ready' ? created : await waitForPreparedContext({
+      baseUrl: options.baseUrl,
+      id: created.id,
+      headers: scopeHeaders,
+    });
+    const result = await streamingChat(options.baseUrl, {
+      model,
+      max_tokens: 1,
+      prepared_context_id: ready.id,
+      context_cache_strict: true,
+      messages,
+    }, scopeHeaders);
+    preparedTtft.push(result.ttftMs);
+    preparedReused.push(result.cachedTokens);
+    prefillLatency.push(ready.prefillMs || 0);
+    discardedDecodeTokens.push(ready.discardedDecodeTokens || 0);
+  }
 
   const realtimeQueue = [];
   for (let index = 0; index < options.samples; index++) {
@@ -129,7 +179,7 @@ async function run() {
       max_tokens: 128,
       request_priority: 'background',
       messages: [{ role: 'user', content: `Write a long numbered list for contention run ${index}.` }],
-    }).catch(() => null);
+    }, scopeHeaders).catch(() => null);
     await new Promise(resolve => setTimeout(resolve, 50));
     const realtime = await streamingChat(options.baseUrl, {
       model,
@@ -137,7 +187,7 @@ async function run() {
       request_priority: 'realtime',
       routing: 'local_only',
       messages: [{ role: 'user', content: 'Reply now with OK.' }],
-    });
+    }, scopeHeaders);
     realtimeQueue.push(realtime.queueWaitMs);
     await background;
   }
@@ -149,12 +199,16 @@ async function run() {
     cold_ttft_ms: summarizeSamples(cold),
     growing_ttft_ms: summarizeSamples(warm),
     growing_reused_prefix_tokens: summarizeSamples(reused),
+    prepared_ttft_ms: summarizeSamples(preparedTtft),
+    prepared_reused_prefix_tokens: summarizeSamples(preparedReused),
+    prepared_prefill_ms: summarizeSamples(prefillLatency),
+    prepared_discarded_decode_tokens: summarizeSamples(discardedDecodeTokens),
     realtime_queue_wait_ms: summarizeSamples(realtimeQueue),
-    prepared_context: { id: prepared.id || null, status: prepared.status || 'failed' },
+    prepared_context: { samples: preparedTtft.length, strict_reuse: true },
   };
   report.prefill_decision = benchmarkDecision({
     coldP95: report.cold_ttft_ms.p95,
-    warmP95: report.growing_ttft_ms.p95,
+    warmP95: report.prepared_ttft_ms.p95,
     realtimeQueueP95: report.realtime_queue_wait_ms.p95,
   });
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

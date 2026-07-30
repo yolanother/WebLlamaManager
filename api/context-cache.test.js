@@ -52,6 +52,10 @@ test('slot affinity invalidates every in-memory lineage owned by a scope', () =>
   registry.assign({ model: 'gemma', lineageKey: 'lineage_a', scopeId: 'scope_a', slotCount: 2 });
   registry.assign({ model: 'gemma', lineageKey: 'lineage_b', scopeId: 'scope_b', slotCount: 2 });
 
+  assert.deepEqual(
+    registry.listScope('scope_a').map(record => ({ model: record.model, lineageKey: record.lineageKey, slotId: record.slotId })),
+    [{ model: 'gemma', lineageKey: 'lineage_a', slotId: 0 }],
+  );
   assert.equal(registry.invalidateScope('scope_a'), 1);
   assert.equal(registry.get('gemma', 'lineage_a'), null);
   assert.equal(registry.get('gemma', 'lineage_b').slotId, 1);
@@ -139,5 +143,14 @@ test('fallback conversation identity stays stable as turns grow', () => {
   assert.deepEqual(deriveConversationCacheIdentity({ explicitKey: 'caller-owned' }), {
     key: 'caller-owned', source: 'explicit',
   });
-  assert.equal(deriveConversationCacheIdentity({ messages: [{ role: 'user', content: 'one shot' }] }), null);
+  const firstRequest = deriveConversationCacheIdentity({ messages: [{ role: 'user', content: 'one shot' }] });
+  const grownRequest = deriveConversationCacheIdentity({
+    messages: [
+      { role: 'user', content: 'one shot' },
+      { role: 'assistant', content: 'first answer' },
+      { role: 'user', content: 'follow up' },
+    ],
+  });
+  assert.equal(firstRequest.key, grownRequest.key);
+  assert.equal(firstRequest.source, 'conversation_head');
 });

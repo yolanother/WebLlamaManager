@@ -15,6 +15,8 @@ test('llama advertises exact context management and bounded limits', () => {
   assert.equal(capabilities.exact_input_tokens, true);
   assert.equal(capabilities.prepared_context, true);
   assert.equal(capabilities.persisted_kv, true);
+  assert.equal(capabilities.zero_decode_prefill, false);
+  assert.equal(capabilities.discarded_prefill_decode_tokens, 1);
   assert.equal(capabilities.priority_classes.realtime, true);
   assert.equal(capabilities.routing.local_only, true);
   assert.equal(capabilities.limits.prepared_ttl_seconds, 900);

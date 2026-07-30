@@ -28,10 +28,16 @@ They run the same OpenAI request conversion, chat template, tokenizer, tool
 rendering, and multimodal processing used by generation. Llama Manager therefore
 proxies those operations instead of maintaining a second renderer.
 
-True prefill uses the same chat request with `max_tokens: 0`, `cache_prompt:
-true`, and a manager-owned slot. In llama.cpp, zero output tokens evaluates the
-prompt into KV without emitting a dummy answer. The legacy manager
-`preTokenize()` approximation is not part of this public contract.
+True prefill uses the same exact chat body with `cache_prompt: true` and a
+manager-owned slot. Live conformance against llama.cpp b9820 found that both
+OpenAI and native completion handlers clamp `max_tokens`/`n_predict` zero to one
+decoded token, and the special zero path does not yield reusable-prefix telemetry
+on the next request. The manager therefore requests the minimum one internal
+token, consumes and discards it privately, reports `discardedDecodeTokens`, and
+never emits or appends it to conversation history. Capability metadata advertises
+`zero_decode_prefill: false` instead of claiming a native primitive that this
+engine build does not provide. The legacy manager `preTokenize()` approximation
+is not part of this public contract.
 
 ## Scope and security boundary
 
@@ -71,14 +77,17 @@ handle or disk state before reuse.
 For compatible clients that omit the extension, multi-message chats derive a
 fallback identity from leading system/developer instructions plus the first user
 message. Appending turns cannot change that hash, fixing the former per-turn
-round-robin drift. One-shot prompts remain unpinned so llama.cpp may select by
-native prompt similarity. Applications that can have identical conversation
-heads should send an explicit key to avoid intentional fallback collisions.
+round-robin drift. The first user turn is pinned as well, so its KV state is the
+start of the same lineage used by later turns. Applications that can have
+identical conversation heads should send an explicit key to avoid intentional
+fallback collisions.
 
 Slot ownership is bidirectional. Assigning `(model, slot)` to a new lineage
 invalidates the old lineage immediately, so stale map entries are never counted
-as hits. User input fields `id_slot`, `cache_prompt`, and raw token prompts are
-removed or overwritten on manager-owned chat preparation paths.
+as hits. Before a cold lineage uses an assigned slot, the manager erases it on
+the serialized local lane and fails closed if clean ownership cannot be
+established. User input fields `id_slot`, `cache_prompt`, and raw token prompts
+are removed or overwritten on manager-owned chat preparation paths.
 
 ## Prepared-context lifecycle
 
@@ -135,9 +144,12 @@ model, slot metadata, byte count, and timestamps. A versioned manifest is
 written atomically and reconciled with disk at startup. It never contains prompt
 text, credentials, token arrays, or raw caller identifiers.
 
-Invalidation removes in-memory affinity/lease state first, then erases an owned
-live slot when safe and unlinks its disk dump before returning. Ordinary unlink
-does not promise physical secure erasure from SSD media. Deployments requiring
+Invalidation removes in-memory affinity/lease state, erases resident owned slots
+on the serialized local lane, and unlinks disk dumps before returning. A live
+erase may be reported as deferred when its model is not resident or the engine
+is unavailable; the mapping is still gone and the next cold assignment must
+erase successfully before use. Ordinary unlink does not promise physical secure
+erasure from SSD media. Deployments requiring
 cryptographic deletion must place the cache directory on an encrypted volume or
 add per-scope encrypted dumps with key destruction; v1 documents but does not
 misrepresent that storage property.
@@ -192,7 +204,8 @@ never reported as a performance win.
   tools, or multimodal markers.
 - Caller-selected slot IDs: they can steal another conversation's state.
 - Tenant names in request bodies: without authentication they are not authority.
-- Dummy generated answers for warming: they pollute history and spend decode
-  work; native zero-output evaluation exists.
+- Client-visible dummy answers for warming: they pollute canonical history.
+  b9820's unavoidable single internal decode is discarded, measured, and exposed
+  as a capability limitation rather than represented as user-visible output.
 - Treating a map hit as a cache hit: only upstream cached-token evidence proves
   KV reuse.

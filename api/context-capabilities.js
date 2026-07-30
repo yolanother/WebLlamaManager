@@ -24,6 +24,8 @@ export function contextCapabilities(engine, { slotCacheEnabled = false } = {}) {
     persisted_kv: llama && slotCacheEnabled,
     prepared_context: llama,
     idle_prefill: llama,
+    zero_decode_prefill: false,
+    discarded_prefill_decode_tokens: llama ? 1 : 0,
     raw_token_ids_exposed: false,
     raw_slot_ids_exposed: false,
     priority_classes: {

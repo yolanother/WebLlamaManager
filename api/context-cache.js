@@ -59,8 +59,9 @@ export function validateConversationCacheKey(value) {
  * Resolve a stable conversation identity from an explicit extension or, for
  * compatible clients, a hashed conversation head. The fallback intentionally
  * uses only leading system/developer instructions and the first user message,
- * so appending assistant/user turns cannot cause per-turn slot drift. One-shot
- * prompts remain unpinned and use llama.cpp's native similarity selection.
+ * so appending assistant/user turns cannot cause per-turn slot drift. The first
+ * user turn is pinned as well, ensuring a growing conversation keeps the slot
+ * that actually contains its initial KV state.
  *
  * @param {{explicitKey?:unknown,messages?:unknown[]}} input Identity inputs.
  * @returns {{key:string,source:'explicit'|'conversation_head'}|null} Stable identity.
@@ -70,7 +71,7 @@ export function deriveConversationCacheIdentity({ explicitKey, messages } = {}) 
   if (explicitKey != null && explicitKey !== '') {
     return { key: validateConversationCacheKey(explicitKey), source: 'explicit' };
   }
-  if (!Array.isArray(messages) || messages.length < 2) return null;
+  if (!Array.isArray(messages) || messages.length < 1) return null;
   const firstUserIndex = messages.findIndex(message => message?.role === 'user');
   if (firstUserIndex < 0) return null;
   const leadingInstructions = messages
@@ -131,6 +132,7 @@ function publicPreparedRecord(record) {
     abortController: _abortController,
     requestHash: _requestHash,
     lineageKey: _lineageKey,
+    slotNeedsReset: _slotNeedsReset,
     preparationBody: _preparationBody,
     ...safe
   } = record;
@@ -399,6 +401,21 @@ export class SlotAffinityRegistry {
   }
 
   /**
+   * List current slot ownership records for one authorization-derived scope.
+   * Returned copies let the server erase owned live slots without exposing
+   * mutable registry state or raw slot ids to API callers.
+   *
+   * @param {string} scopeId Opaque scope id.
+   * @param {string} [model] Optional resolved-model filter.
+   * @returns {Object[]} Matching ownership records.
+   */
+  listScope(scopeId, model) {
+    return [...this.byLineage.values()]
+      .filter(record => record.scopeId === scopeId && (!model || record.model === model))
+      .map(record => ({ ...record }));
+  }
+
+  /**
    * Remove every in-memory lineage owned by an authorization-derived scope.
    * @param {string} scopeId Opaque scope id.
    * @param {string} [model] Optional resolved-model filter.
@@ -406,8 +423,7 @@ export class SlotAffinityRegistry {
    */
   invalidateScope(scopeId, model) {
     let invalidated = 0;
-    for (const record of [...this.byLineage.values()]) {
-      if (record.scopeId !== scopeId || (model && record.model !== model)) continue;
+    for (const record of this.listScope(scopeId, model)) {
       if (this.invalidate(record.model, record.lineageKey)) invalidated++;
     }
     return invalidated;

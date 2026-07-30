@@ -500,7 +500,7 @@
       "post": {
         "operationId": "prepareContext",
         "summary": "Create an exact prepared-context lease",
-        "description": "Creates a scope-bound opaque lease. count mode renders and counts exactly; prefill mode additionally schedules cancellable zero-output KV preparation on the background lane. Prefill does not load a nonresident model unless allow_model_load is true.",
+        "description": "Creates a scope-bound opaque lease. count mode renders and counts exactly; prefill mode additionally schedules cancellable KV preparation on the background lane. llama.cpp b9820 requires one internal decode token, which is discarded and never returned as conversation output. Prefill does not load a nonresident model unless allow_model_load is true.",
         "tags": ["Context Management"],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"allOf": [{"$ref": "#/components/schemas/ChatCompletionRequest"}, {"type": "object", "properties": {"mode": {"type": "string", "enum": ["count", "prefill"], "default": "count"}, "allow_model_load": {"type": "boolean", "default": false}, "conversation_cache_key": {"type": "string", "maxLength": 200}}}]}}}},
         "responses": {
@@ -514,7 +514,7 @@
       "delete": {
         "operationId": "invalidateContextCacheScope",
         "summary": "Invalidate caller-owned context cache state",
-        "description": "Deletes prepared leases, in-memory affinity, and attributable disk slot dumps in the Authorization-derived scope. Anonymous callers share one trusted local scope.",
+        "description": "Deletes prepared leases, in-memory affinity, attributable disk slot dumps, and resident owned slots in the Authorization-derived scope. A live slot erase can be reported as deferred when its model is not resident or the engine is unavailable; the next cold assignment still erases before use. Anonymous callers share one trusted local scope.",
         "tags": ["Context Management"],
         "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"model": {"type": "string"}}}}}},
         "responses": {"200": {"description": "Deletion counts by cache layer"}}
@@ -904,6 +904,8 @@
           "persisted_kv": {"type": "boolean"},
           "prepared_context": {"type": "boolean"},
           "idle_prefill": {"type": "boolean"},
+          "zero_decode_prefill": {"type": "boolean"},
+          "discarded_prefill_decode_tokens": {"type": "integer"},
           "priority_classes": {"type": "object"},
           "routing": {"type": "object"},
           "limits": {"type": "object"}
@@ -935,7 +937,8 @@
           "prefixHash": {"type": "string"},
           "compatibilityHash": {"type": "string"},
           "expiresAt": {"type": "integer"},
-          "preparationOutcome": {"type": "string"}
+          "preparationOutcome": {"type": "string"},
+          "discardedDecodeTokens": {"type": "integer", "description": "Internal engine decode tokens consumed and discarded during prefill; never returned as model output"}
         }
       },
       "ChatCompletionRequest": {

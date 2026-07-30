@@ -37,3 +37,46 @@ export function benchmarkDecision({ coldP95, warmP95, realtimeQueueP95 }) {
   if (realtimeQueueP95 > 150) reasons.push('realtime p95 queue wait exceeded 150 ms');
   return { decision: reasons.length === 0 ? 'go' : 'no-go', ttftImprovementPercent, reasons };
 }
+
+/**
+ * Poll one opaque prepared-context lease until it is ready for strict reuse.
+ * Terminal non-ready states reject so benchmarks cannot silently measure a
+ * cold fallback and mislabel it as prepared-prefix performance.
+ *
+ * @param {Object} input Polling inputs.
+ * @param {string} input.baseUrl Llama Manager `/api/v1` base URL.
+ * @param {string} input.id Opaque prepared-context id.
+ * @param {Record<string,string>} [input.headers] Scope-preserving request headers.
+ * @param {number} [input.timeoutMs=60000] Maximum wait duration.
+ * @param {number} [input.pollMs=50] Delay between status requests.
+ * @param {typeof fetch} [input.fetchImpl] Injectable fetch implementation.
+ * @param {() => number} [input.now] Injectable monotonic clock.
+ * @param {(ms:number) => Promise<void>} [input.sleep] Injectable delay.
+ * @returns {Promise<Record<string,unknown>>} Ready lease metadata.
+ * @throws {Error} When status lookup fails, preparation terminates, or timeout expires.
+ */
+export async function waitForPreparedContext({
+  baseUrl,
+  id,
+  headers = {},
+  timeoutMs = 60_000,
+  pollMs = 50,
+  fetchImpl = fetch,
+  now = () => Date.now(),
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+} = {}) {
+  if (!baseUrl || !id) throw new TypeError('baseUrl and id are required');
+  const deadline = now() + Math.max(1, timeoutMs);
+  const pending = new Set(['queued', 'tokenizing', 'prefilling']);
+  while (now() <= deadline) {
+    const response = await fetchImpl(`${String(baseUrl).replace(/\/+$/, '')}/context/${encodeURIComponent(id)}`, { headers });
+    if (!response.ok) throw new Error(`prepared context ${id} status failed (${response.status})`);
+    const lease = await response.json();
+    if (lease.status === 'ready') return lease;
+    if (!pending.has(lease.status)) {
+      throw new Error(`prepared context ${id} ${lease.status || 'invalid'}${lease.error ? `: ${lease.error}` : ''}`);
+    }
+    await sleep(pollMs);
+  }
+  throw new Error(`prepared context ${id} timed out`);
+}

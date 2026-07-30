@@ -65,11 +65,15 @@ Local llama.cpp models advertise a versioned `context_management` capability
 object and provide exact production-template counts at
 `chat/completions/input_tokens` and `responses/input_tokens`. Stable
 `conversation_cache_key` values keep growing histories on a useful slot lineage;
-clients without the extension receive a stable hashed conversation-head fallback.
+clients without the extension receive a stable hashed conversation-head fallback
+starting on the first user turn. Cold assignments erase the manager-owned slot
+before use, preventing stale KV reuse across lineages or authorization scopes.
 
 `context/prepare` creates an opaque, Authorization-scoped lease. `mode: "count"`
-only renders/counts; `mode: "prefill"` queues zero-output KV work at background
-priority and is cancelled when realtime work arrives. Status and deletion use
+only renders/counts; `mode: "prefill"` queues KV work at background priority and
+is cancelled when realtime work arrives. llama.cpp b9820 requires one internal
+decode token to retain reusable KV; the manager discards it and advertises this
+limit without emitting client output. Status and deletion use
 `context/{id}`; `DELETE context/cache` removes every attributable memory and disk
 record in the caller scope. Raw token and llama.cpp slot ids are never public.
 

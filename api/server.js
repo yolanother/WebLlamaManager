@@ -73,6 +73,7 @@ import {
   validateConversationCacheKey,
 } from './context-cache.js';
 import { DurableSlotCacheRegistry } from './slot-cache-registry.js';
+import { eraseSlotForColdAssignment } from './slot-ownership.js';
 import { contextCapabilities } from './context-capabilities.js';
 import { PriorityRequestQueue } from './request-queue.js';
 import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
@@ -316,8 +317,8 @@ const STALL_WATCHDOG_INTERVAL = 5_000;
 // === Conversation affinity ========================================================
 // Stable caller identities remain opaque and are scoped by Authorization. Clients
 // without the extension use a hashed conversation head, which remains unchanged as
-// turns grow and fixes the former per-turn prefix-key drift. One-shot prompts are not
-// pinned, leaving llama.cpp free to use native prompt-similarity slot selection.
+// turns grow and fixes the former per-turn prefix-key drift. The initial user turn is
+// pinned so its KV state cannot be selected from a slot owned by another scope.
 const slotAffinity = new SlotAffinityRegistry({ maxLineages: 256 });
 
 // Slot count for the loaded llama-server (cached). Discovered by hitting /slots.
@@ -7128,6 +7129,54 @@ async function isLocalModelResident(model) {
   }
 }
 
+/**
+ * Remove current live-slot ownership for records selected by a cache deletion.
+ * Erasure runs on the local execution lane and never loads a nonresident model;
+ * a skipped erase remains safe because the mapping is invalidated and every
+ * subsequent cold assignment erases before use.
+ *
+ * @param {Object[]} records Internal affinity records returned by listScope.
+ * @returns {Promise<{invalidated:number,erased:number,deferred:number}>} Lifecycle counts.
+ */
+async function eraseOwnedAffinitySlots(records) {
+  if (!Array.isArray(records) || records.length === 0) {
+    return { invalidated: 0, erased: 0, deferred: 0 };
+  }
+  let queueId = null;
+  let erased = 0;
+  let deferred = 0;
+  try {
+    queueId = await llamaQueue.acquire({
+      model: records[0].model,
+      endpoint: 'context/cache/delete',
+      priority: 'interactive',
+    });
+    for (const record of records) {
+      slotAffinity.invalidate(record.model, record.lineageKey);
+      if (!(await isLocalModelResident(record.model))) {
+        deferred++;
+        continue;
+      }
+      try {
+        await eraseSlotForColdAssignment({
+          baseUrl: `http://localhost:${LLAMA_PORT}`,
+          model: record.model,
+          slotId: record.slotId,
+        });
+        erased++;
+      } catch {
+        deferred++;
+      }
+    }
+  } catch {
+    deferred = records.length;
+    for (const record of records) slotAffinity.invalidate(record.model, record.lineageKey);
+  } finally {
+    if (queueId != null) llamaQueue.release(queueId);
+  }
+  return { invalidated: records.length, erased, deferred };
+}
+
 /** Run zero-output prefill on the background lane and update its opaque lease. */
 async function schedulePreparedPrefill(leaseId, scopeId) {
   const lease = preparedContexts.getInternal(leaseId, scopeId);
@@ -7142,14 +7191,25 @@ async function schedulePreparedPrefill(leaseId, scopeId) {
       priority: 'background',
       onPreempt: reason => controller.abort(reason),
     });
+    if (lease.slotNeedsReset) {
+      await eraseSlotForColdAssignment({
+        baseUrl: `http://localhost:${LLAMA_PORT}`,
+        model: lease.resolvedModel,
+        slotId: lease.internalSlotId,
+        signal: controller.signal,
+      });
+    }
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...managerControlledContextBody(lease.preparationBody, lease.resolvedModel),
         stream: false,
-        max_tokens: 0,
-        n_predict: 0,
+        // llama.cpp b9820 clamps a zero decode budget to one token and does not
+        // retain a reusable prefix on its special n_predict=0 path. Request the
+        // minimum explicitly, consume it privately, and never expose or append it.
+        max_tokens: 1,
+        n_predict: 1,
         cache_prompt: true,
         id_slot: lease.internalSlotId,
       }),
@@ -7159,11 +7219,14 @@ async function schedulePreparedPrefill(leaseId, scopeId) {
       const details = (await response.text().catch(() => '')).slice(0, 500);
       throw new Error(`llama.cpp prefill failed (${response.status}): ${details}`);
     }
-    await response.arrayBuffer();
+    const result = await response.json();
+    const discardedDecodeTokens = result.usage?.completion_tokens || result.timings?.predicted_n || 0;
     preparedContexts.update(leaseId, scopeId, {
       status: 'ready',
       prefillMs: Date.now() - lease.prefillStartedAt,
       readyAt: Date.now(),
+      discardedDecodeTokens,
+      slotNeedsReset: false,
       abortController: null,
       preparationBody: null,
     });
@@ -7265,6 +7328,7 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       preparedContexts.update(lease.id, scope.id, {
         internalSlotId: assignment.slotId,
         lineageKey,
+        slotNeedsReset: !assignment.hit,
       });
       queueMicrotask(() => schedulePreparedPrefill(lease.id, scope.id));
     }
@@ -7283,9 +7347,10 @@ app.post('/api/v1/context/prepare', async (req, res) => {
 });
 
 /** Delete all prepared and persisted cache state owned by the caller scope. */
-app.delete('/api/v1/context/cache', (req, res) => {
+app.delete('/api/v1/context/cache', async (req, res) => {
   const scope = deriveCacheScope(req.headers);
   const resolvedModel = req.body?.model ? resolveDefaultModel(req.body.model, config) : undefined;
+  const ownedSlots = slotAffinity.listScope(scope.id, resolvedModel);
   let deletedPrepared = 0;
   for (const lease of preparedContexts.list(scope.id)) {
     const internal = preparedContexts.getInternal(lease.id, scope.id);
@@ -7293,8 +7358,16 @@ app.delete('/api/v1/context/cache', (req, res) => {
     if (preparedContexts.invalidate(lease.id, scope.id, 'scope_deleted')) deletedPrepared++;
   }
   const durable = slotCacheRegistry.invalidate({ scopeId: scope.id, resolvedModel });
-  const memory = slotAffinity.invalidateScope(scope.id, resolvedModel);
-  return res.json({ deleted: { prepared: deletedPrepared, memory, disk: durable.deleted } });
+  const live = await eraseOwnedAffinitySlots(ownedSlots);
+  return res.json({
+    deleted: {
+      prepared: deletedPrepared,
+      memory: live.invalidated,
+      disk: durable.deleted,
+      live_slots_erased: live.erased,
+      live_slots_deferred: live.deferred,
+    },
+  });
 });
 
 /** Return scope-safe prepared lease status without revealing existence cross-scope. */
@@ -7304,12 +7377,13 @@ app.get('/api/v1/context/:id', (req, res) => {
 });
 
 /** Invalidate one owned prepared lease and any attributable durable dump. */
-app.delete('/api/v1/context/:id', (req, res) => {
+app.delete('/api/v1/context/:id', async (req, res) => {
   const scope = deriveCacheScope(req.headers);
   const internal = preparedContexts.getInternal(req.params.id, scope.id);
   if (!internal) return res.status(404).json({ error: { message: 'prepared context not found', code: 'CONTEXT_NOT_FOUND' } });
   if (internal.lineageKey) {
-    slotAffinity.invalidate(internal.resolvedModel, internal.lineageKey);
+    const owned = slotAffinity.get(internal.resolvedModel, internal.lineageKey);
+    if (owned) await eraseOwnedAffinitySlots([owned]);
     slotCacheRegistry.invalidate({
       scopeId: scope.id,
       resolvedModel: internal.resolvedModel,
@@ -8639,6 +8713,14 @@ async function handleChatCompletions(req, res) {
     if (slotAssignment) {
       slotAssignment.compatibilityHash ||= await modelCompatibilityHash(requestedModel);
       slotAssignment.prefixHash ||= canonicalHash(managerControlledContextBody(req.body, requestedModel));
+    }
+    if (slotAssignment && slotAssignment.slotId != null && !slotAssignment.hit) {
+      await eraseSlotForColdAssignment({
+        baseUrl: `http://localhost:${LLAMA_PORT}`,
+        model: requestedModel,
+        slotId: slotAssignment.slotId,
+        signal: getActiveRequestSignal(activeReqId),
+      });
     }
     // If this conversation has a disk-saved slot dump and its assigned slot is
     // now cold (the child was reloaded since we saved), restore the KV cache
