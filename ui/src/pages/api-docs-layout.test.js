@@ -35,6 +35,16 @@ test('roving API tabs support arrow, Home, and End keys', () => {
   assert.equal((source.match(/onKeyDown=\{handleApiTabKeyDown\}/g) ?? []).length, 2);
 });
 
+test('endpoint navigation is searchable, descriptive, and resets between API groups', () => {
+  assert.match(source, /import \{ filterApiEndpoints \} from '\.\/api-docs-search\.js';/);
+  assert.match(source, /const \[endpointQuery, setEndpointQuery\] = useState\(''\);/);
+  assert.match(source, /filterApiEndpoints\(endpoints, endpointQuery\)/);
+  assert.match(source, /selectApiTab[\s\S]*setEndpointQuery\(''\)/);
+  assert.match(source, /<label[^>]*htmlFor="api-endpoint-search"[\s\S]*Search endpoints[\s\S]*<input[\s\S]*id="api-endpoint-search"[\s\S]*type="search"/);
+  assert.match(source, /filteredEndpoints\.map\(endpoint =>[\s\S]*className="endpoint-item-summary"[\s\S]*\{endpoint\.summary\}/);
+  assert.match(source, /No endpoints match “\{endpointQuery\.trim\(\)\}”/);
+});
+
 test('multimodal help is a closed disclosure inside only the OpenAI panel', () => {
   const panelIndex = source.indexOf('role="tabpanel"');
   const openAiGuideIndex = source.indexOf("{activeTab === 'openai' && (", panelIndex);

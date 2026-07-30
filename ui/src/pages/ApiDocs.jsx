@@ -10,6 +10,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { SearchableSelect } from '../components/SearchableSelect.jsx';
 import { CodeBlock } from '../components/CodeBlock.jsx';
+import { filterApiEndpoints } from './api-docs-search.js';
 import '../styles/pages.css';
 
 const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete'];
@@ -252,6 +253,7 @@ function ApiDocsPage() {
   const [specError, setSpecError] = useState('');
   const [activeEndpoint, setActiveEndpoint] = useState(null);
   const [activeTab, setActiveTab] = useState('manager');
+  const [endpointQuery, setEndpointQuery] = useState('');
   const [params, setParams] = useState({});
   const [requestBodyText, setRequestBodyText] = useState('');
   const [requestError, setRequestError] = useState('');
@@ -313,6 +315,10 @@ function ApiDocsPage() {
     [allEndpoints]
   );
   const endpoints = activeTab === 'manager' ? managerEndpoints : openaiEndpoints;
+  const filteredEndpoints = useMemo(
+    () => filterApiEndpoints(endpoints, endpointQuery),
+    [endpoints, endpointQuery]
+  );
   const chatEndpoint = useMemo(
     () => openaiEndpoints.find(endpoint => endpoint.path === '/v1/chat/completions')
       || openaiEndpoints.find(endpoint => endpoint.path === '/api/v1/chat/completions'),
@@ -324,6 +330,7 @@ function ApiDocsPage() {
   /** Changes the API group and clears tester state that belongs to the prior group. */
   const selectApiTab = useCallback((tab) => {
     setActiveTab(tab);
+    setEndpointQuery('');
     setActiveEndpoint(null);
     setResponse(null);
   }, []);
@@ -611,8 +618,19 @@ function ApiDocsPage() {
         <div className="api-docs-layout" id="api-tester">
           <aside className="api-endpoints-list glass-panel" aria-label="Endpoints">
             <h3>{activeTab === 'manager' ? 'Manager endpoints' : 'OpenAI-compatible endpoints'}</h3>
+            <div className="api-endpoint-search">
+              <label htmlFor="api-endpoint-search">Search endpoints</label>
+              <input
+                id="api-endpoint-search"
+                className="glass-input"
+                type="search"
+                value={endpointQuery}
+                placeholder="Method, path, or description"
+                onChange={event => setEndpointQuery(event.target.value)}
+              />
+            </div>
             <div className="endpoints-list">
-              {endpoints.map(endpoint => (
+              {filteredEndpoints.map(endpoint => (
                 <button
                   key={endpoint.id}
                   type="button"
@@ -621,10 +639,18 @@ function ApiDocsPage() {
                   title={`${endpoint.method} ${endpoint.path}: ${endpoint.summary}`}
                   onClick={() => selectEndpoint(endpoint)}
                 >
-                  <span className={`method-badge ${endpoint.method.toLowerCase()}`}>{endpoint.method}</span>
-                  <span className="endpoint-path">{endpoint.path}</span>
+                  <span className="endpoint-item-heading">
+                    <span className={`method-badge ${endpoint.method.toLowerCase()}`}>{endpoint.method}</span>
+                    <span className="endpoint-path">{endpoint.path}</span>
+                  </span>
+                  <span className="endpoint-item-summary">{endpoint.summary}</span>
                 </button>
               ))}
+              {filteredEndpoints.length === 0 && endpointQuery.trim() && (
+                <p className="api-endpoints-empty" role="status">
+                  No endpoints match “{endpointQuery.trim()}”
+                </p>
+              )}
             </div>
           </aside>
 
