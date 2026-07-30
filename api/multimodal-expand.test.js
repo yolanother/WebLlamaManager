@@ -356,6 +356,37 @@ test('repeated URL in a conversation reuses one ingestion result', async () => {
   assert.equal(result.media.length, 2);
 });
 
+test('cache lifetime is per call unless a shared cache is explicitly provided', async () => {
+  let ingestions = 0;
+  const messages = [{
+    role: 'user',
+    content: [{
+      type: 'audio_url',
+      audio_url: { url: 'https://cdn.example.test/per-request.wav' },
+    }],
+  }];
+  const options = {
+    ingest: async () => {
+      ingestions += 1;
+      return {
+        id: 'cache-lifetime', kind: 'audio', durationSec: 5, frames: [],
+        audio: { segments: ['/audio/0'] },
+      };
+    },
+    loadArtifact: async () => Buffer.from('audio'),
+  };
+
+  await expandMessages(messages, options);
+  await expandMessages(messages, options);
+
+  assert.equal(ingestions, 2);
+  const cache = new Map();
+  await expandMessages(messages, { ...options, cache });
+  await expandMessages(messages, { ...options, cache });
+
+  assert.equal(ingestions, 3);
+});
+
 test('default dependencies ingest and load raw artifacts through the media API', async () => {
   const calls = [];
   const fetchImpl = async (url, options = {}) => {

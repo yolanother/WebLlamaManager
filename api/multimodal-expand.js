@@ -10,7 +10,6 @@
 import { classifyMediaUrl } from './media.js';
 import { planSegments } from './media-segments.js';
 
-const DEFAULT_CACHE = new Map();
 const MEDIA_DIGEST_PROMPT = 'Describe the speech, visuals, and notable events in this media window. Include useful timestamps and do not speculate beyond the supplied content.';
 
 /**
@@ -88,7 +87,7 @@ function resolveOptions(options) {
   const baseUrl = String(options.baseUrl || 'http://127.0.0.1:5250').replace(/\/+$/, '');
   return {
     ...options,
-    cache: options.cache || DEFAULT_CACHE,
+    cache: options.cache ?? new Map(),
     ingest: options.ingest || ((url, context) => defaultIngest(url, context, { fetchImpl, baseUrl })),
     loadArtifact: options.loadArtifact || (path => defaultLoadArtifact(path, { fetchImpl, baseUrl })),
     complete: options.complete || (request => defaultComplete(request, { fetchImpl, baseUrl })),
