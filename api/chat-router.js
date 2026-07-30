@@ -88,8 +88,8 @@ export function lastUserText(body) {
 
 /**
  * Detect image, video, and audio inputs across OpenAI content parts and optional
- * attachment metadata. Sampled video frame markers count as video as well as
- * image input.
+ * attachment metadata. A video URL requires image capability and, unless its
+ * `include_audio` option is false, audio capability too.
  *
  * @param {object|null|undefined} body chat-completions request body
  * @returns {{image:boolean, video:boolean, audio:boolean, any:boolean}} attachment flags
@@ -103,6 +103,10 @@ export function attachmentPresence(body) {
       const type = String(part?.type || '').toLowerCase();
       if (type === 'image_url' || type === 'input_image' || type === 'image') image = true;
       if (type === 'video_url' || type === 'input_video' || type === 'video') video = true;
+      if (type === 'video_url') {
+        image = true;
+        if (part?.video_url?.include_audio !== false) audio = true;
+      }
       if (type === 'input_audio' || type === 'audio_url' || type === 'audio') audio = true;
       if (type === 'text' && /\[frame\s+\d+\/\d+\s+@\s+\d{1,2}:\d{2}\]/i.test(part.text || '')) {
         video = true;

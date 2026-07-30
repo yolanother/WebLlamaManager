@@ -45,7 +45,7 @@ test('buildClassificationPrompt includes truncated last-user text, attachments, 
         role: 'user',
         content: [
           { type: 'text', text: longText },
-          { type: 'video_url', video_url: { url: 'https://example.test/clip.mp4' } },
+          { type: 'input_video', input_video: { data: 'AAAA' } },
         ],
       },
     ],
@@ -127,6 +127,47 @@ test('attachmentPresence recognizes inline and URL audio parts', () => {
     }],
   });
   assert.deepEqual(presence, { image: false, video: false, audio: true, any: true });
+});
+
+test('attachmentPresence treats video_url as sound-aware by default', () => {
+  const presence = attachmentPresence({
+    messages: [{
+      role: 'user',
+      content: [{ type: 'video_url', video_url: { url: 'https://youtu.be/example' } }],
+    }],
+  });
+  assert.deepEqual(presence, { image: true, video: true, audio: true, any: true });
+});
+
+test('attachmentPresence honors video_url include_audio false', () => {
+  const presence = attachmentPresence({
+    messages: [{
+      role: 'user',
+      content: [{
+        type: 'video_url',
+        video_url: { url: 'https://example.test/silent.mp4', include_audio: false },
+      }],
+    }],
+  });
+  assert.deepEqual(presence, { image: true, video: true, audio: false, any: true });
+});
+
+test('filterRoutingCandidates requires vision and audio for sound-aware video_url', () => {
+  const body = {
+    messages: [{
+      role: 'user',
+      content: [{ type: 'video_url', video_url: { url: 'https://youtu.be/example' } }],
+    }],
+  };
+  const models = [
+    { id: 'vision-only', modalities: ['text', 'image'], capabilitySource: 'mmproj' },
+    { id: 'audio-only', modalities: ['text', 'audio'], capabilitySource: 'mmproj' },
+    { id: 'vision-and-audio', modalities: ['text', 'image', 'audio'], capabilitySource: 'mmproj' },
+  ];
+  assert.deepEqual(
+    filterRoutingCandidates(body, models).map(model => model.id),
+    ['vision-and-audio'],
+  );
 });
 
 test('filterRoutingCandidates restricts audio requests to mmproj audio-capable models', () => {
