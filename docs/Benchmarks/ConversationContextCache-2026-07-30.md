@@ -64,3 +64,17 @@ Manager now derives slot-dependent capabilities from the concrete router model
 descriptor, leaves exact count/render enabled, and rejects strict prefill before
 calling the unsupported lifecycle endpoint. Reload/restore conformance must use
 a text-only model child.
+
+## Reload/restore conformance
+
+After hardening the lazy-router startup path, a three-sample maintenance run
+with text-only `tinyllama` passed the unload/restore probe. The first request
+after explicit unload reported `cache_kind: disk_restore`, reused 424 prefix
+tokens, and completed in 957 ms. The same run verified scope deletion across
+three prepared handles, four in-memory lineages, ten disk dumps, and four live
+slots; the first request after deletion reused zero tokens. Realtime queue wait
+remained 2 ms at p95.
+
+This small-model run is lifecycle conformance evidence, not the performance
+acceptance baseline. The 20-sample Qwen run above remains the prefill go/no-go
+measurement.
