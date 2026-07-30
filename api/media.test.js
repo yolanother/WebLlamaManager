@@ -8,9 +8,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { PassThrough, Readable } from 'node:stream';
 import {
   classifyMediaUrl,
+  createMediaRouter,
+  extractAudio,
   frameTimestamps,
   isSafeMediaId,
   mapProcessError,
@@ -38,6 +44,61 @@ function mockChildProcess({ error, code = 0, stdout = '', stderr = '' } = {}) {
     child.emit('close', code, null);
   });
   return child;
+}
+
+function createRouterHarness(routerOptions) {
+  const routes = new Map();
+  const router = {
+    use() {},
+    get(path, handler) { routes.set(`GET ${path}`, handler); },
+    post(path, handler) { routes.set(`POST ${path}`, handler); },
+  };
+  const expressImpl = {
+    Router: () => router,
+    json: () => () => {},
+  };
+  createMediaRouter({ ...routerOptions, expressImpl });
+  return routes;
+}
+
+async function invokeRoute(routes, method, path, { body, headers = {}, params = {} } = {}) {
+  const request = body instanceof Buffer ? Readable.from([body]) : Readable.from([]);
+  request.body = body instanceof Buffer ? undefined : body;
+  request.headers = headers;
+  request.params = params;
+  const response = {
+    statusCode: 200,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(value) {
+      this.body = value;
+      return this;
+    },
+    type(value) {
+      this.contentType = value;
+      return this;
+    },
+    sendFile(filePath, callback) {
+      try {
+        this.payload = readFileSync(filePath);
+        callback?.();
+      } catch (error) {
+        callback?.(error);
+      }
+    },
+  };
+  await routes.get(`${method} ${path}`)(request, response);
+  return response;
+}
+
+function multipartFileBody(boundary, filename, mime, data) {
+  return Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${mime}\r\n\r\n`),
+    data,
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
 }
 
 test('classifyMediaUrl accepts only HTTP(S) direct and supported YouTube URLs', () => {
@@ -104,6 +165,141 @@ test('runProcess captures stdout and stderr from a mocked successful spawn', asy
   assert.equal(result.stderr, 'warning\n');
   assert.deepEqual(calls[0].args, ['input.mp4']);
   assert.equal(calls[0].options.shell, false);
+});
+
+test('extractAudio normalizes a bounded source window to 16 kHz mono PCM WAV', async () => {
+  const calls = [];
+  await extractAudio({
+    sourcePath: '/media/source.mp4',
+    outputPath: '/media/audio/1.wav',
+    startSec: 600,
+    endSec: 650,
+    spawnImpl(command, args, options) {
+      calls.push({ command, args, options });
+      return mockChildProcess();
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, 'ffmpeg');
+  assert.deepEqual(calls[0].args, [
+    '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+    '-ss', '600.000000',
+    '-i', '/media/source.mp4',
+    '-t', '50.000000',
+    '-vn',
+    '-ac', '1',
+    '-ar', '16000',
+    '-c:a', 'pcm_s16le',
+    '/media/audio/1.wav',
+  ]);
+});
+
+test('video upload exposes and serves one normalized audio file per planned window', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-test-'));
+  const calls = [];
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'video-audio-id',
+      spawnImpl(command, args) {
+        calls.push({ command, args });
+        if (command === 'ffprobe') return mockChildProcess({ stdout: '1250\n' });
+        const outputPath = args.at(-1);
+        mkdirSync(dirname(outputPath), { recursive: true });
+        writeFileSync(outputPath, args.includes('-vn') ? Buffer.from('normalized-wav') : Buffer.from('jpeg'));
+        return mockChildProcess();
+      },
+    });
+    const boundary = 'llama-media-boundary';
+    const uploadBody = multipartFileBody(
+      boundary,
+      'long.mp4',
+      'video/mp4',
+      Buffer.from('\x00\x00\x00\x18ftypisom\x00\x00\x00\x00', 'binary'),
+    );
+    const uploaded = await invokeRoute(routes, 'POST', '/upload', {
+      body: uploadBody,
+      headers: {
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+        'content-length': String(uploadBody.length),
+      },
+    });
+    assert.equal(uploaded.statusCode, 200);
+    const metadata = uploaded.body;
+      assert.equal(metadata.kind, 'video');
+      assert.equal(metadata.durationSec, 1_250);
+      assert.equal(metadata.frames.length, 48);
+      assert.deepEqual(metadata.audio, {
+        segments: [
+          '/api/media/video-audio-id/audio/0.wav',
+          '/api/media/video-audio-id/audio/1.wav',
+          '/api/media/video-audio-id/audio/2.wav',
+        ],
+        durationSec: 1_250,
+        sampleRate: 16_000,
+        channels: 1,
+      });
+
+    const audio = await invokeRoute(routes, 'GET', '/:id/audio/:n.wav', {
+      params: { id: 'video-audio-id', n: '1' },
+    });
+    assert.equal(audio.statusCode, 200);
+    assert.equal(audio.contentType, 'audio/wav');
+    assert.deepEqual(audio.payload, Buffer.from('normalized-wav'));
+
+    const audioCalls = calls.filter(call => call.command === 'ffmpeg' && call.args.includes('-vn'));
+    assert.equal(audioCalls.length, 3);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('audio upload normalizes sound without attempting video frame extraction', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-test-'));
+  const calls = [];
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'audio-only-id',
+      spawnImpl(command, args) {
+        calls.push({ command, args });
+        if (command === 'ffprobe') return mockChildProcess({ stdout: '30\n' });
+        const outputPath = args.at(-1);
+        mkdirSync(dirname(outputPath), { recursive: true });
+        writeFileSync(outputPath, Buffer.from('normalized-wav'));
+        return mockChildProcess();
+      },
+    });
+    const boundary = 'llama-audio-boundary';
+    const uploadBody = multipartFileBody(
+      boundary,
+      'voice.wav',
+      'audio/wav',
+      Buffer.from('RIFF\x24\x00\x00\x00WAVEfmt ', 'binary'),
+    );
+    const uploaded = await invokeRoute(routes, 'POST', '/upload', {
+      body: uploadBody,
+      headers: {
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+        'content-length': String(uploadBody.length),
+      },
+    });
+
+    assert.equal(uploaded.statusCode, 200);
+    assert.equal(uploaded.body.kind, 'audio');
+    assert.deepEqual(uploaded.body.frames, []);
+    assert.deepEqual(uploaded.body.audio, {
+      segments: ['/api/media/audio-only-id/audio/0.wav'],
+      durationSec: 30,
+      sampleRate: 16_000,
+      channels: 1,
+    });
+    assert.equal(calls.filter(call => call.command === 'ffmpeg' && call.args.includes('-vn')).length, 1);
+    assert.equal(calls.filter(call => call.command === 'ffmpeg' && call.args.includes('-frames:v')).length, 0);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test('missing yt-dlp and ffmpeg processes map to graceful 501 responses', async () => {

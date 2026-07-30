@@ -23,6 +23,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { basename, extname, join, resolve } from 'node:path';
+import { planSegments } from './media-segments.js';
 
 const DEFAULT_MAX_ITEMS = 20;
 const DEFAULT_MAX_BYTES = 250 * 1024 * 1024;
@@ -254,6 +255,46 @@ export function mapProcessError(binary, error) {
 }
 
 /**
+ * Normalize one bounded source-media window to a 16 kHz mono PCM WAV file.
+ *
+ * @param {{
+ *   sourcePath:string,
+ *   outputPath:string,
+ *   startSec:number,
+ *   endSec:number,
+ *   spawnImpl?:Function,
+ *   ffmpegTimeoutMs?:number,
+ * }} options Source window, destination, and injectable process options.
+ * @returns {Promise<void>} Resolves after ffmpeg writes the normalized WAV file.
+ * @throws {MediaPipelineError} When ffmpeg is unavailable or conversion fails.
+ */
+export async function extractAudio({
+  sourcePath,
+  outputPath,
+  startSec,
+  endSec,
+  spawnImpl = nodeSpawn,
+  ffmpegTimeoutMs = FFMPEG_TIMEOUT_MS,
+}) {
+  const start = Number(startSec);
+  const end = Number(endSec);
+  if (!Number.isFinite(start) || start < 0 || !Number.isFinite(end) || end <= start) {
+    throw new TypeError('extractAudio requires a valid startSec/endSec window');
+  }
+  await requiredProcess('ffmpeg', [
+    '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+    '-ss', start.toFixed(6),
+    '-i', sourcePath,
+    '-t', (end - start).toFixed(6),
+    '-vn',
+    '-ac', '1',
+    '-ar', '16000',
+    '-c:a', 'pcm_s16le',
+    outputPath,
+  ], { spawnImpl, timeoutMs: ffmpegTimeoutMs });
+}
+
+/**
  * Identify supported image, video, or audio data using magic bytes with MIME/filename fallback.
  *
  * @param {Buffer|Uint8Array} bytes Initial media bytes.
@@ -386,6 +427,7 @@ export function parseMultipartFile(body, contentType, maxBytes) {
  *   ffmpegTimeoutMs?:number,
  *   ytdlpTimeoutMs?:number,
  *   idFactory?:Function,
+ *   expressImpl?:Function & {Router:Function, json:Function},
  * }} options Runtime path and injectable side effects.
  * @returns {import('express').Router} Router intended for mounting at /api/media.
  */
@@ -399,13 +441,14 @@ export function createMediaRouter({
   ffmpegTimeoutMs = FFMPEG_TIMEOUT_MS,
   ytdlpTimeoutMs = YTDLP_TIMEOUT_MS,
   idFactory = () => randomBytes(12).toString('base64url'),
+  expressImpl,
 } = {}) {
   if (typeof dataDir !== 'string' || !dataDir) throw new TypeError('dataDir is required');
   if (typeof fetchImpl !== 'function') throw new TypeError('fetch is not available');
 
   // Load the server's existing dependency only when a router is actually built,
   // keeping pure-helper tests runnable before npm dependencies are installed.
-  const express = require('express');
+  const express = expressImpl || require('express');
   const router = express.Router();
   const mediaRoot = resolve(dataDir, 'media');
   const limits = {
@@ -519,6 +562,26 @@ export function createMediaRouter({
     }
   });
 
+  router.get('/:id/audio/:n.wav', async (req, res) => {
+    try {
+      const stored = await loadStoredMetadata(mediaRoot, req.params.id, true);
+      if (!/^(0|[1-9]\d*)$/.test(req.params.n)) {
+        throw new MediaPipelineError(400, { error: 'Invalid audio segment number' });
+      }
+      const segmentIndex = Number(req.params.n);
+      if (!stored.audio || !Array.isArray(stored.audio.segments)
+        || segmentIndex >= stored.audio.segments.length) {
+        throw new MediaPipelineError(404, { error: 'Audio segment not found' });
+      }
+      res.type('audio/wav');
+      res.sendFile(join(mediaRoot, stored.id, 'audio', `${segmentIndex}.wav`), error => {
+        if (error && !res.headersSent) sendMediaError(res, fileSendError(error));
+      });
+    } catch (error) {
+      sendMediaError(res, error);
+    }
+  });
+
   router.get('/:id', async (req, res) => {
     try {
       const stored = await loadStoredMetadata(mediaRoot, req.params.id, true);
@@ -539,6 +602,28 @@ export function createMediaRouter({
       spawnImpl,
       ffmpegTimeoutMs,
     });
+    let audio;
+    if (kind !== 'image') {
+      const segments = planSegments(extracted.durationSec);
+      const audioDir = join(item.dir, 'audio');
+      await mkdir(audioDir, { recursive: true });
+      for (const segment of segments) {
+        await extractAudio({
+          sourcePath,
+          outputPath: join(audioDir, `${segment.index}.wav`),
+          startSec: segment.startSec,
+          endSec: segment.endSec,
+          spawnImpl,
+          ffmpegTimeoutMs,
+        });
+      }
+      audio = {
+        segments: segments.map(segment => `/api/media/${item.id}/audio/${segment.index}.wav`),
+        durationSec: extracted.durationSec,
+        sampleRate: 16_000,
+        channels: 1,
+      };
+    }
     const now = new Date().toISOString();
     const stored = {
       id: item.id,
@@ -549,6 +634,7 @@ export function createMediaRouter({
       url: `/api/media/${item.id}/file`,
       frames: extracted.frames.map(index => `/api/media/${item.id}/frames/${index}.jpg`),
       durationSec: extracted.durationSec,
+      ...(audio ? { audio } : {}),
       sourceFile,
       createdAt: now,
       lastAccessAt: now,
@@ -591,12 +677,14 @@ async function extractFrames({ sourcePath, framesDir, kind, spawnImpl, ffmpegTim
   const durationSec = Number.parseFloat(probe.stdout.trim());
   if (!Number.isFinite(durationSec) || durationSec <= 0) {
     throw new MediaPipelineError(422, {
-      error: 'Unable to determine video duration',
+      error: 'Unable to determine media duration',
       ...(probe.stderr ? { stderr: probe.stderr } : {}),
     });
   }
 
-  const timestamps = frameTimestamps(durationSec);
+  if (kind === 'audio') return { durationSec, frames: [] };
+
+  const timestamps = planSegments(durationSec).flatMap(segment => segment.frameTimestamps);
   for (let index = 0; index < timestamps.length; index += 1) {
     await requiredProcess('ffmpeg', [
       '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
@@ -858,6 +946,7 @@ function publicMetadata(stored) {
     url: stored.url,
     frames: stored.frames,
     durationSec: stored.durationSec,
+    ...(stored.audio ? { audio: stored.audio } : {}),
   };
 }
 
