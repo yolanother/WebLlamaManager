@@ -8,7 +8,12 @@
 // p50/p95 TTFT and queue wait plus the documented prefill go/no-go decision.
 
 import { randomUUID } from 'node:crypto';
-import { benchmarkDecision, summarizeSamples, waitForPreparedContext } from '../api/context-benchmark.js';
+import {
+  benchmarkDecision,
+  localBenchmarkChatBody,
+  summarizeSamples,
+  waitForPreparedContext,
+} from '../api/context-benchmark.js';
 
 /**
  * Parse the supported command-line options.
@@ -37,7 +42,7 @@ async function streamingChat(baseUrl, body, headers = {}) {
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify({ ...body, stream: true }),
+    body: JSON.stringify(localBenchmarkChatBody(body)),
   });
   if (!response.ok) throw new Error(`chat failed: ${response.status} ${await response.text()}`);
   const reader = response.body.getReader();
