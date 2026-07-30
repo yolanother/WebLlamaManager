@@ -7,7 +7,7 @@
 // inspecting slots for durable restore. These boundaries prevent stale KV state
 // from a prior lineage or authorization scope from participating in reuse.
 
-import { classifyUpstreamFailure } from './upstream-retry.js';
+import { classifyUpstreamFailure, upstreamRetryPlan } from './upstream-retry.js';
 
 /** Error raised when Llama Manager cannot establish clean slot ownership. */
 export class SlotOwnershipError extends Error {
@@ -107,4 +107,65 @@ export async function fetchModelSlotsWhenReady({
   if (!response.ok) return null;
   const payload = await response.json().catch(() => null);
   return Array.isArray(payload) ? payload : null;
+}
+
+/**
+ * Restore a durable dump while tolerating the short interval where the router
+ * reports a lazy child as loaded but its proxy socket still rejects requests.
+ * Only classified child-loading failures retry; unsupported or invalid actions
+ * fail cold without hiding their nature behind repeated requests.
+ *
+ * @param {Object} input Restore inputs.
+ * @param {string} input.baseUrl llama.cpp/router base URL.
+ * @param {string} input.model Concrete model whose slot is restored.
+ * @param {number} input.slotId Server-owned slot identifier.
+ * @param {string} input.filename Safe manager-owned slot dump filename.
+ * @param {typeof fetch} [input.fetchImpl] Injectable fetch implementation.
+ * @param {(model:string)=>Promise<boolean>} input.waitForReady Model-ready waiter.
+ * @param {(milliseconds:number)=>Promise<void>} [input.sleep] Injectable delay.
+ * @param {number} [input.retries=6] Maximum transient retries.
+ * @param {AbortSignal} [input.signal] Optional cancellation signal.
+ * @returns {Promise<Record<string,unknown>|null>} Upstream restore result, or null on failure.
+ */
+export async function restoreModelSlotWhenReady({
+  baseUrl,
+  model,
+  slotId,
+  filename,
+  fetchImpl = fetch,
+  waitForReady,
+  sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
+  retries = 6,
+  signal,
+} = {}) {
+  if (!baseUrl || !model || !Number.isInteger(slotId) || slotId < 0 || !filename || typeof waitForReady !== 'function') {
+    throw new TypeError('baseUrl, model, slotId, filename, and waitForReady are required');
+  }
+  const url = `${String(baseUrl).replace(/\/+$/, '')}/slots/${slotId}?action=restore`;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let response;
+    try {
+      response = await fetchImpl(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename, model }),
+        signal,
+      });
+    } catch {
+      return null;
+    }
+    if (response.ok) return await response.json().catch(() => ({}));
+    const detail = await response.text().catch(() => '');
+    if (classifyUpstreamFailure({ status: response.status, text: detail }).kind !== 'proxy') return null;
+    const plan = upstreamRetryPlan({
+      kind: 'proxy',
+      attempt,
+      retries,
+      baseDelayMs: 500,
+      maxDelayMs: 2000,
+    });
+    if (plan.action !== 'retry' || !(await waitForReady(model))) return null;
+    await sleep(plan.delayMs);
+  }
+  return null;
 }

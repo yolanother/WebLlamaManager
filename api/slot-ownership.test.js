@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import {
   eraseSlotForColdAssignment,
   fetchModelSlotsWhenReady,
+  restoreModelSlotWhenReady,
   SlotOwnershipError,
 } from './slot-ownership.js';
 
@@ -74,4 +75,28 @@ test('fetchModelSlotsWhenReady does not wait for non-loading slot failures', asy
 
   assert.equal(slots, null);
   assert.equal(waited, false);
+});
+
+test('restoreModelSlotWhenReady retries transient proxy failures after loaded status', async () => {
+  const responses = [
+    new Response('proxy error: Could not establish connection', { status: 500 }),
+    new Response('proxy error: Failed to read connection', { status: 500 }),
+    new Response(JSON.stringify({ n_restored: 425 }), { status: 200 }),
+  ];
+  const waits = [];
+  const delays = [];
+  const restored = await restoreModelSlotWhenReady({
+    baseUrl: 'http://localhost:5251',
+    model: 'tinyllama',
+    slotId: 0,
+    filename: 'slot_abc.bin',
+    fetchImpl: async () => responses.shift(),
+    waitForReady: async model => { waits.push(model); return true; },
+    sleep: async milliseconds => { delays.push(milliseconds); },
+  });
+
+  assert.deepEqual(restored, { n_restored: 425 });
+  assert.deepEqual(waits, ['tinyllama', 'tinyllama']);
+  assert.deepEqual(delays, [500, 1000]);
+  assert.equal(responses.length, 0);
 });
