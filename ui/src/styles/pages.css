@@ -417,8 +417,404 @@
   background: color-mix(in srgb, var(--accent) 9%, var(--glass-bg));
 }
 
+/* Spec-driven API reference and multimodal guide. */
+.api-docs-page {
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.api-docs-intro {
+  max-width: 72ch;
+  line-height: 1.6;
+}
+
+.api-resource-links.glass-panel,
+.multimodal-guide.glass-panel,
+.api-spec-state.glass-panel {
+  padding: clamp(16px, 2vw, 24px);
+  margin-bottom: 20px;
+  background: var(--glass-bg);
+}
+
+.api-resource-links {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.api-resource-links > div:first-child {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.api-resource-links span,
+.multimodal-guide p,
+.guide-example-button span,
+.media-digest-note span,
+.api-inline-note {
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.api-resource-link-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.docs-resource-link.glass-btn,
+.api-tab,
+.code-sample-tab,
+.guide-example-button,
+.api-spec-state .glass-btn,
+.api-docs-page .btn-primary {
+  min-height: 44px;
+}
+
+.docs-resource-link {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.docs-resource-link:focus-visible,
+.endpoint-item:focus-visible,
+.code-sample-tab:focus-visible,
+.guide-example-button:focus-visible,
+.api-docs-page input:focus-visible,
+.api-docs-page select:focus-visible,
+.api-docs-page textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.multimodal-guide {
+  display: grid;
+  gap: 18px;
+}
+
+.multimodal-guide-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 24px;
+  align-items: start;
+}
+
+.multimodal-guide h3,
+.multimodal-guide h4,
+.multimodal-guide p {
+  margin: 0;
+}
+
+.api-eyebrow {
+  margin-bottom: 4px !important;
+  color: var(--accent) !important;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.multimodal-guide-header h3 {
+  margin-bottom: 8px;
+  font-size: clamp(1.2rem, 2vw, 1.5rem);
+}
+
+.multimodal-limits {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(110px, 1fr));
+  gap: 8px;
+}
+
+.multimodal-limits span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 10px 12px;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  background: color-mix(in srgb, var(--glass-bg-elevated) 86%, transparent);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+}
+
+.multimodal-limits strong {
+  color: var(--text-primary);
+  font-size: 1rem;
+}
+
+.guide-example-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.guide-example-button {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.guide-example-button span {
+  font-size: 0.82rem;
+}
+
+.guide-example-button.active {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--glass-border));
+  background: color-mix(in srgb, var(--accent) 12%, var(--glass-bg-elevated));
+  box-shadow: var(--shadow-pressed);
+}
+
+.guide-example-detail {
+  min-width: 0;
+  padding-top: 18px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.guide-example-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 18px;
+}
+
+.guide-example-detail-header > div {
+  min-width: 0;
+}
+
+.guide-example-detail-header h4 {
+  margin-bottom: 5px;
+}
+
+.media-digest-note {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--info-bg);
+  border: 1px solid color-mix(in srgb, var(--info) 34%, var(--glass-border));
+  border-radius: var(--radius-md);
+}
+
+.media-digest-note code {
+  overflow-wrap: anywhere;
+}
+
+.api-spec-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 180px;
+}
+
+.api-spec-state > div {
+  display: grid;
+  gap: 4px;
+}
+
+.api-spec-error {
+  color: var(--error);
+}
+
+.api-loading-indicator {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--glass-border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: api-docs-spin 800ms linear infinite;
+}
+
+@keyframes api-docs-spin {
+  to { transform: rotate(360deg); }
+}
+
+.api-docs-layout {
+  width: 100%;
+  max-width: 100%;
+}
+
+.api-endpoints-list,
+.api-endpoint-detail,
+.endpoint-header,
+.endpoint-examples,
+.api-code-samples,
+.code-block {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.api-endpoints-list h3 {
+  margin-top: 0;
+}
+
+.endpoint-item {
+  width: 100%;
+  min-height: 44px;
+  text-align: left;
+  box-shadow: none;
+}
+
+.endpoint-item.active {
+  border-left: 3px solid var(--accent);
+}
+
+.endpoint-header {
+  flex-wrap: wrap;
+}
+
+.endpoint-path-large {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.endpoint-summary {
+  margin: 0 0 8px;
+  font-size: 1.1rem;
+}
+
+.request-body-section,
+.endpoint-examples {
+  margin-bottom: 24px;
+}
+
+.request-body-heading-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.request-body-heading-row h4 {
+  margin: 0;
+}
+
+.request-body-heading-row code,
+.model-field-label {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.model-field {
+  margin-bottom: 14px;
+}
+
+.model-field-label,
+.request-body-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.request-body-input.glass-input {
+  display: block;
+  min-height: 260px;
+  max-width: 100%;
+  resize: vertical;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  tab-size: 2;
+}
+
+.request-body-input:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.api-inline-note,
+.api-inline-error {
+  margin: 7px 0 0;
+  font-size: 0.83rem;
+}
+
+.api-inline-error {
+  padding: 10px 12px;
+  color: var(--error);
+  background: var(--error-bg);
+  border: 1px solid color-mix(in srgb, var(--error) 42%, var(--glass-border));
+  border-radius: var(--radius-sm);
+}
+
+.code-sample-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.code-sample-tab {
+  min-width: 82px;
+  padding: 8px 14px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.code-sample-tab.active {
+  color: var(--control-contrast);
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: var(--shadow-pressed);
+}
+
+.api-code-samples .code-block {
+  margin-bottom: 0;
+}
+
+.api-code-samples .code-block pre,
+.response-body {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.api-docs-page button:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.no-endpoint-selected strong {
+  color: var(--text-primary);
+}
+
+.no-endpoint-selected p {
+  margin-top: 6px;
+}
+
 .param-field .glass-input {
   max-width: 100%;
+}
+
+@media (max-width: 1100px) {
+  .guide-example-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .multimodal-guide-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  .api-docs-layout {
+    grid-template-columns: minmax(0, 1fr);
+    overflow: visible;
+  }
+
+  .api-endpoints-list {
+    max-height: 320px;
+  }
 }
 
 @media (max-width: 700px) {
@@ -506,6 +902,48 @@
   .api-endpoints-list.glass-panel {
     padding: 16px;
   }
+
+  .api-resource-links,
+  .guide-example-detail-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .api-resource-link-list {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .docs-resource-link,
+  .guide-example-detail-header .btn-primary {
+    justify-content: center;
+    width: 100%;
+  }
+
+  .guide-example-grid,
+  .multimodal-limits {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .media-digest-note {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .api-docs-page,
+  .api-docs-page input,
+  .api-docs-page select,
+  .api-docs-page textarea {
+    font-size: 1rem;
+  }
+
+  .response-status {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .response-time {
+    margin-left: 0;
+  }
 }
 
 @media (max-width: 420px) {
@@ -519,5 +957,12 @@
   .queue-section.glass-panel,
   .process-card.glass-panel {
     padding: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .api-loading-indicator {
+    animation: none;
+    border-top-color: var(--accent);
   }
 }

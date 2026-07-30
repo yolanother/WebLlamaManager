@@ -1,426 +1,431 @@
-// Llama Manager — interactive API documentation page.
+// Llama Manager — spec-driven interactive API documentation page.
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Documents manager and OpenAI-compatible endpoints and provides an interactive
-// request builder in responsive glass navigation and detail panels.
+// Fetches the server's OpenAPI document as the sole endpoint inventory, renders
+// its copyable code samples, explains the multimodal content-part contract, and
+// provides a live request tester that preserves the user's JSON request bytes.
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { API_BASE, copyTextToClipboard } from '../api.js';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { SearchableSelect } from '../components/SearchableSelect.jsx';
+import { CodeBlock } from '../components/CodeBlock.jsx';
 import '../styles/pages.css';
 
-// API Documentation Page
+const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete'];
+const LANGUAGE_ORDER = ['curl', 'python', 'javascript'];
+
+const STANDARD_IMAGE_BODY = {
+  model: 'gemma-4',
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Compare these two images.' },
+      {
+        type: 'image_url',
+        image_url: { url: 'https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg' }
+      },
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+        }
+      }
+    ]
+  }]
+};
+
+const STANDARD_AUDIO_BODY = {
+  model: 'gemma-4',
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Describe this audio clip.' },
+      {
+        type: 'input_audio',
+        input_audio: {
+          data: 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=',
+          format: 'wav'
+        }
+      }
+    ]
+  }]
+};
+
+const VIDEO_FILE_BODY = {
+  model: 'gemma-4',
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'Summarize the events and speech in this video.' },
+      {
+        type: 'video_url',
+        video_url: {
+          url: 'https://storage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+          max_frames: 16,
+          include_audio: true
+        }
+      }
+    ]
+  }]
+};
+
+/** Returns the first concrete example value declared for a request body. */
+function getRequestExample(contentEntry) {
+  const examples = Object.values(contentEntry?.examples || {});
+  return examples.find(example => example?.value !== undefined)?.value
+    ?? contentEntry?.example
+    ?? contentEntry?.schema?.example
+    ?? null;
+}
+
+/** Converts OpenAPI paths into the compact endpoint model consumed by the page. */
+function normalizeEndpoints(spec) {
+  return Object.entries(spec?.paths || {}).flatMap(([path, pathItem]) => (
+    HTTP_METHODS.flatMap(method => {
+      const operation = pathItem?.[method];
+      if (!operation) return [];
+
+      const bodyEntries = Object.entries(operation.requestBody?.content || {});
+      const [bodyContentType, bodyContent] = bodyEntries.find(([type]) => type === 'application/json')
+        || bodyEntries[0]
+        || [null, null];
+
+      return [{
+        id: `${method}-${path}`,
+        method: method.toUpperCase(),
+        path,
+        summary: operation.summary || path,
+        description: operation.description || operation.summary || 'No description provided.',
+        tags: operation.tags || [],
+        params: (operation.parameters || []).map(parameter => ({
+          name: parameter.name,
+          type: parameter.in,
+          valueType: parameter.schema?.type || 'string',
+          required: Boolean(parameter.required),
+          description: parameter.description || `${parameter.name} ${parameter.in} parameter.`,
+          defaultValue: parameter.example ?? parameter.schema?.default ?? ''
+        })),
+        bodyContentType,
+        bodyRequired: Boolean(operation.requestBody?.required),
+        bodyExample: getRequestExample(bodyContent),
+        bodySchema: bodyContent?.schema || null,
+        codeSamples: operation['x-codeSamples'] || []
+      }];
+    })
+  ));
+}
+
+/** Maps OpenAPI language labels to stable tab ids and highlight.js grammars. */
+function normalizeLanguage(language) {
+  const normalized = String(language || '').toLowerCase();
+  if (normalized === 'curl' || normalized === 'shell' || normalized === 'bash') return 'curl';
+  if (normalized === 'python') return 'python';
+  if (normalized === 'javascript' || normalized === 'js') return 'javascript';
+  return normalized;
+}
+
+/** Builds all three runnable client examples for guide-only request bodies. */
+function generateCodeSamples(path, body) {
+  const compactBody = JSON.stringify(body);
+  const url = `${window.location.origin}${path}`;
+  return [
+    {
+      lang: 'cURL',
+      source: `curl -s -X POST '${url}' -H 'Content-Type: application/json' -d '${compactBody}'`
+    },
+    {
+      lang: 'Python',
+      source: `import json\nimport requests\n\npayload = json.loads(r'''${compactBody}''')\nresponse = requests.post('${url}', json=payload)\nprint(response.json())`
+    },
+    {
+      lang: 'JavaScript',
+      source: `const response = await fetch('${url}', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify(${JSON.stringify(body, null, 2)})\n});\nconsole.log(await response.json());`
+    }
+  ];
+}
+
+/** Renders one OpenAPI code-sample set with accessible language tabs. */
+function CodeSampleViewer({ samples, activeLanguage, onLanguageChange, label }) {
+  const samplesByLanguage = useMemo(() => new Map(
+    samples.map(sample => [normalizeLanguage(sample.lang), sample])
+  ), [samples]);
+  const availableLanguages = LANGUAGE_ORDER.filter(language => samplesByLanguage.has(language));
+  const selectedLanguage = availableLanguages.includes(activeLanguage)
+    ? activeLanguage
+    : availableLanguages[0];
+  const sample = samplesByLanguage.get(selectedLanguage);
+
+  if (!sample) {
+    return <p className="api-inline-note">No code samples are declared for this operation.</p>;
+  }
+
+  return (
+    <div className="api-code-samples">
+      <div className="code-sample-tabs" role="tablist" aria-label={label}>
+        {availableLanguages.map(language => (
+          <button
+            key={language}
+            type="button"
+            role="tab"
+            aria-selected={selectedLanguage === language}
+            className={`code-sample-tab ${selectedLanguage === language ? 'active' : ''}`}
+            onClick={() => onLanguageChange(language)}
+          >
+            {language === 'curl' ? 'curl' : language}
+          </button>
+        ))}
+      </div>
+      <CodeBlock
+        code={sample.source}
+        language={selectedLanguage === 'curl' ? 'bash' : selectedLanguage}
+      />
+    </div>
+  );
+}
+
+/** Creates guide examples while sourcing the worked YouTube case from OpenAPI. */
+function createGuideExamples(chatEndpoint) {
+  if (!chatEndpoint) return [];
+
+  const generated = [
+    {
+      id: 'images',
+      title: 'Images: HTTPS and data URLs',
+      description: 'Use the standard image_url part with either an HTTPS URL or a data:image/... URL. These parts are forwarded unchanged.',
+      body: STANDARD_IMAGE_BODY
+    },
+    {
+      id: 'audio',
+      title: 'Audio: inline input_audio',
+      description: 'Use the standard input_audio part with base64 WAV or MP3 bytes. Replace the tiny valid WAV placeholder with your own recording.',
+      body: STANDARD_AUDIO_BODY
+    },
+    {
+      id: 'video-file',
+      title: 'Video files',
+      description: 'Use the Llama Manager video_url extension with a direct media URL. Frames and optional audio are expanded server-side.',
+      body: VIDEO_FILE_BODY
+    }
+  ].map(example => ({
+    ...example,
+    codeSamples: generateCodeSamples(chatEndpoint.path, example.body)
+  }));
+
+  if (chatEndpoint.bodyExample) {
+    generated.push({
+      id: 'youtube',
+      title: 'YouTube links',
+      description: 'A YouTube URL is a video_url. This worked body and its client samples come directly from the served OpenAPI document.',
+      body: chatEndpoint.bodyExample,
+      codeSamples: chatEndpoint.codeSamples
+    });
+  }
+
+  return generated;
+}
+
+/** Returns the model id currently present in the unmodified request text. */
+function getBodyModel(requestBodyText) {
+  try {
+    return JSON.parse(requestBodyText || '{}').model || '';
+  } catch {
+    return '';
+  }
+}
+
+/** Formats advertised model modalities for visible dropdown option text. */
+function formatModelOption(model) {
+  const modalities = Array.isArray(model.modalities) && model.modalities.length > 0
+    ? model.modalities.join(', ')
+    : 'text';
+  return `${model.id} — ${modalities}`;
+}
+
+/**
+ * Renders spec-driven API reference content and a live same-origin endpoint tester.
+ * The component fetches both documentation and model metadata from the running server.
+ */
 function ApiDocsPage() {
+  const [spec, setSpec] = useState(null);
+  const [specLoading, setSpecLoading] = useState(true);
+  const [specError, setSpecError] = useState('');
   const [activeEndpoint, setActiveEndpoint] = useState(null);
+  const [activeTab, setActiveTab] = useState('manager');
   const [params, setParams] = useState({});
+  const [requestBodyText, setRequestBodyText] = useState('');
+  const [requestError, setRequestError] = useState('');
   const [response, setResponse] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState('manager');
-  const [openaiModels, setOpenaiModels] = useState([]);
-  const [copiedCurl, setCopiedCurl] = useState(false);
+  const [models, setModels] = useState([]);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsError, setModelsError] = useState('');
+  const [activeCodeLanguage, setActiveCodeLanguage] = useState('curl');
+  const [activeGuideId, setActiveGuideId] = useState('images');
+  const [activeGuideLanguage, setActiveGuideLanguage] = useState('curl');
 
-  // Fetch models for OpenAI tab
-  const fetchOpenaiModels = useCallback(async () => {
+  const fetchSpec = useCallback(async () => {
+    setSpecLoading(true);
+    setSpecError('');
     try {
-      const res = await fetch(`${API_BASE}/v1/models`);
-      if (res.ok) {
-        const data = await res.json();
-        setOpenaiModels(data.data || []);
-      }
-    } catch (err) {
-      console.error('Failed to fetch OpenAI models:', err);
+      const result = await fetch('/api/openapi.json');
+      if (!result.ok) throw new Error(`OpenAPI request failed with ${result.status}`);
+      setSpec(await result.json());
+    } catch (error) {
+      setSpec(null);
+      setSpecError(error.message || 'Unable to load the OpenAPI document.');
+    } finally {
+      setSpecLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    if (activeTab === 'openai') {
-      fetchOpenaiModels();
-    }
-  }, [activeTab, fetchOpenaiModels]);
+    fetchSpec();
+  }, [fetchSpec]);
 
-  // Generate curl example
-  const generateCurlExample = useCallback((endpoint, currentParams) => {
-    if (!endpoint) return '';
-
-    const baseUrl = window.location.origin;
-    let url = baseUrl + endpoint.path;
-
-    // Handle path params
-    for (const param of endpoint.params) {
-      if (param.type === 'path' && currentParams[param.name]) {
-        url = url.replace(`:${param.name}`, encodeURIComponent(currentParams[param.name]));
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchModels() {
+      setModelsLoading(true);
+      setModelsError('');
+      try {
+        const result = await fetch('/v1/models');
+        if (!result.ok) throw new Error(`Models request failed with ${result.status}`);
+        const data = await result.json();
+        if (!cancelled) setModels(data.data || []);
+      } catch (error) {
+        if (!cancelled) setModelsError(error.message || 'Unable to load model options.');
+      } finally {
+        if (!cancelled) setModelsLoading(false);
       }
     }
-
-    // Handle query params
-    const queryParams = endpoint.params
-      .filter(p => p.type === 'query' && currentParams[p.name] !== undefined && currentParams[p.name] !== '')
-      .map(p => `${p.name}=${encodeURIComponent(currentParams[p.name])}`);
-    if (queryParams.length) url += '?' + queryParams.join('&');
-
-    // Build curl command
-    let curl = `curl -X ${endpoint.method} "${url}"`;
-
-    if (endpoint.method !== 'GET') {
-      curl += ` \\\n  -H "Content-Type: application/json"`;
-
-      const bodyParams = {};
-      for (const param of endpoint.params) {
-        if (!['path', 'query'].includes(param.type) && currentParams[param.name] !== undefined && currentParams[param.name] !== '') {
-          let val = currentParams[param.name];
-          if (param.type === 'json' && typeof val === 'string') {
-            try { val = JSON.parse(val); } catch { /* use as-is */ }
-          }
-          bodyParams[param.name] = val;
-        }
-      }
-
-      if (Object.keys(bodyParams).length) {
-        curl += ` \\\n  -d '${JSON.stringify(bodyParams, null, 2).replace(/\n/g, '\n  ')}'`;
-      }
-    }
-
-    return curl;
+    fetchModels();
+    return () => { cancelled = true; };
   }, []);
 
-  const copyCurl = async () => {
-    const curl = generateCurlExample(activeEndpoint, params);
-    try {
-      await copyTextToClipboard(curl);
-      setCopiedCurl(true);
-      setTimeout(() => setCopiedCurl(false), 2000);
-    } catch (err) {
-      console.error('Failed to copy:', err);
-    }
-  };
-
-  const managerEndpoints = [
-    {
-      id: 'get-status',
-      method: 'GET',
-      path: '/api/status',
-      description: 'Get server status including llama health, mode, and downloads',
-      params: [],
-      example: null
-    },
-    {
-      id: 'get-models',
-      method: 'GET',
-      path: '/api/models',
-      description: 'List all local and server-loaded models',
-      params: [],
-      example: null
-    },
-    {
-      id: 'load-model',
-      method: 'POST',
-      path: '/api/models/load',
-      description: 'Load a model into the llama server',
-      params: [
-        { name: 'model', type: 'string', required: true, description: 'Model name or path to load' }
-      ],
-      example: { model: 'Qwen_Qwen2.5-Coder-32B-Instruct-GGUF/qwen2.5-coder-32b-instruct-q5_k_m.gguf' }
-    },
-    {
-      id: 'unload-model',
-      method: 'POST',
-      path: '/api/models/unload',
-      description: 'Unload a model from the llama server',
-      params: [
-        { name: 'model', type: 'string', required: true, description: 'Model ID to unload' }
-      ],
-      example: { model: 'model-id' }
-    },
-    {
-      id: 'get-settings',
-      method: 'GET',
-      path: '/api/settings',
-      description: 'Get current server settings',
-      params: [],
-      example: null
-    },
-    {
-      id: 'update-settings',
-      method: 'POST',
-      path: '/api/settings',
-      description: 'Update server settings',
-      params: [
-        { name: 'contextSize', type: 'number', required: false, description: 'Context window size (512-262144)' },
-        { name: 'modelsMax', type: 'number', required: false, description: 'Max loaded models (1-10)' },
-        { name: 'gpuLayers', type: 'number', required: false, description: 'GPU layers (0-999)' },
-        { name: 'autoStart', type: 'boolean', required: false, description: 'Auto-start server on manager start' },
-        { name: 'noWarmup', type: 'boolean', required: false, description: 'Skip model warmup' },
-        { name: 'flashAttn', type: 'boolean', required: false, description: 'Enable flash attention' }
-      ],
-      example: { contextSize: 8192, modelsMax: 2 }
-    },
-    {
-      id: 'start-server',
-      method: 'POST',
-      path: '/api/server/start',
-      description: 'Start the llama server in router mode',
-      params: [],
-      example: null
-    },
-    {
-      id: 'stop-server',
-      method: 'POST',
-      path: '/api/server/stop',
-      description: 'Stop the llama server',
-      params: [],
-      example: null
-    },
-    {
-      id: 'get-presets',
-      method: 'GET',
-      path: '/api/presets',
-      description: 'List available optimized presets',
-      params: [],
-      example: null
-    },
-    {
-      id: 'activate-preset',
-      method: 'POST',
-      path: '/api/presets/:presetId/activate',
-      description: 'Activate an optimized preset (single-model mode)',
-      params: [
-        { name: 'presetId', type: 'path', required: true, description: 'Preset ID (e.g., gpt120, qwen3, qwen2.5)' }
-      ],
-      example: null
-    },
-    {
-      id: 'get-analytics',
-      method: 'GET',
-      path: '/api/analytics',
-      description: 'Get time-series analytics data',
-      params: [
-        { name: 'minutes', type: 'query', required: false, description: 'Minutes of data to retrieve (default: 5)' }
-      ],
-      example: null
-    },
-    {
-      id: 'get-processes',
-      method: 'GET',
-      path: '/api/processes',
-      description: 'List running llama-server processes',
-      params: [],
-      example: null
-    },
-    {
-      id: 'kill-process',
-      method: 'POST',
-      path: '/api/processes/:pid/kill',
-      description: 'Kill a specific process by PID',
-      params: [
-        { name: 'pid', type: 'path', required: true, description: 'Process ID to kill' }
-      ],
-      example: null
-    },
-    {
-      id: 'search-models',
-      method: 'GET',
-      path: '/api/search',
-      description: 'Search HuggingFace for GGUF models',
-      params: [
-        { name: 'query', type: 'query', required: true, description: 'Search query' }
-      ],
-      example: null
-    },
-    {
-      id: 'pull-model',
-      method: 'POST',
-      path: '/api/pull',
-      description: 'Download a model from HuggingFace',
-      params: [
-        { name: 'repo', type: 'string', required: true, description: 'HuggingFace repo (e.g., Qwen/Qwen2.5-Coder-32B-Instruct-GGUF)' },
-        { name: 'quantization', type: 'string', required: true, description: 'Quantization to download (e.g., Q5_K_M)' }
-      ],
-      example: { repo: 'Qwen/Qwen2.5-Coder-32B-Instruct-GGUF', quantization: 'Q5_K_M' }
-    },
-    {
-      id: 'get-logs',
-      method: 'GET',
-      path: '/api/logs',
-      description: 'Get server logs',
-      params: [
-        { name: 'limit', type: 'query', required: false, description: 'Max logs to return (default: 100)' }
-      ],
-      example: null
-    }
-  ];
-
-  const openaiEndpoints = [
-    {
-      id: 'openai-models',
-      method: 'GET',
-      path: '/api/v1/models',
-      description: 'List available models (OpenAI-compatible)',
-      params: [],
-      example: null
-    },
-    {
-      id: 'openai-chat',
-      method: 'POST',
-      path: '/api/v1/chat/completions',
-      description: 'Create a chat completion (OpenAI-compatible). Supports streaming.',
-      params: [
-        { name: 'model', type: 'string', required: true, description: 'Model ID to use' },
-        { name: 'messages', type: 'json', required: true, description: 'Array of message objects with role and content' },
-        { name: 'temperature', type: 'number', required: false, description: 'Sampling temperature (0-2)' },
-        { name: 'max_tokens', type: 'number', required: false, description: 'Maximum tokens to generate' },
-        { name: 'stream', type: 'boolean', required: false, description: 'Stream the response' },
-        { name: 'top_p', type: 'number', required: false, description: 'Nucleus sampling parameter' },
-        { name: 'frequency_penalty', type: 'number', required: false, description: 'Frequency penalty (-2 to 2)' },
-        { name: 'presence_penalty', type: 'number', required: false, description: 'Presence penalty (-2 to 2)' }
-      ],
-      example: {
-        model: 'model-id',
-        messages: [
-          { role: 'system', content: 'You are a helpful assistant.' },
-          { role: 'user', content: 'Hello!' }
-        ],
-        temperature: 0.7,
-        max_tokens: 500
-      }
-    },
-    {
-      id: 'openai-completions',
-      method: 'POST',
-      path: '/api/v1/completions',
-      description: 'Create a text completion (legacy OpenAI-compatible endpoint)',
-      params: [
-        { name: 'model', type: 'string', required: true, description: 'Model ID to use' },
-        { name: 'prompt', type: 'string', required: true, description: 'The prompt to complete' },
-        { name: 'max_tokens', type: 'number', required: false, description: 'Maximum tokens to generate' },
-        { name: 'temperature', type: 'number', required: false, description: 'Sampling temperature' },
-        { name: 'stream', type: 'boolean', required: false, description: 'Stream the response' }
-      ],
-      example: {
-        model: 'model-id',
-        prompt: 'Once upon a time',
-        max_tokens: 100,
-        temperature: 0.7
-      }
-    },
-    {
-      id: 'openai-embeddings',
-      method: 'POST',
-      path: '/api/v1/embeddings',
-      description: 'Create embeddings (OpenAI-compatible). Served by a dedicated embedding model; supports batched input. Default model Qwen3-Embedding-0.6B returns 1024-dim vectors.',
-      params: [
-        { name: 'model', type: 'string', required: true, description: 'Embedding model id (see /v1/models)' },
-        { name: 'input', type: 'string | string[]', required: true, description: 'Text or array of texts to embed' }
-      ],
-      example: {
-        model: 'model-id',
-        input: 'Hello world'
-      }
-    }
-  ];
-
+  const allEndpoints = useMemo(() => normalizeEndpoints(spec), [spec]);
+  const managerEndpoints = useMemo(
+    () => allEndpoints.filter(endpoint => !endpoint.tags.includes('openai')),
+    [allEndpoints]
+  );
+  const openaiEndpoints = useMemo(
+    () => allEndpoints.filter(endpoint => endpoint.tags.includes('openai')),
+    [allEndpoints]
+  );
   const endpoints = activeTab === 'manager' ? managerEndpoints : openaiEndpoints;
+  const chatEndpoint = useMemo(
+    () => openaiEndpoints.find(endpoint => endpoint.path === '/v1/chat/completions')
+      || openaiEndpoints.find(endpoint => endpoint.path === '/api/v1/chat/completions'),
+    [openaiEndpoints]
+  );
+  const guideExamples = useMemo(() => createGuideExamples(chatEndpoint), [chatEndpoint]);
+  const activeGuide = guideExamples.find(example => example.id === activeGuideId) || guideExamples[0];
 
-  const handleParamChange = (name, value, type) => {
-    let parsedValue = value;
-    if (type === 'number' && value !== '') {
-      parsedValue = parseFloat(value);
-    } else if (type === 'boolean') {
-      parsedValue = value === 'true';
-    } else if (type === 'json') {
-      try {
-        parsedValue = JSON.parse(value);
-      } catch {
-        parsedValue = value;
-      }
-    }
-    setParams(p => ({ ...p, [name]: parsedValue }));
-  };
-
-  const testEndpoint = async (endpoint) => {
-    setLoading(true);
-    setResponse(null);
-
-    try {
-      let url = endpoint.path;
-      const queryParams = [];
-      const bodyParams = {};
-
-      // Process parameters
-      for (const param of endpoint.params) {
-        const value = params[param.name];
-        if (value === undefined || value === '') continue;
-
-        if (param.type === 'path') {
-          url = url.replace(`:${param.name}`, encodeURIComponent(value));
-        } else if (param.type === 'query') {
-          queryParams.push(`${param.name}=${encodeURIComponent(value)}`);
-        } else {
-          let val = value;
-          if (param.type === 'json' && typeof val === 'string') {
-            try { val = JSON.parse(val); } catch { /* use as-is */ }
-          }
-          bodyParams[param.name] = val;
-        }
-      }
-
-      if (queryParams.length > 0) {
-        url += '?' + queryParams.join('&');
-      }
-
-      const options = {
-        method: endpoint.method,
-        headers: { 'Content-Type': 'application/json' }
-      };
-
-      if (endpoint.method !== 'GET' && Object.keys(bodyParams).length > 0) {
-        options.body = JSON.stringify(bodyParams);
-      }
-
-      const startTime = Date.now();
-      const res = await fetch(url, options);
-      const duration = Date.now() - startTime;
-
-      let data;
-      const contentType = res.headers.get('content-type');
-      if (contentType && contentType.includes('application/json')) {
-        data = await res.json();
-      } else {
-        data = await res.text();
-      }
-
-      setResponse({
-        status: res.status,
-        statusText: res.statusText,
-        duration,
-        data
-      });
-    } catch (err) {
-      setResponse({
-        status: 'Error',
-        statusText: err.message,
-        duration: 0,
-        data: null
-      });
-    }
-
-    setLoading(false);
-  };
-
-  const selectEndpoint = (endpoint) => {
+  /** Selects an operation and initializes its path/query fields and example body. */
+  const selectEndpoint = useCallback((endpoint, bodyOverride = undefined) => {
     setActiveEndpoint(endpoint);
+    setParams(Object.fromEntries(endpoint.params.map(param => [param.name, param.defaultValue])));
+    const body = bodyOverride !== undefined ? bodyOverride : endpoint.bodyExample;
+    setRequestBodyText(body == null ? '' : JSON.stringify(body, null, 2));
+    setRequestError('');
     setResponse(null);
-    // Pre-fill with example if available
-    if (endpoint.example) {
-      const newParams = {};
-      for (const [key, value] of Object.entries(endpoint.example)) {
-        newParams[key] = typeof value === 'object' ? JSON.stringify(value, null, 2) : value;
-      }
-      setParams(newParams);
-    } else {
-      setParams({});
+    setActiveCodeLanguage('curl');
+  }, []);
+
+  /** Loads a guide request into the live tester without transforming its content parts. */
+  const loadGuideInTester = useCallback((example) => {
+    if (!chatEndpoint) return;
+    setActiveTab('openai');
+    selectEndpoint(chatEndpoint, example.body);
+    window.setTimeout(() => document.getElementById('api-tester')?.scrollIntoView({ block: 'start' }), 0);
+  }, [chatEndpoint, selectEndpoint]);
+
+  /** Updates a path or query parameter while keeping its schema type. */
+  const handleParamChange = useCallback((param, value) => {
+    let nextValue = value;
+    if (param.valueType === 'number' || param.valueType === 'integer') {
+      nextValue = value === '' ? '' : Number(value);
+    } else if (param.valueType === 'boolean') {
+      nextValue = value === '' ? '' : value === 'true';
     }
-  };
+    setParams(current => ({ ...current, [param.name]: nextValue }));
+  }, []);
+
+  /** Replaces only the model field after the user explicitly chooses a model. */
+  const handleModelChange = useCallback((model) => {
+    try {
+      const body = JSON.parse(requestBodyText || '{}');
+      setRequestBodyText(JSON.stringify({ ...body, model }, null, 2));
+      setRequestError('');
+    } catch {
+      setRequestError('Fix the JSON request body before selecting a model.');
+    }
+  }, [requestBodyText]);
+
+  /** Sends the visible body text as-is so standard multimodal bytes are not rewritten. */
+  const testEndpoint = useCallback(async () => {
+    if (!activeEndpoint) return;
+    setRequestError('');
+    setResponse(null);
+
+    let url = activeEndpoint.path;
+    const query = new URLSearchParams();
+    for (const param of activeEndpoint.params) {
+      const value = params[param.name];
+      if ((value === '' || value === undefined) && param.required) {
+        setRequestError(`${param.name} is required.`);
+        return;
+      }
+      if (value === '' || value === undefined) continue;
+      if (param.type === 'path') {
+        url = url
+          .replace(`{${param.name}}`, encodeURIComponent(value))
+          .replace(`:${param.name}`, encodeURIComponent(value));
+      } else if (param.type === 'query') {
+        query.append(param.name, String(value));
+      }
+    }
+
+    if (query.size > 0) url += `?${query.toString()}`;
+
+    const hasBody = activeEndpoint.method !== 'GET' && requestBodyText.trim() !== '';
+    if (activeEndpoint.bodyRequired && !hasBody) {
+      setRequestError('A request body is required.');
+      return;
+    }
+    if (hasBody && activeEndpoint.bodyContentType !== 'application/json') {
+      setRequestError(`The live tester currently supports JSON bodies; this operation requires ${activeEndpoint.bodyContentType}.`);
+      return;
+    }
+    if (hasBody) {
+      try {
+        JSON.parse(requestBodyText);
+      } catch (error) {
+        setRequestError(`Request body is not valid JSON: ${error.message}`);
+        return;
+      }
+    }
+
+    setLoading(true);
+    try {
+      const startedAt = performance.now();
+      const result = await fetch(url, {
+        method: activeEndpoint.method,
+        headers: hasBody ? { 'Content-Type': 'application/json' } : undefined,
+        body: hasBody ? requestBodyText : undefined
+      });
+      const duration = Math.round(performance.now() - startedAt);
+      const contentType = result.headers.get('content-type') || '';
+      const data = contentType.includes('application/json') ? await result.json() : await result.text();
+      setResponse({ status: result.status, statusText: result.statusText, duration, data });
+    } catch (error) {
+      setResponse({ status: 'Error', statusText: error.message, duration: 0, data: null });
+    } finally {
+      setLoading(false);
+    }
+  }, [activeEndpoint, params, requestBodyText]);
+
+  const operationHasModel = Boolean(activeEndpoint?.bodySchema?.properties?.model);
+  const selectedModel = getBodyModel(requestBodyText);
 
   return (
     <div className="page api-docs-page">
@@ -428,178 +433,301 @@ function ApiDocsPage() {
         <h2>API Documentation</h2>
       </div>
 
-      <p className="page-description">
-        Interactive API documentation for Llama Manager. Test endpoints directly from this page.
+      <p className="page-description api-docs-intro">
+        Live, spec-driven reference for Llama Manager and its OpenAI-compatible multimodal API.
       </p>
 
-      <div className="api-tabs">
-        <button
-          className={`api-tab glass-btn ${activeTab === 'manager' ? 'active' : ''}`}
-          onClick={() => { setActiveTab('manager'); setActiveEndpoint(null); setResponse(null); }}
-        >
-          Manager API
-        </button>
-        <button
-          className={`api-tab glass-btn ${activeTab === 'openai' ? 'active' : ''}`}
-          onClick={() => { setActiveTab('openai'); setActiveEndpoint(null); setResponse(null); }}
-        >
-          OpenAI API (v1)
-        </button>
-      </div>
+      <nav className="api-resource-links glass-panel" aria-label="Machine-readable API documentation">
+        <div>
+          <strong>Use the same source as this page</strong>
+          <span>Agent-readable references and the complete OpenAPI schema stay in sync with the server.</span>
+        </div>
+        <div className="api-resource-link-list">
+          <a className="docs-resource-link glass-btn" href="/llms.txt">llms.txt</a>
+          <a className="docs-resource-link glass-btn" href="/llms-full.txt">llms-full.txt</a>
+          <a className="docs-resource-link glass-btn" href="/api/openapi.json">openapi.json</a>
+        </div>
+      </nav>
 
-      <div className="api-docs-layout">
-        {/* Endpoints List */}
-        <div className="api-endpoints-list glass-panel">
-          <h3>{activeTab === 'manager' ? 'Manager Endpoints' : 'OpenAI-Compatible Endpoints'}</h3>
-          {activeTab === 'openai' && (
-            <p className="api-base-url">Base URL: <code>/api/v1</code></p>
-          )}
-          <div className="endpoints-list">
-            {endpoints.map(endpoint => (
-              <div
-                key={endpoint.id}
-                className={`endpoint-item ${activeEndpoint?.id === endpoint.id ? 'active' : ''}`}
-                onClick={() => selectEndpoint(endpoint)}
-              >
-                <span className={`method-badge ${endpoint.method.toLowerCase()}`}>
-                  {endpoint.method}
-                </span>
-                <span className="endpoint-path">{endpoint.path}</span>
-              </div>
-            ))}
+      <section className="multimodal-guide glass-panel" aria-labelledby="multimodal-guide-heading">
+        <div className="multimodal-guide-header">
+          <div>
+            <p className="api-eyebrow">Content-part guide</p>
+            <h3 id="multimodal-guide-heading">Multimodal requests</h3>
+            <p>
+              Standard image and audio parts pass through unchanged. Llama Manager expands direct video,
+              YouTube, and audio URLs before inference.
+            </p>
+          </div>
+          <div className="multimodal-limits" aria-label="Multimodal limits">
+            <span><strong>200 MB</strong> JSON body limit</span>
+            <span><strong>16</strong> frames per window</span>
+            <span><strong>600 s</strong> default window</span>
+            <span><strong>720p</strong> YouTube ceiling</span>
           </div>
         </div>
 
-        {/* Endpoint Details & Testing */}
-        <div className="api-endpoint-detail glass-panel">
-          {activeEndpoint ? (
-            <>
-              <div className="endpoint-header">
-                <span className={`method-badge large ${activeEndpoint.method.toLowerCase()}`}>
-                  {activeEndpoint.method}
-                </span>
-                <code className="endpoint-path-large">{activeEndpoint.path}</code>
+        <div className="guide-example-grid" aria-label="Multimodal examples">
+          {guideExamples.map(example => (
+            <button
+              key={example.id}
+              type="button"
+              className={`guide-example-button ${activeGuide?.id === example.id ? 'active' : ''}`}
+              aria-pressed={activeGuide?.id === example.id}
+              onClick={() => { setActiveGuideId(example.id); setActiveGuideLanguage('curl'); }}
+            >
+              <strong>{example.title}</strong>
+              <span>{example.description}</span>
+            </button>
+          ))}
+        </div>
+
+        {activeGuide && (
+          <div className="guide-example-detail">
+            <div className="guide-example-detail-header">
+              <div>
+                <h4>{activeGuide.title}</h4>
+                <p>{activeGuide.description}</p>
               </div>
+              <button
+                type="button"
+                className="btn-primary glass-btn"
+                onClick={() => loadGuideInTester(activeGuide)}
+              >
+                Load in tester
+              </button>
+            </div>
+            <CodeSampleViewer
+              samples={activeGuide.codeSamples}
+              activeLanguage={activeGuideLanguage}
+              onLanguageChange={setActiveGuideLanguage}
+              label={`${activeGuide.title} languages`}
+            />
+          </div>
+        )}
 
-              <p className="endpoint-description">{activeEndpoint.description}</p>
+        <div className="media-digest-note">
+          <strong>Long media is not silently truncated.</strong>
+          <span>
+            Content longer than one window is segmented and summarized. Responses report windows,
+            frames used, and digest status in <code>metadata.llama_manager_media</code> for non-streaming
+            responses and <code>x-llama-manager-media</code> for streams. WAV and MP3 work with
+            <code>input_audio</code>; <code>audio_url</code> supports remote audio.
+          </span>
+        </div>
+      </section>
 
-              {/* Parameters Form */}
-              {activeEndpoint.params.length > 0 && (
-                <div className="params-section">
-                  <h4>Parameters</h4>
-                  <div className="params-form">
-                    {activeEndpoint.params.map(param => (
-                      <div key={param.name} className="param-field">
-                        <label>
-                          <span className="param-name">{param.name}</span>
-                          {param.required && <span className="param-required">*</span>}
-                          <span className="param-type">{param.type}</span>
-                        </label>
-                        <p className="param-description">{param.description}</p>
-                        {param.type === 'boolean' ? (
-                          <select
-                            className="glass-input"
-                            value={params[param.name] ?? ''}
-                            onChange={(e) => handleParamChange(param.name, e.target.value, 'boolean')}
-                          >
-                            <option value="">-- Select --</option>
-                            <option value="true">true</option>
-                            <option value="false">false</option>
-                          </select>
-                        ) : param.type === 'json' ? (
-                          <textarea
-                            className="glass-input"
-                            value={params[param.name] ?? ''}
-                            onChange={(e) => handleParamChange(param.name, e.target.value, 'json')}
-                            placeholder={`Enter JSON...`}
-                            rows={4}
-                          />
-                        ) : param.name === 'model' && activeTab === 'openai' && openaiModels.length > 0 ? (
-                          <SearchableSelect
-                            value={params[param.name] ?? ''}
-                            onChange={(val) => handleParamChange(param.name, val, 'string')}
-                            options={openaiModels.map(m => ({ value: m.id, label: m.id }))}
-                            placeholder="-- Select model --"
-                            storageKey="lastApiDocsModel"
-                          />
+      <div className="api-tabs" role="tablist" aria-label="API groups">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'manager'}
+          className={`api-tab glass-btn ${activeTab === 'manager' ? 'active' : ''}`}
+          onClick={() => { setActiveTab('manager'); setActiveEndpoint(null); setResponse(null); }}
+        >
+          Manager API ({managerEndpoints.length})
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'openai'}
+          className={`api-tab glass-btn ${activeTab === 'openai' ? 'active' : ''}`}
+          onClick={() => { setActiveTab('openai'); setActiveEndpoint(null); setResponse(null); }}
+        >
+          OpenAI API ({openaiEndpoints.length})
+        </button>
+      </div>
+
+      {specLoading ? (
+        <div className="api-spec-state glass-panel" role="status">
+          <span className="api-loading-indicator" aria-hidden="true" />
+          Loading <code>/api/openapi.json</code>…
+        </div>
+      ) : specError ? (
+        <div className="api-spec-state api-spec-error glass-panel" role="alert">
+          <div>
+            <strong>Could not load the API specification.</strong>
+            <span>{specError}</span>
+          </div>
+          <button type="button" className="glass-btn" onClick={fetchSpec}>Retry</button>
+        </div>
+      ) : (
+        <div className="api-docs-layout" id="api-tester">
+          <aside className="api-endpoints-list glass-panel" aria-label="Endpoints">
+            <h3>{activeTab === 'manager' ? 'Manager endpoints' : 'OpenAI-compatible endpoints'}</h3>
+            {activeTab === 'openai' && (
+              <p className="api-base-url">Preferred SDK base URL: <code>/v1</code></p>
+            )}
+            <div className="endpoints-list">
+              {endpoints.map(endpoint => (
+                <button
+                  key={endpoint.id}
+                  type="button"
+                  className={`endpoint-item ${activeEndpoint?.id === endpoint.id ? 'active' : ''}`}
+                  aria-pressed={activeEndpoint?.id === endpoint.id}
+                  title={`${endpoint.method} ${endpoint.path}: ${endpoint.summary}`}
+                  onClick={() => selectEndpoint(endpoint)}
+                >
+                  <span className={`method-badge ${endpoint.method.toLowerCase()}`}>{endpoint.method}</span>
+                  <span className="endpoint-path">{endpoint.path}</span>
+                </button>
+              ))}
+            </div>
+          </aside>
+
+          <main className="api-endpoint-detail glass-panel">
+            {activeEndpoint ? (
+              <>
+                <div className="endpoint-header">
+                  <span className={`method-badge large ${activeEndpoint.method.toLowerCase()}`}>
+                    {activeEndpoint.method}
+                  </span>
+                  <code className="endpoint-path-large">{activeEndpoint.path}</code>
+                </div>
+                <h3 className="endpoint-summary">{activeEndpoint.summary}</h3>
+                <p className="endpoint-description">{activeEndpoint.description}</p>
+
+                {activeEndpoint.params.length > 0 && (
+                  <section className="params-section" aria-labelledby="parameters-heading">
+                    <h4 id="parameters-heading">Path and query parameters</h4>
+                    <div className="params-form">
+                      {activeEndpoint.params.map(param => {
+                        const inputId = `api-param-${activeEndpoint.id}-${param.name}`.replace(/[^a-z0-9-_]/gi, '-');
+                        return (
+                          <div key={param.name} className="param-field">
+                            <label htmlFor={inputId}>
+                              <span className="param-name">{param.name}</span>
+                              {param.required && <span className="param-required">required</span>}
+                              <span className="param-type">{param.type}</span>
+                            </label>
+                            <p className="param-description" id={`${inputId}-description`}>{param.description}</p>
+                            {param.valueType === 'boolean' ? (
+                              <select
+                                id={inputId}
+                                className="glass-input"
+                                value={params[param.name] ?? ''}
+                                aria-describedby={`${inputId}-description`}
+                                onChange={event => handleParamChange(param, event.target.value)}
+                              >
+                                <option value="">Select a value</option>
+                                <option value="true">true</option>
+                                <option value="false">false</option>
+                              </select>
+                            ) : (
+                              <input
+                                id={inputId}
+                                className="glass-input"
+                                type={param.valueType === 'number' || param.valueType === 'integer' ? 'number' : 'text'}
+                                value={params[param.name] ?? ''}
+                                aria-describedby={`${inputId}-description`}
+                                onChange={event => handleParamChange(param, event.target.value)}
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
+
+                {activeEndpoint.bodyContentType && (
+                  <section className="request-body-section" aria-labelledby="request-body-heading">
+                    <div className="request-body-heading-row">
+                      <h4 id="request-body-heading">Request body</h4>
+                      <code>{activeEndpoint.bodyContentType}</code>
+                    </div>
+                    {operationHasModel && (
+                      <div className="param-field model-field">
+                        <span className="model-field-label" id="api-model-label">Model and advertised modalities</span>
+                        {modelsLoading ? (
+                          <p className="api-inline-note" role="status">Loading models from <code>/v1/models</code>…</p>
+                        ) : modelsError ? (
+                          <p className="api-inline-error" role="alert">{modelsError}</p>
                         ) : (
-                          <input
-                            className="glass-input"
-                            type={param.type === 'number' ? 'number' : 'text'}
-                            value={params[param.name] ?? ''}
-                            onChange={(e) => handleParamChange(param.name, e.target.value, param.type)}
-                            placeholder={param.type === 'path' ? `Enter ${param.name}...` : `Enter value...`}
-                          />
+                          <div aria-labelledby="api-model-label">
+                            <SearchableSelect
+                              value={selectedModel}
+                              onChange={handleModelChange}
+                              options={models.map(model => ({
+                                value: model.id,
+                                label: formatModelOption(model),
+                                modalities: model.modalities
+                              }))}
+                              placeholder="Select a model"
+                              storageKey="lastApiDocsModel"
+                            />
+                          </div>
                         )}
                       </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+                    )}
+                    <label className="request-body-label" htmlFor="api-request-body">
+                      JSON request body {activeEndpoint.bodyRequired ? '(required)' : '(optional)'}
+                    </label>
+                    <textarea
+                      id="api-request-body"
+                      className="glass-input request-body-input"
+                      value={requestBodyText}
+                      spellCheck="false"
+                      disabled={activeEndpoint.bodyContentType !== 'application/json'}
+                      aria-describedby="request-body-help"
+                      onChange={event => { setRequestBodyText(event.target.value); setRequestError(''); }}
+                    />
+                    <p className="api-inline-note" id="request-body-help">
+                      The tester sends these JSON bytes exactly as shown. It does not rewrite standard multimodal parts.
+                    </p>
+                  </section>
+                )}
 
-              {/* curl Example */}
-              {activeEndpoint && (
-                <div className="curl-section">
-                  <h4>
-                    curl Example
-                    <button
-                      className={`curl-copy-btn glass-btn ${copiedCurl ? 'copied' : ''}`}
-                      onClick={copyCurl}
-                    >
-                      {copiedCurl ? 'Copied!' : 'Copy'}
-                    </button>
-                  </h4>
-                  <div className="curl-code-container">
-                    <pre className="curl-code">{generateCurlExample(activeEndpoint, params)}</pre>
-                  </div>
-                </div>
-              )}
+                {requestError && <p className="api-inline-error" role="alert">{requestError}</p>}
 
-              {/* Test Button */}
-              <div className="test-section">
-                <button
-                  className="btn-primary glass-btn"
-                  onClick={() => testEndpoint(activeEndpoint)}
-                  disabled={loading}
-                >
-                  {loading ? 'Sending...' : 'Send Request'}
-                </button>
+                <section className="test-section" aria-label="Live request tester">
+                  <button
+                    type="button"
+                    className="btn-primary glass-btn"
+                    disabled={loading || (activeEndpoint.bodyContentType && activeEndpoint.bodyContentType !== 'application/json')}
+                    onClick={testEndpoint}
+                  >
+                    {loading ? 'Sending request…' : 'Send request'}
+                  </button>
+                </section>
+
+                {response && (
+                  <section className="response-section" aria-live="polite">
+                    <h4>Response</h4>
+                    <div className={`response-status ${Number(response.status) >= 200 && Number(response.status) < 300 ? 'success' : 'error'}`}>
+                      <span className="status-code">{response.status}</span>
+                      <span className="status-text">{response.statusText}</span>
+                      <span className="response-time">{response.duration} ms</span>
+                    </div>
+                    <pre className="response-body">
+                      {typeof response.data === 'object'
+                        ? JSON.stringify(response.data, null, 2)
+                        : response.data || 'No response body'}
+                    </pre>
+                  </section>
+                )}
+
+                <section className="endpoint-examples" aria-labelledby="client-examples-heading">
+                  <h4 id="client-examples-heading">Client examples from OpenAPI</h4>
+                  <CodeSampleViewer
+                    samples={activeEndpoint.codeSamples}
+                    activeLanguage={activeCodeLanguage}
+                    onLanguageChange={setActiveCodeLanguage}
+                    label={`${activeEndpoint.summary} client languages`}
+                  />
+                </section>
+              </>
+            ) : (
+              <div className="no-endpoint-selected">
+                <div>
+                  <strong>Select an endpoint</strong>
+                  <p>View its spec details, copy client examples, or send a live request.</p>
+                </div>
               </div>
-
-              {/* Response */}
-              {response && (
-                <div className="response-section">
-                  <h4>Response</h4>
-                  <div className={`response-status ${response.status >= 200 && response.status < 300 ? 'success' : 'error'}`}>
-                    <span className="status-code">{response.status}</span>
-                    <span className="status-text">{response.statusText}</span>
-                    <span className="response-time">{response.duration}ms</span>
-                  </div>
-                  <pre className="response-body">
-                    {typeof response.data === 'object'
-                      ? JSON.stringify(response.data, null, 2)
-                      : response.data || 'No response body'}
-                  </pre>
-                </div>
-              )}
-
-              {/* Example */}
-              {activeEndpoint.example && (
-                <div className="example-section">
-                  <h4>Example Request Body</h4>
-                  <pre className="example-code">
-                    {JSON.stringify(activeEndpoint.example, null, 2)}
-                  </pre>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="no-endpoint-selected">
-              <p>Select an endpoint from the list to view details and test it.</p>
-            </div>
-          )}
+            )}
+          </main>
         </div>
-      </div>
+      )}
     </div>
   );
 }
