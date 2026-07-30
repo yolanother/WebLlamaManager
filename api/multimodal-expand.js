@@ -178,7 +178,14 @@ async function expandAudioPart(part, options) {
   if (classification.kind === 'invalid') throw new TypeError(classification.reason);
   const sourceKind = classification.kind === 'youtube' ? 'youtube' : 'direct';
   const item = await cachedIngest(descriptor.url, sourceKind, options);
+  if (!Array.isArray(item.audio?.segments) || item.audio.segments.length === 0) {
+    throw new TypeError('ingested media has no normalized audio artifacts');
+  }
   const range = mediaRange(item.durationSec, descriptor);
+  const processingWindows = rangeWindows(range, 16);
+  if (processingWindows.length > 1) {
+    return expandLongAudio(item, descriptor, range, processingWindows, options);
+  }
   const segments = selectAudioSegments(item, range);
   const warnings = audioRangeWarning('audio_url', descriptor.url, item.durationSec, range);
   const parts = [];
@@ -195,11 +202,71 @@ async function expandAudioPart(part, options) {
       id: item.id,
       kind: item.kind || 'audio',
       durationSec: Number(item.durationSec) || 0,
-      windows: planSegments(range.end - range.start).length,
+      windows: processingWindows.length,
       framesUsed: 0,
       digested: false,
     },
     warnings,
+  };
+}
+
+/**
+ * Map-reduce multi-window audio into timestamped per-window digest text.
+ *
+ * @param {object} item Ingested audio metadata.
+ * @param {object} descriptor Audio content options.
+ * @param {{start:number,end:number}} range Requested processing range.
+ * @param {Array<{index:number,startSec:number,endSec:number}>} windows Absolute windows.
+ * @param {object} options Expansion dependencies.
+ * @returns {Promise<{parts:object[],metadata:object,warnings:string[]}>} Digested expansion.
+ */
+async function expandLongAudio(item, descriptor, range, windows, options) {
+  if (typeof options.complete !== 'function') {
+    throw new TypeError('expandMessages requires a complete function for long media');
+  }
+  const audioWindows = planSegments(Number(item.durationSec));
+  const audioArtifacts = Array.isArray(item.audio?.segments) ? item.audio.segments : [];
+  const summaries = [];
+  for (const window of windows) {
+    const content = [{
+      type: 'text',
+      text: `[media window ${window.index + 1}/${windows.length} @ ${formatTimestamp(window.startSec)}-${formatTimestamp(window.endSec)}]`,
+    }];
+    for (let index = 0; index < audioArtifacts.length; index += 1) {
+      const audioWindow = audioWindows[index];
+      if (!audioWindow || audioWindow.endSec <= window.startSec || audioWindow.startSec >= window.endSec) continue;
+      const bytes = await loadBytes(audioArtifacts[index], options);
+      content.push({
+        type: 'input_audio',
+        input_audio: { data: bytes.toString('base64'), format: 'wav' },
+      });
+    }
+    const completion = await options.complete({
+      model: options.model,
+      messages: [
+        { role: 'system', content: MEDIA_DIGEST_PROMPT },
+        { role: 'user', content },
+      ],
+    });
+    summaries.push(completionText(completion));
+  }
+  const filename = item.filename || item.id || 'media';
+  return {
+    parts: [{
+      type: 'text',
+      text: `[media digest: ${filename}]\n${windows.map((window, index) => (
+        `[${formatTimestamp(window.startSec)}-${formatTimestamp(window.endSec)}] ${summaries[index]}`
+      )).join('\n')}`,
+    }],
+    metadata: {
+      id: item.id,
+      kind: item.kind || 'audio',
+      durationSec: Number(item.durationSec) || 0,
+      windows: windows.length,
+      framesUsed: 0,
+      digested: true,
+    },
+    warnings: audioRangeWarning('audio_url', descriptor.url, item.durationSec, range),
   };
 }
 
@@ -388,7 +455,8 @@ function mediaRange(durationSec, descriptor) {
   const requestedStart = Number(descriptor.start);
   const requestedEnd = Number(descriptor.end);
   const start = Number.isFinite(requestedStart) ? Math.min(duration, Math.max(0, requestedStart)) : 0;
-  const end = Number.isFinite(requestedEnd) ? Math.min(duration, Math.max(start, requestedEnd)) : duration;
+  const end = Number.isFinite(requestedEnd) ? Math.min(duration, Math.max(0, requestedEnd)) : duration;
+  if (end <= start) throw new TypeError('media end must be greater than start');
   return { start, end };
 }
 
@@ -480,6 +548,7 @@ function selectAudioSegments(item, range) {
  * Explain when requested audio bounds can only be approximated by stored WAV
  * windows, ensuring callers are never led to believe the audio was sample-trimmed.
  *
+ * @param {'audio_url'|'video_url'} partType Extension content-part type.
  * @param {string} url Source media URL.
  * @param {unknown} durationSec Full media duration.
  * @param {{start:number,end:number}} range Requested processing range.

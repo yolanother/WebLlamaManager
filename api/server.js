@@ -6,6 +6,8 @@
 // llama.cpp and DS4 inference engines, manages models and configuration, and
 // persists operational analytics. Mutable resources are resolved through the
 // package-safe runtime path contract so installed application files stay immutable.
+// OpenAI routes support both /api/v1 and bare /v1 paths, with URL-based media
+// expanded into standard multimodal parts before chat inference.
 
 import express from 'express';
 import cors from 'cors';
@@ -52,6 +54,7 @@ import { slotCacheFilename, planSlotEviction, shouldRestoreSlot } from './slot-c
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import { aggregateRequestStats } from './request-stats.js';
 import { createMediaRouter } from './media.js';
+import { expandMessages } from './multimodal-expand.js';
 import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
@@ -6962,7 +6965,13 @@ app.get('/api/analytics/crashes', (req, res) => {
 });
 
 // OpenAI-compatible models endpoint - returns models from llama.cpp that can be loaded
-app.get('/api/v1/models', async (req, res) => {
+/**
+ * List locally available, active, aliased, DS4, and embedding models.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after the model catalog response is sent.
+ */
+async function handleModels(req, res) {
   try {
     // ds4 engine active: llama-server is stopped and serves nothing. Advertise the
     // single ds4 model (owned_by 'ds4') plus any configured default aliases, and
@@ -7058,7 +7067,9 @@ app.get('/api/v1/models', async (req, res) => {
     // Fallback to empty list if llama.cpp is not available
     res.json({ object: 'list', data: [] });
   }
-});
+}
+app.get('/api/v1/models', handleModels);
+app.get('/v1/models', handleModels);
 
 // Sanitize messages for llama.cpp chat templates that reject both content+thinking on tool_calls
 function sanitizeMessages(messages) {
@@ -7510,9 +7521,9 @@ function injectModelSamplingDefaults(body) {
  * entry with backend='ds4'.
  * @param {import('express').Request} req
  * @param {import('express').Response} res
- * @param {{requestedModel:string, isStreaming:boolean, startTime:number}} ctx
+ * @param {{requestedModel:string, isStreaming:boolean, startTime:number, mediaMetadata?:object}} ctx
  */
-async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime }) {
+async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime, mediaMetadata }) {
   const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const url = ds4TargetUrl(ds4.port, '/v1/chat/completions');
   console.log(`[chat/completions] ds4 engine active — forwarding to ${url}`);
@@ -7576,6 +7587,9 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
 
     // Non-streaming.
     const data = await upstream.json();
+    if (mediaMetadata) {
+      data.metadata = { ...data.metadata, llama_manager_media: mediaMetadata };
+    }
     const dur = Date.now() - startTime;
     const usage = data.usage || {};
     addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: 200, duration: dur, promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0, tokensPerSecond: (usage.completion_tokens || 0) / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: data.choices?.[0]?.message?.content || null, error: null, backend: 'ds4', requestBody: req.body });
@@ -7654,7 +7668,13 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
 }
 
 // OpenAI-compatible chat completions (streaming and non-streaming)
-app.post('/api/v1/chat/completions', async (req, res) => {
+/**
+ * Expand multimodal URL parts and proxy an OpenAI chat completion request.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
+ */
+async function handleChatCompletions(req, res) {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
   // Normalize messages: accept stringified JSON arrays for compatibility
@@ -7715,6 +7735,23 @@ app.post('/api/v1/chat/completions', async (req, res) => {
   // engine. The promise resolves (never rejects) for awaiters.
   if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
 
+  const mediaExpansion = await expandMessages(req.body.messages, {
+    model: req.body.model || 'default',
+    baseUrl: `http://127.0.0.1:${API_PORT}`,
+  });
+  if (mediaExpansion.messages !== req.body.messages) {
+    req.body.messages = mediaExpansion.messages;
+  }
+  const mediaMetadata = mediaExpansion.media.length > 0 || mediaExpansion.warnings.length > 0
+    ? {
+        items: mediaExpansion.media,
+        ...(mediaExpansion.warnings.length > 0 ? { warnings: mediaExpansion.warnings } : {}),
+      }
+    : null;
+  if (isStreaming && mediaMetadata) {
+    res.setHeader('x-llama-manager-media', JSON.stringify(mediaMetadata));
+  }
+
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
@@ -7731,7 +7768,7 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'chat/completions'),
     });
     if (decision.target === 'local-ds4') {
-      return proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime });
+      return proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime, mediaMetadata });
     }
     if (decision.target === 'reject') {
       const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
@@ -7982,6 +8019,9 @@ app.post('/api/v1/chat/completions', async (req, res) => {
         });
         // Normalize model field to match what was requested
         if (data.model) data.model = requestedModel;
+        if (mediaMetadata) {
+          data.metadata = { ...data.metadata, llama_manager_media: mediaMetadata };
+        }
         data._llama_manager = enrichLlamaManagerMeta(
           { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: backend.id },
           { completionTokens }
@@ -8523,6 +8563,9 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       if (data.model && requestedModel !== 'default') {
         data.model = requestedModel;
       }
+      if (mediaMetadata) {
+        data.metadata = { ...data.metadata, llama_manager_media: mediaMetadata };
+      }
 
       // Add our tracking info to response (with compute/warning derivation)
       data._llama_manager = enrichLlamaManagerMeta(
@@ -8588,10 +8631,18 @@ app.post('/api/v1/chat/completions', async (req, res) => {
       res.end();
     }
   }
-});
+}
+app.post('/api/v1/chat/completions', handleChatCompletions);
+app.post('/v1/chat/completions', handleChatCompletions);
 
 // OpenAI-compatible completions (legacy endpoint)
-app.post('/api/v1/completions', async (req, res) => {
+/**
+ * Proxy a legacy OpenAI text completion request to the selected backend.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
+ */
+async function handleCompletions(req, res) {
   const startTime = Date.now();
   // Resolve default-big/default-small aliases and forward the resolved name downstream.
   const rawModel = req.body.model || 'unknown';
@@ -8828,10 +8879,18 @@ app.post('/api/v1/completions', async (req, res) => {
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
-});
+}
+app.post('/api/v1/completions', handleCompletions);
+app.post('/v1/completions', handleCompletions);
 
 // OpenAI-compatible embeddings endpoint (served by the dedicated embed server).
 // Mounted at the versioned path and an unversioned alias.
+/**
+ * Proxy an OpenAI embeddings request to a remote or dedicated local backend.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after the embedding response is sent.
+ */
 async function handleEmbeddings(req, res) {
   const startedAt = Date.now();
   // Resolve default-big/default-small aliases and forward the resolved name downstream.
@@ -8893,6 +8952,7 @@ async function handleEmbeddings(req, res) {
   }
 }
 app.post('/api/v1/embeddings', handleEmbeddings);
+app.post('/v1/embeddings', handleEmbeddings);
 app.post('/api/embeddings', handleEmbeddings); // unversioned convenience alias
 
 // Health of the dedicated embed server (mirrors /api/v1/health).
@@ -8919,7 +8979,13 @@ app.post('/api/embed/model', async (req, res) => {
 });
 
 // OpenAI-compatible single model retrieval
-app.get('/api/v1/models/:model', async (req, res) => {
+/**
+ * Retrieve one OpenAI-compatible model descriptor from llama.cpp.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after the model response is sent.
+ */
+async function handleModel(req, res) {
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/models`);
     if (!response.ok) {
@@ -8953,10 +9019,18 @@ app.get('/api/v1/models/:model', async (req, res) => {
     console.error('[v1/models/:model] Error:', error.message);
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
-});
+}
+app.get('/api/v1/models/:model', handleModel);
+app.get('/v1/models/:model', handleModel);
 
 // OpenAI Responses API (proxied to llama.cpp)
-app.post('/api/v1/responses', async (req, res) => {
+/**
+ * Proxy an OpenAI Responses API request to the selected backend.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
+ */
+async function handleResponses(req, res) {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
   const requestedModel = req.body.model || 'default';
@@ -9202,10 +9276,18 @@ app.post('/api/v1/responses', async (req, res) => {
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
-});
+}
+app.post('/api/v1/responses', handleResponses);
+app.post('/v1/responses', handleResponses);
 
 // Anthropic Messages API compatibility (proxied to llama.cpp)
-app.post('/api/v1/messages', async (req, res) => {
+/**
+ * Proxy an Anthropic-compatible Messages request to the selected backend.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
+ */
+async function handleMessages(req, res) {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
   const requestedModel = req.body.model || 'default';
@@ -9443,10 +9525,18 @@ app.post('/api/v1/messages', async (req, res) => {
     });
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
-});
+}
+app.post('/api/v1/messages', handleMessages);
+app.post('/v1/messages', handleMessages);
 
 // Anthropic Messages token counting (proxied to llama.cpp)
-app.post('/api/v1/messages/count_tokens', async (req, res) => {
+/**
+ * Proxy an Anthropic-compatible token-count request to llama.cpp.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after the token count response is sent.
+ */
+async function handleMessageTokenCount(req, res) {
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/messages/count_tokens`, {
       method: 'POST',
@@ -9464,10 +9554,18 @@ app.post('/api/v1/messages/count_tokens', async (req, res) => {
   } catch (error) {
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
-});
+}
+app.post('/api/v1/messages/count_tokens', handleMessageTokenCount);
+app.post('/v1/messages/count_tokens', handleMessageTokenCount);
 
 // OpenAI-compatible reranking endpoint
-app.post('/api/v1/rerank', async (req, res) => {
+/**
+ * Proxy an OpenAI-compatible rerank request to llama.cpp.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after the rerank response is sent.
+ */
+async function handleRerank(req, res) {
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/rerank`, {
       method: 'POST',
@@ -9485,10 +9583,18 @@ app.post('/api/v1/rerank', async (req, res) => {
   } catch (error) {
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
-});
+}
+app.post('/api/v1/rerank', handleRerank);
+app.post('/v1/rerank', handleRerank);
 
 // Reranking alias
-app.post('/api/v1/reranking', async (req, res) => {
+/**
+ * Proxy the alternate reranking route to llama.cpp.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<void>} Resolves after the reranking response is sent.
+ */
+async function handleReranking(req, res) {
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/reranking`, {
       method: 'POST',
@@ -9506,7 +9612,9 @@ app.post('/api/v1/reranking', async (req, res) => {
   } catch (error) {
     res.status(502).json({ error: 'Failed to reach llama server', details: error.message });
   }
-});
+}
+app.post('/api/v1/reranking', handleReranking);
+app.post('/v1/reranking', handleReranking);
 
 // Catch-all for SPA routing
 app.get('*', (req, res) => {

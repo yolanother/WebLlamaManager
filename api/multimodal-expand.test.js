@@ -8,6 +8,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { expandMessages } from './multimodal-expand.js';
 
 test('standard OpenAI content parts preserve the exact upstream request body', async () => {
@@ -393,4 +394,116 @@ test('default dependencies ingest and load raw artifacts through the media API',
       format: 'wav',
     },
   });
+});
+
+test('audio longer than one window is digested per window', async () => {
+  const completions = [];
+  const result = await expandMessages([{
+    role: 'user',
+    content: [{
+      type: 'audio_url',
+      audio_url: { url: 'https://cdn.example.test/long-audio.wav' },
+    }],
+  }], {
+    model: 'gemma-4',
+    cache: new Map(),
+    ingest: async () => ({
+      id: 'long-audio', kind: 'audio', filename: 'long-audio.wav', durationSec: 1_200,
+      frames: [], audio: { segments: ['/audio/0', '/audio/1'] },
+    }),
+    loadArtifact: async path => Buffer.from(path),
+    complete: async request => {
+      completions.push(request);
+      return `audio digest ${completions.length}`;
+    },
+  });
+
+  assert.equal(completions.length, 2);
+  assert.deepEqual(completions.map(call => call.messages[1].content.map(part => part.type)), [
+    ['text', 'input_audio'],
+    ['text', 'input_audio'],
+  ]);
+  assert.deepEqual(result.messages[0].content, [{
+    type: 'text',
+    text: '[media digest: long-audio.wav]\n[00:00-10:00] audio digest 1\n[10:00-20:00] audio digest 2',
+  }]);
+  assert.deepEqual(result.media, [{
+    id: 'long-audio', kind: 'audio', durationSec: 1_200,
+    windows: 2, framesUsed: 0, digested: true,
+  }]);
+});
+
+test('bare v1 aliases register the same named handlers before the SPA catch-all', async () => {
+  const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
+  const registrations = [
+    ['get', 'models', 'handleModels'],
+    ['get', 'models/:model', 'handleModel'],
+    ['post', 'chat/completions', 'handleChatCompletions'],
+    ['post', 'completions', 'handleCompletions'],
+    ['post', 'embeddings', 'handleEmbeddings'],
+    ['post', 'responses', 'handleResponses'],
+    ['post', 'messages', 'handleMessages'],
+    ['post', 'messages/count_tokens', 'handleMessageTokenCount'],
+    ['post', 'rerank', 'handleRerank'],
+    ['post', 'reranking', 'handleReranking'],
+  ];
+  const catchAllIndex = source.indexOf("app.get('*'");
+
+  for (const [method, path, handler] of registrations) {
+    const apiRegistration = `app.${method}('/api/v1/${path}', ${handler});`;
+    const bareRegistration = `app.${method}('/v1/${path}', ${handler});`;
+    assert.ok(source.includes(apiRegistration), apiRegistration);
+    assert.ok(source.includes(bareRegistration), bareRegistration);
+    assert.ok(source.indexOf(bareRegistration) < catchAllIndex, `${bareRegistration} must precede SPA fallback`);
+  }
+
+  const chatHandler = source.slice(
+    source.indexOf('async function handleChatCompletions'),
+    source.indexOf("app.post('/api/v1/chat/completions'"),
+  );
+  assert.match(chatHandler, /const isStreaming = req\.body\.stream === true/);
+  assert.equal((chatHandler.match(/expandMessages\(/g) || []).length, 1);
+  assert.match(chatHandler, /res\.setHeader\('x-llama-manager-media', JSON\.stringify\(mediaMetadata\)\)/);
+});
+
+test('audio without normalized artifacts preserves the original part', async () => {
+  const part = {
+    type: 'audio_url',
+    audio_url: { url: 'https://cdn.example.test/silent.wav' },
+  };
+  const result = await expandMessages([{ role: 'user', content: [part] }], {
+    cache: new Map(),
+    ingest: async () => ({
+      id: 'missing-audio', kind: 'audio', durationSec: 10, frames: [],
+    }),
+  });
+
+  assert.strictEqual(result.messages[0].content[0], part);
+  assert.deepEqual(result.warnings, [
+    'audio_url https://cdn.example.test/silent.wav was not expanded: ingested media has no normalized audio artifacts',
+  ]);
+});
+
+test('empty media range preserves the original part instead of dropping content', async () => {
+  const part = {
+    type: 'video_url',
+    video_url: {
+      url: 'https://cdn.example.test/range.mp4',
+      start: 90,
+      end: 10,
+      include_audio: false,
+    },
+  };
+  const result = await expandMessages([{ role: 'user', content: [part] }], {
+    cache: new Map(),
+    ingest: async () => ({
+      id: 'bad-range', kind: 'video', filename: 'range.mp4', durationSec: 100,
+      frames: ['/frame/0'],
+    }),
+  });
+
+  assert.strictEqual(result.messages[0].content[0], part);
+  assert.deepEqual(result.warnings, [
+    'video_url https://cdn.example.test/range.mp4 was not expanded: media end must be greater than start',
+  ]);
 });
