@@ -155,15 +155,18 @@ export class PriorityRequestQueue {
 
   /** Pick the next item, enforcing priority ordering and bounded starvation. */
   _nextIndex() {
-    const backgroundIndex = this.queue.findIndex(item => item.priority === 'background');
-    if (backgroundIndex >= 0 && this._highPriorityBurst >= this.maxHighPriorityBurst) {
-      this._highPriorityBurst = 0;
-      return backgroundIndex;
-    }
+    // Realtime is a hard latency class: queued background work must never use
+    // the starvation budget to jump ahead of it. Background fairness applies
+    // only once no realtime request is waiting.
     const realtimeIndex = this.queue.findIndex(item => item.priority === 'realtime');
     if (realtimeIndex >= 0) {
       this._highPriorityBurst++;
       return realtimeIndex;
+    }
+    const backgroundIndex = this.queue.findIndex(item => item.priority === 'background');
+    if (backgroundIndex >= 0 && this._highPriorityBurst >= this.maxHighPriorityBurst) {
+      this._highPriorityBurst = 0;
+      return backgroundIndex;
     }
     const interactiveIndex = this.queue.findIndex(item => item.priority === 'interactive');
     if (interactiveIndex >= 0) {

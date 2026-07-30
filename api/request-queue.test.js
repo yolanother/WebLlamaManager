@@ -64,7 +64,7 @@ test('bounds queued background work without affecting interactive admission', as
   queue.release(await firstBackground);
 });
 
-test('serves background after a bounded burst of realtime requests', async () => {
+test('background fairness never lets background bypass queued realtime work', async () => {
   const queue = new PriorityRequestQueue(1, { maxHighPriorityBurst: 2 });
   const active = await queue.acquire();
   const order = [];
@@ -76,7 +76,24 @@ test('serves background after a bounded burst of realtime requests', async () =>
   queue.release(active);
   queue.release(await realtimeOne);
   queue.release(await realtimeTwo);
-  queue.release(await background);
   queue.release(await realtimeThree);
-  assert.deepEqual(order, ['realtime-1', 'realtime-2', 'background', 'realtime-3']);
+  queue.release(await background);
+  assert.deepEqual(order, ['realtime-1', 'realtime-2', 'realtime-3', 'background']);
+});
+
+test('serves background after a bounded burst of interactive requests', async () => {
+  const queue = new PriorityRequestQueue(1, { maxHighPriorityBurst: 2 });
+  const active = await queue.acquire();
+  const order = [];
+  const background = queue.acquire({ priority: 'background' }).then(id => { order.push('background'); return id; });
+  const interactiveOne = queue.acquire({ priority: 'interactive' }).then(id => { order.push('interactive-1'); return id; });
+  const interactiveTwo = queue.acquire({ priority: 'interactive' }).then(id => { order.push('interactive-2'); return id; });
+  const interactiveThree = queue.acquire({ priority: 'interactive' }).then(id => { order.push('interactive-3'); return id; });
+
+  queue.release(active);
+  queue.release(await interactiveOne);
+  queue.release(await interactiveTwo);
+  queue.release(await background);
+  queue.release(await interactiveThree);
+  assert.deepEqual(order, ['interactive-1', 'interactive-2', 'background', 'interactive-3']);
 });

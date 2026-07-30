@@ -79,7 +79,9 @@ record in the caller scope. Raw token and llama.cpp slot ids are never public.
 
 Chat extensions `request_priority: "realtime" | "interactive" | "background"`
 and `routing: "local_only"` control the single local lane. Realtime skips queued
-lower-priority work and preempts background work. `local_only` suppresses every
+lower-priority work and preempts background work; background fairness can
+interleave with interactive work but never bypasses queued realtime work.
+`local_only` suppresses every
 remote offload path and returns a machine-readable local-busy error instead of
 silently sending prompt data elsewhere. Full rationale and limits are in
 [ConversationContextCache.md](Designs/ConversationContextCache.md).
