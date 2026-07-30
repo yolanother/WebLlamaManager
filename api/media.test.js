@@ -15,6 +15,7 @@ import {
   isSafeMediaId,
   mapProcessError,
   runProcess,
+  sniffMediaType,
 } from './media.js';
 
 function mockChildProcess({ error, code = 0, stdout = '', stderr = '' } = {}) {
@@ -72,6 +73,21 @@ test('frame timestamps are evenly spaced inside the duration and capped at 16', 
   const spacing = timestamps[1] - timestamps[0];
   for (let i = 2; i < timestamps.length; i += 1) {
     assert.ok(Math.abs((timestamps[i] - timestamps[i - 1]) - spacing) < 1e-9);
+  }
+});
+
+test('sniffMediaType recognizes supported audio formats from magic bytes', () => {
+  const cases = [
+    ['wav', Buffer.from('RIFF\x24\x00\x00\x00WAVEfmt ', 'binary'), 'audio/wav', 'wav'],
+    ['mp3 ID3', Buffer.from('ID3\x04\x00\x00', 'binary'), 'audio/mpeg', 'mp3'],
+    ['mp3 frame', Buffer.from([0xff, 0xfb, 0x90, 0x64]), 'audio/mpeg', 'mp3'],
+    ['flac', Buffer.from('fLaC\x00\x00\x00\x22', 'binary'), 'audio/flac', 'flac'],
+    ['ogg', Buffer.from('OggS\x00\x02', 'binary'), 'audio/ogg', 'ogg'],
+    ['m4a', Buffer.from('\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00', 'binary'), 'audio/mp4', 'm4a'],
+  ];
+
+  for (const [label, bytes, mime, extension] of cases) {
+    assert.deepEqual(sniffMediaType(bytes), { kind: 'audio', mime, extension }, label);
   }
 });
 

@@ -1,12 +1,13 @@
-// Llama Manager — server-side media ingestion, storage, and video frame extraction.
+// Llama Manager — server-side image, video, and audio ingestion and processing.
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
 // This module owns the /api/media router. It accepts bounded multipart uploads,
 // direct HTTP(S) media downloads, and supported YouTube URLs, then stores each
-// item below the runtime data directory and prepares JPEG frames for vision
-// models with ffprobe/ffmpeg. Process and network dependencies are injectable so
-// the pipeline remains testable on hosts where the optional binaries are absent.
+// item below the runtime data directory, prepares JPEG frames for vision models,
+// and normalizes audio for audio-capable models with ffprobe/ffmpeg. Process and
+// network dependencies are injectable so the pipeline remains testable on hosts
+// where the optional binaries are absent.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -46,6 +47,13 @@ const MIME_EXTENSIONS = new Map([
   ['video/x-msvideo', 'avi'],
   ['video/ogg', 'ogv'],
   ['video/mpeg', 'mpeg'],
+  ['audio/wav', 'wav'],
+  ['audio/x-wav', 'wav'],
+  ['audio/mpeg', 'mp3'],
+  ['audio/flac', 'flac'],
+  ['audio/ogg', 'ogg'],
+  ['audio/mp4', 'm4a'],
+  ['audio/x-m4a', 'm4a'],
 ]);
 
 class MediaPipelineError extends Error {
@@ -246,19 +254,20 @@ export function mapProcessError(binary, error) {
 }
 
 /**
- * Identify supported image/video data using magic bytes with MIME/filename fallback.
+ * Identify supported image, video, or audio data using magic bytes with MIME/filename fallback.
  *
  * @param {Buffer|Uint8Array} bytes Initial media bytes.
  * @param {string} [declaredMime=''] MIME supplied by the client or origin.
  * @param {string} [filename=''] Source filename.
- * @returns {{kind:'video'|'image', mime:string, extension:string}} Detected media type.
+ * @returns {{kind:'video'|'image'|'audio', mime:string, extension:string}} Detected media type.
  * @throws {Error} When the bytes and hints do not describe supported media.
  */
 export function sniffMediaType(bytes, declaredMime = '', filename = '') {
   const head = Buffer.from(bytes || []).subarray(0, 512);
   const ascii = head.toString('ascii').trimStart().toLowerCase();
+  const normalizedDeclared = String(declaredMime).split(';', 1)[0].trim().toLowerCase();
   if (ascii.startsWith('<!doctype html') || ascii.startsWith('<html')) {
-    throw new MediaPipelineError(415, { error: 'URL did not return supported image or video media' });
+    throw new MediaPipelineError(415, { error: 'URL did not return supported media' });
   }
 
   let mime = '';
@@ -272,21 +281,31 @@ export function sniffMediaType(bytes, declaredMime = '', filename = '') {
     && head.subarray(8, 12).toString('ascii') === 'WEBP') {
     mime = 'image/webp';
   } else if (head.length >= 12 && head.subarray(4, 8).toString('ascii') === 'ftyp') {
-    mime = head.subarray(8, 12).toString('ascii') === 'qt  ' ? 'video/quicktime' : 'video/mp4';
+    const brand = head.subarray(8, 12).toString('ascii');
+    mime = brand === 'M4A ' ? 'audio/mp4' : brand === 'qt  ' ? 'video/quicktime' : 'video/mp4';
   } else if (head.length >= 4 && head.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))) {
     mime = declaredMime.toLowerCase().startsWith('video/x-matroska') ? 'video/x-matroska' : 'video/webm';
   } else if (head.length >= 12 && head.subarray(0, 4).toString('ascii') === 'RIFF'
     && head.subarray(8, 12).toString('ascii') === 'AVI ') {
     mime = 'video/x-msvideo';
+  } else if (head.length >= 12 && head.subarray(0, 4).toString('ascii') === 'RIFF'
+    && head.subarray(8, 12).toString('ascii') === 'WAVE') {
+    mime = 'audio/wav';
+  } else if (head.subarray(0, 3).toString('ascii') === 'ID3'
+    || (head.length >= 2 && head[0] === 0xff && head[1] === 0xfb)) {
+    mime = 'audio/mpeg';
+  } else if (head.subarray(0, 4).toString('ascii') === 'fLaC') {
+    mime = 'audio/flac';
   } else if (head.subarray(0, 4).toString('ascii') === 'OggS') {
-    mime = 'video/ogg';
+    mime = normalizedDeclared === 'video/ogg' ? 'video/ogg' : 'audio/ogg';
   } else if (head.length >= 4 && head[0] === 0x00 && head[1] === 0x00
     && head[2] === 0x01 && (head[3] === 0xba || head[3] === 0xb3)) {
     mime = 'video/mpeg';
   }
 
-  const normalizedDeclared = String(declaredMime).split(';', 1)[0].trim().toLowerCase();
-  if (!mime && (normalizedDeclared.startsWith('image/') || normalizedDeclared.startsWith('video/'))) {
+  if (!mime && (normalizedDeclared.startsWith('image/')
+    || normalizedDeclared.startsWith('video/')
+    || normalizedDeclared.startsWith('audio/'))) {
     mime = normalizedDeclared;
   }
   if (!mime) {
@@ -294,16 +313,16 @@ export function sniffMediaType(bytes, declaredMime = '', filename = '') {
     const inferred = [...MIME_EXTENSIONS.entries()].find(([, ext]) => ext === extension)?.[0];
     if (inferred) mime = inferred;
   }
-  if (!mime || (!mime.startsWith('image/') && !mime.startsWith('video/'))) {
+  if (!mime || (!mime.startsWith('image/') && !mime.startsWith('video/') && !mime.startsWith('audio/'))) {
     throw new MediaPipelineError(415, { error: 'Unsupported media type' });
   }
 
-  const kind = mime.startsWith('image/') ? 'image' : 'video';
+  const kind = mime.startsWith('image/') ? 'image' : mime.startsWith('audio/') ? 'audio' : 'video';
   let extension = MIME_EXTENSIONS.get(mime);
   if (!extension) {
     extension = extname(String(filename)).slice(1).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10);
   }
-  if (!extension) extension = kind === 'image' ? 'jpg' : 'mp4';
+  if (!extension) extension = kind === 'image' ? 'jpg' : kind === 'audio' ? 'wav' : 'mp4';
   return { kind, mime, extension };
 }
 
