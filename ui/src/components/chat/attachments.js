@@ -106,7 +106,14 @@ function buildReadyMediaAttachment({
       status: 'ready',
     };
   }
-  return { ...common, frames, status: 'ready' };
+  return {
+    ...common,
+    frames,
+    ...(segmentDataUrls.length ? {
+      segments: segmentDataUrls.map((dataUrl) => ({ dataUrl, format: 'wav' })),
+    } : {}),
+    status: 'ready',
+  };
 }
 
 /**
@@ -153,6 +160,8 @@ function videoParts(attachment) {
     parts.push({ type: 'image_url', image_url: { url: dataUrl } });
   });
 
+  parts.push(...inputAudioParts(attachment.segments));
+
   return parts;
 }
 
@@ -168,6 +177,24 @@ function audioFormat(segment) {
 }
 
 /**
+ * Convert normalized audio segments into standard OpenAI audio content parts.
+ *
+ * @param {Array<object>} segments audio segments carrying base64 data URLs
+ * @returns {Array<object>} prefix-free OpenAI audio content parts
+ */
+function inputAudioParts(segments = []) {
+  return segments.flatMap((segment) => {
+    const dataUrl = String(segment?.dataUrl || '');
+    const data = dataUrl.includes(',') ? dataUrl.slice(dataUrl.indexOf(',') + 1) : dataUrl;
+    if (!data) return [];
+    return [{
+      type: 'input_audio',
+      input_audio: { data, format: audioFormat(segment) },
+    }];
+  });
+}
+
+/**
  * Convert an ingested audio attachment into standard OpenAI audio parts.
  *
  * @param {object} attachment ready audio attachment with base64 data URLs
@@ -180,15 +207,7 @@ function audioParts(attachment) {
     text: `[audio: ${attachment.filename || 'audio'}, duration ${formatMediaTime(durationSec)}]`,
   }];
 
-  (attachment.segments || []).forEach((segment) => {
-    const dataUrl = String(segment?.dataUrl || '');
-    const data = dataUrl.includes(',') ? dataUrl.slice(dataUrl.indexOf(',') + 1) : dataUrl;
-    if (!data) return;
-    parts.push({
-      type: 'input_audio',
-      input_audio: { data, format: audioFormat(segment) },
-    });
-  });
+  parts.push(...inputAudioParts(attachment.segments));
 
   return parts;
 }

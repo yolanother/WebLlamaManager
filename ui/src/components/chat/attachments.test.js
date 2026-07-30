@@ -119,6 +119,40 @@ test('buildReadyMediaAttachment maps server WAV segments onto an audio upload', 
   });
 });
 
+test('video ingest appends normalized audio after its unchanged frame parts', () => {
+  const attachment = buildReadyMediaAttachment({
+    media: {
+      id: 'video-1',
+      kind: 'video',
+      filename: 'demo.mp4',
+      mime: 'video/mp4',
+      size: 4096,
+      durationSec: 75,
+      audio: {
+        durationSec: 75,
+        segments: ['/api/media/video-1/audio/0.wav'],
+      },
+    },
+    source: { type: 'video-file', file: { name: 'demo.mp4' } },
+    frames: [{ dataUrl: 'data:image/jpeg;base64,FRAME' }],
+    segmentDataUrls: ['data:audio/wav;base64,U09VTkQ='],
+  });
+
+  assert.deepEqual(buildMessageContent({
+    text: 'Describe the clip.',
+    attachments: [attachment],
+  }), [
+    { type: 'text', text: 'Describe the clip.' },
+    { type: 'text', text: '[video: demo.mp4, duration 01:15]' },
+    { type: 'text', text: '[frame 1/1 @ 00:00]' },
+    { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,FRAME' } },
+    {
+      type: 'input_audio',
+      input_audio: { data: 'U09VTkQ=', format: 'wav' },
+    },
+  ]);
+});
+
 test('buildMessageContent assembles text, images, long text, and video frame pairs', () => {
   const content = buildMessageContent({
     text: 'Summarize these inputs.',

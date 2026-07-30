@@ -269,9 +269,9 @@ function ChatPage({ stats }) {
       const frames = await Promise.all((media.frames || []).map(async (url) => ({
         dataUrl: await responseToDataUrl(url),
       })));
-      const segmentDataUrls = media.kind === 'audio'
-        ? await Promise.all((media.audio?.segments || []).map(responseToDataUrl))
-        : [];
+      const segmentDataUrls = await Promise.all(
+        (media.audio?.segments || []).map(responseToDataUrl),
+      );
       replaceAttachment(id, buildReadyMediaAttachment({
         media,
         source,
