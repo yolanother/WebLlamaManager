@@ -56,6 +56,7 @@ import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-re
 import { aggregateRequestStats } from './request-stats.js';
 import { createMediaRouter } from './media.js';
 import { createAudioTranscriptionHandler } from './audio-transcriptions.js';
+import { renderLlmsFullReference, renderLlmsIndex } from './api-spec.js';
 import { expandMessages } from './multimodal-expand.js';
 import {
   ContextUpstreamError,
@@ -6460,6 +6461,33 @@ app.get('/api/openapi.json', (req, res) => {
   }
 });
 
+/**
+ * Serve the concise agent-readable API index as Markdown.
+ *
+ * @param {import('express').Request} _req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {void}
+ */
+function sendLlmsIndex(_req, res) {
+  res.set('Content-Type', 'text/markdown; charset=utf-8').send(renderLlmsIndex());
+}
+
+/**
+ * Serve the complete agent-readable API reference as Markdown.
+ *
+ * @param {import('express').Request} _req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {void}
+ */
+function sendLlmsFullReference(_req, res) {
+  res.set('Content-Type', 'text/markdown; charset=utf-8').send(renderLlmsFullReference());
+}
+
+app.get('/llms.txt', sendLlmsIndex);
+app.get('/api/llms.txt', sendLlmsIndex);
+app.get('/llms-full.txt', sendLlmsFullReference);
+app.get('/api/llms-full.txt', sendLlmsFullReference);
+
 // Simple API info endpoint for agents
 app.get('/api/info', (req, res) => {
   res.json({
@@ -6467,6 +6495,11 @@ app.get('/api/info', (req, res) => {
     version: '1.0.0',
     description: 'API for managing llama.cpp inference servers',
     openapi: '/api/openapi.json',
+    docs: {
+      index: '/llms.txt',
+      full: '/llms-full.txt',
+      apiAliases: ['/api/llms.txt', '/api/llms-full.txt'],
+    },
     mcp: '/mcp',
     endpoints: {
       health: 'GET /health',

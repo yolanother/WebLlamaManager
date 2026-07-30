@@ -255,6 +255,89 @@ const CHAT_OPTIONS = path => ({
   examples: [youtubeChatExample(path)],
 });
 
+const TRANSCRIPTION_REQUEST_SCHEMA = {
+  type: 'object',
+  required: ['file', 'model'],
+  properties: {
+    file: { type: 'string', format: 'binary', description: 'Audio file uploaded as multipart/form-data.' },
+    model: { type: 'string', description: 'Audio-capable local model identifier.' },
+    response_format: { type: 'string', enum: ['json', 'text', 'verbose_json'], default: 'json' },
+    language: { type: 'string', description: 'Optional language hint.' },
+    prompt: { type: 'string', description: 'Optional transcription context or vocabulary hint.' },
+  },
+  additionalProperties: false,
+};
+
+const TRANSCRIPTION_RESPONSE_SCHEMA = {
+  oneOf: [
+    {
+      type: 'object',
+      required: ['text'],
+      properties: { text: { type: 'string' } },
+      additionalProperties: false,
+      description: 'JSON transcript when response_format is json.',
+    },
+    { type: 'string', description: 'Plain transcript when response_format is text.' },
+    {
+      type: 'object',
+      required: ['task', 'language', 'duration', 'text', 'segments'],
+      properties: {
+        task: { const: 'transcribe' },
+        language: { type: 'string' },
+        duration: { type: 'number', minimum: 0 },
+        text: { type: 'string' },
+        segments: {
+          type: 'array',
+          description: 'Chronological segments whose start and end timings are approximate fixed window edges.',
+          items: {
+            type: 'object',
+            required: ['id', 'start', 'end', 'text'],
+            properties: {
+              id: { type: 'integer', minimum: 0 },
+              start: { type: 'number', minimum: 0, description: 'Approximate window start in seconds.' },
+              end: { type: 'number', minimum: 0, description: 'Approximate window end in seconds.' },
+              text: { type: 'string' },
+            },
+            additionalProperties: false,
+          },
+        },
+      },
+      additionalProperties: false,
+      description: 'Detailed transcript when response_format is verbose_json.',
+    },
+  ],
+};
+
+/**
+ * Build a multipart audio transcription example for one route alias.
+ *
+ * @param {string} path Transcription route path.
+ * @returns {object} Complete curl, Python, and JavaScript example bundle.
+ */
+function transcriptionExample(path) {
+  const url = `${HOST}${path}`;
+  return {
+    title: 'Transcribe an audio file with approximate segment windows',
+    body: null,
+    curl: `curl -s -X POST '${url}' -F 'file=@/path/to/audio.wav' -F 'model=gemma-4' -F 'response_format=verbose_json'`,
+    python: `import requests\n\nwith open('/path/to/audio.wav', 'rb') as audio_file:\n    response = requests.post(\n        '${url}',\n        files={'file': ('audio.wav', audio_file, 'audio/wav')},\n        data={'model': 'gemma-4', 'response_format': 'verbose_json'},\n    )\nprint(response.text)`,
+    javascript: `import { readFile } from 'node:fs/promises';\n\nconst form = new FormData();\nform.append('file', new Blob([await readFile('/path/to/audio.wav')], { type: 'audio/wav' }), 'audio.wav');\nform.append('model', 'gemma-4');\nform.append('response_format', 'verbose_json');\nconst response = await fetch('${url}', { method: 'POST', body: form });\nconsole.log(await response.text());`,
+  };
+}
+
+/**
+ * Return the complete multipart contract for one transcription route alias.
+ *
+ * @param {string} path Transcription route path.
+ * @returns {object} Endpoint description, schemas, and examples.
+ */
+const TRANSCRIPTION_OPTIONS = path => ({
+  description: 'Transcribes multipart audio with an audio-capable model. For verbose_json, segment timings are approximate fixed window edges, not detected speech boundaries or word-level timestamps; Gemma is not a dedicated ASR model.',
+  requestSchema: TRANSCRIPTION_REQUEST_SCHEMA,
+  responseSchema: TRANSCRIPTION_RESPONSE_SCHEMA,
+  examples: [transcriptionExample(path)],
+});
+
 /**
  * Creates an endpoint entry with uniform defaults and inferred path parameters.
  *
@@ -381,6 +464,7 @@ const ROUTES = [
   // OpenAI-, Anthropic-, and reranking-compatible inference APIs.
   ['GET', '/api/v1/models', 'openai', 'List OpenAI-compatible models'],
   ['POST', '/api/v1/chat/completions', 'openai', 'Create a chat completion', CHAT_OPTIONS('/api/v1/chat/completions')],
+  ['POST', '/api/v1/chat/completions/input_tokens', 'openai', 'Count exact rendered chat input tokens'],
   ['POST', '/api/v1/completions', 'openai', 'Create a legacy text completion'],
   ['POST', '/api/v1/embeddings', 'openai', 'Create vector embeddings'],
   ['POST', '/api/embeddings', 'openai', 'Create vector embeddings through the convenience alias'],
@@ -389,11 +473,18 @@ const ROUTES = [
   ['POST', '/api/embed/model', 'models', 'Set the active embedding model'],
   ['GET', '/api/v1/models/{model}', 'openai', 'Get an OpenAI-compatible model'],
   ['POST', '/api/v1/responses', 'openai', 'Create an OpenAI Responses API response'],
+  ['POST', '/api/v1/responses/input_tokens', 'openai', 'Count exact rendered Responses API input tokens'],
   ['POST', '/api/v1/messages', 'openai', 'Create an Anthropic-compatible message'],
   ['POST', '/api/v1/messages/count_tokens', 'openai', 'Count Anthropic message tokens'],
   ['POST', '/api/v1/rerank', 'openai', 'Rerank documents'],
   ['POST', '/api/v1/reranking', 'openai', 'Rerank documents through the compatibility alias'],
-  ['POST', '/api/v1/audio/transcriptions', 'openai', 'Transcribe an audio file'],
+  ['POST', '/api/v1/audio/transcriptions', 'openai', 'Transcribe an audio file', TRANSCRIPTION_OPTIONS('/api/v1/audio/transcriptions')],
+
+  // Llama Manager context preparation and durable slot-cache extensions.
+  ['POST', '/api/v1/context/prepare', 'context', 'Prepare a reusable inference context'],
+  ['DELETE', '/api/v1/context/cache', 'context', 'Clear all prepared context entries'],
+  ['GET', '/api/v1/context/{id}', 'context', 'Get a prepared context entry'],
+  ['DELETE', '/api/v1/context/{id}', 'context', 'Delete a prepared context entry'],
 
   // Bare OpenAI-compatible aliases used by stock SDKs with the documented
   // http://<host>:5250/v1 base URL. The /api/v1 variants remain supported.
@@ -407,7 +498,7 @@ const ROUTES = [
   ['POST', '/v1/messages/count_tokens', 'openai', 'Count Anthropic message tokens'],
   ['POST', '/v1/rerank', 'openai', 'Rerank documents'],
   ['POST', '/v1/reranking', 'openai', 'Rerank documents through the compatibility alias'],
-  ['POST', '/v1/audio/transcriptions', 'openai', 'Transcribe an audio file'],
+  ['POST', '/v1/audio/transcriptions', 'openai', 'Transcribe an audio file', TRANSCRIPTION_OPTIONS('/v1/audio/transcriptions')],
 
   // Agent-readable documentation generated from this catalog.
   ['GET', '/llms.txt', 'system', 'Get the concise agent-readable API index'],
@@ -423,3 +514,176 @@ const ROUTES = [
  * request and response schemas, and at least one curl/Python/JavaScript example.
  */
 export const ENDPOINTS = ROUTES.map(route => endpoint(...route));
+
+/**
+ * Render the concise llms.txt index from the shared endpoint catalog.
+ *
+ * @returns {string} Agent-readable Markdown ending with a newline.
+ */
+export function renderLlmsIndex() {
+  const endpointLines = ENDPOINTS.map(entry =>
+    `- \`${entry.method} ${entry.path}\`: ${entry.summary}`,
+  );
+
+  return [
+    '# Llama Manager',
+    '',
+    '> Llama Manager serves OpenAI-compatible text and multimodal inference, model lifecycle management, media ingestion, observability, and runtime administration from one local HTTP service.',
+    '',
+    `OpenAI-compatible base URL: \`${OPENAI_BASE_URL}\``,
+    '',
+    '## Endpoints',
+    '',
+    ...endpointLines,
+    '',
+    '## Full reference',
+    '',
+    '- [Complete agent-readable API reference](/llms-full.txt)',
+    '',
+  ].join('\n');
+}
+
+/**
+ * Format one JSON-compatible value as a fenced Markdown block.
+ *
+ * @param {unknown} value Value to serialize.
+ * @returns {string} Pretty-printed JSON fence.
+ */
+function jsonFence(value) {
+  return `\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
+}
+
+/**
+ * Render one endpoint and its complete schemas and examples as Markdown.
+ *
+ * @param {object} entry One ENDPOINTS catalog item.
+ * @returns {string[]} Markdown lines for the endpoint.
+ */
+function renderEndpointReference(entry) {
+  const lines = [
+    `### ${entry.method} ${entry.path}`,
+    '',
+    entry.summary,
+    '',
+    entry.description,
+    '',
+    `Tags: ${entry.tags.map(tag => `\`${tag}\``).join(', ')}`,
+    '',
+    '#### Parameters',
+    '',
+  ];
+
+  if (entry.params.length === 0) {
+    lines.push('None.', '');
+  } else {
+    lines.push('| Name | Location | Required | Description | Schema |');
+    lines.push('| --- | --- | --- | --- | --- |');
+    for (const parameter of entry.params) {
+      lines.push(`| \`${parameter.name}\` | ${parameter.in} | ${parameter.required ? 'yes' : 'no'} | ${parameter.description} | \`${JSON.stringify(parameter.schema)}\` |`);
+    }
+    lines.push('');
+  }
+
+  lines.push('#### Request schema', '', jsonFence(entry.requestSchema), '');
+  lines.push('#### Response schema', '', jsonFence(entry.responseSchema), '');
+  lines.push('#### Examples', '');
+  for (const example of entry.examples) {
+    lines.push(
+      `##### ${example.title}`,
+      '',
+      '```curl',
+      example.curl,
+      '```',
+      '',
+      '```python',
+      example.python,
+      '```',
+      '',
+      '```javascript',
+      example.javascript,
+      '```',
+      '',
+    );
+  }
+  return lines;
+}
+
+/**
+ * Render the shared multimodal content-part contract and processing policy.
+ *
+ * @returns {string[]} Markdown lines describing accepted parts and reporting.
+ */
+function renderMultimodalGuide() {
+  const lines = [
+    '## Multimodal content-part contract',
+    '',
+    'Message content may be a string or an ordered array of the following parts. OpenAI-standard parts pass through unchanged. Llama Manager extensions are expanded server-side before inference.',
+    '',
+  ];
+
+  for (const part of MULTIMODAL_CONTENT_PARTS) {
+    lines.push(
+      `### \`${part.type}\` (${part.standard ? 'OpenAI standard' : 'Llama Manager extension'})`,
+      '',
+      part.description,
+      '',
+      'Schema:',
+      '',
+      jsonFence(part.schema),
+      '',
+      'Example:',
+      '',
+      jsonFence(part.example),
+      '',
+    );
+  }
+
+  lines.push(
+    'A `video_url` may point to a direct video or a YouTube URL; there is no separate YouTube part type. The server expands it to timestamped frame markers, `image_url` frames, and—when requested and supported—`input_audio` windows. An `audio_url` is downloaded and expanded to normalized `input_audio` windows.',
+    '',
+    '## Media limits and digest reporting',
+    '',
+    '- Processing windows are 600 seconds by default.',
+    '- Each window uses at most 16 frames; extracted frames have a longest edge of 768 pixels.',
+    '- The HTTP request body cap is 200 MB, including inline base64 content.',
+    '- YouTube downloads are capped at 720p.',
+    '- Media longer than one window is segmented and summarized with map-reduce digest calls instead of being silently truncated.',
+    '',
+    'Non-streaming responses report media handling in `metadata.llama_manager_media`. Streaming responses expose the same object as JSON in the `x-llama-manager-media` response header:',
+    '',
+    jsonFence({
+      items: [{
+        id: 'media-id',
+        kind: 'video',
+        durationSec: 1234.5,
+        windows: 3,
+        framesUsed: 16,
+        digested: true,
+      }],
+    }),
+    '',
+    '## Audio transcription timing semantics',
+    '',
+    '`verbose_json` segment start/end timings are approximate fixed window edges. They are not detected speech boundaries or word-level timestamps. Gemma is not a dedicated ASR model.',
+    '',
+  );
+  return lines;
+}
+
+/**
+ * Render the complete agent-facing Markdown API reference.
+ *
+ * @returns {string} Agent-readable Markdown ending with a newline.
+ */
+export function renderLlmsFullReference() {
+  return [
+    '# Llama Manager API: complete agent reference',
+    '',
+    `Preferred OpenAI-compatible base URL: \`${OPENAI_BASE_URL}\``,
+    '',
+    ...renderMultimodalGuide(),
+    '## Endpoint reference',
+    '',
+    ...ENDPOINTS.flatMap(renderEndpointReference),
+  ].join('\n');
+}
