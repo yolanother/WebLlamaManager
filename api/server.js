@@ -74,7 +74,13 @@ import {
   PreparedContextStore,
   SlotAffinityRegistry,
   validateConversationCacheKey,
+  CONTEXT_CACHE_CONTRACT_VERSION,
 } from './context-cache.js';
+import {
+  contextPrepareAdmission,
+  normalizeContextPreparePriority,
+  resolveContextResidency,
+} from './context-prepare-policy.js';
 import { DurableSlotCacheRegistry } from './slot-cache-registry.js';
 import {
   eraseSlotForColdAssignment,
@@ -7365,6 +7371,7 @@ async function schedulePreparedPrefill(leaseId, scopeId) {
     const discardedDecodeTokens = result.usage?.completion_tokens || result.timings?.predicted_n || 0;
     preparedContexts.update(leaseId, scopeId, {
       status: 'ready',
+      preparationOutcome: 'prefilled',
       prefillMs: Date.now() - lease.prefillStartedAt,
       readyAt: Date.now(),
       discardedDecodeTokens,
@@ -7398,37 +7405,118 @@ app.post('/api/v1/context/prepare', async (req, res) => {
   if (!Array.isArray(req.body?.messages)) {
     return res.status(400).json({ error: { message: 'messages must be an array', type: 'invalid_request_error' } });
   }
-  if (currentEngine === ENGINE_TYPES.DS4) {
-    return res.status(501).json({ error: { message: 'prepared contexts are unsupported by DS4', code: 'CONTEXT_PREPARE_UNSUPPORTED' } });
-  }
-  const slotOperationsSupported = await modelHasSlotOperations(resolvedModel);
-  if (mode === 'prefill' && !slotOperationsSupported) {
-    return res.status(501).json({
-      error: {
-        message: 'KV prefill is unsupported by this concrete llama.cpp model child',
-        type: 'not_supported_error',
-        code: 'CONTEXT_PREFILL_UNSUPPORTED',
-      },
-    });
-  }
 
-  if (mode === 'prefill' && req.body?.allow_model_load !== true && !(await isLocalModelResident(resolvedModel))) {
-    const skipped = preparedContexts.create({
-      scopeId: scope.id,
-      requestedModel,
-      resolvedModel,
-      engine: ENGINE_TYPES.LLAMA,
-      mode,
-      status: 'skipped',
-      preparationOutcome: 'model_not_resident',
-      compatibilityHash: compatibilityFingerprint({ resolvedModel, engine: ENGINE_TYPES.LLAMA }),
-    });
-    return res.status(200).json(skipped);
-  }
-
+  let priority;
   try {
-    await acquireLocalSlot(req, res, { model: resolvedModel, endpoint: 'context/prepare', priority: 'interactive' });
-    await ensureModelServed(resolvedModel);
+    priority = normalizeContextPreparePriority(req.body?.priority ?? req.body?.request_priority);
+  } catch (error) {
+    return res.status(400).json({
+      error: { message: error.message, type: 'invalid_request_error', code: error.code },
+      requested_model: requestedModel,
+      resolved_model: resolvedModel,
+      context_cache_contract: CONTEXT_CACHE_CONTRACT_VERSION,
+    });
+  }
+  const residency = resolveContextResidency({
+    mode,
+    priority,
+    residentOnly: req.body?.resident_only,
+    allowModelLoad: req.body?.allow_model_load,
+  });
+
+  // Engine support is decided before any upstream probe so an engine that cannot
+  // prepare contexts never causes a llama.cpp round trip.
+  const unsupportedEngine = contextPrepareAdmission({ mode, engine: currentEngine });
+  if (unsupportedEngine.decision === 'unsupported') {
+    return res.status(unsupportedEngine.httpStatus).json({
+      error: {
+        message: unsupportedEngine.message,
+        type: 'not_supported_error',
+        code: unsupportedEngine.code,
+      },
+      requested_model: requestedModel,
+      resolved_model: resolvedModel,
+      engine: currentEngine,
+      context_cache_contract: CONTEXT_CACHE_CONTRACT_VERSION,
+    });
+  }
+
+  const slotOperationsSupported = await modelHasSlotOperations(resolvedModel);
+  const capabilities = { exact_count: true, exact_render: true, kv_prefill: slotOperationsSupported };
+  /** Build a terminal lease describing preparation that never touched the model. */
+  const terminalLease = decision => preparedContexts.create({
+    scopeId: scope.id,
+    requestedModel,
+    resolvedModel,
+    engine: ENGINE_TYPES.LLAMA,
+    mode,
+    priority,
+    residentOnly: residency.residentOnly,
+    residencySource: residency.source,
+    status: decision.status,
+    preparationOutcome: decision.preparationOutcome,
+    capabilities,
+    compatibilityHash: compatibilityFingerprint({ resolvedModel, engine: ENGINE_TYPES.LLAMA }),
+  });
+
+  const preflight = contextPrepareAdmission({
+    mode,
+    engine: ENGINE_TYPES.LLAMA,
+    slotOperationsSupported,
+    residentOnly: residency.residentOnly,
+    isResident: residency.residentOnly ? await isLocalModelResident(resolvedModel) : true,
+  });
+  if (preflight.decision === 'unsupported') {
+    return res.status(preflight.httpStatus).json({
+      error: { message: preflight.message, type: 'not_supported_error', code: preflight.code },
+      requested_model: requestedModel,
+      resolved_model: resolvedModel,
+      engine: ENGINE_TYPES.LLAMA,
+      context_cache_contract: CONTEXT_CACHE_CONTRACT_VERSION,
+    });
+  }
+  if (preflight.decision === 'skip') {
+    return res.status(preflight.httpStatus).json(terminalLease(preflight));
+  }
+
+  // Cancellation is cooperative: a realtime arrival preempts background
+  // preparation, and the same controller aborts the upstream measurement calls.
+  const controller = new AbortController();
+  try {
+    await acquireLocalSlot(req, res, {
+      model: resolvedModel,
+      endpoint: 'context/prepare',
+      priority,
+      onPreempt: reason => controller.abort(reason),
+    });
+
+    // Residency is re-verified INSIDE the lane. The preflight above is advisory:
+    // only this check is ordered against model swaps and competing admissions.
+    if (residency.residentOnly) {
+      const admitted = contextPrepareAdmission({
+        mode,
+        engine: ENGINE_TYPES.LLAMA,
+        slotOperationsSupported: await modelHasSlotOperations(resolvedModel),
+        residentOnly: true,
+        isResident: await isLocalModelResident(resolvedModel),
+        stage: 'post_admission',
+      });
+      if (admitted.decision === 'skip') {
+        return res.status(admitted.httpStatus).json(terminalLease(admitted));
+      }
+      if (admitted.decision === 'unsupported') {
+        return res.status(admitted.httpStatus).json({
+          error: { message: admitted.message, type: 'not_supported_error', code: admitted.code },
+          requested_model: requestedModel,
+          resolved_model: resolvedModel,
+          engine: ENGINE_TYPES.LLAMA,
+          context_cache_contract: CONTEXT_CACHE_CONTRACT_VERSION,
+        });
+      }
+    } else {
+      await ensureModelServed(resolvedModel);
+    }
+
     const [count, rendered, compatibilityHash] = await Promise.all([
       requestExactInputTokens({
         kind: 'chat',
@@ -7437,11 +7525,13 @@ app.post('/api/v1/context/prepare', async (req, res) => {
         resolvedModel,
         engine: ENGINE_TYPES.LLAMA,
         body: req.body,
+        signal: controller.signal,
       }),
       requestRenderedPrefix({
         baseUrl: `http://localhost:${LLAMA_PORT}`,
         resolvedModel,
         body: req.body,
+        signal: controller.signal,
       }),
       modelCompatibilityHash(resolvedModel),
     ]);
@@ -7452,13 +7542,17 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       resolvedModel,
       engine: ENGINE_TYPES.LLAMA,
       mode,
+      priority,
+      residentOnly: residency.residentOnly,
+      residencySource: residency.source,
       status: mode === 'prefill' ? 'queued' : 'ready',
+      preparationOutcome: mode === 'prefill' ? 'prefill_scheduled' : 'counted',
       inputTokens: count.input_tokens,
       prefixHash: rendered.prefix_hash,
       compatibilityHash,
       requestHash,
       preparationBody: mode === 'prefill' ? req.body : null,
-      capabilities: { exact_count: true, exact_render: true, kv_prefill: slotOperationsSupported },
+      capabilities,
     });
 
     if (mode === 'prefill') {
@@ -7486,6 +7580,15 @@ app.post('/api/v1/context/prepare', async (req, res) => {
     }
     return res.status(mode === 'prefill' ? 202 : 201).json(preparedContexts.get(lease.id, scope.id));
   } catch (error) {
+    // A preempted or client-cancelled measurement is a normal terminal outcome,
+    // not an upstream failure: report it as a typed lease so the caller can tell
+    // "realtime traffic took the lane" apart from "the engine broke".
+    if (controller.signal.aborted) {
+      return res.status(200).json(terminalLease({
+        status: 'cancelled',
+        preparationOutcome: String(controller.signal.reason || 'cancelled'),
+      }));
+    }
     const status = error instanceof ContextUpstreamError ? error.status : (error.statusCode || 502);
     return res.status(status).json({
       error: {
@@ -7494,6 +7597,10 @@ app.post('/api/v1/context/prepare', async (req, res) => {
         code: 'CONTEXT_PREPARE_FAILED',
         ...(error.details ? { details: error.details } : {}),
       },
+      requested_model: requestedModel,
+      resolved_model: resolvedModel,
+      engine: ENGINE_TYPES.LLAMA,
+      context_cache_contract: CONTEXT_CACHE_CONTRACT_VERSION,
     });
   }
 });
