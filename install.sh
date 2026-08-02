@@ -37,6 +37,21 @@ Use llama-managerctl for service, configuration, and model management.
 EOF
 }
 
+# Atomically writes the source install's protected systemd credential env file.
+# Arguments: <path> <Hugging Face token>. Prints nothing containing the token.
+write_service_credentials() {
+  local destination="$1" token="$2" temporary
+  [[ "$token" != *$'\n'* && "$token" != *$'\r'* ]] \
+    || { printf 'HF_TOKEN must be a single-line value\n' >&2; return 1; }
+  umask 077
+  mkdir -p "$(dirname "$destination")"
+  chmod 700 "$(dirname "$destination")"
+  temporary="$(mktemp "${destination}.XXXXXX")"
+  printf 'HF_TOKEN=%s\n' "$token" > "$temporary"
+  chmod 600 "$temporary"
+  mv -fT "$temporary" "$destination"
+}
+
 # Seed config.json's embed block (idempotent). Args: <config-path> <model-id>.
 # Only sets embed.model when unset, so re-running install never clobbers a choice.
 embed_seed_config() {
@@ -235,6 +250,8 @@ npm run build
 echo
 echo "[4/6] Setting up systemd user service..."
 mkdir -p ~/.config/systemd/user
+CREDENTIAL_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/llama-manager/credentials.env"
+write_service_credentials "$CREDENTIAL_ENV" "$HF_TOKEN"
 
 # Generate service file with configured values
 USER_ID=$(id -u)
@@ -268,7 +285,7 @@ Environment=CONTEXT_SIZE=$CONTEXT_SIZE
 Environment=AUTO_START=$AUTO_START
 Environment=STATS_INTERVAL=$STATS_INTERVAL
 Environment=LLAMA_UI_URL=$LLAMA_UI_URL
-Environment=HF_TOKEN=$HF_TOKEN
+EnvironmentFile=-$CREDENTIAL_ENV
 
 # Allow the service to manage distrobox containers
 Environment=XDG_RUNTIME_DIR=/run/user/$USER_ID

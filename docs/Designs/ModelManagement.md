@@ -247,8 +247,28 @@ This handles the brief window where llama.cpp is restarting or a model is being 
 | `MODELS_MAX` | `2` | Override for modelsMax |
 | `CONTEXT_SIZE` | `8192` | Override for contextSize |
 | `AUTO_START` | `true` | Override for autoStart |
-| `HF_TOKEN` | _(unset)_ | HuggingFace token for gated model downloads |
+| `HF_TOKEN` | _(unset)_ | Fallback HuggingFace token for gated model downloads; the installer and runtime launchers deliver it through protected files, never process arguments |
 | `LLAMA_UI_URL` | _(unset)_ | Override URL for the llama.cpp native UI link |
+
+### Credential Delivery
+
+The Settings-managed HuggingFace token remains the preferred source for model
+downloads. When the `HF_TOKEN` environment fallback is used, `install.sh`
+atomically writes it to a mode-0600 systemd `EnvironmentFile` in the user's
+Llama Manager configuration directory. The generated unit references that file
+instead of embedding the value in the unit or its command line.
+
+`start-llama.sh` and `start-embed.sh` use the shared
+`scripts/runtime-credentials.sh` helper to atomically create component-specific,
+mode-0600 environment files beneath `$XDG_RUNTIME_DIR/llama-manager`. Distrobox
+receives only `--env-file=<path>`; the raw credential is therefore absent from
+the host and container-launch process argument lists. The containing runtime
+directory is mode 0700.
+
+Rotating the fallback credential requires updating the environment source and
+rerunning `./install.sh`; subsequent runtime launches atomically replace their
+component credential files. Revocation and creation of HuggingFace tokens must
+be performed by an authorized operator in HuggingFace itself.
 
 ## Graceful Shutdown
 

@@ -12,9 +12,12 @@
 #      EMBED_GPU_LAYERS (default 99), EMBED_CTX (0 = model default),
 #      MODELS_DIR, HF_TOKEN, DISTROBOX_CONTAINER, LLAMA_SERVER_BIN.
 # Flag: --print-cmd  prints the llama-server command and exits (test seam).
+# The Hugging Face credential is delivered through a protected runtime env file;
+# no raw secret is passed in Distrobox or inner-shell argv.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/scripts/runtime-credentials.sh"
 if [ -f "$SCRIPT_DIR/.env" ]; then set -a; . "$SCRIPT_DIR/.env"; set +a; fi
 
 case "${LLAMA_MANAGER_PACKAGED:-}" in
@@ -70,26 +73,29 @@ if [ "${1:-}" = "--print-cmd" ]; then
   exit 0
 fi
 
-DISTROBOX="/usr/local/bin/distrobox"
-[ -x "$DISTROBOX" ] || DISTROBOX="$(which distrobox 2>/dev/null || echo distrobox)"
+DISTROBOX="${DISTROBOX_BIN:-/usr/local/bin/distrobox}"
+command -v "$DISTROBOX" >/dev/null 2>&1 \
+  || DISTROBOX="$(which distrobox 2>/dev/null || echo distrobox)"
 
 echo "Starting embedding server in distrobox '$CONTAINER_NAME' on port $EMBED_PORT (model: $MODEL_ARG)"
 
+# Store the secret outside argv. Distrobox passes this path to the container
+# manager's --env-file option; process listings reveal only the protected path.
+CREDENTIAL_FILE="$(runtime_credentials_write embed "$HF_TOKEN")"
+
 # Enter the container; set the same AMD/ROCm unified-memory env container-start.sh
-# uses, then exec the embeddings llama-server. Values are passed as POSITIONAL
-# ARGS to the inner shell (not interpolated into the command string) and the
-# argv is rebuilt inside with proper quoting, so a model path containing spaces
-# or shell metacharacters can never be word-split or injected. In package mode
-# the absolute server path is passed independently of the operator's PATH.
-exec "$DISTROBOX" enter "$CONTAINER_NAME" -- bash -c '
+# uses, then exec the embeddings llama-server. Non-secret values are positional
+# args to the inner shell and rebuilt with proper quoting, so model paths cannot
+# be word-split or injected. Package mode passes the absolute binary separately.
+exec "$DISTROBOX" enter --additional-flags "--env-file=$CREDENTIAL_FILE" \
+    "$CONTAINER_NAME" -- bash -c '
   export HSA_OVERRIDE_GFX_VERSION=11.5.1
   export ROCM_LLVM_PRE_VEGA=1
   export GGML_HIP_UMA=1
   export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
   export LLAMA_CACHE="$1"
-  export HF_TOKEN="$2"
   mkdir -p "$1"
-  server_bin="$3"
-  shift 3
+  server_bin="$2"
+  shift 2
   exec "$server_bin" "$@"
-' embed-launch "$MODELS_DIR" "$HF_TOKEN" "$LLAMA_SERVER_BIN" "${CMD_ARGS[@]}"
+' embed-launch "$MODELS_DIR" "$LLAMA_SERVER_BIN" "${CMD_ARGS[@]}"

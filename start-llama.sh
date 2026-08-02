@@ -6,12 +6,15 @@
 # This host-side launcher forwards router settings into the ROCm distrobox and
 # executes container-start.sh. Debian packages use immutable container/binary
 # selections and address package scripts through Distrobox's /run/host mount;
-# source checkouts preserve their configured container and checkout paths.
+# source checkouts preserve their configured container and checkout paths. The
+# Hugging Face credential is delivered through a protected runtime env file so
+# neither Distrobox nor process-status argv exposes its value.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$SCRIPT_DIR/scripts/runtime-credentials.sh"
 # If a project .env exists, export its variables (simple KEY=VAL lines)
 if [ -f "$PROJECT_ROOT/.env" ]; then
     set -a
@@ -56,9 +59,9 @@ echo "Models directory: $MODELS_DIR"
 # Ensure models directory exists on host
 mkdir -p "$MODELS_DIR"
 
-# Use full path to distrobox
-DISTROBOX="/usr/local/bin/distrobox"
-if [ ! -x "$DISTROBOX" ]; then
+# Use full path to distrobox, with an explicit test/packaging override.
+DISTROBOX="${DISTROBOX_BIN:-/usr/local/bin/distrobox}"
+if ! command -v "$DISTROBOX" >/dev/null 2>&1; then
     DISTROBOX=$(which distrobox 2>/dev/null || echo "distrobox")
 fi
 
@@ -71,9 +74,14 @@ if ! echo "$CONTAINER_LIST" | grep -E "\\|[[:space:]]*${CONTAINER_NAME}[[:space:
     exit 1
 fi
 
-# Enter the container and run the selected script. Each value is a separate
-# argv element so configuration is never interpolated as shell source.
-exec "$DISTROBOX" enter "$CONTAINER_NAME" -- /usr/bin/env \
+# Store the secret outside argv. Distrobox passes this path to the container
+# manager's --env-file option; process listings reveal only the protected path.
+CREDENTIAL_FILE="$(runtime_credentials_write llama "$HF_TOKEN")"
+
+# Enter the container and run the selected script. Non-secret values remain
+# separate argv elements so configuration is never interpolated as shell source.
+exec "$DISTROBOX" enter --additional-flags "--env-file=$CREDENTIAL_FILE" \
+    "$CONTAINER_NAME" -- /usr/bin/env \
     "MODELS_DIR=$MODELS_DIR" \
     "MODELS_MAX=$MODELS_MAX" \
     "CONTEXT=$CONTEXT" \
@@ -81,7 +89,6 @@ exec "$DISTROBOX" enter "$CONTAINER_NAME" -- /usr/bin/env \
     "NO_WARMUP=$NO_WARMUP" \
     "FLASH_ATTN=$FLASH_ATTN" \
     "GPU_LAYERS=$GPU_LAYERS" \
-    "HF_TOKEN=$HF_TOKEN" \
     "SLOT_SAVE_PATH=$SLOT_SAVE_PATH" \
     "LLAMA_SERVER_BIN=$LLAMA_SERVER_BIN" \
     bash "$CONTAINER_START"
