@@ -69,6 +69,28 @@ export function resolveContextResidency({
 }
 
 /**
+ * Decide the engine gate on its own, before any upstream probe. Kept separate
+ * from {@link contextPrepareAdmission} so a handler can refuse an engine that
+ * cannot prepare contexts at all without accidentally applying the mode-specific
+ * slot-capability rule, which needs a probe result the handler does not yet have.
+ *
+ * @param {string|null} engine Active engine identifier.
+ * @returns {{decision:'unsupported', status:string, httpStatus:number, code:string, reason:string, message:string}|null}
+ *   An unsupported decision, or null when the engine can prepare contexts.
+ */
+export function contextPrepareEngineDecision(engine) {
+  if (engine === 'llama') return null;
+  return {
+    decision: 'unsupported',
+    status: 'unsupported',
+    httpStatus: 501,
+    code: 'CONTEXT_PREPARE_UNSUPPORTED',
+    reason: 'engine_unsupported',
+    message: `prepared contexts are unsupported by ${engine || 'the active engine'}`,
+  };
+}
+
+/**
  * Decide whether a prepared-context request may proceed against the concrete
  * resolved model. The same rule runs twice: once before the local lane is
  * requested, and again after it has been acquired, so a model swap or unload
@@ -93,16 +115,8 @@ export function contextPrepareAdmission({
   isResident = false,
   stage = 'preflight',
 } = {}) {
-  if (engine !== 'llama') {
-    return {
-      decision: 'unsupported',
-      status: 'unsupported',
-      httpStatus: 501,
-      code: 'CONTEXT_PREPARE_UNSUPPORTED',
-      reason: 'engine_unsupported',
-      message: `prepared contexts are unsupported by ${engine || 'the active engine'}`,
-    };
-  }
+  const engineDecision = contextPrepareEngineDecision(engine);
+  if (engineDecision) return engineDecision;
   if (mode === 'prefill' && !slotOperationsSupported) {
     return {
       decision: 'unsupported',

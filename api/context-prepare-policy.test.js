@@ -14,6 +14,7 @@ import { test } from 'node:test';
 import {
   CONTEXT_PREPARE_PRIORITIES,
   contextPrepareAdmission,
+  contextPrepareEngineDecision,
   normalizeContextPreparePriority,
   resolveContextResidency,
 } from './context-prepare-policy.js';
@@ -150,6 +151,21 @@ test('unsupported engines refuse preparation before any residency or slot probe'
   const missing = contextPrepareAdmission({ mode: 'count', engine: null });
   assert.equal(missing.decision, 'unsupported');
   assert.equal(missing.code, 'CONTEXT_PREPARE_UNSUPPORTED');
+});
+
+test('the engine gate is decidable on its own so prefill is not refused before its slot probe', () => {
+  assert.equal(contextPrepareEngineDecision('llama'), null);
+
+  const ds4 = contextPrepareEngineDecision('ds4');
+  assert.equal(ds4.decision, 'unsupported');
+  assert.equal(ds4.code, 'CONTEXT_PREPARE_UNSUPPORTED');
+  assert.equal(ds4.httpStatus, 501);
+  assert.match(ds4.message, /ds4/);
+  assert.equal(contextPrepareEngineDecision(null).code, 'CONTEXT_PREPARE_UNSUPPORTED');
+
+  // The gate must not depend on mode: a prefill on llama has to survive it and
+  // reach the slot-capability probe rather than being pre-emptively refused.
+  assert.equal(contextPrepareEngineDecision('llama'), null);
 });
 
 test('realtime work arriving during background preparation preempts and cancels it', async () => {

@@ -78,6 +78,7 @@ import {
 } from './context-cache.js';
 import {
   contextPrepareAdmission,
+  contextPrepareEngineDecision,
   normalizeContextPreparePriority,
   resolveContextResidency,
 } from './context-prepare-policy.js';
@@ -7426,8 +7427,8 @@ app.post('/api/v1/context/prepare', async (req, res) => {
 
   // Engine support is decided before any upstream probe so an engine that cannot
   // prepare contexts never causes a llama.cpp round trip.
-  const unsupportedEngine = contextPrepareAdmission({ mode, engine: currentEngine });
-  if (unsupportedEngine.decision === 'unsupported') {
+  const unsupportedEngine = contextPrepareEngineDecision(currentEngine);
+  if (unsupportedEngine) {
     return res.status(unsupportedEngine.httpStatus).json({
       error: {
         message: unsupportedEngine.message,
