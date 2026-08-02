@@ -442,6 +442,68 @@ test('the built record exposes only the documented top-level surface', () => {
   ]);
 });
 
+test('a dimension the manager structurally cannot observe carries its own typed reason', () => {
+  const clock = fakeClock();
+  const recorder = new TimingEvidenceRecorder({
+    requestId: 'req_chat',
+    profile: TIMING_EVIDENCE_PROFILES.GENERATION,
+    clock,
+  });
+  recorder.setIdentity(IDENTITY);
+  recorder.mark('received');
+  clock.advance(30);
+  recorder.mark('admitted');
+  // A served generation exposes no discrete tokenization or prefill boundary to
+  // the manager; llama.cpp reports prompt processing only.
+  recorder.markDimensionUnsupported('tokenization', TIMING_UNSUPPORTED_REASONS.ENGINE_DOES_NOT_SEPARATE_TOKENIZATION);
+  recorder.markDimensionUnsupported('prefill', TIMING_UNSUPPORTED_REASONS.MANAGER_CANNOT_SEPARATE_PREFILL);
+  recorder.markDimensionUnsupported('inference_start', TIMING_UNSUPPORTED_REASONS.MANAGER_CANNOT_OBSERVE_INFERENCE_START);
+  clock.advance(400);
+  recorder.mark('first_content');
+  recorder.setEngineTimings({ promptMs: 210, predictedMs: 180, promptN: 700, cacheN: 500 });
+  recorder.setTokenAccounting({ exactInputTokens: 700, cachedTokens: 500, source: 'llama_cpp_timings' });
+  const record = recorder.build();
+
+  assert.equal(record.manager_observed.tokenization.supported, false);
+  assert.equal(
+    record.manager_observed.tokenization.reason,
+    TIMING_UNSUPPORTED_REASONS.ENGINE_DOES_NOT_SEPARATE_TOKENIZATION,
+  );
+  assert.equal(record.manager_observed.prefill.reason, TIMING_UNSUPPORTED_REASONS.MANAGER_CANNOT_SEPARATE_PREFILL);
+  // Prefill is still certifiable because the engine reports it directly.
+  assert.equal(record.engine_reported.prefill.ms, 210);
+  assert.equal(record.manager_observed.queue_wait.ms, 30);
+  assert.equal(record.manager_observed.first_content.ms, 430);
+  assert.equal(record.cache.classification, 'warm_prefix');
+  // Tokenization and inference start remain uncertifiable, with typed reasons.
+  assert.equal(record.complete, false);
+  assert.deepEqual(record.incomplete_reasons, [
+    `tokenization:${TIMING_UNSUPPORTED_REASONS.ENGINE_DOES_NOT_SEPARATE_TOKENIZATION}`,
+    `inference_start:${TIMING_UNSUPPORTED_REASONS.MANAGER_CANNOT_OBSERVE_INFERENCE_START}`,
+  ]);
+});
+
+test('an explicit unsupported declaration cannot overwrite a real measurement', () => {
+  const clock = fakeClock();
+  const recorder = new TimingEvidenceRecorder({ requestId: 'req_x', profile: TIMING_EVIDENCE_PROFILES.COUNT, clock });
+  recorder.setIdentity(IDENTITY);
+  recorder.mark('received');
+  clock.advance(2);
+  recorder.mark('admitted');
+  recorder.markDimensionUnsupported('queue_wait', TIMING_UNSUPPORTED_REASONS.MARK_MISSING);
+  assert.equal(recorder.build().manager_observed.queue_wait.ms, 2);
+  assert.throws(() => recorder.markDimensionUnsupported('not_a_dimension', 'x'), /unknown/i);
+});
+
+test('a request id may be bound after the recorder starts timing', () => {
+  const recorder = new TimingEvidenceRecorder({ profile: TIMING_EVIDENCE_PROFILES.COUNT, clock: () => 0 });
+  recorder.setIdentity(IDENTITY);
+  recorder.mark('received');
+  assert.equal(recorder.build().request_id, null);
+  recorder.setRequestId('req_late');
+  assert.equal(recorder.build().request_id, 'req_late');
+});
+
 test('tokenizer revision fingerprints canonical tokenizer material and is never fabricated', () => {
   const props = {
     'tokenizer.ggml.model': 'gemma',

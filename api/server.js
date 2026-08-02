@@ -8360,6 +8360,96 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
   }
 }
 
+/**
+ * Read already-probed serving revisions for a model without triggering a new
+ * `/props` probe. An unprobed model yields nulls rather than a fabricated
+ * revision, so evidence never certifies an unverified tokenizer.
+ *
+ * @param {string} model Concrete resolved model id.
+ * @returns {{compatibility:string|null,tokenizer:string|null}} Cached revisions.
+ */
+function cachedServingRevisions(model) {
+  const cached = modelCompatibilityCache.get(model);
+  return cached && Date.now() - cached.checkedAt < 60_000
+    ? { compatibility: cached.compatibility, tokenizer: cached.tokenizer }
+    : { compatibility: null, tokenizer: null };
+}
+
+/**
+ * Finalize the timing evidence of a served chat completion.
+ *
+ * A served generation gives the manager only two directly observable moments:
+ * admission (the local queue slot was acquired) and first emitted content.
+ * llama.cpp reports prompt-processing time but folds input tokenization into
+ * it and never reports when decoding began, so tokenization and inference start
+ * are declared unsupported with explicit typed reasons instead of being derived
+ * from prompt timing or from an aggregate queue counter. Records from this path
+ * are therefore observational: they stay `complete: false` by construction, and
+ * certification must use the context-prepare measurement path.
+ *
+ * @param {import('./timing-evidence.js').TimingEvidenceRecorder} recorder Request recorder.
+ * @param {Object} context Request outcome context.
+ * @param {string|number} [context.requestId] Active request identifier.
+ * @param {string} [context.requestedModel] Caller-supplied model or alias.
+ * @param {string} [context.resolvedModel] Concrete model that served.
+ * @param {string} [context.priority] Effective request priority class.
+ * @param {string} [context.routingPolicy] Effective routing outcome.
+ * @param {Object|null} [context.timings] llama.cpp `timings` payload, when reported.
+ * @param {number} [context.promptTokens] Exact input tokens reported for the request.
+ * @param {number} [context.cachedTokens] Reused prefix tokens reported for the request.
+ * @param {string} [context.cacheHitKind] Manager cache hit classification.
+ * @param {boolean} [context.reloaded] Whether a persisted KV dump was restored.
+ * @returns {Record<string, unknown>|null} The public record, or null if unbuildable.
+ */
+function finalizeChatTiming(recorder, {
+  requestId = null,
+  requestedModel = null,
+  resolvedModel = null,
+  priority = null,
+  routingPolicy = null,
+  timings = null,
+  promptTokens = 0,
+  cachedTokens = 0,
+  cacheHitKind = 'none',
+  reloaded = false,
+} = {}) {
+  if (!recorder || !resolvedModel) return null;
+  const revisions = cachedServingRevisions(resolvedModel);
+  recorder.setRequestId(requestId == null ? null : String(requestId));
+  recorder.setIdentity({
+    requestedModel,
+    resolvedModel,
+    engine: currentEngine,
+    modelRevision: revisions.compatibility,
+    tokenizerRevision: revisions.tokenizer,
+    priority,
+    routingPolicy,
+  });
+  recorder.markDimensionUnsupported('tokenization', TIMING_UNSUPPORTED_REASONS.ENGINE_DOES_NOT_SEPARATE_TOKENIZATION);
+  recorder.markDimensionUnsupported('prefill', TIMING_UNSUPPORTED_REASONS.MANAGER_CANNOT_SEPARATE_PREFILL);
+  recorder.markDimensionUnsupported('inference_start', TIMING_UNSUPPORTED_REASONS.MANAGER_CANNOT_OBSERVE_INFERENCE_START);
+  if (timings) {
+    recorder.setEngineTimings({
+      promptMs: timings.prompt_ms,
+      predictedMs: timings.predicted_ms,
+      promptN: timings.prompt_n,
+      cacheN: Number(cachedTokens) || 0,
+    });
+  }
+  const exactInputTokens = Number(promptTokens) || 0;
+  recorder.setTokenAccounting({
+    exactInputTokens,
+    cachedTokens: Math.min(Number(cachedTokens) || 0, exactInputTokens),
+    source: timings ? 'llama_cpp_timings' : 'openai_usage',
+  });
+  recorder.setCacheSignals({ cacheHitKind, reloaded });
+  try {
+    return recorder.build();
+  } catch {
+    return null;
+  }
+}
+
 // OpenAI-compatible chat completions (streaming and non-streaming)
 /**
  * Expand multimodal URL parts and proxy an OpenAI chat completion request.
@@ -8369,6 +8459,8 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
  */
 async function handleChatCompletions(req, res) {
   const startTime = Date.now();
+  const chatTiming = new TimingEvidenceRecorder({ profile: TIMING_EVIDENCE_PROFILES.GENERATION });
+  chatTiming.mark('received');
   const isStreaming = req.body.stream === true;
   let requestPolicy;
   try {
@@ -8933,6 +9025,7 @@ async function handleChatCompletions(req, res) {
       } : null
     });
     initialQueueWait = slot.queueWait;
+    chatTiming.mark('admitted');
     if (isStreaming && !res.writableEnded) {
       flushSseHeaders();
       res.write(`: manager queue-wait-ms=${initialQueueWait} priority=${requestPolicy.priority}\n\n`);
@@ -9209,6 +9302,7 @@ async function handleChatCompletions(req, res) {
       let model = req.body.model || 'unknown';
       let responseText = '';
       let serverTimings = null;
+      let firstContentMarked = false;
 
       const processStream = async () => {
         try {
@@ -9242,6 +9336,7 @@ async function handleChatCompletions(req, res) {
                                  delta.reasoning || delta.thinking ||
                                  delta.text || '';
                     if (text) {
+                      if (!firstContentMarked) { firstContentMarked = true; chatTiming.mark('first_content'); }
                       completionTokens++;
                       responseText += text;
                       updateActiveRequest(activeReqId, text);
@@ -9319,7 +9414,19 @@ async function handleChatCompletions(req, res) {
             status: 200, duration: wallDuration, promptTokens, completionTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.messages || null, prompt: null,
-            response: responseText, error: null
+            response: responseText, error: null,
+            timingEvidence: finalizeChatTiming(chatTiming, {
+              requestId: activeReqId,
+              requestedModel: rawModel,
+              resolvedModel: requestedModel,
+              priority: requestPolicy.priority,
+              routingPolicy: routing.offloadSuppressed ? 'offload-suppressed(local_only)' : 'local',
+              timings: serverTimings,
+              promptTokens,
+              cachedTokens: serverTimings?.cache_n || serverTimings?.prompt_n_cached || 0,
+              cacheHitKind: diskRestored ? 'disk_restore' : (slotAssignment?.prepared ? 'prepared' : (slotAssignment?.hit ? 'affinity' : 'none')),
+              reloaded: diskRestored,
+            }),
           });
           endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
         } catch (e) {
@@ -9390,12 +9497,29 @@ async function handleChatCompletions(req, res) {
         routingOutcome: routing.offloadSuppressed ? 'offload-suppressed(local_only)' : 'local',
       });
 
+      // The non-streaming path has no per-token stream to observe, so the
+      // manager's first-content moment is the arrival of the complete body.
+      if (completionTokens > 0) chatTiming.mark('first_content');
+      const timingEvidence = finalizeChatTiming(chatTiming, {
+        requestId: activeReqId,
+        requestedModel: rawModel,
+        resolvedModel: requestedModel,
+        priority: requestPolicy.priority,
+        routingPolicy: routing.offloadSuppressed ? 'offload-suppressed(local_only)' : 'local',
+        timings: data.timings || null,
+        promptTokens,
+        cachedTokens: usage.prompt_tokens_details?.cached_tokens || timings.cache_n || timings.prompt_n_cached || 0,
+        cacheHitKind: diskRestored ? 'disk_restore' : (slotAssignment?.prepared ? 'prepared' : (slotAssignment?.hit ? 'affinity' : 'none')),
+        reloaded: diskRestored,
+      });
+
       logLlm({
         endpoint: 'chat/completions', model: requestedModel,
         stream: false, status: 200, duration: wallDuration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
-        response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || data.choices?.[0]?.message?.reasoning || null, error: null
+        response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || data.choices?.[0]?.message?.reasoning || null, error: null,
+        timingEvidence,
       });
 
       // Normalize model field: return what was requested, not what llama-server reports
@@ -9425,6 +9549,7 @@ async function handleChatCompletions(req, res) {
             affinity: !!slotAssignment?.hit,
           },
           contextCacheContract: 1,
+          timingEvidence,
         },
         { completionTokens }
       );

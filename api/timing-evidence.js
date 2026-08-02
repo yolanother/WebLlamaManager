@@ -37,6 +37,10 @@ export const TIMING_UNSUPPORTED_REASONS = Object.freeze({
   ENGINE_LACKS_PREFILL_INSTRUMENTATION: 'engine_lacks_prefill_instrumentation',
   /** The serving engine exposes no timing instrumentation at all. */
   ENGINE_UNSUPPORTED: 'engine_unsupported',
+  /** A served generation exposes no prefill boundary the manager can observe. */
+  MANAGER_CANNOT_SEPARATE_PREFILL: 'manager_cannot_separate_prefill',
+  /** Neither manager nor engine reports when decoding began for this request. */
+  MANAGER_CANNOT_OBSERVE_INFERENCE_START: 'manager_cannot_observe_inference_start',
   /** The caller did not report its own wall-clock first-token latency. */
   CLIENT_CLOCK_NOT_REPORTED: 'client_clock_not_reported',
   /** The phase began but never completed (cancellation, preemption, failure). */
@@ -297,6 +301,38 @@ export class TimingEvidenceRecorder {
     this.cancellationReason = null;
     this.observedModel = null;
     this.startedAtIso = null;
+    this.declaredUnsupported = new Map();
+  }
+
+  /**
+   * Bind the manager request identifier after timing has already started, for
+   * handlers that allocate their request id after receipt.
+   *
+   * @param {string|null} requestId Opaque manager request identifier.
+   * @returns {TimingEvidenceRecorder} This recorder, for chaining.
+   */
+  setRequestId(requestId) {
+    this.requestId = requestId ?? null;
+    return this;
+  }
+
+  /**
+   * Declare that one manager-observed dimension is structurally unobservable on
+   * this serving path, with an explicit typed reason. A declaration never
+   * overwrites a real measurement, so it is safe to declare a limit up front and
+   * still record marks if they later become available.
+   *
+   * @param {string} dimension A member of the reported manager dimensions.
+   * @param {string} reason A member of {@link TIMING_UNSUPPORTED_REASONS}.
+   * @returns {TimingEvidenceRecorder} This recorder, for chaining.
+   * @throws {TypeError} When the dimension is not part of the contract.
+   */
+  markDimensionUnsupported(dimension, reason) {
+    if (!MANAGER_DIMENSIONS.includes(dimension)) {
+      throw new TypeError(`unknown timing dimension: ${dimension}`);
+    }
+    this.declaredUnsupported.set(dimension, reason);
+    return this;
   }
 
   /**
@@ -463,6 +499,9 @@ export class TimingEvidenceRecorder {
       if (this.marks.has(offsetMark) && this.marks.has('received')) {
         return measured(this.marks.get(offsetMark) - this.marks.get('received'), 'manager_monotonic');
       }
+    }
+    if (this.declaredUnsupported.has(dimension)) {
+      return unsupported(this.declaredUnsupported.get(dimension));
     }
     return unsupported(
       this.cancelled ? TIMING_UNSUPPORTED_REASONS.PHASE_NOT_REACHED : TIMING_UNSUPPORTED_REASONS.MARK_MISSING,
