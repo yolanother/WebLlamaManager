@@ -123,7 +123,11 @@ const PREPARED_CONTEXT_STATES = new Set([
   'cancelled', 'expired', 'invalidated', 'unsupported', 'failed',
 ]);
 
-/** Return the safe, externally observable portion of an internal lease record. */
+/**
+ * Return the safe, externally observable portion of an internal lease record.
+ * Every public record is stamped with the canonical contract version so clients
+ * can never infer the prepared-context contract from field presence alone.
+ */
 function publicPreparedRecord(record) {
   if (!record) return null;
   const {
@@ -136,7 +140,7 @@ function publicPreparedRecord(record) {
     preparationBody: _preparationBody,
     ...safe
   } = record;
-  return { ...safe };
+  return { contextCacheContract: CONTEXT_CACHE_CONTRACT_VERSION, ...safe };
 }
 
 /**
