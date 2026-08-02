@@ -5,6 +5,8 @@
 // supplies the summaries, schemas, parameters, and runnable examples consumed
 // by generated OpenAPI and agent-facing documentation.
 
+import { CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
+
 const HOST = 'http://localhost:5250';
 const GENERIC_OBJECT_SCHEMA = { type: 'object', additionalProperties: true };
 
@@ -338,6 +340,150 @@ const TRANSCRIPTION_OPTIONS = path => ({
   examples: [transcriptionExample(path)],
 });
 
+const CONTEXT_PREPARE_REQUEST_SCHEMA = {
+  type: 'object',
+  required: ['model', 'messages'],
+  properties: {
+    model: {
+      type: 'string',
+      description: 'Requested model id or alias. The response reports the concrete resolved model separately so an alias can never silently certify a different model.',
+    },
+    messages: CHAT_REQUEST_SCHEMA.properties.messages,
+    mode: {
+      type: 'string',
+      enum: ['count', 'prefill'],
+      default: 'count',
+      description: 'count renders and counts the exact production prefix; prefill additionally schedules cancellable KV prewarming on the background lane.',
+    },
+    priority: {
+      type: 'string',
+      enum: ['interactive', 'background'],
+      default: 'interactive',
+      description: 'Scheduling class for the measurement itself. background is bounded, preemptible maintenance work that can never displace or starve realtime or interactive inference. realtime is rejected with CONTEXT_PREPARE_INVALID_PRIORITY.',
+    },
+    request_priority: {
+      type: 'string',
+      enum: ['interactive', 'background'],
+      description: 'Accepted alias for priority, matching the chat-completions extension name.',
+    },
+    resident_only: {
+      type: 'boolean',
+      description: 'Fail-closed residency restriction for both count and prefill. When true the manager never loads, switches, or evicts a model: a nonresident concrete model returns HTTP 200 with status skipped. Implied by priority background.',
+    },
+    allow_model_load: {
+      type: 'boolean',
+      default: false,
+      description: 'Legacy compatibility opt-out that permits prefill to load a nonresident model. Retained for existing callers only; it is unsafe for realtime background prewarming and is always overridden by resident_only or background priority.',
+    },
+    conversation_cache_key: {
+      type: 'string',
+      maxLength: 200,
+      description: 'Opaque stable conversation identity used for slot lineage affinity.',
+    },
+    prompt_cache_key: {
+      type: 'string',
+      maxLength: 200,
+      description: 'Compatibility alias for conversation_cache_key.',
+    },
+  },
+  additionalProperties: true,
+};
+
+const CONTEXT_PREPARE_RESPONSE_SCHEMA = {
+  type: 'object',
+  required: ['contextCacheContract', 'id', 'requestedModel', 'resolvedModel', 'engine', 'mode', 'status'],
+  properties: {
+    contextCacheContract: {
+      const: CONTEXT_CACHE_CONTRACT_VERSION,
+      type: 'integer',
+      description: 'Version of the prepared-context and cache metadata contract. Present on every prepared-context response.',
+    },
+    id: { type: 'string', description: 'Opaque, Authorization-scoped, process-local lease handle.' },
+    requestedModel: { type: 'string', description: 'The model id or alias exactly as requested.' },
+    resolvedModel: { type: 'string', description: 'The concrete model that was actually measured or prewarmed, after alias resolution.' },
+    engine: { type: 'string', enum: ['llama'], description: 'Engine that produced the lease.' },
+    mode: { type: 'string', enum: ['count', 'prefill'] },
+    status: {
+      type: 'string',
+      enum: ['queued', 'tokenizing', 'prefilling', 'ready', 'skipped', 'cancelled', 'expired', 'invalidated', 'unsupported', 'failed'],
+      description: 'Lease lifecycle state. skipped and cancelled are normal terminal outcomes, not errors.',
+    },
+    preparationOutcome: {
+      type: 'string',
+      enum: ['counted', 'prefill_scheduled', 'prefilled', 'model_not_resident', 'model_no_longer_resident', 'realtime_request', 'upstream_error'],
+      description: 'Why the lease reached its current state. model_not_resident is a preflight refusal; model_no_longer_resident means the concrete model changed after the local lane was acquired; realtime_request means live inference preempted the preparation.',
+    },
+    priority: { type: 'string', enum: ['interactive', 'background'], description: 'Effective scheduling class used for the measurement.' },
+    residentOnly: { type: 'boolean', description: 'Whether the request was restricted to an already resident model.' },
+    residencySource: {
+      type: 'string',
+      enum: ['explicit', 'background_priority', 'legacy_prefill_default', 'legacy_allow_model_load', 'legacy_default'],
+      description: 'Which rule produced the effective residency restriction.',
+    },
+    inputTokens: { type: 'integer', minimum: 0, description: 'Exact production-template input token count. Present when preparation succeeded.' },
+    prefixHash: { type: 'string', description: 'Hash of the exact rendered prefix.' },
+    compatibilityHash: { type: 'string', description: 'Versioned fingerprint of model, engine, template, tokenizer, projector, adapters, and runtime.' },
+    capabilities: {
+      type: 'object',
+      properties: {
+        exact_count: { type: 'boolean', description: 'Exact production-template token counting is available.' },
+        exact_render: { type: 'boolean', description: 'Exact prefix rendering is available.' },
+        kv_prefill: { type: 'boolean', description: 'The concrete child implements the slot operations required for KV prefill.' },
+      },
+      additionalProperties: true,
+    },
+    inputTokensDiscarded: { type: 'integer', minimum: 0, description: 'Internal decode tokens consumed and discarded during prefill.' },
+    createdAt: { type: 'integer', description: 'Epoch milliseconds when the lease was created.' },
+    updatedAt: { type: 'integer', description: 'Epoch milliseconds of the last lease transition.' },
+    expiresAt: { type: 'integer', description: 'Epoch milliseconds when the lease expires.' },
+  },
+  additionalProperties: true,
+};
+
+/**
+ * Documentation overrides for the prepared-context preparation route, stating
+ * the scheduling, residency, loading, eviction, cancellation, and versioning
+ * guarantees that make the endpoint safe to call alongside realtime inference.
+ */
+const CONTEXT_PREPARE_OPTIONS = {
+  description: [
+    'Measures the exact production-template input token count for a conversation and optionally prewarms its KV state.',
+    'Set resident_only: true for a fail-closed measurement that never loads, switches, or evicts a model: if the concrete resolved model is not resident the call returns HTTP 200 with status "skipped".',
+    'Residency is re-verified after the local inference lane is acquired, so a model swap racing the request yields "model_no_longer_resident" instead of certifying the wrong model.',
+    'priority: "background" is bounded, preemptible maintenance work implying resident_only; arriving realtime inference cancels it and the lease reports status "cancelled". realtime cannot be requested here.',
+    'Every response carries contextCacheContract plus both requestedModel and resolvedModel so an alias can never silently certify a different model.',
+    'allow_model_load remains supported for existing callers but is unsafe for realtime background prewarming.',
+  ].join(' '),
+  requestSchema: CONTEXT_PREPARE_REQUEST_SCHEMA,
+  responseSchema: CONTEXT_PREPARE_RESPONSE_SCHEMA,
+  examples: [
+    makeExample(
+      'POST',
+      '/api/v1/context/prepare',
+      'Count a conversation without disturbing realtime inference',
+      {
+        model: 'gemma-4',
+        mode: 'count',
+        priority: 'background',
+        resident_only: true,
+        messages: [{ role: 'user', content: 'How many tokens does this conversation cost?' }],
+      },
+    ),
+    makeExample(
+      'POST',
+      '/api/v1/context/prepare',
+      'Prewarm KV state for a resident model',
+      {
+        model: 'gemma-4',
+        mode: 'prefill',
+        resident_only: true,
+        conversation_cache_key: 'thread-8f21',
+        messages: [{ role: 'system', content: 'You are a terse assistant.' }, { role: 'user', content: 'Summarize the attached policy.' }],
+      },
+    ),
+  ],
+};
+
 /**
  * Creates an endpoint entry with uniform defaults and inferred path parameters.
  *
@@ -481,7 +627,7 @@ const ROUTES = [
   ['POST', '/api/v1/audio/transcriptions', 'openai', 'Transcribe an audio file', TRANSCRIPTION_OPTIONS('/api/v1/audio/transcriptions')],
 
   // Llama Manager context preparation and durable slot-cache extensions.
-  ['POST', '/api/v1/context/prepare', 'context', 'Prepare a reusable inference context'],
+  ['POST', '/api/v1/context/prepare', 'context', 'Prepare a reusable inference context', CONTEXT_PREPARE_OPTIONS],
   ['DELETE', '/api/v1/context/cache', 'context', 'Clear all prepared context entries'],
   ['GET', '/api/v1/context/{id}', 'context', 'Get a prepared context entry'],
   ['DELETE', '/api/v1/context/{id}', 'context', 'Delete a prepared context entry'],
