@@ -7,13 +7,14 @@
 # worktree, runs the respin repo's docs/BUILDING.md sequence inside the rootless
 # podman builder (with the release passphrase preset into a container-local
 # gpg-agent so reprepro's InRelease and the ISO SHA256SUMS.asc sign unattended),
-# publishes atomically to the NAS public tree, rsyncs the tree to the live
-# download host (thromgar) and makes it world-readable, verifies the public URLs,
-# and records the last-built commit. A single-flight lock prevents overlapping
-# runs and all output is written to a timestamped logfile. `--check` validates
-# preconditions only (no passphrase, no build); `--dry-run` runs the whole
-# pipeline except the signed publish and the live sync (also no passphrase). This
-# is the unit invoked by the commit watcher; it may also be run by hand.
+# publishes atomically to the NAS public tree, transfers only active immutable
+# snapshots to the live download host (thromgar), activates their symlinks after
+# every payload is complete, makes the result world-readable, verifies the public
+# URLs, and records the last-built commit. A single-flight lock prevents
+# overlapping runs and all output is written to a timestamped logfile. `--check`
+# validates preconditions only (no passphrase, no build); `--dry-run` runs the
+# whole pipeline except the signed publish and live sync (also no passphrase).
+# This is the unit invoked by the commit watcher; it may also be run by hand.
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -274,45 +275,10 @@ else
   log "Could not read thromgar free space; proceeding (verify manually if the sync fails)." WARN
 fi
 
-# The NAS publish is atomic -- publish-snapshot.sh writes an immutable snapshot
-# directory and swaps a symlink onto it in one rename -- but a naive sync throws
-# that guarantee away. The top-level `apt`, `images`, and `images-<platform>`
-# symlinks are tiny and transfer almost immediately, while the snapshot they
-# point at is tens of GB. Syncing everything in one pass therefore publishes the
-# pointer long before its payload, and the live site 404s for the whole transfer
-# (observed 2026-08-02: ~2.5 h of downtime on a 291 GB tree).
-#
-# Worse, in the C locale `SHA256SUMS` sorts before `llama-manager-*.iso`, so the
-# manifest lands first by default: for a window the site advertises a checksum
-# whose ISO has not arrived, and a client downloads the previous image and fails
-# integrity. download.ts does not resume after a hash mismatch, so every retry
-# is a full multi-GB re-download.
-#
-# Two passes preserve the guarantee: content first, pointers last.
-#
-# --chmod normalizes perms DURING transfer (NAS-side publish writes 700 dirs /
-# 600 key files): if the run dies before the post-sync chmod, files must still
-# be world-readable for nginx or the live site 404s (seen 2026-07-25).
-#
-# --delay-updates stages each transferred file beside its target and renames it
-# into place only after the transfer completes, so a partially-written file is
-# never served. It costs temporary space on the destination equal to the changed
-# content, which the free-space check above accounts for.
-# shellcheck disable=SC2054  # the comma belongs to --chmod's argument, not the array
-RSYNC_COMMON=(-a --info=progress2 --delay-updates --chmod=Da+rx,Fa+r)
-
-log "Rsyncing snapshot content to $THROMGAR_HOST:$THROMGAR_PATH/ (pass 1: payload)"
-rsync "${RSYNC_COMMON[@]}" --no-links --exclude='/.*' \
-  "$PUBLIC_DIR/" "$THROMGAR_HOST:$THROMGAR_PATH/" \
-  || die "rsync payload to thromgar failed (release is published locally; re-run to re-sync)"
-
-# Only now that every snapshot directory is complete on the far side does the
-# live site get repointed. This pass moves bytes only for the symlinks, so the
-# window in which the site is inconsistent is a single rename rather than hours.
-log "Repointing live tree (pass 2: symlinks)"
-rsync "${RSYNC_COMMON[@]}" --links --exclude='/.*' \
-  "$PUBLIC_DIR/" "$THROMGAR_HOST:$THROMGAR_PATH/" \
-  || die "rsync symlink repoint to thromgar failed (payload is synced; re-run to complete)"
+log "Syncing active snapshots before live pointers"
+"$SELF_DIR/sync-public-tree.sh" \
+  "$PUBLIC_DIR" "$THROMGAR_HOST:$THROMGAR_PATH" \
+  || die "sync to thromgar failed (the previous live pointers remain safe; re-run to re-sync)"
 
 ssh -o BatchMode=yes "$THROMGAR_HOST" "chmod -R a+rX '$THROMGAR_PATH'" \
   || die "chmod on thromgar failed"

@@ -48,7 +48,9 @@ entirely as `yolan` using rootless podman — no root, no sudo.
         │
         ├─ 3. record last-built-commit
         │
-        ├─ 4. rsync public/ → thromgar:/volumes/llama-manager.doubtech.ai/public/
+        ├─ 4. sync active immutable snapshots → thromgar
+        │       payloads first with delayed updates; stable symlinks last
+        │       inactive history is not retransmitted
         │       ssh chmod -R a+rX   (world-readable for nginx)
         │
         └─ 5. verify: curl / and /downloads (200), InRelease (200 + good sig),
@@ -171,9 +173,11 @@ cd /home/yolan/workspace/ai/llama-server/distribution/release-service
   signed run without the 0600 file; a wrong passphrase makes the in-container
   `enable-auto-signing.sh verify` fail before any publish. Re-run
   `write-passphrase.sh`.
-- **rsync/verify failure after a successful signed publish** — the release is
+- **sync/verify failure after a successful signed publish** — the release is
   already live locally and `last-built-commit` is recorded (so no rebuild loop).
-  Re-run `./release-runner.sh --force` to re-sync, or rsync manually per the skill.
+  A payload-sync failure leaves the existing live symlinks on their previous
+  complete snapshots. Re-run `./release-runner.sh --force` to resume and activate
+  the new snapshots after all active payloads finish.
 - **thromgar full (~88% used; an ISO is ~7 GB)** — the runner checks free space
   before syncing and aborts with a clear message if under
   `THROMGAR_MIN_FREE_MIB` (default 9000 MiB). Prune stale

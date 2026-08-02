@@ -57,6 +57,7 @@ API and routes/offloads requests across local and remote backends. It provides:
 | [RequestStatistics.md](Designs/RequestStatistics.md) | Per-request store, TTFT capture, and the per-model median/min/max tok/s table |
 | [ConversationContextCache.md](Designs/ConversationContextCache.md) | Exact token counts, stable conversation affinity, prepared KV leases, lifecycle, and cache telemetry |
 | [ContextTimingEvidence.md](Designs/ContextTimingEvidence.md) | Versioned per-request timing evidence: clocks, units, lifecycle ordering, cache semantics, version compatibility, and privacy guarantees |
+| [ReleasePublication.md](Designs/ReleasePublication.md) | Payload-before-pointer publication of immutable signed snapshots to the live download host |
 | [Feature.md](Designs/Feature.md) | Template for documenting new features |
 
 ## Screenshots
