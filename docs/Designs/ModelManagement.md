@@ -170,7 +170,28 @@ POST /api/presets/:presetId/activate
 
 ## Automatic OOM Recovery
 
-When a model fails to load because there isn't enough GPU/GTT memory (typically because other models are already consuming it), the API layer automatically unloads competing models and retries.
+### Proactive Admission
+
+Before a managed inference request or `POST /api/models/load` contacts
+llama.cpp, the API serializes it through the local request lane and estimates
+the incoming model's full GGUF weights, KV cache, and runtime overhead against
+host `MemAvailable`. This accounts for Strix Halo unified CPU/GPU memory because
+GPU-layer weights consume the same host RAM budget.
+
+The guard preserves operator-configured headroom by subtracting
+`config.guard.headroomFrac` of total host RAM. Operators that prefer a fixed
+reserve can set `config.guard.reservedHeadroomGb`, which overrides the fraction.
+If the model does not currently fit, the manager unloads eligible competing
+models and remeasures before attempting the load. If it still cannot fit, it
+returns `507 MODEL_TOO_LARGE`; an explicit preload whose local size cannot be
+resolved returns `503 MODEL_SIZE_UNKNOWN`. Neither case starts loading the
+target model.
+
+### Reactive Fallback
+
+When a model passes proactive admission but llama.cpp still reports insufficient
+GPU/GTT memory, the API layer retains a reactive unload-and-retry fallback for
+runtime estimates that differ from the actual allocator footprint.
 
 ### Detection
 
@@ -229,13 +250,14 @@ Client request (e.g., POST /v1/chat/completions with model A)
 
 ### Affected Endpoints
 
-The OOM recovery logic is applied to all three proxy endpoints that load models on-demand:
+Proactive admission and the reactive fallback protect these model-loading paths:
 
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/chat/completions` | OpenAI-compatible chat completions |
 | `POST /v1/responses` | OpenAI Responses API |
 | `POST /v1/messages` | Anthropic Messages API format |
+| `POST /api/models/load` | Explicit model preload; unknown size fails closed |
 
 ### Message Sanitization (Template Error Recovery)
 

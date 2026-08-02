@@ -377,7 +377,8 @@ All knobs live under `config.guard` (sane defaults if omitted):
     "criticalC": 96,        // unload the model to force a cooldown at/above this
     "memThresholdPct": 90,  // memory-watchdog trigger (system RAM %)
     "maxQueueDepth": 8,     // reject new requests when the backlog is deeper
-    "headroomFrac": 0.12,   // RAM kept free by the pre-flight fit check
+    "headroomFrac": 0.12,   // fraction of total RAM kept free by pre-flight
+    "reservedHeadroomGb": null, // optional absolute GiB override
     "kvBytesPerToken": 262144,
     "overheadBytes": 3221225472,
     "minContext": 4096
@@ -389,8 +390,11 @@ All knobs live under `config.guard` (sane defaults if omitted):
   requests) above `warnC`, resumes below `resumeC`, and unloads the model above
   `criticalC`. Current state shows on the dashboard ("Thermal Guard" card) and in
   `/api/stats` (`guard`).
-- **Memory** — an earlier memory watchdog (`memThresholdPct`) plus a coarse
-  pre-flight that refuses a model whose weights cannot fit available RAM.
+- **Memory** — every managed local inference and explicit model preload is
+  serialized through a pre-flight admission check. It reserves either
+  `headroomFrac` of total host RAM or the `reservedHeadroomGb` override, then
+  pre-evicts competing models before loading; loads that still cannot fit are
+  refused without contacting llama.cpp.
 - **Queue** — bounded by `maxQueueDepth` so a stuck model can't pile up requests.
 
 > Note: hitting 98–99 °C indicates marginal cooling for sustained max-power loads.

@@ -2,6 +2,7 @@
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, DEFAULTS } from './resource-guard.js';
 
 const GiB = 2 ** 30;
@@ -10,6 +11,51 @@ test('checkModelFit: small model at modest context fits', () => {
   const r = checkModelFit({ fileBytes: 10 * GiB, contextSize: 8192, availableBytes: 124 * GiB });
   assert.equal(r.fits, true);
   assert.equal(r.recommendedContext, 8192);
+});
+
+test('checkModelFit reserves headroom from total RAM rather than current availability', () => {
+  const r = checkModelFit({
+    fileBytes: 25 * GiB,
+    contextSize: 4096,
+    availableBytes: 38 * GiB,
+    totalBytes: 124 * GiB,
+    kvBytesPerToken: 0,
+    overheadBytes: 3 * GiB,
+    headroomFrac: 0.12,
+  });
+
+  assert.equal(r.budgetBytes, Math.floor(38 * GiB - (124 * GiB * 0.12)));
+  assert.equal(r.fits, false);
+});
+
+test('checkModelFit allows an absolute reserved headroom override', () => {
+  const r = checkModelFit({
+    fileBytes: 19 * GiB,
+    contextSize: 4096,
+    availableBytes: 38 * GiB,
+    totalBytes: 124 * GiB,
+    reservedHeadroomBytes: 16 * GiB,
+    kvBytesPerToken: 0,
+    overheadBytes: 3 * GiB,
+    headroomFrac: 0.5,
+  });
+
+  assert.equal(r.budgetBytes, 22 * GiB);
+  assert.equal(r.fits, true);
+});
+
+test('checkModelFit never creates a budget larger than total RAM minus reserve', () => {
+  const r = checkModelFit({
+    fileBytes: 1,
+    contextSize: 0,
+    availableBytes: 150 * GiB,
+    totalBytes: 124 * GiB,
+    kvBytesPerToken: 0,
+    overheadBytes: 0,
+    headroomFrac: 0.12,
+  });
+
+  assert.equal(r.budgetBytes, Math.floor(124 * GiB * 0.88));
 });
 
 test('checkModelFit: oversized model+context is refused but a smaller context is recommended', () => {
@@ -219,6 +265,23 @@ test('planMemoryRecovery: nothing reclaimable and does not fit => refuse (no poi
     alreadyLoaded: false, reclaimableBytes: 0, ...KNOBS
   });
   assert.equal(r.action, 'refuse');
+});
+
+test('explicit model preload runs memory admission before contacting llama.cpp', async () => {
+  const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
+  const routeStart = source.indexOf("app.post('/api/models/load'");
+  const routeEnd = source.indexOf("app.post('/api/models/unload'", routeStart);
+  const route = source.slice(routeStart, routeEnd);
+  const queueAdmission = route.indexOf('await acquireLocalSlot(req, res');
+  const admission = route.indexOf("await ensureModelServed(model, { requireKnownSize: true })");
+  const upstreamLoad = route.indexOf("fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`");
+
+  assert.ok(routeStart >= 0 && routeEnd > routeStart, 'model load route must exist');
+  assert.ok(queueAdmission >= 0, 'model load route must serialize through the local lane');
+  assert.ok(queueAdmission < admission, 'queue admission must precede memory and mode admission');
+  assert.ok(admission >= 0, 'model load route must invoke proactive memory admission');
+  assert.ok(admission < upstreamLoad, 'memory admission must run before the upstream load request');
+  assert.match(route, /res\.status\(error\.statusCode \|\| 500\)/);
 });
 
 // ── dispatchPreference: try remote-first when prefer-remote OR thermally paused ─

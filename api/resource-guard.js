@@ -12,7 +12,7 @@ export const DEFAULTS = {
   // Conservative, operator-tunable knobs (overridable via config.guard).
   kvBytesPerToken: 262144,   // ~256 KiB/token KV-cache reserve estimate
   overheadBytes: 3 * (2 ** 30), // ~3 GiB for compute buffers / runtime
-  headroomFrac: 0.12,        // keep 12% of available RAM free
+  headroomFrac: 0.12,        // keep 12% of total RAM free
   minContext: 4096,          // smallest context worth serving
   // Thermal thresholds (deg C), governed on the die temperature (k10temp Tctl,
   // the hotter of GPU/CPU on this shared-die APU).
@@ -47,20 +47,29 @@ function estimateBytes({ fileBytes, contextSize, kvBytesPerToken, overheadBytes 
  * @param {number} a.fileBytes Model file size in bytes.
  * @param {number} a.contextSize Requested context length.
  * @param {number} a.availableBytes Currently-available RAM (e.g. MemAvailable).
+ * @param {number} [a.totalBytes] Total system RAM used to calculate reserved headroom.
+ * @param {number} [a.reservedHeadroomBytes] Absolute reserved headroom; overrides the fraction.
  * @param {number} [a.kvBytesPerToken]
  * @param {number} [a.overheadBytes]
- * @param {number} [a.headroomFrac] Fraction of available RAM to keep free.
+ * @param {number} [a.headroomFrac] Fraction of total RAM to keep free.
  * @param {number} [a.minContext]
  * @returns {{fits:boolean, recommendedContext:number|null, requiredBytes:number, budgetBytes:number, reason:string}}
  */
 export function checkModelFit({
-  fileBytes, contextSize, availableBytes,
+  fileBytes, contextSize, availableBytes, totalBytes, reservedHeadroomBytes,
   kvBytesPerToken = DEFAULTS.kvBytesPerToken,
   overheadBytes = DEFAULTS.overheadBytes,
   headroomFrac = DEFAULTS.headroomFrac,
   minContext = DEFAULTS.minContext
 }) {
-  const budgetBytes = Math.floor(availableBytes * (1 - headroomFrac));
+  const reserveBase = totalBytes > 0 ? totalBytes : availableBytes;
+  const reserveBytes = Number.isFinite(reservedHeadroomBytes)
+    ? Math.max(0, reservedHeadroomBytes)
+    : reserveBase * headroomFrac;
+  const usableAvailable = totalBytes > 0
+    ? Math.min(availableBytes, totalBytes)
+    : availableBytes;
+  const budgetBytes = Math.max(0, Math.floor(usableAvailable - reserveBytes));
   const requiredBytes = estimateBytes({ fileBytes, contextSize, kvBytesPerToken, overheadBytes });
 
   if (requiredBytes <= budgetBytes) {
@@ -106,6 +115,8 @@ export function checkModelFit({
  * @param {number} a.fileBytes Requested model weights size in bytes (0 = unknown -> serve).
  * @param {number} a.contextSize Requested context length.
  * @param {number} a.availableBytes Current MemAvailable in bytes.
+ * @param {number} [a.totalBytes] Total system RAM used to calculate reserved headroom.
+ * @param {number} [a.reservedHeadroomBytes] Absolute reserved headroom; overrides the fraction.
  * @param {boolean} a.alreadyLoaded Whether the requested model is already loaded.
  * @param {number} a.reclaimableBytes RAM (bytes) that freeing other models / restarting returns to MemAvailable.
  * @param {number} [a.kvBytesPerToken]
@@ -115,13 +126,21 @@ export function checkModelFit({
  * @returns {{action:'serve'|'reclaim'|'refuse', requiredBytes:number, budgetBytes:number, reclaimableBudgetBytes:number, reason:string}}
  */
 export function planMemoryRecovery({
-  fileBytes, contextSize, availableBytes, alreadyLoaded = false, reclaimableBytes = 0,
+  fileBytes, contextSize, availableBytes, totalBytes, reservedHeadroomBytes,
+  alreadyLoaded = false, reclaimableBytes = 0,
   kvBytesPerToken = DEFAULTS.kvBytesPerToken,
   overheadBytes = DEFAULTS.overheadBytes,
   headroomFrac = DEFAULTS.headroomFrac,
   minContext = DEFAULTS.minContext
 }) {
-  const knobs = { kvBytesPerToken, overheadBytes, headroomFrac, minContext };
+  const knobs = {
+    kvBytesPerToken,
+    overheadBytes,
+    headroomFrac,
+    minContext,
+    ...(totalBytes > 0 ? { totalBytes } : {}),
+    ...(Number.isFinite(reservedHeadroomBytes) ? { reservedHeadroomBytes } : {}),
+  };
   const cur = checkModelFit({ fileBytes, contextSize, availableBytes, ...knobs });
 
   // Unknown size -> fail open. Already-loaded -> its memory is already committed,

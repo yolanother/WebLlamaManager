@@ -2242,6 +2242,7 @@ function guardCfg() {
     appCpuHeatPct: g.appCpuHeatPct ?? GUARD_DEFAULTS.appCpuHeatPct,
     hardCriticalC: g.hardCriticalC ?? GUARD_DEFAULTS.hardCriticalC,
     headroomFrac: g.headroomFrac ?? GUARD_DEFAULTS.headroomFrac,
+    reservedHeadroomGb: g.reservedHeadroomGb ?? null,
     kvBytesPerToken: g.kvBytesPerToken ?? GUARD_DEFAULTS.kvBytesPerToken,
     overheadBytes: g.overheadBytes ?? GUARD_DEFAULTS.overheadBytes,
     minContext: g.minContext ?? GUARD_DEFAULTS.minContext,
@@ -2478,7 +2479,10 @@ function warnContextMayNotFit(modelId, contextSize, cfg) {
   const fit = checkModelFit({
     fileBytes, contextSize: contextSize || cfg.minContext, availableBytes: memAvailableBytes(),
     kvBytesPerToken: cfg.kvBytesPerToken, overheadBytes: cfg.overheadBytes,
-    headroomFrac: cfg.headroomFrac, minContext: cfg.minContext
+    headroomFrac: cfg.headroomFrac,
+    totalBytes: memTotalBytes(),
+    reservedHeadroomBytes: cfg.reservedHeadroomGb > 0 ? cfg.reservedHeadroomGb * (2 ** 30) : undefined,
+    minContext: cfg.minContext
   });
   if (fit.fits || fit.recommendedContext === null) return;
   addLog('system', `[guard] ${modelId}: context ${contextSize} may not fit (~${gibStr(fit.requiredBytes)} GiB vs budget ${gibStr(fit.budgetBytes)} GiB); recommended <= ${fit.recommendedContext}. Monitoring memory at runtime.`);
@@ -2498,26 +2502,41 @@ let lastRecoveryRestartAt = 0;
  *   2. if that isn't enough, restart llama-server (the proven recovery), throttled
  *      by a cooldown so it can't thrash.
  * Only when the weights cannot fit even on a fully-freed box does it throw
- * MODEL_TOO_LARGE (507). Already-loaded models and unknown sizes are served
- * (fail-open); the coarse context-cap case only warns.
+ * MODEL_TOO_LARGE (507). Already-loaded models are served. Unknown sizes fail
+ * open for compatibility unless the caller requires a known local footprint.
+ *
+ * @param {string} modelId Exact local model identifier.
+ * @param {number} contextSize Requested context length.
+ * @param {{requireKnownSize?:boolean}} [options] Admission strictness.
+ * @returns {Promise<void>}
+ * @throws {Error} With statusCode 503/507 when admission cannot be proven safe.
  */
-async function preflightModelGuard(modelId, contextSize) {
+async function preflightModelGuard(modelId, contextSize, { requireKnownSize = false } = {}) {
   const cfg = guardCfg();
   if (!cfg.enabled) return;
+  const loaded = await listLoadedModelIds();
+  if (loaded.includes(modelId)) return;
   const fileBytes = resolveModelSizeBytes(modelId);
-  if (!fileBytes) return; // unknown size -> fail open
+  if (!fileBytes) {
+    if (!requireKnownSize) return;
+    const error = new Error(`Cannot safely preload model "${modelId}": local model size is unknown.`);
+    error.code = 'MODEL_SIZE_UNKNOWN';
+    error.statusCode = 503;
+    throw error;
+  }
 
   const knobs = {
     kvBytesPerToken: cfg.kvBytesPerToken, overheadBytes: cfg.overheadBytes,
-    headroomFrac: cfg.headroomFrac, minContext: cfg.minContext
+    headroomFrac: cfg.headroomFrac,
+    totalBytes: memTotalBytes(),
+    reservedHeadroomBytes: cfg.reservedHeadroomGb > 0 ? cfg.reservedHeadroomGb * (2 ** 30) : undefined,
+    minContext: cfg.minContext
   };
   const ctx = contextSize || cfg.minContext;
 
-  const loaded = await listLoadedModelIds();
-  const alreadyLoaded = loaded.includes(modelId);
   const plan = planMemoryRecovery({
     fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(),
-    alreadyLoaded, reclaimableBytes: llamaServerRssBytes(), ...knobs
+    alreadyLoaded: false, reclaimableBytes: llamaServerRssBytes(), ...knobs
   });
 
   if (plan.action === 'serve') { warnContextMayNotFit(modelId, contextSize, cfg); return; }
@@ -4568,6 +4587,12 @@ app.post('/api/models/load', async (req, res) => {
   }
 
   try {
+    await acquireLocalSlot(req, res, {
+      model,
+      endpoint: 'models/load',
+    });
+    await ensureModelServed(model, { requireKnownSize: true });
+
     // In router mode, trigger model loading by making a minimal completion request
     // llama.cpp will load the model on-demand
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
@@ -4597,7 +4622,13 @@ app.post('/api/models/load', async (req, res) => {
   } catch (error) {
     console.error(`[models/load] Error: ${error.message}`);
     addLog('models', `Error loading model: ${error.message}`);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({
+      error: {
+        message: error.message,
+        type: 'model_load_error',
+        code: error.code || 'MODEL_LOAD_FAILED',
+      },
+    });
   }
 });
 
@@ -5071,7 +5102,15 @@ async function ensureDs4ForModel(rawModel, resolvedModel) {
   return null;
 }
 
-async function ensureModelServed(modelName) {
+/**
+ * Prepare the active llama mode and memory budget to serve an exact model.
+ *
+ * @param {string} modelName Exact local model identifier.
+ * @param {{requireKnownSize?:boolean}} [options] Whether unknown footprints must be rejected.
+ * @returns {Promise<void>}
+ * @throws {Error} When memory admission or a required mode switch fails.
+ */
+async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
   // While the ds4 engine owns the box, do NOT run any llama mode-switch/restart:
   // starting llama-server alongside ds4 would OOM (ds4's 81GB model + a llama
   // model can't coexist in 124GB RAM). ds4 chat requests are served upstream in
@@ -5083,7 +5122,7 @@ async function ensureModelServed(modelName) {
   // current free RAM but the shortfall is reclaimable, free memory (unload other
   // models, then restart llama-server) and retry; only refuse (MODEL_TOO_LARGE)
   // when the weights can't fit even on a fully-freed box.
-  await preflightModelGuard(modelName, config.contextSize);
+  await preflightModelGuard(modelName, config.contextSize, { requireKnownSize });
 
   // Two correctness rules:
   //   (1) If the model has an autoActivate preset and we're not in it -> swap to it.
