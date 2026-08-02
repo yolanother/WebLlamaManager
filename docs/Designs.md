@@ -56,6 +56,7 @@ API and routes/offloads requests across local and remote backends. It provides:
 | [OpenCode.md](Designs/OpenCode.md) | OpenCode AI integration |
 | [RequestStatistics.md](Designs/RequestStatistics.md) | Per-request store, TTFT capture, and the per-model median/min/max tok/s table |
 | [ConversationContextCache.md](Designs/ConversationContextCache.md) | Exact token counts, stable conversation affinity, prepared KV leases, lifecycle, and cache telemetry |
+| [ContextTimingEvidence.md](Designs/ContextTimingEvidence.md) | Versioned per-request timing evidence: clocks, units, lifecycle ordering, cache semantics, version compatibility, and privacy guarantees |
 | [Feature.md](Designs/Feature.md) | Template for documenting new features |
 
 ## Screenshots
