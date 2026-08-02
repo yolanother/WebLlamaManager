@@ -18,7 +18,9 @@ import {
   TIMING_UNSUPPORTED_REASONS,
   TimingEvidenceRecorder,
   classifyCacheOutcome,
+  createRequestTimingRecorder,
   monotonicClockMs,
+  tokenizerRevision,
 } from './timing-evidence.js';
 
 /** Build a deterministic controllable clock for recorder tests. */
@@ -438,6 +440,43 @@ test('the built record exposes only the documented top-level surface', () => {
     'inference_started',
     'first_content',
   ]);
+});
+
+test('tokenizer revision fingerprints canonical tokenizer material and is never fabricated', () => {
+  const props = {
+    'tokenizer.ggml.model': 'gemma',
+    n_vocab: 262144,
+    bos_token: '<bos>',
+    eos_token: '<eos>',
+    chat_template: '{{ messages }}',
+  };
+  const revision = tokenizerRevision(props);
+  assert.match(revision, /^tok_[0-9a-f]{32}$/);
+  assert.equal(tokenizerRevision({ ...props }), revision);
+  assert.notEqual(tokenizerRevision({ ...props, n_vocab: 128000 }), revision);
+  assert.notEqual(tokenizerRevision({ ...props, chat_template: '{{ other }}' }), revision);
+  // Absent evidence yields null so the record reports an unknown tokenizer
+  // rather than certifying a fabricated one.
+  assert.equal(tokenizerRevision(null), null);
+  assert.equal(tokenizerRevision(undefined), null);
+});
+
+test('createRequestTimingRecorder binds identity and marks receipt in one step', () => {
+  const clock = fakeClock();
+  const recorder = createRequestTimingRecorder({
+    requestId: 'req_factory',
+    profile: TIMING_EVIDENCE_PROFILES.PREFILL,
+    clock,
+    ...IDENTITY,
+  });
+  clock.advance(8);
+  recorder.mark('admitted');
+  const record = recorder.build();
+  assert.equal(record.request_id, 'req_factory');
+  assert.equal(record.profile, TIMING_EVIDENCE_PROFILES.PREFILL);
+  assert.equal(record.identity.resolved_model, 'gemma-4-27b');
+  assert.equal(record.manager_observed.queue_wait.ms, 8);
+  assert.deepEqual(record.lifecycle, ['received', 'admitted']);
 });
 
 test('the default monotonic clock advances and never returns wall-clock epoch time', () => {

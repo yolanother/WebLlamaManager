@@ -138,6 +138,7 @@ function publicPreparedRecord(record) {
     lineageKey: _lineageKey,
     slotNeedsReset: _slotNeedsReset,
     preparationBody: _preparationBody,
+    timingRecorder: _timingRecorder,
     ...safe
   } = record;
   return { contextCacheContract: CONTEXT_CACHE_CONTRACT_VERSION, ...safe };

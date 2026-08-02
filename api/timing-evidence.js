@@ -11,7 +11,7 @@
 // classifies the cache outcome (cold, warm prefix, persona change, eviction
 // reload, cancelled, unsupported), and carries no prompt text or credentials.
 
-import { CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
+import { canonicalHash, CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
 
 /** Version of the public timing-evidence record contract. */
 export const TIMING_EVIDENCE_VERSION = 1;
@@ -123,6 +123,50 @@ const ENGINE_TIMING_FIELDS = Object.freeze(['promptMs', 'predictedMs', 'promptN'
  */
 export function monotonicClockMs() {
   return Number(process.hrtime.bigint()) / 1e6;
+}
+
+/**
+ * Fingerprint the canonical tokenizer material of one concrete model from a
+ * llama.cpp `/props` payload. Two requests certified against the same tokenizer
+ * revision rendered their input with the same vocabulary, special tokens, and
+ * chat template, so their exact and cached token counts are comparable.
+ *
+ * Missing property evidence returns null rather than a fabricated identifier —
+ * an unknown tokenizer must never be certified as a known one.
+ *
+ * @param {Record<string, unknown>|null|undefined} props llama.cpp `/props` payload.
+ * @returns {string|null} An opaque `tok_*` revision, or null when unknown.
+ */
+export function tokenizerRevision(props) {
+  if (!props || typeof props !== 'object') return null;
+  const digest = canonicalHash({
+    version: CONTEXT_CACHE_CONTRACT_VERSION,
+    model: props['tokenizer.ggml.model'] ?? props.tokenizer?.model ?? null,
+    vocabulary: props.n_vocab ?? props.tokenizer?.n_vocab ?? null,
+    bos: props.bos_token ?? null,
+    eos: props.eos_token ?? null,
+    template: props.chat_template ?? props.default_generation_settings?.chat_template ?? null,
+  });
+  return `tok_${digest.slice(0, 32)}`;
+}
+
+/**
+ * Create a recorder already bound to a request identity with the `received`
+ * lifecycle mark taken, so handlers can start timing in one statement.
+ *
+ * @param {Object} input Recorder configuration and identity fields.
+ * @param {string} [input.requestId] Opaque manager request identifier.
+ * @param {string} [input.profile] One of {@link TIMING_EVIDENCE_PROFILES}.
+ * @param {() => number} [input.clock] Injectable monotonic clock.
+ * @param {() => Date} [input.wallClock] Injectable wall clock for correlation.
+ * @returns {TimingEvidenceRecorder} A recorder with identity bound and receipt marked.
+ * @throws {TypeError} When the profile or an identity field is unsupported.
+ */
+export function createRequestTimingRecorder({ requestId, profile, clock, wallClock, ...identity } = {}) {
+  const recorder = new TimingEvidenceRecorder({ requestId, profile, clock, wallClock });
+  recorder.setIdentity(identity);
+  recorder.mark('received');
+  return recorder;
 }
 
 /**
