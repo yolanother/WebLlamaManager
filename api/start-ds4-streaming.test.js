@@ -25,7 +25,7 @@ after(() => rmSync(FIXTURE_ROOT, { recursive: true, force: true }));
 function printCmd(extraEnv = {}) {
   const result = spawnSync('bash', [SCRIPT, '--print-cmd'], {
     env: {
-      HOME: FIXTURE_ROOT,
+      HOME: process.env.HOME,
       PATH: process.env.PATH || '/usr/bin:/bin',
       DS4_MODEL: '/tmp/model.gguf',
       DS4_STATE_DIR: join(FIXTURE_ROOT, 'state'),
