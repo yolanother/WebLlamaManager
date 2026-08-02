@@ -42,14 +42,23 @@ THROMGAR_MIN_FREE_MIB="${THROMGAR_MIN_FREE_MIB:-9000}"
 MODE="release"   # release | dry-run | check
 FORCE=false
 PIN_COMMIT=""
+# Publish to the NAS and stop there, leaving the live download host untouched.
+# Used while iterating on the image: a full sync moves the entire public tree to
+# thromgar, which is slow and repeatedly republishes a half-baked release to real
+# users. The NAS tree is complete and signed either way, so a local-only run
+# produces an image the flasher can consume over the LAN.
+SYNC_LIVE=true
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) MODE="check"; shift ;;
     --dry-run) MODE="dry-run"; shift ;;
     --force) FORCE=true; shift ;;
+    --no-sync|--local) SYNC_LIVE=false; shift ;;
     --commit) PIN_COMMIT="${2:-}"; shift 2 ;;
     -h|--help)
-      printf 'Usage: release-runner.sh [--check|--dry-run] [--force] [--commit SHA]\n'; exit 0 ;;
+      printf 'Usage: release-runner.sh [--check|--dry-run] [--force] [--no-sync] [--commit SHA]\n'
+      printf '  --no-sync  publish to the NAS only; do not touch the live download host\n'
+      exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -76,6 +85,69 @@ fi
 log "Release runner starting (mode=$MODE, force=$FORCE)"
 
 # ---------------------------------------------------------------------------
+# Builder image freshness
+# ---------------------------------------------------------------------------
+# The runner used to assert only that the builder image EXISTED. That silently
+# ran every build inside whatever image happened to be on the host: when
+# Containerfile.builder gained squashfs-tools/cpio/fakeroot the release failed
+# with "FAIL: mksquashfs is required by this contract" and needed a manual
+# podman build to recover (2026-08-02). The inverse is worse and silent -- a tool
+# that no contract test pins lets a stale image satisfy the suite while building
+# artifacts with different tooling than the Containerfile declares.
+#
+# Bind the image to its Containerfile by hashing the file into a label, and
+# rebuild whenever they diverge. The platform is pinned because an unpinned
+# podman build on this host has produced an arm64 image under qemu emulation,
+# which would xz-compress multi-GB layers under emulation for hours.
+BUILDER_LABEL='org.doubtech.containerfile-sha256'
+BUILDER_PLATFORM="${BUILDER_PLATFORM:-linux/amd64}"
+
+# Prints the sha256 of the Containerfile the builder image must match.
+builder_containerfile_digest() {
+  sha256sum "$RESPIN_REPO/Containerfile.builder" | awk '{print $1}'
+}
+
+# Rebuilds the builder image when it is absent, stale, or the wrong architecture.
+ensure_builder_image() {
+  local containerfile="$RESPIN_REPO/Containerfile.builder"
+  [ -f "$containerfile" ] || die "Containerfile not found: $containerfile"
+  local want; want="$(builder_containerfile_digest)"
+  local have='' arch='' reason=''
+
+  if podman image exists "$BUILDER_IMAGE"; then
+    have="$(podman image inspect "$BUILDER_IMAGE" \
+      --format "{{index .Labels \"$BUILDER_LABEL\"}}" 2>/dev/null || echo '')"
+    arch="$(podman image inspect "$BUILDER_IMAGE" --format '{{.Architecture}}' 2>/dev/null || echo '')"
+    if [ "$have" != "$want" ]; then
+      reason="Containerfile changed (image ${have:-unlabelled}, want $want)"
+    elif [ "$arch" != 'amd64' ]; then
+      reason="image architecture is '$arch', expected amd64"
+    fi
+  else
+    reason='image is missing'
+  fi
+
+  if [ -z "$reason" ]; then
+    log "Builder image is current ($BUILDER_IMAGE, $BUILDER_LABEL=${want:0:12})"
+    return 0
+  fi
+
+  if [ "$MODE" = 'check' ]; then
+    die "Builder image is stale: $reason. Re-run without --check to rebuild it."
+  fi
+
+  log "Rebuilding builder image: $reason"
+  podman build --platform "$BUILDER_PLATFORM" \
+    --label "$BUILDER_LABEL=$want" \
+    -f "$containerfile" -t "$BUILDER_IMAGE" "$RESPIN_REPO" \
+    || die "Builder image rebuild failed"
+
+  arch="$(podman image inspect "$BUILDER_IMAGE" --format '{{.Architecture}}' 2>/dev/null || echo '')"
+  [ "$arch" = 'amd64' ] || die "Rebuilt builder image is '$arch', expected amd64"
+  log "Builder image rebuilt and labelled ${want:0:12}"
+}
+
+# ---------------------------------------------------------------------------
 # Preconditions
 # ---------------------------------------------------------------------------
 preflight() {
@@ -87,7 +159,7 @@ preflight() {
   [ -d "$RESPIN_REPO/scripts" ] || die "Respin repo not found: $RESPIN_REPO"
   [ -x "$RESPIN_REPO/scripts/container-build.sh" ] || die "container-build.sh missing in respin repo"
   findmnt -T "$NAS_ROOT" >/dev/null 2>&1 || die "NAS not mounted at $NAS_ROOT"
-  podman image exists "$BUILDER_IMAGE" || die "Builder image missing: $BUILDER_IMAGE (build it from $RESPIN_REPO/Containerfile.builder)"
+  ensure_builder_image
   [ -d "$INPUTS_DIR" ] || die "Inputs directory not found: $INPUTS_DIR"
   [ -d "$SIGNING_ROOT/gnupg" ] || die "Signing GnuPG home not found: $SIGNING_ROOT/gnupg"
   [ -f "$SIGNING_ROOT/FINGERPRINT" ] || die "Signing fingerprint metadata not found; run setup-signing.sh export-public"
@@ -184,6 +256,15 @@ log "Recorded last-built commit: $SHORT"
 # ---------------------------------------------------------------------------
 # Step 3 — Sync to the live download host (thromgar) + world-readable
 # ---------------------------------------------------------------------------
+if [ "$SYNC_LIVE" != true ]; then
+  log "Local-only run (--no-sync): the live download host was NOT updated."
+  log "Signed release is complete on the NAS at $PUBLIC_DIR"
+  log "Serve it for the flasher with: $SELF_DIR/serve-local.sh"
+  log "Then point the flasher at it: LMF_AMD_BASE_URL=http://<this-host>:8710/images"
+  log "Release runner finished (local-only) for $SHORT"
+  exit 0
+fi
+
 log "Checking thromgar free space before sync"
 FREE_MIB="$(ssh -o BatchMode=yes "$THROMGAR_HOST" "df -Pm '$THROMGAR_PATH' | awk 'NR==2{print \$4}'" 2>/dev/null || echo '')"
 if [ -n "$FREE_MIB" ]; then
@@ -193,12 +274,46 @@ else
   log "Could not read thromgar free space; proceeding (verify manually if the sync fails)." WARN
 fi
 
-log "Rsyncing $PUBLIC_DIR/ to $THROMGAR_HOST:$THROMGAR_PATH/"
+# The NAS publish is atomic -- publish-snapshot.sh writes an immutable snapshot
+# directory and swaps a symlink onto it in one rename -- but a naive sync throws
+# that guarantee away. The top-level `apt`, `images`, and `images-<platform>`
+# symlinks are tiny and transfer almost immediately, while the snapshot they
+# point at is tens of GB. Syncing everything in one pass therefore publishes the
+# pointer long before its payload, and the live site 404s for the whole transfer
+# (observed 2026-08-02: ~2.5 h of downtime on a 291 GB tree).
+#
+# Worse, in the C locale `SHA256SUMS` sorts before `llama-manager-*.iso`, so the
+# manifest lands first by default: for a window the site advertises a checksum
+# whose ISO has not arrived, and a client downloads the previous image and fails
+# integrity. download.ts does not resume after a hash mismatch, so every retry
+# is a full multi-GB re-download.
+#
+# Two passes preserve the guarantee: content first, pointers last.
+#
 # --chmod normalizes perms DURING transfer (NAS-side publish writes 700 dirs /
 # 600 key files): if the run dies before the post-sync chmod, files must still
 # be world-readable for nginx or the live site 404s (seen 2026-07-25).
-rsync -a --info=progress2 --chmod=Da+rx,Fa+r "$PUBLIC_DIR/" "$THROMGAR_HOST:$THROMGAR_PATH/" \
-  || die "rsync to thromgar failed (release is published locally; re-run to re-sync)"
+#
+# --delay-updates stages each transferred file beside its target and renames it
+# into place only after the transfer completes, so a partially-written file is
+# never served. It costs temporary space on the destination equal to the changed
+# content, which the free-space check above accounts for.
+# shellcheck disable=SC2054  # the comma belongs to --chmod's argument, not the array
+RSYNC_COMMON=(-a --info=progress2 --delay-updates --chmod=Da+rx,Fa+r)
+
+log "Rsyncing snapshot content to $THROMGAR_HOST:$THROMGAR_PATH/ (pass 1: payload)"
+rsync "${RSYNC_COMMON[@]}" --no-links --exclude='/.*' \
+  "$PUBLIC_DIR/" "$THROMGAR_HOST:$THROMGAR_PATH/" \
+  || die "rsync payload to thromgar failed (release is published locally; re-run to re-sync)"
+
+# Only now that every snapshot directory is complete on the far side does the
+# live site get repointed. This pass moves bytes only for the symlinks, so the
+# window in which the site is inconsistent is a single rename rather than hours.
+log "Repointing live tree (pass 2: symlinks)"
+rsync "${RSYNC_COMMON[@]}" --links --exclude='/.*' \
+  "$PUBLIC_DIR/" "$THROMGAR_HOST:$THROMGAR_PATH/" \
+  || die "rsync symlink repoint to thromgar failed (payload is synced; re-run to complete)"
+
 ssh -o BatchMode=yes "$THROMGAR_HOST" "chmod -R a+rX '$THROMGAR_PATH'" \
   || die "chmod on thromgar failed"
 log "Live tree synced and made world-readable"
