@@ -24,6 +24,22 @@ export function normalizeRequestPriority(value) {
 }
 
 /**
+ * Parse a queue identifier from the API's numeric or display-prefixed form.
+ * @param {unknown} value Candidate identifier such as 5 or "q5".
+ * @returns {number|null} Positive safe integer, or null when the value is invalid.
+ */
+export function parseQueueItemId(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string') return null;
+  const match = /^q?([1-9]\d*)$/i.exec(value);
+  if (!match) return null;
+  const id = Number(match[1]);
+  return Number.isSafeInteger(id) ? id : null;
+}
+
+/**
  * Queue work for a bounded-concurrency inference backend.
  *
  * Preemption is cooperative: when realtime work arrives, the queue invokes the
@@ -105,12 +121,16 @@ export class PriorityRequestQueue {
     return true;
   }
 
-  /** Release active capacity and start the next eligible item. */
+  /**
+   * Release active capacity and start the next eligible item.
+   * @param {number} id Active queue-item identifier returned by acquire.
+   * @returns {boolean} True only when this call released an active item.
+   */
   release(id) {
-    if (id != null && !this.activeItems.has(id)) return;
-    if (id != null) this.activeItems.delete(id);
-    this.running = Math.max(0, this.running - 1);
+    if (id == null || !this.activeItems.delete(id)) return false;
+    this.running = this.activeItems.size;
     this._drain();
+    return true;
   }
 
   /** Number of pending items. */

@@ -96,7 +96,7 @@ import {
   createRequestTimingRecorder,
   tokenizerRevision,
 } from './timing-evidence.js';
-import { PriorityRequestQueue } from './request-queue.js';
+import { parseQueueItemId, PriorityRequestQueue } from './request-queue.js';
 import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
 import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
@@ -1296,7 +1296,7 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
   }
 
   const queueStart = Date.now();
-  await queue.acquire();
+  const queueId = await queue.acquire();
   const queueWait = Date.now() - queueStart;
   if (queueWait > 100) {
     console.log(`[${label}][${backend.name}] Queued for ${queueWait}ms`);
@@ -1395,7 +1395,7 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
     recordBackendFailure(backend.id, backend.name);
     throw lastError;
   } finally {
-    queue.release();
+    queue.release(queueId);
   }
 }
 
@@ -4225,8 +4225,8 @@ app.get('/api/queue', (req, res) => {
 
 // Cancel a specific pending queue item
 app.delete('/api/queue/:id', (req, res) => {
-  const id = parseInt(req.params.id);
-  if (isNaN(id)) return res.status(400).json({ error: 'Invalid queue item ID' });
+  const id = parseQueueItemId(req.params.id);
+  if (id == null) return res.status(400).json({ error: 'Invalid queue item ID' });
   const cancelled = llamaQueue.cancel(id);
   if (cancelled) {
     const msg = `Queue item ${id} cancelled`;

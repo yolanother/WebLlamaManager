@@ -7,13 +7,24 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { PriorityRequestQueue, normalizeRequestPriority } from './request-queue.js';
+import {
+  parseQueueItemId,
+  PriorityRequestQueue,
+  normalizeRequestPriority,
+} from './request-queue.js';
 
 test('normalizes supported priorities and defaults to interactive', () => {
   assert.equal(normalizeRequestPriority('realtime'), 'realtime');
   assert.equal(normalizeRequestPriority('background'), 'background');
   assert.equal(normalizeRequestPriority(undefined), 'interactive');
   assert.throws(() => normalizeRequestPriority('urgent'), /request priority/);
+});
+
+test('parses numeric and display-prefixed pending queue identifiers exactly', () => {
+  for (const value of ['5', 'q5', 5]) assert.equal(parseQueueItemId(value), 5);
+  for (const value of ['', 'q', 'slot5', 'q5junk', '5junk', 'q0', '-1', null]) {
+    assert.equal(parseQueueItemId(value), null, String(value));
+  }
 });
 
 test('realtime skips queued interactive and background work', async () => {
@@ -47,6 +58,41 @@ test('realtime cooperatively preempts a running background request', async () =>
   assert.equal(preemptionReason, 'realtime_request');
   queue.release(background);
   queue.release(await realtimePromise);
+});
+
+test('duplicate and unidentified releases preserve active capacity and serialization', async () => {
+  const queue = new PriorityRequestQueue(1);
+  const first = await queue.acquire({ priority: 'interactive' });
+  let secondStarted = false;
+  const secondPromise = queue.acquire({ priority: 'interactive' }).then(id => {
+    secondStarted = true;
+    return id;
+  });
+
+  queue.release();
+  await Promise.resolve();
+  assert.equal(secondStarted, false);
+  assert.equal(queue.active, 1);
+
+  queue.release(first);
+  const second = await secondPromise;
+  assert.equal(queue.active, 1);
+
+  let thirdStarted = false;
+  const thirdPromise = queue.acquire({ priority: 'interactive' }).then(id => {
+    thirdStarted = true;
+    return id;
+  });
+  queue.release(first);
+  await Promise.resolve();
+  assert.equal(thirdStarted, false);
+  assert.equal(queue.active, 1);
+
+  queue.release(second);
+  const third = await thirdPromise;
+  assert.equal(queue.active, 1);
+  queue.release(third);
+  assert.equal(queue.active, 0);
 });
 
 test('bounds queued background work without affecting interactive admission', async () => {

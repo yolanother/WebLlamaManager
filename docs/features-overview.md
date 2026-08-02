@@ -156,6 +156,14 @@ weight → queue depth. Backends have per-model `modelMapping` (exact/glob/`*`),
 API-key env vars, cost/concurrency/timeout, and health/circuit-breaker state.
 Managed at `/api/backends*`.
 
+Local and remote inference lanes release capacity by the exact identifier
+returned from queue acquisition. Unknown, missing, or duplicate releases are
+no-ops, so watchdog cleanup and later response-close callbacks cannot reduce the
+active count twice or bypass configured concurrency. Pending rows returned by
+`GET /api/queue` use display IDs such as `q5`; `DELETE /api/queue/q5` and the
+numeric `queueItemId` form cancel the same pending item. Synthetic active IDs
+such as `slot5` are intentionally not accepted by the pending-item route.
+
 While **DS4 is active** the box is exclusive: the DS4 model serves locally and
 *every other* model offloads (or gets a clean 503) — see [`ds4-engine.md`](ds4-engine.md).
 
