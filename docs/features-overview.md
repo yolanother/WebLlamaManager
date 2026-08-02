@@ -77,6 +77,21 @@ limit without emitting client output. Status and deletion use
 `context/{id}`; `DELETE context/cache` removes every attributable memory and disk
 record in the caller scope. Raw token and llama.cpp slot ids are never public.
 
+Preparation is admitted under an explicit policy so it can run safely beside
+live inference. `resident_only: true` is fail-closed for **both** count and
+prefill — the manager never loads, switches, or evicts a model, and a nonresident
+model returns HTTP 200 with `status: "skipped"`. Residency of the concrete
+resolved model is re-checked *after* the local lane is acquired, so a model swap
+racing the request reports `model_no_longer_resident` rather than certifying the
+wrong model. `priority: "background"` implies `resident_only`, stays bounded
+(HTTP 429 past the queue limit), and is cancelled to `status: "cancelled"` when
+realtime work arrives; `priority: "realtime"` is refused outright. Every
+response carries `contextCacheContract` plus both `requestedModel` and
+`resolvedModel`, so an alias can never silently certify a different model.
+`allow_model_load` remains supported as the legacy compatibility path but is
+unsafe for realtime background prewarming and is overridden by `resident_only`
+or background priority.
+
 Chat extensions `request_priority: "realtime" | "interactive" | "background"`
 and `routing: "local_only"` control the single local lane. Realtime skips queued
 lower-priority work and preempts background work; background fairness can

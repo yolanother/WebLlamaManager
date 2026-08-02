@@ -116,6 +116,59 @@ Defaults:
 | Conversation key | 200 characters |
 | Prefill model policy | already resident only |
 
+### Preparation admission guarantees
+
+`POST /api/v1/context/prepare` is measurement and prewarming work, so it is
+admitted under an explicit policy (`api/context-prepare-policy.js`) rather than
+being treated as ordinary interactive traffic. The policy is pure and unit
+tested; the handler only executes its decision.
+
+**Scheduling.** `priority` (alias `request_priority`) selects `interactive` or
+`background`. `realtime` is refused with HTTP 400 and
+`CONTEXT_PREPARE_INVALID_PRIORITY`: preparation must never claim the latency
+class reserved for live inference. `background` is bounded (eight queued items,
+then HTTP 429 `BACKGROUND_QUEUE_FULL`) and cooperatively preemptible. Absent
+priority remains the FIFO-compatible `interactive`.
+
+**Residency.** `resident_only: true` is a fail-closed restriction that applies to
+`count` as well as `prefill`. Under it the manager never loads, switches, or
+evicts a model; a nonresident concrete model yields HTTP 200 with
+`status: "skipped"` and `preparationOutcome: "model_not_resident"`. Selecting
+`priority: "background"` implies `resident_only` unconditionally, so maintenance
+work can never cause a model load or eviction.
+
+**Atomicity.** The preflight residency probe is advisory only. Residency and slot
+support of the *concrete resolved* model are re-verified after the local lane has
+been acquired, inside the lane, so a model swap or a competing admission that
+races the preflight cannot cause the manager to certify a model it is no longer
+serving. That post-admission refusal is reported distinctly as
+`preparationOutcome: "model_no_longer_resident"`.
+
+**Cancellation.** An arriving realtime request preempts background preparation;
+the same `AbortController` aborts the upstream count and render calls. The
+response is HTTP 200 with `status: "cancelled"` and
+`preparationOutcome: "realtime_request"` — a normal terminal outcome, not an
+error. Client disconnect releases the lane through the response lifecycle.
+
+**Versioning and provability.** Every prepared-context record — create, get,
+list, and update — is stamped with `contextCacheContract`, sourced from the
+canonical `CONTEXT_CACHE_CONTRACT_VERSION`. Every response, including the 501
+unsupported and 5xx failure envelopes, reports both `requestedModel` and
+`resolvedModel` (`requested_model`/`resolved_model` on error envelopes) plus the
+engine, so an alias can never silently certify a different model than the pinned
+one the caller asked for. Successful leases additionally report `mode`,
+`status`, `preparationOutcome`, `priority`, `residentOnly`, `residencySource`,
+`inputTokens`, and the `capabilities.exact_count` flag.
+
+**Legacy compatibility.** `allow_model_load: true` remains supported and keeps
+its original meaning — it permits `prefill` to load a nonresident model — and
+omitting `resident_only` preserves the previous defaults (`count` may load,
+`prefill` is resident-only). These legacy defaults are **not** suitable for
+realtime background prewarming: they can load or evict a model while live
+traffic is running. New callers should send `resident_only: true` with
+`priority: "background"`. `allow_model_load` is always overridden by an explicit
+`resident_only: true` or by `priority: "background"`.
+
 Prefill is admitted as bounded `background` work and waits until the local lane
 is available. Queued `realtime` and `interactive` work skips it. Arrival of a
 `realtime` request cooperatively aborts active background work; the lane remains

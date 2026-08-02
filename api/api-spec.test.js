@@ -12,6 +12,7 @@ import {
   MULTIMODAL_CONTENT_PARTS,
   OPENAI_BASE_URL,
 } from './api-spec.js';
+import { CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
 import { buildOpenApiDocument } from '../scripts/gen-openapi.mjs';
 
 const CURRENT_ENDPOINT_KEYS = [
@@ -191,6 +192,45 @@ test('catalog describes the dual OpenAI surface and full multimodal contract', (
   assert.match(youtubeExample.python, /video_url/);
   assert.match(youtubeExample.python, /json\.loads/, 'JSON booleans need valid Python decoding');
   assert.match(youtubeExample.javascript, /video_url/);
+});
+
+test('context/prepare documents its residency, scheduling, and versioning contract', () => {
+  const prepare = ENDPOINTS.find(entry => entry.path === '/api/v1/context/prepare');
+  assert.ok(prepare, 'the prepared-context route must be catalogued');
+
+  const request = prepare.requestSchema.properties;
+  assert.deepEqual(request.mode.enum, ['count', 'prefill']);
+  assert.deepEqual(request.priority.enum, ['interactive', 'background']);
+  assert.equal(request.resident_only.type, 'boolean');
+  assert.equal(request.allow_model_load.type, 'boolean');
+  assert.match(request.allow_model_load.description, /legacy/i);
+  assert.match(prepare.description, /resident/i);
+  assert.match(prepare.description, /realtime/i);
+
+  const response = prepare.responseSchema.properties;
+  assert.equal(response.contextCacheContract.const, CONTEXT_CACHE_CONTRACT_VERSION);
+  assert.equal(response.requestedModel.type, 'string');
+  assert.equal(response.resolvedModel.type, 'string');
+  assert.equal(response.engine.type, 'string');
+  assert.deepEqual(response.mode.enum, ['count', 'prefill']);
+  assert.ok(response.status.enum.includes('skipped'));
+  assert.ok(response.status.enum.includes('cancelled'));
+  assert.ok(response.preparationOutcome.enum.includes('model_not_resident'));
+  assert.ok(response.preparationOutcome.enum.includes('model_no_longer_resident'));
+  assert.equal(response.inputTokens.type, 'integer');
+  assert.equal(response.residentOnly.type, 'boolean');
+  assert.equal(response.capabilities.properties.exact_count.type, 'boolean');
+  assert.ok(
+    prepare.responseSchema.required.includes('requestedModel')
+    && prepare.responseSchema.required.includes('resolvedModel')
+    && prepare.responseSchema.required.includes('contextCacheContract'),
+    'clients must always be able to prove which concrete model was certified',
+  );
+
+  assert.ok(
+    prepare.examples.some(example => example.body?.resident_only === true && example.body?.priority === 'background'),
+    'the documented example must show the safe realtime-compatible invocation',
+  );
 });
 
 test('OpenAPI generator emits a structurally complete OpenAPI 3.1 document', () => {
