@@ -29,6 +29,44 @@ let currentMode = 'router';
 let currentPreset = null;
 ```
 
+### Exact Desired-Model Residency
+
+Operators can declare exact concrete model identifiers that must remain loaded
+locally in router mode. The declaration is persisted in
+`config.modelResidency.desiredModels` and is intentionally separate from the
+size-based anti-thrash policy: residency is an explicit identity contract, not
+an estimate based on file size.
+
+```http
+PUT /api/models/residency
+Content-Type: application/json
+
+{"models":["google_gemma-4-E2B-it-qat-q4_0-gguf"]}
+```
+
+The router immediately begins restoring missing declared models and returns
+`202 Accepted`. Send an empty array to release all declarations and restore the
+ordinary routing and eviction behavior.
+
+While a declaration is active:
+
+- Requests for that exact model are forced to the local router, even when a
+  remote backend can serve a similarly named model.
+- A conflicting request is sent to a viable remote backend when possible.
+  Otherwise it is rejected before eviction with HTTP `409` and code
+  `RESIDENT_MODEL_PROTECTED`.
+- Automated memory recovery, manual unloads, DS4 activation, and incompatible
+  single-model presets cannot remove the declared resident.
+- Router startup and restart restore any missing declarations before normal
+  recovery continues.
+
+`GET /api/models/residency` returns the desired models and their current loaded
+state. `GET /api/models/residency/ready` refreshes the live router snapshot and
+returns `503` whenever any declaration is missing. `/api/status`, `/health`, and
+each `/v1/models` entry also expose residency state; a model alias derives its
+readiness from the concrete alias target rather than from the synthetic alias
+entry.
+
 ### Single Model Mode (Presets)
 
 Activated by launching an optimized preset. Stops the router and starts llama.cpp with model-specific settings (sampling parameters, chat templates, reasoning format, custom switches).

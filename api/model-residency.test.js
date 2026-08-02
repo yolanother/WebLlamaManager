@@ -9,7 +9,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { modelResidencyDecision, modelResidencyStatus } from './model-residency.js';
+import {
+  annotateModelResidency,
+  modelResidencyDecision,
+  modelResidencyStatus,
+  modelsEligibleForUnload,
+  normalizeDesiredModels,
+  residencyMutationDecision,
+} from './model-residency.js';
 
 const GEMMA = 'google_gemma-4-E2B-it-qat-q4_0-gguf';
 
@@ -87,4 +94,80 @@ test('readiness fails immediately when a desired model is no longer resident', (
     desiredModels: [{ model: GEMMA, desired: true, loaded: false }],
     missingModels: [GEMMA],
   });
+});
+
+test('desired model configuration trims and deduplicates exact identifiers', () => {
+  assert.deepEqual(normalizeDesiredModels([
+    ` ${GEMMA} `,
+    GEMMA,
+    'qwen3-8b',
+  ], { modelsMax: 2 }), [GEMMA, 'qwen3-8b']);
+});
+
+test('memory recovery never selects desired residents for unload', () => {
+  assert.deepEqual(modelsEligibleForUnload([
+    { id: GEMMA, status: { value: 'loaded' } },
+    { id: 'other', status: { value: 'loaded' } },
+    { id: 'gpt-oss-120b', status: { value: 'loaded' } },
+  ], {
+    keepModel: 'gpt-oss-120b',
+    desiredModels: [GEMMA],
+  }).map((model) => model.id), ['other']);
+});
+
+test('integration: protected Gemma rejects gpt-oss-120b before eviction', () => {
+  const loadedModels = [{ id: GEMMA }, { id: 'qwen3-8b' }];
+  const decision = modelResidencyDecision({
+    requestedModel: 'Unsloth_gpt-oss-120b-GGUF_Q5_K_M_gpt-oss-120b-Q5_K_M',
+    desiredModels: [GEMMA],
+    loadedModels,
+    modelsMax: 2,
+    hasViableRemote: false,
+  });
+
+  assert.equal(decision.action, 'reject');
+  assert.equal(decision.protectedModel, GEMMA);
+  assert.equal(loadedModels.some((model) => model.id === GEMMA), true);
+});
+
+test('model catalog marks the concrete target and its alias from live target state', () => {
+  const catalog = annotateModelResidency([
+    { id: GEMMA, status: 'loaded' },
+    { id: 'realtime-gemma', status: 'alias', aliasTarget: GEMMA },
+  ], [GEMMA]);
+
+  assert.deepEqual(catalog.map((entry) => entry.residency), [
+    { desired: true, ready: true, target: GEMMA },
+    { desired: true, ready: true, target: GEMMA },
+  ]);
+});
+
+test('manual unload cannot remove a desired resident until the declaration is released', () => {
+  assert.deepEqual(residencyMutationDecision({
+    removedModels: [GEMMA],
+    desiredModels: [GEMMA],
+  }), {
+    allowed: false,
+    protectedModel: GEMMA,
+  });
+  assert.deepEqual(residencyMutationDecision({
+    removedModels: [GEMMA],
+    desiredModels: [],
+  }), { allowed: true });
+});
+
+test('single-model activation cannot replace a different desired resident', () => {
+  assert.deepEqual(residencyMutationDecision({
+    removedModels: [GEMMA],
+    replacementModel: 'qwen3-8b',
+    desiredModels: [GEMMA],
+  }), {
+    allowed: false,
+    protectedModel: GEMMA,
+  });
+  assert.deepEqual(residencyMutationDecision({
+    removedModels: [GEMMA],
+    replacementModel: GEMMA,
+    desiredModels: [GEMMA],
+  }), { allowed: true });
 });

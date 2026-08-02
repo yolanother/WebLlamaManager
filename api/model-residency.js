@@ -7,6 +7,30 @@
 // This exact identity contract is separate from size-based anti-thrash policy.
 
 /**
+ * Validate and normalize persisted exact desired-model identifiers.
+ *
+ * @param {unknown} value Candidate array of model identifiers.
+ * @param {{modelsMax?:number}} [options] Router capacity constraint.
+ * @returns {string[]} Trimmed identifiers in declaration order without duplicates.
+ * @throws {TypeError} When the value or any identifier has the wrong type.
+ * @throws {RangeError} When an identifier is blank or declarations exceed capacity.
+ */
+export function normalizeDesiredModels(value, { modelsMax = 2 } = {}) {
+  if (!Array.isArray(value)) throw new TypeError('models must be an array of exact model identifiers');
+  const models = [];
+  for (const item of value) {
+    if (typeof item !== 'string') throw new TypeError('each desired model must be a string');
+    const model = item.trim();
+    if (!model) throw new RangeError('desired model identifiers cannot be blank');
+    if (!models.includes(model)) models.push(model);
+  }
+  if (models.length > modelsMax) {
+    throw new RangeError(`desired models cannot exceed router capacity (${modelsMax})`);
+  }
+  return models;
+}
+
+/**
  * Decide routing/admission for an exact desired-model residency declaration.
  *
  * @param {Object} input Residency and routing state.
@@ -78,4 +102,70 @@ export function modelResidencyStatus({ desiredModels = [], loadedModels = [] } =
     desiredModels: models,
     missingModels,
   };
+}
+
+/**
+ * Select loaded router models that memory recovery may safely unload.
+ *
+ * @param {Array<{id:string,status?:{value?:string}}>} models Router model records.
+ * @param {{keepModel?:string,desiredModels?:string[]}} [options] Protected identities.
+ * @returns {Array<{id:string,status?:{value?:string}}>} Loaded, non-protected candidates.
+ */
+export function modelsEligibleForUnload(models = [], {
+  keepModel = '',
+  desiredModels = [],
+} = {}) {
+  const protectedIds = new Set([keepModel, ...desiredModels]);
+  return models.filter((model) => (
+    model?.status?.value === 'loaded'
+    && !protectedIds.has(model.id)
+  ));
+}
+
+/**
+ * Decide whether an operation that removes local models preserves declarations.
+ *
+ * @param {Object} input Planned local model mutation.
+ * @param {string[]} [input.removedModels=[]] Exact models the operation removes.
+ * @param {string[]} [input.desiredModels=[]] Persisted exact desired models.
+ * @param {string} [input.replacementModel=''] Exact model replacing removed models.
+ * @returns {{allowed:true}|{allowed:false,protectedModel:string}} Mutation decision.
+ */
+export function residencyMutationDecision({
+  removedModels = [],
+  desiredModels = [],
+  replacementModel = '',
+} = {}) {
+  const protectedModel = removedModels.find((model) => (
+    desiredModels.includes(model) && model !== replacementModel
+  ));
+  return protectedModel
+    ? { allowed: false, protectedModel }
+    : { allowed: true };
+}
+
+/**
+ * Annotate model catalog entries with desired residency and live readiness.
+ * Alias readiness always follows the concrete alias target's loaded status.
+ *
+ * @param {Array<{id:string,status?:string,aliasTarget?:string}>} entries Model catalog entries.
+ * @param {string[]} [desiredModels=[]] Persisted exact concrete desired models.
+ * @returns {Array<Object>} Copied entries with a `residency` status object.
+ */
+export function annotateModelResidency(entries = [], desiredModels = []) {
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const desired = new Set(desiredModels);
+  return entries.map((entry) => {
+    const target = entry.aliasTarget || entry.id;
+    const targetEntry = byId.get(target);
+    const isDesired = desired.has(target);
+    return {
+      ...entry,
+      residency: {
+        desired: isDesired,
+        ready: isDesired && targetEntry?.status === 'loaded',
+        target,
+      },
+    };
+  });
 }

@@ -55,6 +55,14 @@ import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
 import { slotCacheFilename, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
+import {
+  annotateModelResidency,
+  modelResidencyDecision,
+  modelResidencyStatus,
+  modelsEligibleForUnload,
+  normalizeDesiredModels,
+  residencyMutationDecision,
+} from './model-residency.js';
 import { aggregateRequestStats } from './request-stats.js';
 import { createMediaRouter } from './media.js';
 import { createAudioTranscriptionHandler } from './audio-transcriptions.js';
@@ -775,7 +783,20 @@ function estimateLocalProcessingMs(inputTokens) {
 // Resolve which backend should handle a request
 function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = {}) {
   const backends = config.backends || {};
+  const desiredModels = desiredResidentModels();
+  const residencyApplies = endpoint !== 'embeddings';
   if (!backends.enabled || !backends.directory?.length) {
+    if (residencyApplies) {
+      const residency = modelResidencyDecision({
+        requestedModel,
+        desiredModels,
+        loadedModels: loadedModelsSnapshot,
+        modelsMax: config.modelsMax || 2,
+        hasViableRemote: false,
+      });
+      if (residency.action === 'reject') return blockedResidencyRouting(residency);
+      if (residency.action === 'force-local') return { remote: false, forceLocal: true };
+    }
     return { remote: false };
   }
 
@@ -827,6 +848,25 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = 
     if (queue && queue.active >= queue.concurrency) return false;
     return true;
   });
+  if (residencyApplies) {
+    const residency = modelResidencyDecision({
+      requestedModel,
+      desiredModels,
+      loadedModels: loadedModelsSnapshot,
+      modelsMax: config.modelsMax || 2,
+      hasViableRemote,
+    });
+    if (residency.action === 'force-local') {
+      return { remote: false, forceLocal: true };
+    }
+    if (residency.action === 'reject' || (residency.action === 'offload' && localOnly)) {
+      return blockedResidencyRouting(residency);
+    }
+    if (residency.action === 'offload') {
+      shouldOffload = true;
+      console.log(`[routing] desired residency: keeping ${residency.protectedModel} resident, offloading ${requestedModel}`);
+    }
+  }
   if (pref.tryRemoteFirst && hasViableRemote) {
     shouldOffload = true;
     console.log(`[routing] Try-remote (${pref.reason}): "${requestedModel}" has a viable remote backend; keeping local slot free`);
@@ -993,6 +1033,42 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = 
   console.log(`[routing] Selected backend: ${chosen.name} (${chosenQueue?.active || 0}/${chosenQueue?.concurrency || '?'} active, ${Math.round(chosenStats?.avgTokPerSec || 0)} tok/s, priority=${chosen.priority ?? 50})`);
   const remoteModel = resolveModelMapping(chosen.modelMapping, requestedModel);
   return buildRemoteRouting(chosen, remoteModel, endpoint);
+}
+
+/** Return a stable routing rejection for a local load that would evict a desired model. */
+function blockedResidencyRouting(decision) {
+  return {
+    remote: false,
+    blocked: true,
+    status: 409,
+    code: 'RESIDENT_MODEL_PROTECTED',
+    message: `Model load blocked to keep desired resident model '${decision.protectedModel}' loaded`,
+    protectedModel: decision.protectedModel,
+  };
+}
+
+/** Send the stable exact-residency conflict response returned by resolveBackend. */
+function sendBlockedResidency(res, routing) {
+  return res.status(routing.status || 409).json({
+    error: {
+      message: routing.message,
+      type: 'model_residency_conflict',
+      code: routing.code || 'RESIDENT_MODEL_PROTECTED',
+    },
+    protected_model: routing.protectedModel,
+  });
+}
+
+/** Return validated persisted desired-model ids; malformed legacy config fails closed to none. */
+function desiredResidentModels() {
+  try {
+    return normalizeDesiredModels(config.modelResidency?.desiredModels || [], {
+      modelsMax: config.modelsMax || 2,
+    });
+  } catch (error) {
+    console.error(`[residency] Ignoring invalid desired-model config: ${error.message}`);
+    return [];
+  }
 }
 
 function buildRemoteRouting(backend, remoteModel, endpoint) {
@@ -2310,6 +2386,40 @@ async function refreshLoadedModelsSnapshot() {
 }
 setInterval(refreshLoadedModelsSnapshot, 5000).unref?.();
 refreshLoadedModelsSnapshot();
+
+let desiredResidencyRestorePromise = null;
+/** Restore persisted desired models after the llama router becomes ready. */
+async function restoreDesiredResidentModels() {
+  if (desiredResidencyRestorePromise) return desiredResidencyRestorePromise;
+  desiredResidencyRestorePromise = (async () => {
+    const desiredModels = desiredResidentModels();
+    if (desiredModels.length === 0 || currentEngine !== ENGINE_TYPES.LLAMA) return;
+    const ready = await waitForServerReady({ maxWait: 60_000, label: 'residency-restore' });
+    if (!ready) {
+      addLog('models', 'Desired residency restore deferred: llama router is not ready');
+      return;
+    }
+    await refreshLoadedModelsSnapshot();
+    for (const model of desiredModels) {
+      if (loadedModelsSnapshot.some((loaded) => loaded.id === model)) continue;
+      const response = await fetch(`http://127.0.0.1:${API_PORT}/api/models/load`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        addLog('models', `Desired residency unavailable for ${model}: ${detail}`);
+      }
+    }
+    await refreshLoadedModelsSnapshot();
+  })();
+  try {
+    await desiredResidencyRestorePromise;
+  } finally {
+    desiredResidencyRestorePromise = null;
+  }
+}
 
 /** Total resident memory (bytes) held by all running llama-server processes. */
 function llamaServerRssBytes() {
@@ -3888,6 +3998,7 @@ app.get('/api/status', async (req, res) => {
       modelsDir: MODELS_DIR,
       mode: currentMode,
       currentPreset: currentPreset ? config.presets[currentPreset] : null,
+      modelResidency: currentModelResidencyStatus(),
       downloads: Object.fromEntries(
         Array.from(downloadProcesses.entries()).map(([id, info]) => [
           id,
@@ -3910,6 +4021,7 @@ app.get('/api/status', async (req, res) => {
       modelsDir: MODELS_DIR,
       mode: currentMode,
       currentPreset: currentPreset ? config.presets[currentPreset] : null,
+      modelResidency: currentModelResidencyStatus(),
       error: error.message
     });
   }
@@ -3936,6 +4048,7 @@ app.get('/health', async (req, res) => {
   res.status(httpStatus).json({
     status,
     uptime: process.uptime(),
+    modelResidency: currentModelResidencyStatus(),
     llama: {
       running: llamaRunning,
       healthy: llamaStatus.healthy,
@@ -4373,6 +4486,53 @@ app.get('/api/models', async (req, res) => {
   }
 });
 
+/** Return current desired-model residency readiness from the last router snapshot. */
+function currentModelResidencyStatus() {
+  return modelResidencyStatus({
+    desiredModels: desiredResidentModels(),
+    loadedModels: loadedModelsSnapshot,
+  });
+}
+
+// Desired exact-model residency configuration and readiness.
+app.get('/api/models/residency', async (req, res) => {
+  await refreshLoadedModelsSnapshot();
+  res.json(currentModelResidencyStatus());
+});
+
+app.get('/api/models/residency/ready', async (req, res) => {
+  await refreshLoadedModelsSnapshot();
+  const status = currentModelResidencyStatus();
+  res.status(status.ready ? 200 : 503).json(status);
+});
+
+app.put('/api/models/residency', (req, res) => {
+  let desiredModels;
+  try {
+    desiredModels = normalizeDesiredModels(req.body?.models, {
+      modelsMax: config.modelsMax || 2,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      error: {
+        message: error.message,
+        type: 'invalid_request_error',
+        code: 'INVALID_MODEL_RESIDENCY',
+      },
+    });
+  }
+
+  config.modelResidency = { desiredModels };
+  saveConfig(config);
+  addLog('models', `Desired model residency updated: ${desiredModels.join(', ') || '(none)'}`);
+  if (desiredModels.length > 0) {
+    restoreDesiredResidentModels().catch((error) => {
+      console.error(`[residency] Restore failed: ${error.message}`);
+    });
+  }
+  return res.status(202).json(currentModelResidencyStatus());
+});
+
 // Load a model in llama-server (router mode)
 // In router mode, models are loaded on-demand when chat completions are requested.
 // This endpoint pre-loads a model by making a minimal completion request.
@@ -4381,6 +4541,17 @@ app.post('/api/models/load', async (req, res) => {
 
   if (!model) {
     return res.status(400).json({ error: 'Missing model parameter' });
+  }
+
+  const residency = modelResidencyDecision({
+    requestedModel: model,
+    desiredModels: desiredResidentModels(),
+    loadedModels: loadedModelsSnapshot,
+    modelsMax: config.modelsMax || 2,
+    hasViableRemote: false,
+  });
+  if (residency.action === 'reject') {
+    return sendBlockedResidency(res, blockedResidencyRouting(residency));
   }
 
   // Resolve model name to full path to verify it exists
@@ -4418,6 +4589,7 @@ app.post('/api/models/load', async (req, res) => {
 
     // Consume the response
     await response.text();
+    await refreshLoadedModelsSnapshot();
 
     console.log(`[models/load] Model loaded successfully: ${model}`);
     addLog('models', `Model loaded: ${model}`);
@@ -4440,6 +4612,16 @@ app.post('/api/models/unload', async (req, res) => {
     return res.status(400).json({ error: 'Missing model parameter' });
   }
 
+  const mutation = residencyMutationDecision({
+    removedModels: [model],
+    desiredModels: desiredResidentModels(),
+  });
+  if (!mutation.allowed) {
+    return sendBlockedResidency(res, blockedResidencyRouting({
+      protectedModel: mutation.protectedModel,
+    }));
+  }
+
   console.log(`[models/unload] Attempting to unload model: ${model}`);
   addLog('models', `Unloading model: ${model}`);
 
@@ -4453,6 +4635,7 @@ app.post('/api/models/unload', async (req, res) => {
 
     if (response.ok) {
       const data = await response.json();
+      await refreshLoadedModelsSnapshot();
       console.log(`[models/unload] Model unloaded successfully: ${model}`);
       addLog('models', `Model unloaded: ${model}`);
       res.json({ success: true, ...data });
@@ -4864,6 +5047,14 @@ let modeSwitchPromise = null;
 async function ensureDs4ForModel(rawModel, resolvedModel) {
   const ref = ds4PresetForModel(config, resolvedModel);
   if (ref) {
+    const desiredModels = desiredResidentModels();
+    if (desiredModels.length > 0 && !desiredModels.includes(resolvedModel)) {
+      return {
+        ok: false,
+        status: 409,
+        error: `DS4 activation blocked to preserve desired resident model '${desiredModels[0]}'`,
+      };
+    }
     if (currentEngine === ENGINE_TYPES.DS4) return null; // ds4 already active → served downstream
     console.log(`[ds4] default-model request for ds4 preset '${ref.presetId}' — activating exclusive ds4 mode`);
     addLog('presets', `Request for ds4 preset '${ref.presetId}' (via default-model alias or name) — activating exclusive ds4 mode`);
@@ -5089,6 +5280,7 @@ async function restartLlamaServer({ governed = true } = {}) {
       consecutiveFailedRestarts = 0; // recovery cleared the wedge signal
       console.log('[restart] Llama server restarted successfully');
       addLog('system', 'Llama server restarted successfully');
+      await restoreDesiredResidentModels();
     } else {
       consecutiveFailedRestarts++;
       console.error(`[restart] Llama server failed to become ready after restart (consecutive failures: ${consecutiveFailedRestarts})`);
@@ -5692,6 +5884,9 @@ app.post('/api/server/start', async (req, res) => {
     intentionalStop = false;
 
     res.json({ success: true, mode: 'router', pid: llamaProcess.pid });
+    restoreDesiredResidentModels().catch((error) => {
+      console.error(`[residency] Router-start restore failed: ${error.message}`);
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -5706,6 +5901,17 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
 
   if (!preset) {
     return res.status(404).json({ error: `Preset '${presetId}' not found` });
+  }
+
+  const removedDesiredModels = desiredResidentModels().filter((model) => !presetServesModel(preset, model));
+  const mutation = residencyMutationDecision({
+    removedModels: removedDesiredModels,
+    desiredModels: desiredResidentModels(),
+  });
+  if (!mutation.allowed) {
+    return sendBlockedResidency(res, blockedResidencyRouting({
+      protectedModel: mutation.protectedModel,
+    }));
   }
 
   // ── ds4 engine preset ──────────────────────────────────────────────────────
@@ -6545,6 +6751,8 @@ app.get('/api/info', (req, res) => {
       stats: 'GET /api/stats',
       analytics: 'GET /api/analytics',
       models: 'GET /api/models',
+      modelResidency: 'GET|PUT /api/models/residency',
+      modelResidencyReady: 'GET /api/models/residency/ready',
       loadModel: 'POST /api/models/load',
       unloadModel: 'POST /api/models/unload',
       startServer: 'POST /api/server/start',
@@ -7209,6 +7417,7 @@ async function handleModels(req, res) {
         context_management: contextCapabilities('embedding'),
       });
     }
+    data.data = annotateModelResidency(data.data, desiredResidentModels());
     data.data = addModelCapabilityMetadata(data.data, resolveModelCapabilities, localModels);
     res.json(data);
   } catch (error) {
@@ -7249,6 +7458,7 @@ async function handleExactInputTokenRequest(kind, req, res) {
   }
 
   const routing = resolveBackend(resolvedModel, endpoint, req.body || {});
+  if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.remote) {
     res.status(501).json({
       error: {
@@ -8125,7 +8335,10 @@ async function unloadOtherModels(keepModel) {
     const modelsRes = await fetch(`http://localhost:${LLAMA_PORT}/models`);
     if (!modelsRes.ok) return false;
     const modelsData = await modelsRes.json();
-    const loaded = (modelsData.data || []).filter(m => m.status?.value === 'loaded' && m.id !== keepModel);
+    const loaded = modelsEligibleForUnload(modelsData.data || [], {
+      keepModel,
+      desiredModels: desiredResidentModels(),
+    });
     if (loaded.length === 0) return false;
 
     console.log(`[model-switch] Unloading ${loaded.length} model(s) to make room for ${keepModel}`);
@@ -8599,6 +8812,7 @@ async function handleChatCompletions(req, res) {
     // Resolve backend routing (local vs remote) the normal way.
     routing = resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly });
   }
+  if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;
     return res.status(409).json({
@@ -9679,6 +9893,7 @@ async function handleCompletions(req, res) {
     // Route to remote backend if applicable
     routing = resolveBackend(requestedModel, 'completions', req.body, { localOnly: requestPolicy.localOnly });
   }
+  if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;
     return res.status(409).json({ error: { message: 'local_only conflicts with an explicit remote backend prefix', code: 'LOCAL_ONLY_REMOTE_CONFLICT' } });
@@ -10058,6 +10273,7 @@ async function handleResponses(req, res) {
 
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'responses', req.body, { localOnly: requestPolicy.localOnly });
+  if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;
     return res.status(409).json({ error: { message: 'local_only conflicts with an explicit remote backend prefix', code: 'LOCAL_ONLY_REMOTE_CONFLICT' } });
@@ -10323,6 +10539,7 @@ async function handleMessages(req, res) {
 
   // Route to remote backend if applicable
   const routing = resolveBackend(requestedModel, 'messages', req.body, { localOnly: requestPolicy.localOnly });
+  if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;
     return res.status(409).json({ error: { message: 'local_only conflicts with an explicit remote backend prefix', code: 'LOCAL_ONLY_REMOTE_CONFLICT' } });

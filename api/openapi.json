@@ -1674,6 +1674,135 @@
         ]
       }
     },
+    "/api/models/residency": {
+      "get": {
+        "operationId": "get_api_models_residency",
+        "summary": "Get desired local model residency status",
+        "description": "Get desired local model residency status through the Llama Manager HTTP API.",
+        "tags": [
+          "models"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X GET 'http://localhost:5250/api/models/residency'"
+          },
+          {
+            "lang": "Python",
+            "source": "import requests\n\nresponse = requests.get('http://localhost:5250/api/models/residency')\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/models/residency');\nconsole.log(await response.json());"
+          }
+        ]
+      },
+      "put": {
+        "operationId": "put_api_models_residency",
+        "summary": "Replace desired local model declarations",
+        "description": "Replace desired local model declarations through the Llama Manager HTTP API.",
+        "tags": [
+          "models"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X PUT 'http://localhost:5250/api/models/residency' -H 'Content-Type: application/json' -d '{}'"
+          },
+          {
+            "lang": "Python",
+            "source": "import json\nimport requests\n\npayload = json.loads(r'''{}''')\nresponse = requests.put('http://localhost:5250/api/models/residency', json=payload)\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/models/residency', {\n  method: 'PUT',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({})\n});\nconsole.log(await response.json());"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "examples": {
+                "example1": {
+                  "summary": "Replace desired local model declarations example",
+                  "value": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/models/residency/ready": {
+      "get": {
+        "operationId": "get_api_models_residency_ready",
+        "summary": "Check desired model residency readiness",
+        "description": "Check desired model residency readiness through the Llama Manager HTTP API.",
+        "tags": [
+          "models"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X GET 'http://localhost:5250/api/models/residency/ready'"
+          },
+          {
+            "lang": "Python",
+            "source": "import requests\n\nresponse = requests.get('http://localhost:5250/api/models/residency/ready')\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/models/residency/ready');\nconsole.log(await response.json());"
+          }
+        ]
+      }
+    },
     "/api/models/load": {
       "post": {
         "operationId": "post_api_models_load",
