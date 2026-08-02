@@ -1,26 +1,44 @@
 // Llama Manager — start-ds4.sh SSD-streaming flag test (--print-cmd contract).
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 //
-// Exercises the real start-ds4.sh launcher via its `--print-cmd` seam (which prints
-// the ds4-server argv and exits, spawning nothing) to prove the DS4_SSD_STREAMING /
-// DS4_SSD_STREAMING_CACHE_EXPERTS env contract the adaptive controller relies on:
-// streaming appends `--ssd-streaming [--ssd-streaming-cache-experts <N>]`; unset/0
-// omits them. Runs on the host without the ds4 binary or the 81GB model.
+// Exercises a temporary copy of start-ds4.sh via its `--print-cmd` seam, beside a
+// sentinel .env that would terminate the process if sourced. This proves both
+// that print-only inspection never reads repository configuration or launches an
+// engine and that SSD-streaming flags follow the adaptive controller's contract.
 
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'start-ds4.sh');
+const REPOSITORY_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'start-ds4.sh');
+const FIXTURE_ROOT = mkdtempSync(join(tmpdir(), 'llama-ds4-print-test-'));
+const SCRIPT = join(FIXTURE_ROOT, 'start-ds4.sh');
+copyFileSync(REPOSITORY_SCRIPT, SCRIPT);
+writeFileSync(join(FIXTURE_ROOT, '.env'), 'exit 97\n');
+after(() => rmSync(FIXTURE_ROOT, { recursive: true, force: true }));
 
 /** Run `start-ds4.sh --print-cmd` with `extraEnv` merged in; return the printed argv line. */
 function printCmd(extraEnv = {}) {
-  return execFileSync('bash', [SCRIPT, '--print-cmd'], {
-    env: { ...process.env, DS4_MODEL: '/tmp/model.gguf', ...extraEnv },
+  const result = spawnSync('bash', [SCRIPT, '--print-cmd'], {
+    env: {
+      HOME: FIXTURE_ROOT,
+      PATH: process.env.PATH || '/usr/bin:/bin',
+      DS4_MODEL: '/tmp/model.gguf',
+      DS4_STATE_DIR: join(FIXTURE_ROOT, 'state'),
+      ...extraEnv,
+    },
     encoding: 'utf8',
-  }).trim();
+  });
+  assert.equal(
+    result.status,
+    0,
+    `start-ds4.sh --print-cmd failed (status=${result.status}, signal=${result.signal || 'none'}): ${result.stderr.trim()}`,
+  );
+  return result.stdout.trim();
 }
 
 test('start-ds4.sh: no streaming env → no --ssd-streaming flag', () => {

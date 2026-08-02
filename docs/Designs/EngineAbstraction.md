@@ -80,8 +80,10 @@ ds4-server -m <model> --host 127.0.0.1 --port <port> \
   <extraSwitches (default "--rocm --cors")>
 ```
 
-`--print-cmd` prints the resolved command and exits (test seam). Env: `DS4_MODEL`
-(required), `DS4_SERVER_BIN`, `DS4_PORT`, `DS4_CTX`, `DS4_GGUF_DIR`, `DS4_POWER`,
+`--print-cmd` prints the resolved command and exits without sourcing the checkout
+`.env` or entering Distrobox (hermetic test/inspection seam). Its inputs come
+only from the invoking environment. Runtime env: `DS4_MODEL` (required),
+`DS4_SERVER_BIN`, `DS4_PORT`, `DS4_CTX`, `DS4_GGUF_DIR`, `DS4_POWER`,
 `DS4_KV_DISK_DIR`, `DS4_KV_DISK_SPACE_MB`, `DS4_EXTRA_SWITCHES`, `DS4_CONTAINER`,
 `DS4_IN_DISTROBOX`.
 

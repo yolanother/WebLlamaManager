@@ -28,11 +28,16 @@
 #      DS4_CONTAINER (default llama-rocm-7.2.4 — the SAME container the live
 #        llama.cpp uses; the 7rc container's HSA runtime segfaults on gfx1151),
 #      DS4_IN_DISTROBOX (1 = run inside distrobox [default], 0 = run on host).
-# Flag: --print-cmd  prints the ds4-server command and exits (test seam).
+# Flag: --print-cmd  prints the ds4-server command and exits without sourcing
+#                    repository configuration or touching an engine (test seam).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/.env" ]; then set -a; . "$SCRIPT_DIR/.env"; set +a; fi
+PRINT_COMMAND=0
+[ "${1:-}" = "--print-cmd" ] && PRINT_COMMAND=1
+if [ "$PRINT_COMMAND" -eq 0 ] && [ -f "$SCRIPT_DIR/.env" ]; then
+  set -a; . "$SCRIPT_DIR/.env"; set +a
+fi
 
 # Resolve the ds4-server binary. Package installations never execute binaries
 # from group-writable state: signed APT owns the fixed /usr/lib binary. For a
@@ -120,7 +125,7 @@ build_args() {
 
 build_args
 
-if [ "${1:-}" = "--print-cmd" ]; then
+if [ "$PRINT_COMMAND" -eq 1 ]; then
   printf '%s ' "$DS4_EXEC_BIN" "${DS4_ARGS[@]}"; echo; exit 0
 fi
 
