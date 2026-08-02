@@ -362,10 +362,6 @@ export class TimingEvidenceRecorder {
         throw new RangeError(`lifecycle order violated: ${start} must precede ${end}`);
       }
     }
-    if (name === 'first_content' && this.marks.has('inference_started') === false
-      && this.profile === TIMING_EVIDENCE_PROFILES.GENERATION && this.marks.has('prefill_completed')) {
-      throw new RangeError('lifecycle order violated: inference_started must precede first_content');
-    }
     const at = this.clock();
     if (name === 'received') this.startedAtIso = this.wallClock().toISOString();
     this.marks.set(name, at);
