@@ -27,6 +27,7 @@ defines.
 | --- | --- | --- |
 | `POST /api/v1/context/prepare` (lease field `timingEvidence`) | `count` or `prefill` | **Yes** |
 | `GET /api/v1/context/{id}` (lease field `timingEvidence`) | `count` or `prefill` | **Yes** |
+| Terminal prepare leases (`model_not_resident`, `model_no_longer_resident`) | `count` or `prefill` | No — always incomplete |
 | `POST /v1/chat/completions`, non-streaming (`_llama_manager.timingEvidence`) | `generation` | No — observational |
 | `POST /v1/chat/completions`, streaming (LLM capture log entry) | `generation` | No — observational |
 
@@ -116,7 +117,7 @@ neither is certifiable.
 
 | Dimension | Derivation | Notes |
 | --- | --- | --- |
-| `queue_wait` | `admitted − received` | Admission wait on the manager's priority queue. |
+| `queue_wait` | `admitted − received` | Admission wait on the manager's priority queue, in the class named by `identity.priority`. |
 | `tokenization` | `tokenization_completed − tokenization_started` | The discrete manager-issued exact-count call only. |
 | `prefill` | `prefill_completed − prefill_started` | The upstream prefill request window only. |
 | `inference_start` | `inference_started − received` | Offset, not a duration. |
@@ -138,7 +139,9 @@ neither is certifiable.
 2. Manager prefill is measured strictly around the upstream prefill request. The
    background-lane queue wait that precedes it is deliberately *outside* the
    window and is not folded into any dimension; the lease's `queued → prefilling`
-   status transition remains the signal for it.
+   status transition remains the signal for it. `queue_wait` on a prepare record
+   therefore covers admission to the *preparation* lane only, never the separate
+   background lane the prefill itself runs on.
 3. Tokenization is never derived by subtracting anything from prefill, and never
    read from the aggregate `preTokenized` queue counter surfaced on the active
    requests API. That counter is a legacy background approximation and is not
@@ -242,6 +245,36 @@ canonical tokenizer contract:
   EOS tokens, and chat template from the live `/props` probe. When the model has
   not been probed the field is `null` — an unknown tokenizer is never certified
   as a known one.
+
+## Relationship to `preparationOutcome`
+
+A prepared-context lease also carries `preparationOutcome` (see
+[ConversationContextCache.md](ConversationContextCache.md)). It and
+`cache.classification` are **orthogonal axes and never contradict each other**:
+
+- `preparationOutcome` answers *"what happened to this lease?"* — `counted`,
+  `prefill_scheduled`, `prefilled`, `model_not_resident`,
+  `model_no_longer_resident`, `realtime_request`, `upstream_error`.
+- `cache.classification` answers *"what KV state did this request find?"* —
+  `cold`, `warm_prefix`, `persona_change`, `eviction_reload`, `cancelled`,
+  `unsupported`.
+
+The only overlapping value is cancellation, and the two agree by construction:
+`onPreempt` calls `recorder.cancel(reason)` on the same signal that sets
+`preparationOutcome: 'realtime_request'`, so a realtime-preempted lease reports
+`classification: 'cancelled'` and `complete: false`.
+
+Terminal leases that never touched the model — `model_not_resident` (preflight
+refusal) and `model_no_longer_resident` (residency lost after the lane was
+acquired) — still publish a record. It carries whatever was genuinely measured
+(`queue_wait` for the post-admission case, nothing for the preflight case) and a
+typed reason for every dimension that never ran. Such a record is always
+`complete: false`; a refusal is never dressed up as a measurement.
+
+`identity.priority` reports the *normalized* class the request actually ran
+under. The prepare endpoint accepts `interactive` and `background` only —
+`realtime` cannot be requested there — while served chat completions may report
+any of the three.
 
 ## Model identity
 

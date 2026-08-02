@@ -101,6 +101,21 @@ remote offload path and returns a machine-readable local-busy error instead of
 silently sending prompt data elsewhere. Full rationale and limits are in
 [ConversationContextCache.md](Designs/ConversationContextCache.md).
 
+Every prepared-context lease and every chat completion carries a versioned
+`timingEvidence` record that separates admission wait, input tokenization, KV
+prefill, inference start, and first emitted content for one exact resolved model
+and contract revision. Durations are milliseconds on a process-monotonic clock;
+manager-observed and client-observed values are reported separately and never
+substituted for one another. A dimension that cannot be measured carries an
+explicit typed reason and is **never** reported as zero — llama.cpp folds input
+tokenization into prompt processing and never reports decode start, so served
+completions stay `complete: false` and certification runs through
+`context/prepare`, where the manager brackets a discrete tokenization call and a
+discrete prefill call itself. Records contain no prompt text, message content, or
+credentials. Clocks, units, lifecycle ordering, cache semantics, version
+compatibility, and privacy guarantees are defined in
+[ContextTimingEvidence.md](Designs/ContextTimingEvidence.md).
+
 ## 4. Model aliasing & preferred big/small models
 
 Two request-time aliases let clients pin a stable name while the operator retargets
