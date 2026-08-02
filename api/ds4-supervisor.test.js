@@ -79,6 +79,12 @@ test('start: idempotent while running (no second spawn)', () => {
   assert.equal(calls.spawn.length, 1);
 });
 
+test('stop before start does not run global cleanup', async () => {
+  const { sup, calls } = makeSup();
+  await sup.stop();
+  assert.equal(calls.runKill, 0);
+});
+
 test('stop: kills process, calls external kill, clears running', async () => {
   const { sup, calls, procs } = makeSup();
   sup.start(PRESET);

@@ -6,6 +6,8 @@
 // llama.cpp and DS4 inference engines, manages models and configuration, and
 // persists operational analytics. Mutable resources are resolved through the
 // package-safe runtime path contract so installed application files stay immutable.
+// Engine shutdown is ownership-scoped so passive secondary manager instances
+// cannot terminate workers supervised by a different manager.
 // OpenAI routes support both /api/v1 and bare /v1 paths, with URL-based media
 // expanded into standard multimodal parts before chat inference.
 
@@ -114,6 +116,7 @@ import {
 } from './ds4-exclusive.js';
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
+import { shouldRunGlobalEngineCleanup } from './engine-cleanup-policy.js';
 import { queueAdmissionDecision, DEFAULT_MAX_QUEUE_DEPTH, DEFAULT_HARD_MAX, DEFAULT_STALL_MS } from './queue-admission.js';
 import { resolveRuntimePaths } from './runtime-paths.js';
 import {
@@ -124,6 +127,7 @@ import {
 } from './distribution-policy.js';
 import { beginLlamaUpdate, createLlamaSourceUpdateSpec } from './llama-update-controller.js';
 import { applyConfigDefaults } from './config-defaults.js';
+import { scheduleAutoStart } from './auto-start.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -4729,9 +4733,15 @@ function runKillCommand({ label, command, useContainer, timeoutMs = 4000 }) {
   });
 }
 
-async function stopLlamaServer() {
+async function stopLlamaServer({ explicitReclaim = true } = {}) {
   console.log('[stop] Stopping llama server...');
   intentionalStop = true;
+  const ownsEngine = Boolean(llamaProcess);
+
+  if (!shouldRunGlobalEngineCleanup({ ownsEngine, explicitReclaim })) {
+    console.log('[stop] Skipping unowned llama-server cleanup');
+    return { ok: true, remainingPids: [] };
+  }
 
   // First, kill the Node.js spawned process if any
   if (llamaProcess && !llamaProcess.killed) {
@@ -10651,15 +10661,20 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   console.log(`Llama server will run on port ${LLAMA_PORT}`);
   console.log(`Stats interval: ${STATS_INTERVAL}ms`);
 
-  // Auto-start llama if configured
-  if (config.autoStart) {
-    console.log('Auto-starting llama server...');
-    setTimeout(() => {
+  // Auto-start llama only for an explicit boolean true. This keeps isolated
+  // secondary managers passive even when a legacy config contains "false".
+  const autoStartScheduled = scheduleAutoStart({
+    autoStart: config.autoStart,
+    schedule: setTimeout,
+    start: () => {
       fetch(`http://localhost:${API_PORT}/api/server/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       }).catch(err => console.error('Auto-start failed:', err));
-    }, 1000);
+    },
+  });
+  if (autoStartScheduled) {
+    console.log('Auto-starting llama server...');
   }
 
   // Always auto-start the dedicated embedding server (independent of the chat
@@ -11210,7 +11225,11 @@ function shutdownWithTimeout(signal) {
     process.exit(1);
   }, 10000);
   forceExit.unref();
-  Promise.allSettled([stopLlamaServer(), stopEmbedServer(), stopDs4Server()]).finally(() => process.exit(0));
+  Promise.allSettled([
+    stopLlamaServer({ explicitReclaim: false }),
+    stopEmbedServer(),
+    stopDs4Server(),
+  ]).finally(() => process.exit(0));
 }
 
 process.on('SIGTERM', () => shutdownWithTimeout('SIGTERM'));

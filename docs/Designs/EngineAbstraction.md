@@ -61,9 +61,11 @@ supervisor but extracted so start/stop/restart/exit→restart is testable with
 - probes readiness/health against `GET /v1/models`,
 - auto-restarts on unexpected exit through the shared **restart governor**
   (`restart-governor.js`), and
-- on `stop()` SIGTERM→SIGKILLs the child and calls an injected host-side kill
-  that reaps `ds4-server` and frees the ds4 port — a pattern that can **never**
-  match the `llama-server` process pattern (and vice-versa).
+- after `start()` establishes ownership, `stop()` SIGTERM→SIGKILLs the child and
+  calls an injected host-side kill that reaps `ds4-server` and frees the ds4
+  port — a pattern that can **never** match the `llama-server` process pattern
+  (and vice-versa). A supervisor that never spawned DS4 skips this global
+  cleanup, so a passive secondary manager cannot stop another manager's engine.
 
 ### `start-ds4.sh` (launcher)
 
@@ -341,8 +343,9 @@ ever active**, so a single "local engine" governor/watchdog is correct.
 
 - **Kill / emergency paths.** The `llama-server` and `ds4-server` pkill patterns
   are disjoint (`ds4RunKill` frees the ds4 port and never matches `llama-server`,
-  and vice-versa). Shutdown stops all three (`llama`, `embed`, `ds4`); ds4
-  deactivation and the mem-watchdog restart both reap ds4 via the supervisor.
+  and vice-versa). Shutdown stops only engines owned by that manager instance;
+  ds4 deactivation and the mem-watchdog restart explicitly claim supervision
+  and reap ds4 via the supervisor.
 
 ## State variables (`api/server.js`)
 

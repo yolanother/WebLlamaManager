@@ -250,6 +250,12 @@ This handles the brief window where llama.cpp is restarting or a model is being 
 | `HF_TOKEN` | _(unset)_ | Fallback HuggingFace token for gated model downloads; the installer and runtime launchers deliver it through protected files, never process arguments |
 | `LLAMA_UI_URL` | _(unset)_ | Override URL for the llama.cpp native UI link |
 
+Persisted `autoStart` must be the JSON boolean `true` to schedule the internal
+`POST /api/server/start`; boolean `false` and legacy string values remain
+passive. The safe configuration utility preserves valid JSON literals when
+writing JSON files, as documented in
+[dev-config](../Utilities/dev-config.md).
+
 ### Credential Delivery
 
 The Settings-managed HuggingFace token remains the preferred source for model
@@ -276,15 +282,19 @@ be performed by an authorized operator in HuggingFace itself.
 
 When the API server receives SIGTERM or SIGINT:
 
-1. Initiates `stopLlamaServer()`:
+1. Initiates ownership-scoped engine shutdown:
    - Sends SIGTERM to the llama.cpp process
    - Waits 1 second for graceful exit
    - If still running, sends SIGKILL
-   - Falls back to `pkill` if process handle is lost
+   - Performs robust host cleanup only if this manager spawned the engine
 2. Sets a 10-second force-exit timeout as a safety net
 3. Exits cleanly after llama.cpp is stopped
 
 The systemd service (`llama-manager.service`) is configured to handle this via `systemctl --user stop llama-manager`, which sends SIGTERM and waits for clean shutdown.
+Explicit start, mode-switch, and recovery operations still perform global stale
+engine cleanup because those operations deliberately claim supervision. A
+passive secondary manager that never started an engine performs no PID sweep or
+port cleanup on shutdown.
 
 ## Switching Modes
 

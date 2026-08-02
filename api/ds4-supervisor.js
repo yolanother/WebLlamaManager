@@ -8,8 +8,9 @@
 // start-ds4.sh with the ds4 launch env (bin, port, model resolved under the ds4
 // ggufDir, ctx, power, KV-disk cache flags), probes readiness/health against ds4's
 // GET /v1/models (ds4 has NO /health), auto-restarts on unexpected exit through the
-// shared restart governor (debounce + circuit breaker), and on stop kills the
-// process plus frees the ds4 port via an injected external-kill hook. All I/O
+// shared restart governor (debounce + circuit breaker), and on owned stop kills
+// the process plus frees the ds4 port via an injected external-kill hook. A
+// supervisor that never spawned DS4 performs no host-wide cleanup. All I/O
 // (spawn, fetch, timers, sleeps, external kill) is injected so tests can drive the
 // machine deterministically.
 
@@ -56,6 +57,7 @@ export function createDs4Supervisor({
   setTimeoutFn = setTimeout,
 }) {
   let proc = null;
+  let ownsEngine = false;
   let activePreset = null;
   let intentionalStop = false;
   let restartInProgress = false;
@@ -192,6 +194,7 @@ export function createDs4Supervisor({
       detached: false,
     });
     proc = child;
+    ownsEngine = true;
     const ds4 = resolveDs4Config(getConfig() || {}, env);
     log(`[ds4] Starting ds4-server on :${ds4.port} (preset: ${preset.id})`);
     addLog('system', `Starting ds4-server on :${ds4.port} (preset: ${preset.id})`);
@@ -234,6 +237,7 @@ export function createDs4Supervisor({
    */
   async function stop() {
     intentionalStop = true;
+    if (!ownsEngine) return;
     const child = proc;
     if (child && !child.killed) {
       child.kill('SIGTERM');
@@ -242,6 +246,7 @@ export function createDs4Supervisor({
     }
     proc = null;
     await runKill();
+    ownsEngine = false;
   }
 
   /**
