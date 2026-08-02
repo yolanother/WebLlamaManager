@@ -89,6 +89,13 @@ import {
   restoreModelSlotWhenReady,
 } from './slot-ownership.js';
 import { contextCapabilities, modelSupportsSlotOperations } from './context-capabilities.js';
+import {
+  TIMING_EVIDENCE_PROFILES,
+  TIMING_UNSUPPORTED_REASONS,
+  TimingEvidenceRecorder,
+  createRequestTimingRecorder,
+  tokenizerRevision,
+} from './timing-evidence.js';
 import { PriorityRequestQueue } from './request-queue.js';
 import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
 import {
@@ -441,8 +448,20 @@ function slotCacheCfg() {
 
 /** Resolve a short-lived fingerprint of live model/template/tokenizer properties. */
 async function modelCompatibilityHash(model) {
+  return (await modelServingRevisions(model)).compatibility;
+}
+
+/**
+ * Resolve the short-lived compatibility and tokenizer revisions of one concrete
+ * model from a single live `/props` probe. Both revisions share the cache entry
+ * so timing evidence and cache fingerprints always describe the same probe.
+ *
+ * @param {string} model Concrete resolved model id.
+ * @returns {Promise<{compatibility:string,tokenizer:string|null}>} Serving revisions.
+ */
+async function modelServingRevisions(model) {
   const cached = modelCompatibilityCache.get(model);
-  if (cached && Date.now() - cached.checkedAt < 60_000) return cached.hash;
+  if (cached && Date.now() - cached.checkedAt < 60_000) return cached;
   let props = null;
   try {
     const response = await fetch(`http://localhost:${LLAMA_PORT}/props?model=${encodeURIComponent(model)}`, {
@@ -464,8 +483,9 @@ async function modelCompatibilityHash(model) {
     adapters: props?.adapters ?? null,
     runtime: props?.default_generation_settings ?? null,
   });
-  modelCompatibilityCache.set(model, { hash, checkedAt: Date.now() });
-  return hash;
+  const revisions = { compatibility: hash, tokenizer: tokenizerRevision(props), checkedAt: Date.now() };
+  modelCompatibilityCache.set(model, revisions);
+  return revisions;
 }
 
 /**
@@ -7326,6 +7346,46 @@ async function eraseOwnedAffinitySlots(records) {
   return { invalidated: records.length, erased, deferred };
 }
 
+/**
+ * Fold engine-reported prefill telemetry into a prepared lease's timing recorder
+ * and return the finalized public evidence record. Engine timings are recorded
+ * as a separate `engine_reported` dimension so they can never be conflated with
+ * the manager-observed prefill window; leases without a recorder keep whatever
+ * record they already published.
+ *
+ * @param {Object} lease Internal prepared-context lease.
+ * @param {Object} [outcome] Prefill outcome.
+ * @param {Object|null} [outcome.result] Parsed llama.cpp prefill response, when one arrived.
+ * @returns {Record<string, unknown>|undefined} The finalized timing-evidence record.
+ */
+function finalizePreparedTiming(lease, { result = null } = {}) {
+  const recorder = lease?.timingRecorder;
+  if (!recorder) return lease?.timingEvidence;
+  const timings = result?.timings || null;
+  const cachedTokens = result?.usage?.prompt_tokens_details?.cached_tokens
+    ?? timings?.cache_n ?? timings?.prompt_n_cached ?? 0;
+  if (timings) {
+    recorder.setEngineTimings({
+      promptMs: timings.prompt_ms,
+      predictedMs: timings.predicted_ms,
+      promptN: timings.prompt_n,
+      cacheN: Number(cachedTokens) || 0,
+    });
+  }
+  // A concrete model differing from the certified one must invalidate the
+  // record rather than silently certify a swapped model.
+  if (result?.model) recorder.noteObservedModel(result.model);
+  if (Number.isInteger(lease.inputTokens)) {
+    recorder.setTokenAccounting({
+      exactInputTokens: lease.inputTokens,
+      cachedTokens: Math.min(Number(cachedTokens) || 0, lease.inputTokens),
+      source: 'exact_input_tokens_endpoint',
+    });
+  }
+  recorder.setCacheSignals({ cacheHitKind: lease.slotNeedsReset ? 'none' : 'affinity' });
+  return recorder.build();
+}
+
 /** Run zero-output prefill on the background lane and update its opaque lease. */
 async function schedulePreparedPrefill(leaseId, scopeId) {
   const lease = preparedContexts.getInternal(leaseId, scopeId);
@@ -7348,6 +7408,7 @@ async function schedulePreparedPrefill(leaseId, scopeId) {
         signal: controller.signal,
       });
     }
+    lease.timingRecorder?.mark('prefill_started');
     const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -7369,6 +7430,7 @@ async function schedulePreparedPrefill(leaseId, scopeId) {
       throw new Error(`llama.cpp prefill failed (${response.status}): ${details}`);
     }
     const result = await response.json();
+    lease.timingRecorder?.mark('prefill_completed');
     const discardedDecodeTokens = result.usage?.completion_tokens || result.timings?.predicted_n || 0;
     preparedContexts.update(leaseId, scopeId, {
       status: 'ready',
@@ -7379,15 +7441,18 @@ async function schedulePreparedPrefill(leaseId, scopeId) {
       slotNeedsReset: false,
       abortController: null,
       preparationBody: null,
+      timingEvidence: finalizePreparedTiming(lease, { result }),
     });
   } catch (error) {
     const cancelled = controller.signal.aborted;
+    if (cancelled) lease.timingRecorder?.cancel(String(controller.signal.reason || 'cancelled'));
     preparedContexts.update(leaseId, scopeId, {
       status: cancelled ? 'cancelled' : 'failed',
       preparationOutcome: cancelled ? String(controller.signal.reason || 'cancelled') : 'upstream_error',
       error: cancelled ? undefined : String(error.message || error).slice(0, 500),
       abortController: null,
       preparationBody: null,
+      timingEvidence: finalizePreparedTiming(lease),
     });
   } finally {
     if (queueId != null) llamaQueue.release(queueId);
@@ -7400,6 +7465,14 @@ app.post('/api/v1/context/prepare', async (req, res) => {
   const resolvedModel = resolveDefaultModel(requestedModel, config);
   const scope = deriveCacheScope(req.headers);
   const mode = req.body?.mode || 'count';
+  const timing = createRequestTimingRecorder({
+    profile: mode === 'prefill' ? TIMING_EVIDENCE_PROFILES.PREFILL : TIMING_EVIDENCE_PROFILES.COUNT,
+    requestedModel,
+    resolvedModel,
+    engine: currentEngine,
+    priority: 'interactive',
+    routingPolicy: 'local_only',
+  });
   if (!['count', 'prefill'].includes(mode)) {
     return res.status(400).json({ error: { message: 'mode must be count or prefill', type: 'invalid_request_error' } });
   }
@@ -7418,6 +7491,9 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       context_cache_contract: CONTEXT_CACHE_CONTRACT_VERSION,
     });
   }
+  // The evidence record certifies the priority class the request actually ran
+  // under, not the compatible default assumed before the body was parsed.
+  timing.setIdentity({ priority });
   const residency = resolveContextResidency({
     mode,
     priority,
@@ -7458,6 +7534,10 @@ app.post('/api/v1/context/prepare', async (req, res) => {
     preparationOutcome: decision.preparationOutcome,
     capabilities,
     compatibilityHash: compatibilityFingerprint({ resolvedModel, engine: ENGINE_TYPES.LLAMA }),
+    // A lease that never touched the model still publishes evidence: whatever
+    // was measured (queue wait, when admission was reached) plus typed reasons
+    // for every dimension that never ran.
+    timingEvidence: timing.build(),
   });
 
   const preflight = contextPrepareAdmission({
@@ -7488,8 +7568,12 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       model: resolvedModel,
       endpoint: 'context/prepare',
       priority,
-      onPreempt: reason => controller.abort(reason),
+      onPreempt: reason => {
+        timing.cancel(String(reason ?? 'preempted'));
+        controller.abort(reason);
+      },
     });
+    timing.mark('admitted');
 
     // Residency is re-verified INSIDE the lane. The preflight above is advisory:
     // only this check is ordered against model swaps and competing admissions.
@@ -7518,7 +7602,7 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       await ensureModelServed(resolvedModel);
     }
 
-    const [count, rendered, compatibilityHash] = await Promise.all([
+    const [count, rendered, revisions] = await Promise.all([
       requestExactInputTokens({
         kind: 'chat',
         baseUrl: `http://localhost:${LLAMA_PORT}`,
@@ -7527,6 +7611,7 @@ app.post('/api/v1/context/prepare', async (req, res) => {
         engine: ENGINE_TYPES.LLAMA,
         body: req.body,
         signal: controller.signal,
+        recorder: timing,
       }),
       requestRenderedPrefix({
         baseUrl: `http://localhost:${LLAMA_PORT}`,
@@ -7534,8 +7619,15 @@ app.post('/api/v1/context/prepare', async (req, res) => {
         body: req.body,
         signal: controller.signal,
       }),
-      modelCompatibilityHash(resolvedModel),
+      modelServingRevisions(resolvedModel),
     ]);
+    const compatibilityHash = revisions.compatibility;
+    timing.setIdentity({ modelRevision: revisions.compatibility, tokenizerRevision: revisions.tokenizer });
+    timing.setTokenAccounting({
+      exactInputTokens: count.input_tokens,
+      cachedTokens: 0,
+      source: 'exact_input_tokens_endpoint',
+    });
     const requestHash = contextPrefixRequestHash(req.body, resolvedModel);
     const lease = preparedContexts.create({
       scopeId: scope.id,
@@ -7554,6 +7646,8 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       requestHash,
       preparationBody: mode === 'prefill' ? req.body : null,
       capabilities,
+      timingRecorder: mode === 'prefill' ? timing : null,
+      timingEvidence: timing.build(),
     });
 
     if (mode === 'prefill') {
@@ -8266,6 +8360,96 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
   }
 }
 
+/**
+ * Read already-probed serving revisions for a model without triggering a new
+ * `/props` probe. An unprobed model yields nulls rather than a fabricated
+ * revision, so evidence never certifies an unverified tokenizer.
+ *
+ * @param {string} model Concrete resolved model id.
+ * @returns {{compatibility:string|null,tokenizer:string|null}} Cached revisions.
+ */
+function cachedServingRevisions(model) {
+  const cached = modelCompatibilityCache.get(model);
+  return cached && Date.now() - cached.checkedAt < 60_000
+    ? { compatibility: cached.compatibility, tokenizer: cached.tokenizer }
+    : { compatibility: null, tokenizer: null };
+}
+
+/**
+ * Finalize the timing evidence of a served chat completion.
+ *
+ * A served generation gives the manager only two directly observable moments:
+ * admission (the local queue slot was acquired) and first emitted content.
+ * llama.cpp reports prompt-processing time but folds input tokenization into
+ * it and never reports when decoding began, so tokenization and inference start
+ * are declared unsupported with explicit typed reasons instead of being derived
+ * from prompt timing or from an aggregate queue counter. Records from this path
+ * are therefore observational: they stay `complete: false` by construction, and
+ * certification must use the context-prepare measurement path.
+ *
+ * @param {import('./timing-evidence.js').TimingEvidenceRecorder} recorder Request recorder.
+ * @param {Object} context Request outcome context.
+ * @param {string|number} [context.requestId] Active request identifier.
+ * @param {string} [context.requestedModel] Caller-supplied model or alias.
+ * @param {string} [context.resolvedModel] Concrete model that served.
+ * @param {string} [context.priority] Effective request priority class.
+ * @param {string} [context.routingPolicy] Effective routing outcome.
+ * @param {Object|null} [context.timings] llama.cpp `timings` payload, when reported.
+ * @param {number} [context.promptTokens] Exact input tokens reported for the request.
+ * @param {number} [context.cachedTokens] Reused prefix tokens reported for the request.
+ * @param {string} [context.cacheHitKind] Manager cache hit classification.
+ * @param {boolean} [context.reloaded] Whether a persisted KV dump was restored.
+ * @returns {Record<string, unknown>|null} The public record, or null if unbuildable.
+ */
+function finalizeChatTiming(recorder, {
+  requestId = null,
+  requestedModel = null,
+  resolvedModel = null,
+  priority = null,
+  routingPolicy = null,
+  timings = null,
+  promptTokens = 0,
+  cachedTokens = 0,
+  cacheHitKind = 'none',
+  reloaded = false,
+} = {}) {
+  if (!recorder || !resolvedModel) return null;
+  const revisions = cachedServingRevisions(resolvedModel);
+  recorder.setRequestId(requestId == null ? null : String(requestId));
+  recorder.setIdentity({
+    requestedModel,
+    resolvedModel,
+    engine: currentEngine,
+    modelRevision: revisions.compatibility,
+    tokenizerRevision: revisions.tokenizer,
+    priority,
+    routingPolicy,
+  });
+  recorder.markDimensionUnsupported('tokenization', TIMING_UNSUPPORTED_REASONS.ENGINE_DOES_NOT_SEPARATE_TOKENIZATION);
+  recorder.markDimensionUnsupported('prefill', TIMING_UNSUPPORTED_REASONS.MANAGER_CANNOT_SEPARATE_PREFILL);
+  recorder.markDimensionUnsupported('inference_start', TIMING_UNSUPPORTED_REASONS.MANAGER_CANNOT_OBSERVE_INFERENCE_START);
+  if (timings) {
+    recorder.setEngineTimings({
+      promptMs: timings.prompt_ms,
+      predictedMs: timings.predicted_ms,
+      promptN: timings.prompt_n,
+      cacheN: Number(cachedTokens) || 0,
+    });
+  }
+  const exactInputTokens = Number(promptTokens) || 0;
+  recorder.setTokenAccounting({
+    exactInputTokens,
+    cachedTokens: Math.min(Number(cachedTokens) || 0, exactInputTokens),
+    source: timings ? 'llama_cpp_timings' : 'openai_usage',
+  });
+  recorder.setCacheSignals({ cacheHitKind, reloaded });
+  try {
+    return recorder.build();
+  } catch {
+    return null;
+  }
+}
+
 // OpenAI-compatible chat completions (streaming and non-streaming)
 /**
  * Expand multimodal URL parts and proxy an OpenAI chat completion request.
@@ -8275,6 +8459,8 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
  */
 async function handleChatCompletions(req, res) {
   const startTime = Date.now();
+  const chatTiming = new TimingEvidenceRecorder({ profile: TIMING_EVIDENCE_PROFILES.GENERATION });
+  chatTiming.mark('received');
   const isStreaming = req.body.stream === true;
   let requestPolicy;
   try {
@@ -8839,6 +9025,7 @@ async function handleChatCompletions(req, res) {
       } : null
     });
     initialQueueWait = slot.queueWait;
+    chatTiming.mark('admitted');
     if (isStreaming && !res.writableEnded) {
       flushSseHeaders();
       res.write(`: manager queue-wait-ms=${initialQueueWait} priority=${requestPolicy.priority}\n\n`);
@@ -9115,6 +9302,7 @@ async function handleChatCompletions(req, res) {
       let model = req.body.model || 'unknown';
       let responseText = '';
       let serverTimings = null;
+      let firstContentMarked = false;
 
       const processStream = async () => {
         try {
@@ -9148,6 +9336,7 @@ async function handleChatCompletions(req, res) {
                                  delta.reasoning || delta.thinking ||
                                  delta.text || '';
                     if (text) {
+                      if (!firstContentMarked) { firstContentMarked = true; chatTiming.mark('first_content'); }
                       completionTokens++;
                       responseText += text;
                       updateActiveRequest(activeReqId, text);
@@ -9225,7 +9414,19 @@ async function handleChatCompletions(req, res) {
             status: 200, duration: wallDuration, promptTokens, completionTokens,
             tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
             messages: req.body.messages || null, prompt: null,
-            response: responseText, error: null
+            response: responseText, error: null,
+            timingEvidence: finalizeChatTiming(chatTiming, {
+              requestId: activeReqId,
+              requestedModel: rawModel,
+              resolvedModel: requestedModel,
+              priority: requestPolicy.priority,
+              routingPolicy: routing.offloadSuppressed ? 'offload-suppressed(local_only)' : 'local',
+              timings: serverTimings,
+              promptTokens,
+              cachedTokens: serverTimings?.cache_n || serverTimings?.prompt_n_cached || 0,
+              cacheHitKind: diskRestored ? 'disk_restore' : (slotAssignment?.prepared ? 'prepared' : (slotAssignment?.hit ? 'affinity' : 'none')),
+              reloaded: diskRestored,
+            }),
           });
           endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
         } catch (e) {
@@ -9296,12 +9497,29 @@ async function handleChatCompletions(req, res) {
         routingOutcome: routing.offloadSuppressed ? 'offload-suppressed(local_only)' : 'local',
       });
 
+      // The non-streaming path has no per-token stream to observe, so the
+      // manager's first-content moment is the arrival of the complete body.
+      if (completionTokens > 0) chatTiming.mark('first_content');
+      const timingEvidence = finalizeChatTiming(chatTiming, {
+        requestId: activeReqId,
+        requestedModel: rawModel,
+        resolvedModel: requestedModel,
+        priority: requestPolicy.priority,
+        routingPolicy: routing.offloadSuppressed ? 'offload-suppressed(local_only)' : 'local',
+        timings: data.timings || null,
+        promptTokens,
+        cachedTokens: usage.prompt_tokens_details?.cached_tokens || timings.cache_n || timings.prompt_n_cached || 0,
+        cacheHitKind: diskRestored ? 'disk_restore' : (slotAssignment?.prepared ? 'prepared' : (slotAssignment?.hit ? 'affinity' : 'none')),
+        reloaded: diskRestored,
+      });
+
       logLlm({
         endpoint: 'chat/completions', model: requestedModel,
         stream: false, status: 200, duration: wallDuration, promptTokens, completionTokens,
         tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
         messages: req.body.messages || null, prompt: null,
-        response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || data.choices?.[0]?.message?.reasoning || null, error: null
+        response: data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || data.choices?.[0]?.message?.reasoning || null, error: null,
+        timingEvidence,
       });
 
       // Normalize model field: return what was requested, not what llama-server reports
@@ -9331,6 +9549,7 @@ async function handleChatCompletions(req, res) {
             affinity: !!slotAssignment?.hit,
           },
           contextCacheContract: 1,
+          timingEvidence,
         },
         { completionTokens }
       );

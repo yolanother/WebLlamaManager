@@ -252,7 +252,7 @@ function youtubeChatExample(path) {
  * @returns {object} Endpoint description, request schema, and YouTube example.
  */
 const CHAT_OPTIONS = path => ({
-  description: 'Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side.',
+  description: 'Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side. Non-streaming responses carry a versioned `_llama_manager.timingEvidence` record; streamed responses publish the same record on the LLM capture log. Served completions report queue admission and first emitted content as manager-measured, while input tokenization and inference start are explicitly unsupported because llama.cpp folds tokenization into prompt processing and never reports decode start — use POST /api/v1/context/prepare for certifiable tokenization and prefill measurements.',
   requestSchema: CHAT_REQUEST_SCHEMA,
   examples: [youtubeChatExample(path)],
 });
@@ -339,6 +339,168 @@ const TRANSCRIPTION_OPTIONS = path => ({
   responseSchema: TRANSCRIPTION_RESPONSE_SCHEMA,
   examples: [transcriptionExample(path)],
 });
+
+/**
+ * One timing dimension. It either carries a real measurement or an explicit
+ * typed reason why none exists — a dimension is never reported as zero.
+ */
+const TIMING_DIMENSION_SCHEMA = {
+  oneOf: [
+    {
+      type: 'object',
+      required: ['supported', 'ms', 'origin'],
+      properties: {
+        supported: { const: true },
+        ms: { type: 'number', minimum: 0, description: 'Duration in milliseconds with microsecond resolution.' },
+        origin: {
+          type: 'string',
+          enum: ['manager_monotonic', 'engine_reported', 'client_wall_clock'],
+          description: 'Which clock produced the value.',
+        },
+        source: { type: 'string', description: 'Concrete instrument that produced the value.' },
+      },
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      required: ['supported', 'reason'],
+      properties: {
+        supported: { const: false },
+        reason: {
+          type: 'string',
+          enum: [
+            'engine_does_not_separate_tokenization',
+            'engine_lacks_prefill_instrumentation',
+            'engine_unsupported',
+            'manager_cannot_separate_prefill',
+            'manager_cannot_observe_inference_start',
+            'client_clock_not_reported',
+            'phase_not_reached',
+            'phase_not_applicable',
+            'mark_missing',
+          ],
+          description: 'Typed explanation for the absent measurement.',
+        },
+      },
+      additionalProperties: false,
+      description: 'An unmeasurable dimension. Never substitute zero for this shape.',
+    },
+  ],
+};
+
+/**
+ * Versioned per-request timing evidence. Durations are milliseconds measured on
+ * a process-monotonic clock; `started_at` is a wall-clock correlation timestamp
+ * only and must never be used for duration arithmetic. The record contains no
+ * prompt text, message content, or credentials.
+ */
+export const TIMING_EVIDENCE_SCHEMA = {
+  type: 'object',
+  required: [
+    'object', 'timing_evidence_version', 'context_cache_contract', 'profile',
+    'identity', 'clocks', 'manager_observed', 'engine_reported', 'client_observed',
+    'cache', 'lifecycle', 'complete', 'incomplete_reasons',
+  ],
+  properties: {
+    object: { const: 'llama_manager.timing_evidence' },
+    timing_evidence_version: { type: 'integer', description: 'Revision of this record contract.' },
+    context_cache_contract: { type: 'integer', description: 'Context-cache contract revision the counts belong to.' },
+    profile: {
+      type: 'string',
+      enum: ['count', 'prefill', 'generation'],
+      description: 'Certification profile declaring which dimensions must be measured.',
+    },
+    request_id: { type: ['string', 'null'] },
+    identity: {
+      type: 'object',
+      description: 'The exact serving identity this evidence certifies.',
+      properties: {
+        requested_model: { type: ['string', 'null'], description: 'Caller model or alias.' },
+        resolved_model: { type: 'string', description: 'Concrete model that served the request.' },
+        certified_model: { type: 'string', description: 'Model this evidence certifies; always the resolved model.' },
+        engine: { type: ['string', 'null'] },
+        engine_revision: { type: ['string', 'null'] },
+        model_revision: { type: ['string', 'null'], description: 'Live model/template/runtime fingerprint.' },
+        tokenizer_revision: { type: ['string', 'null'], description: 'Canonical tokenizer fingerprint, or null when unprobed.' },
+        priority: { type: ['string', 'null'], enum: ['realtime', 'interactive', 'background', null] },
+        routing_policy: { type: ['string', 'null'] },
+        model_swap_detected: {
+          type: 'boolean',
+          description: 'True when the engine served a model other than the certified one; the record is then incomplete.',
+        },
+      },
+    },
+    clocks: {
+      type: 'object',
+      properties: {
+        unit: { const: 'milliseconds' },
+        precision: { const: 'microsecond' },
+        monotonic_source: { type: 'string', description: 'Monotonic clock backing every duration.' },
+        started_at: { type: ['string', 'null'], format: 'date-time', description: 'Wall-clock correlation only.' },
+      },
+    },
+    manager_observed: {
+      type: 'object',
+      description: 'Dimensions measured by Llama Manager itself.',
+      properties: {
+        queue_wait: TIMING_DIMENSION_SCHEMA,
+        tokenization: TIMING_DIMENSION_SCHEMA,
+        prefill: TIMING_DIMENSION_SCHEMA,
+        inference_start: TIMING_DIMENSION_SCHEMA,
+        first_content: TIMING_DIMENSION_SCHEMA,
+      },
+    },
+    engine_reported: {
+      type: 'object',
+      description: 'Dimensions reported by the serving engine. llama.cpp folds input tokenization into prompt processing, so its tokenization dimension is always unsupported.',
+      properties: {
+        tokenization: TIMING_DIMENSION_SCHEMA,
+        prefill: TIMING_DIMENSION_SCHEMA,
+      },
+    },
+    client_observed: {
+      type: 'object',
+      description: 'Caller wall-clock measurements, kept strictly separate from manager-observed values.',
+      properties: { first_token: TIMING_DIMENSION_SCHEMA },
+    },
+    cache: {
+      type: 'object',
+      properties: {
+        classification: {
+          type: 'string',
+          enum: ['cold', 'warm_prefix', 'persona_change', 'eviction_reload', 'cancelled', 'unsupported'],
+        },
+        hit_kind: { type: ['string', 'null'] },
+        reloaded: { type: 'boolean' },
+        prior_cached_tokens: { type: ['integer', 'null'] },
+        token_accounting: {
+          type: 'object',
+          properties: {
+            exact_input_tokens: { type: ['integer', 'null'] },
+            cached_tokens: { type: ['integer', 'null'] },
+            new_tokens: { type: ['integer', 'null'], description: 'Null when the counts do not reconcile.' },
+            reconciled: { type: 'boolean', description: 'True only when 0 <= cached_tokens <= exact_input_tokens.' },
+            source: { type: ['string', 'null'] },
+            tokenizer_revision: { type: ['string', 'null'] },
+            context_cache_contract: { type: 'integer' },
+          },
+        },
+      },
+    },
+    lifecycle: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Lifecycle marks actually recorded, in contract order.',
+    },
+    cancelled: { type: 'boolean' },
+    cancellation_reason: { type: ['string', 'null'] },
+    complete: {
+      type: 'boolean',
+      description: 'True only when every dimension the profile requires is measured, counts reconcile, no model swap occurred, and tokenization did not overlap prefill. Downstream certification must treat false as red.',
+    },
+    incomplete_reasons: { type: 'array', items: { type: 'string' } },
+  },
+};
 
 const CONTEXT_PREPARE_REQUEST_SCHEMA = {
   type: 'object',
@@ -433,6 +595,7 @@ const CONTEXT_PREPARE_RESPONSE_SCHEMA = {
       additionalProperties: true,
     },
     inputTokensDiscarded: { type: 'integer', minimum: 0, description: 'Internal decode tokens consumed and discarded during prefill.' },
+    timingEvidence: TIMING_EVIDENCE_SCHEMA,
     createdAt: { type: 'integer', description: 'Epoch milliseconds when the lease was created.' },
     updatedAt: { type: 'integer', description: 'Epoch milliseconds of the last lease transition.' },
     expiresAt: { type: 'integer', description: 'Epoch milliseconds when the lease expires.' },
@@ -453,6 +616,8 @@ const CONTEXT_PREPARE_OPTIONS = {
     'priority: "background" is bounded, preemptible maintenance work implying resident_only; arriving realtime inference cancels it and the lease reports status "cancelled". realtime cannot be requested here.',
     'Every response carries contextCacheContract plus both requestedModel and resolvedModel so an alias can never silently certify a different model.',
     'allow_model_load remains supported for existing callers but is unsafe for realtime background prewarming.',
+    'Every lease carries a versioned timingEvidence record separating admission wait, input tokenization, and KV prefill as independently measured monotonic dimensions; a dimension that cannot be measured carries a typed reason and is never reported as zero.',
+    'A prefill lease publishes an incomplete record at creation (HTTP 202) and a finalized one once background preparation settles, so poll GET /api/v1/context/{id} for the final measurements.',
   ].join(' '),
   requestSchema: CONTEXT_PREPARE_REQUEST_SCHEMA,
   responseSchema: CONTEXT_PREPARE_RESPONSE_SCHEMA,
@@ -516,6 +681,19 @@ function endpoint(method, path, tag, summary, options = {}) {
     examples: options.examples ?? [makeExample(method, path, summary, body)],
   };
 }
+
+/**
+ * Documentation overrides for reading back a prepared-context lease. The lease
+ * shape is identical to the preparation response, so the same schema is reused
+ * and only the prose differs.
+ */
+const PREPARED_CONTEXT_OPTIONS = {
+  description: [
+    'Returns a prepared-context lease, including its versioned timingEvidence record.',
+    'Poll this after a prefill lease is accepted (HTTP 202) to read the finalized tokenization and prefill measurements once background preparation settles.',
+  ].join(' '),
+  responseSchema: CONTEXT_PREPARE_RESPONSE_SCHEMA,
+};
 
 const ROUTES = [
   // Media ingestion and artifacts.
@@ -629,7 +807,7 @@ const ROUTES = [
   // Llama Manager context preparation and durable slot-cache extensions.
   ['POST', '/api/v1/context/prepare', 'context', 'Prepare a reusable inference context', CONTEXT_PREPARE_OPTIONS],
   ['DELETE', '/api/v1/context/cache', 'context', 'Clear all prepared context entries'],
-  ['GET', '/api/v1/context/{id}', 'context', 'Get a prepared context entry'],
+  ['GET', '/api/v1/context/{id}', 'context', 'Get a prepared context entry', PREPARED_CONTEXT_OPTIONS],
   ['DELETE', '/api/v1/context/{id}', 'context', 'Delete a prepared context entry'],
 
   // Bare OpenAI-compatible aliases used by stock SDKs with the documented

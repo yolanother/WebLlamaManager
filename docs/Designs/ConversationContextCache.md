@@ -265,6 +265,14 @@ never reported as a performance win.
 The first recorded hardware result and its isolation caveats are in
 [ConversationContextCache-2026-07-30.md](../Benchmarks/ConversationContextCache-2026-07-30.md).
 
+Per-request auditable latency evidence — separating input tokenization, queue
+wait, prefill, inference start, and first emitted content for one exact resolved
+model and contract revision — is a distinct versioned contract defined in
+[ContextTimingEvidence.md](ContextTimingEvidence.md). Prepared-context leases and
+chat completions both publish it; only the prepare path produces certifiable
+records, because llama.cpp folds input tokenization into prompt processing on the
+generation path.
+
 ## Alternatives rejected
 
 - Approximate role/text flattening: it cannot match the generation template,

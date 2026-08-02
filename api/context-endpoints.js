@@ -5,6 +5,8 @@
 // Builds safe llama.cpp requests for exact OpenAI chat/Responses input counting
 // and KV preparation. Manager-only identity, prepared-handle, and raw slot
 // controls are removed before proxying so actual slot ownership remains local.
+// The exact-count call optionally brackets itself on a timing-evidence recorder
+// so input tokenization is measured discretely and never inferred from prefill.
 
 import { canonicalHash, CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
 
@@ -128,6 +130,12 @@ export async function requestRenderedPrefix({
  * @param {Record<string, unknown>} input.body Original request body.
  * @param {typeof fetch} [input.fetchImpl] Injectable fetch implementation.
  * @param {AbortSignal} [input.signal] Optional cancellation signal.
+ * @param {import('./timing-evidence.js').TimingEvidenceRecorder} [input.recorder]
+ *   Optional timing recorder. When supplied, the discrete upstream tokenization
+ *   call — and nothing else — is bracketed by the `tokenization_started` and
+ *   `tokenization_completed` lifecycle marks. A failed or aborted call leaves
+ *   `tokenization_completed` unmarked so the dimension reports an explicit
+ *   unsupported reason rather than a synthesized duration.
  * @returns {Promise<Record<string, unknown>>} Exact count plus manager metadata.
  * @throws {TypeError|ContextUpstreamError} For invalid input/upstream failure.
  */
@@ -140,10 +148,12 @@ export async function requestExactInputTokens({
   body,
   fetchImpl = fetch,
   signal,
+  recorder,
 } = {}) {
   const path = COUNT_PATHS[kind];
   if (!path) throw new TypeError(`unsupported input-token request kind: ${kind}`);
   if (!baseUrl || !resolvedModel) throw new TypeError('baseUrl and resolvedModel are required');
+  recorder?.mark('tokenization_started');
   const response = await fetchImpl(`${String(baseUrl).replace(/\/+$/, '')}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -158,6 +168,7 @@ export async function requestExactInputTokens({
   if (!Number.isInteger(data?.input_tokens) || data.input_tokens < 0) {
     throw new ContextUpstreamError(`exact ${kind} input counting returned an invalid response`, 502);
   }
+  recorder?.mark('tokenization_completed');
   return {
     object: data.object || 'response.input_tokens',
     input_tokens: data.input_tokens,

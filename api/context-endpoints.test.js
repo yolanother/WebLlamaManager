@@ -13,6 +13,7 @@ import {
   requestExactInputTokens,
   requestRenderedPrefix,
 } from './context-endpoints.js';
+import { TimingEvidenceRecorder, TIMING_EVIDENCE_PROFILES } from './timing-evidence.js';
 
 test('requestExactInputTokens proxies the native endpoint with resolved model and strips slot controls', async () => {
   let captured;
@@ -48,6 +49,72 @@ test('requestExactInputTokens proxies the native endpoint with resolved model an
     requested_model: 'voice-fast', resolved_model: 'gemma-real', engine: 'llama',
     context_cache_contract: 1,
   });
+});
+
+test('requestExactInputTokens brackets only the tokenization call on an optional recorder', async () => {
+  const state = { t: 0 };
+  const clock = () => state.t;
+  const recorder = new TimingEvidenceRecorder({
+    requestId: 'req_count',
+    profile: TIMING_EVIDENCE_PROFILES.COUNT,
+    clock,
+  });
+  recorder.setIdentity({ requestedModel: 'voice-fast', resolvedModel: 'gemma-real', engine: 'llama' });
+  recorder.mark('received');
+  recorder.mark('admitted');
+
+  const fetchImpl = async () => {
+    state.t += 17;
+    return new Response(JSON.stringify({ object: 'response.input_tokens', input_tokens: 130 }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  const result = await requestExactInputTokens({
+    kind: 'chat',
+    baseUrl: 'http://llama:5251',
+    requestedModel: 'voice-fast',
+    resolvedModel: 'gemma-real',
+    engine: 'llama',
+    body: { messages: [{ role: 'user', content: 'hello' }] },
+    fetchImpl,
+    recorder,
+  });
+
+  const record = recorder.build();
+  assert.equal(record.manager_observed.tokenization.ms, 17);
+  assert.equal(record.manager_observed.tokenization.source, 'manager_measured_tokenization_call');
+  // The public count payload shape is unchanged by recording.
+  assert.equal(result.input_tokens, 130);
+  assert.equal('timing_evidence' in result, false);
+});
+
+test('requestExactInputTokens leaves tokenization unmeasured when the upstream call fails', async () => {
+  const recorder = new TimingEvidenceRecorder({
+    requestId: 'req_fail',
+    profile: TIMING_EVIDENCE_PROFILES.COUNT,
+    clock: () => 0,
+  });
+  recorder.setIdentity({ resolvedModel: 'gemma-real', engine: 'llama' });
+  recorder.mark('received');
+  recorder.mark('admitted');
+
+  const fetchImpl = async () => new Response('upstream exploded', { status: 500 });
+  await assert.rejects(() => requestExactInputTokens({
+    kind: 'chat',
+    baseUrl: 'http://llama:5251',
+    resolvedModel: 'gemma-real',
+    engine: 'llama',
+    body: {},
+    fetchImpl,
+    recorder,
+  }));
+
+  const record = recorder.build();
+  assert.equal(record.manager_observed.tokenization.supported, false);
+  assert.equal(record.manager_observed.tokenization.reason, 'phase_not_reached');
+  assert.equal(record.complete, false);
 });
 
 test('contextPrefixRequestHash ignores output controls but changes with prefix material', () => {
