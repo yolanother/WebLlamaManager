@@ -475,10 +475,11 @@ gated model, the UI shows an actionable message pointing here.
 For unattended startup, `./install.sh` migrates the `HF_TOKEN` environment
 fallback into a mode-0600 systemd `EnvironmentFile`. Runtime launchers then
 copy it atomically into a mode-0600 file beneath the per-user runtime directory
-and give Distrobox only that filename. The raw token is never placed in a
-service definition or process command line. After rotating a token, update it
-in Settings (preferred), or update the environment fallback and rerun
-`./install.sh` before restarting the service.
+and give Distrobox only that filename after removing the token from Distrobox's
+inherited host environment. The raw token is never placed in a service
+definition or process command line. After rotating a token, update it in
+Settings (preferred), or update the environment fallback and rerun `./install.sh`
+before restarting the service.
 
 ### Via Web UI
 1. Go to "Download from HuggingFace" section

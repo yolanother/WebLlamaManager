@@ -261,9 +261,11 @@ instead of embedding the value in the unit or its command line.
 `start-llama.sh` and `start-embed.sh` use the shared
 `scripts/runtime-credentials.sh` helper to atomically create component-specific,
 mode-0600 environment files beneath `$XDG_RUNTIME_DIR/llama-manager`. Distrobox
-receives only `--env-file=<path>`; the raw credential is therefore absent from
-the host and container-launch process argument lists. The containing runtime
-directory is mode 0700.
+is launched with `HF_TOKEN` removed from its inherited host environment and
+receives only `--env-file=<path>`; this prevents Distrobox's automatic
+environment forwarding from expanding the raw credential into Podman arguments.
+The raw credential is therefore absent from host and container-launch process
+argument lists. The containing runtime directory is mode 0700.
 
 Rotating the fallback credential requires updating the environment source and
 rerunning `./install.sh`; subsequent runtime launches atomically replace their

@@ -87,7 +87,9 @@ CREDENTIAL_FILE="$(runtime_credentials_write embed "$HF_TOKEN")"
 # uses, then exec the embeddings llama-server. Non-secret values are positional
 # args to the inner shell and rebuilt with proper quoting, so model paths cannot
 # be word-split or injected. Package mode passes the absolute binary separately.
-exec "$DISTROBOX" enter --additional-flags "--env-file=$CREDENTIAL_FILE" \
+# Distrobox forwards its host environment by default, so remove HF_TOKEN from
+# that environment before entry and let only the protected env file supply it.
+exec env -u HF_TOKEN "$DISTROBOX" enter --additional-flags "--env-file=$CREDENTIAL_FILE" \
     "$CONTAINER_NAME" -- bash -c '
   export HSA_OVERRIDE_GFX_VERSION=11.5.1
   export ROCM_LLVM_PRE_VEGA=1

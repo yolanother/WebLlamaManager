@@ -80,7 +80,9 @@ CREDENTIAL_FILE="$(runtime_credentials_write llama "$HF_TOKEN")"
 
 # Enter the container and run the selected script. Non-secret values remain
 # separate argv elements so configuration is never interpolated as shell source.
-exec "$DISTROBOX" enter --additional-flags "--env-file=$CREDENTIAL_FILE" \
+# Distrobox forwards its host environment by default, so remove HF_TOKEN from
+# that environment before entry and let only the protected env file supply it.
+exec env -u HF_TOKEN "$DISTROBOX" enter --additional-flags "--env-file=$CREDENTIAL_FILE" \
     "$CONTAINER_NAME" -- /usr/bin/env \
     "MODELS_DIR=$MODELS_DIR" \
     "MODELS_MAX=$MODELS_MAX" \

@@ -47,7 +47,8 @@ assert_eq() {
   fi
 }
 
-# Creates isolated launcher copies and a Distrobox replacement that logs argv.
+# Creates isolated launcher copies and a Distrobox replacement that logs argv
+# plus whether Distrobox inherited the raw credential from the host environment.
 make_fixture() {
   local fixture="$1"
   mkdir -p "$fixture/launchers/scripts" "$fixture/runtime"
@@ -62,6 +63,14 @@ make_fixture() {
 set -euo pipefail
 : "${DISTROBOX_ARGV_LOG:?}"
 printf '%s\n' "$@" > "$DISTROBOX_ARGV_LOG"
+if [ "${1:-}" = enter ]; then
+  : "${DISTROBOX_ENV_LOG:?}"
+  if [ "${HF_TOKEN+x}" = x ]; then
+    printf 'set\n' > "$DISTROBOX_ENV_LOG"
+  else
+    printf 'unset\n' > "$DISTROBOX_ENV_LOG"
+  fi
+fi
 if [ "${1:-}" = list ]; then
   printf '| 000000000000 | credential-test | running | test |\n'
 fi
@@ -84,6 +93,7 @@ test_launcher() {
   env \
     DISTROBOX_BIN="$fixture/distrobox" \
     DISTROBOX_ARGV_LOG="$fixture/argv" \
+    DISTROBOX_ENV_LOG="$fixture/environment" \
     DISTROBOX_CONTAINER=credential-test \
     XDG_RUNTIME_DIR="$fixture/runtime" \
     HF_TOKEN="$SENTINEL" \
@@ -97,6 +107,8 @@ test_launcher() {
   [ ! -f "$fixture/argv" ] || argv="$(cat "$fixture/argv")"
   assert_not_contains "$name argv omits the credential" "$argv" "$SENTINEL"
   assert_contains "$name argv uses an env file" "$argv" "--env-file"
+  assert_eq "$name Distrobox environment omits the credential" "unset" \
+    "$(cat "$fixture/environment" 2>/dev/null || true)"
 
   local credential_file="$fixture/runtime/llama-manager/$name.env"
   assert_eq "$name credential file mode" "600" \
