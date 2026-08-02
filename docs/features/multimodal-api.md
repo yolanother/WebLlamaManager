@@ -5,7 +5,8 @@ Use of this source code is governed by the LICENSE file in the repository root.
 Public contract and operator reference for Llama Manager's OpenAI-compatible
 multimodal API. This document defines accepted chat content parts, server-side
 media expansion, capability discovery, processing limits, digest reporting,
-audio transcription, and the machine-readable API documentation endpoints.
+outbound URL security, audio transcription, and the machine-readable API
+documentation endpoints.
 -->
 
 # Multimodal API
@@ -115,6 +116,20 @@ For media within one processing window, the server expands a video into a
 `[frame n/N @ MM:SS]` markers followed by `image_url` frame parts, and one or
 more normalized WAV `input_audio` parts when audio is requested and present.
 `audio_url` similarly becomes normalized WAV `input_audio` parts.
+
+### Outbound URL security
+
+Direct media ingestion accepts only HTTP(S) destinations whose literal address
+or every current DNS answer is publicly routable. Loopback, private, carrier
+NAT, link-local (including cloud metadata), reserved, multicast, and IPv6
+unique-local destinations are rejected before any request is sent. Redirects
+are handled manually, limited to five hops, and resolved and validated again
+before each hop. Network failures expose only a generic API error, never an
+upstream response body or internal exception detail.
+
+The YouTube route remains restricted to the supported `youtube.com` and
+`youtu.be` hostname forms and validates that hostname's DNS answers before
+starting `yt-dlp`.
 
 ## Limits and long-media digests
 

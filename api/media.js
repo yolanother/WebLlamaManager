@@ -3,15 +3,17 @@
 // LICENSE file in the repository root.
 //
 // This module owns the /api/media router. It accepts bounded multipart uploads,
-// direct HTTP(S) media downloads, and supported YouTube URLs, then stores each
-// item below the runtime data directory, prepares JPEG frames for vision models,
-// and normalizes audio for audio-capable models with ffprobe/ffmpeg. Process and
-// network dependencies are injectable so the pipeline remains testable on hosts
-// where the optional binaries are absent.
+// SSRF-guarded direct HTTP(S) media downloads, and supported YouTube URLs, then
+// stores each item below the runtime data directory, prepares JPEG frames for
+// vision models, and normalizes audio for audio-capable models with
+// ffprobe/ffmpeg. Process and network dependencies are injectable so the
+// pipeline remains testable on hosts where the optional binaries are absent.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { createRequire } from 'node:module';
+import { BlockList, isIP } from 'node:net';
 import {
   mkdir,
   open,
@@ -34,7 +36,41 @@ const PROCESS_OUTPUT_LIMIT = 16_384;
 const MULTIPART_OVERHEAD_BYTES = 1024 * 1024;
 const SCALE_FILTER = "scale=w='if(gte(iw,ih),min(iw,768),-2)':h='if(lt(iw,ih),min(ih,768),-2)'";
 const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
+const MAX_MEDIA_REDIRECTS = 5;
 const require = createRequire(import.meta.url);
+
+const NON_PUBLIC_ADDRESSES = new BlockList();
+for (const [address, prefix] of [
+  ['0.0.0.0', 8],
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['172.16.0.0', 12],
+  ['192.0.0.0', 24],
+  ['192.0.2.0', 24],
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15],
+  ['198.51.100.0', 24],
+  ['203.0.113.0', 24],
+  ['224.0.0.0', 4],
+  ['240.0.0.0', 4],
+]) NON_PUBLIC_ADDRESSES.addSubnet(address, prefix, 'ipv4');
+for (const [address, prefix] of [
+  ['::', 96],
+  ['::1', 128],
+  ['64:ff9b::', 96],
+  ['64:ff9b:1::', 48],
+  ['100::', 64],
+  ['2001::', 23],
+  ['2001:db8::', 32],
+  ['2002::', 16],
+  ['3fff::', 20],
+  ['fc00::', 7],
+  ['fe80::', 10],
+  ['fec0::', 10],
+  ['ff00::', 8],
+]) NON_PUBLIC_ADDRESSES.addSubnet(address, prefix, 'ipv6');
 
 const MIME_EXTENSIONS = new Map([
   ['image/jpeg', 'jpg'],
@@ -100,6 +136,68 @@ export function classifyMediaUrl(value) {
     kind: isWatch || isShort || isShortLink ? 'youtube' : 'direct',
     url: parsed.href,
   };
+}
+
+/**
+ * Determine whether an IP address is globally routable enough for media fetches.
+ *
+ * @param {string} address IPv4 or IPv6 address returned by URL parsing or DNS.
+ * @returns {boolean} True only when the address is outside special-use ranges.
+ */
+function isPublicAddress(address) {
+  const family = isIP(address);
+  if (family === 4) return !NON_PUBLIC_ADDRESSES.check(address, 'ipv4');
+  if (family === 6) return !NON_PUBLIC_ADDRESSES.check(address, 'ipv6');
+  return false;
+}
+
+/**
+ * Resolve and validate one outbound media URL immediately before it is fetched.
+ * Every DNS answer must be public; a single private answer rejects the request.
+ *
+ * @param {string} rawUrl Candidate absolute HTTP(S) URL.
+ * @param {Function} lookupImpl Promise-based DNS lookup implementation.
+ * @returns {Promise<URL>} Parsed URL whose current DNS answers are public.
+ * @throws {MediaPipelineError} When the URL or resolved destination is unsafe.
+ */
+async function assertPublicMediaUrl(rawUrl, lookupImpl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new MediaPipelineError(400, { error: 'Media URL is invalid' });
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new MediaPipelineError(400, { error: 'Media URL must use http or https' });
+  }
+  if (parsed.username || parsed.password) {
+    throw new MediaPipelineError(400, { error: 'Media URL credentials are not allowed' });
+  }
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+    throw new MediaPipelineError(400, { error: 'Media URL must resolve to a public address' });
+  }
+
+  const literalFamily = isIP(hostname);
+  let answers;
+  if (literalFamily) {
+    answers = [{ address: hostname, family: literalFamily }];
+  } else {
+    try {
+      answers = await lookupImpl(hostname, { all: true, verbatim: true });
+    } catch (error) {
+      throw new MediaPipelineError(502, { error: 'Media URL could not be resolved' }, error);
+    }
+  }
+  if (!Array.isArray(answers)) answers = answers ? [answers] : [];
+  if (answers.length === 0) {
+    throw new MediaPipelineError(502, { error: 'Media URL could not be resolved' });
+  }
+  if (answers.some(answer => !isPublicAddress(answer?.address))) {
+    throw new MediaPipelineError(400, { error: 'Media URL must resolve to a public address' });
+  }
+  return parsed;
 }
 
 /**
@@ -421,6 +519,7 @@ export function parseMultipartFile(body, contentType, maxBytes) {
  *   dataDir:string,
  *   spawnImpl?:Function,
  *   fetchImpl?:Function,
+ *   lookupImpl?:Function,
  *   maxItems?:number,
  *   maxBytes?:number,
  *   downloadTimeoutMs?:number,
@@ -435,6 +534,7 @@ export function createMediaRouter({
   dataDir,
   spawnImpl = nodeSpawn,
   fetchImpl = globalThis.fetch,
+  lookupImpl = dnsLookup,
   maxItems = positiveInteger(process.env.LLAMA_MANAGER_MEDIA_MAX_ITEMS, DEFAULT_MAX_ITEMS),
   maxBytes = positiveInteger(process.env.LLAMA_MANAGER_MEDIA_MAX_BYTES, DEFAULT_MAX_BYTES),
   downloadTimeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS,
@@ -445,6 +545,7 @@ export function createMediaRouter({
 } = {}) {
   if (typeof dataDir !== 'string' || !dataDir) throw new TypeError('dataDir is required');
   if (typeof fetchImpl !== 'function') throw new TypeError('fetch is not available');
+  if (typeof lookupImpl !== 'function') throw new TypeError('DNS lookup is not available');
 
   // Load the server's existing dependency only when a router is actually built,
   // keeping pure-helper tests runnable before npm dependencies are installed.
@@ -496,6 +597,7 @@ export function createMediaRouter({
         url: classification.url,
         item,
         fetchImpl,
+        lookupImpl,
         maxBytes: limits.maxBytes,
         timeoutMs: downloadTimeoutMs,
       });
@@ -514,6 +616,7 @@ export function createMediaRouter({
       if (classification.kind !== 'youtube') {
         throw new MediaPipelineError(400, { error: 'A supported YouTube URL is required' });
       }
+      await assertPublicMediaUrl(classification.url, lookupImpl);
       item = await createItemDirectory(mediaRoot, idFactory);
       const downloaded = await downloadYouTubeMedia({
         url: classification.url,
@@ -722,17 +825,60 @@ async function extractFrames({ sourcePath, framesDir, kind, spawnImpl, ffmpegTim
   return { durationSec, frames: timestamps.map((_, index) => index) };
 }
 
-async function downloadDirectMedia({ url, item, fetchImpl, maxBytes, timeoutMs }) {
+/**
+ * Fetch a public media URL while validating every bounded redirect hop.
+ *
+ * @param {{url:string,fetchImpl:Function,lookupImpl:Function,signal:AbortSignal}} options Network dependencies.
+ * @returns {Promise<{response:Response,finalUrl:string}>} Final non-redirect response and URL.
+ * @throws {MediaPipelineError} When resolution or redirect handling is unsafe.
+ */
+async function fetchPublicMedia({ url, fetchImpl, lookupImpl, signal }) {
+  let currentUrl = url;
+  for (let redirectCount = 0; redirectCount <= MAX_MEDIA_REDIRECTS; redirectCount += 1) {
+    const parsed = await assertPublicMediaUrl(currentUrl, lookupImpl);
+    const response = await fetchImpl(parsed.href, {
+      redirect: 'manual',
+      signal,
+      headers: { 'User-Agent': 'Llama-Manager media ingestion' },
+    });
+    if (![301, 302, 303, 307, 308].includes(response.status)) {
+      return { response, finalUrl: parsed.href };
+    }
+
+    try {
+      await response.body?.cancel?.();
+    } catch {
+      // The redirect response body is irrelevant and may already be closed.
+    }
+    if (redirectCount === MAX_MEDIA_REDIRECTS) {
+      throw new MediaPipelineError(502, { error: 'Media URL returned too many redirects' });
+    }
+    const location = response.headers.get('location');
+    if (!location) {
+      throw new MediaPipelineError(502, { error: 'Media URL returned an invalid redirect' });
+    }
+    try {
+      currentUrl = new URL(location, parsed).href;
+    } catch {
+      throw new MediaPipelineError(502, { error: 'Media URL returned an invalid redirect' });
+    }
+  }
+  throw new MediaPipelineError(502, { error: 'Media URL returned too many redirects' });
+}
+
+async function downloadDirectMedia({ url, item, fetchImpl, lookupImpl, maxBytes, timeoutMs }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
   let response;
+  let finalUrl = url;
   try {
-    response = await fetchImpl(url, {
-      redirect: 'follow',
+    ({ response, finalUrl } = await fetchPublicMedia({
+      url,
+      fetchImpl,
+      lookupImpl,
       signal: controller.signal,
-      headers: { 'User-Agent': 'Llama-Manager media ingestion' },
-    });
+    }));
     if (!response.ok) {
       throw new MediaPipelineError(502, { error: `Media URL returned HTTP ${response.status}` });
     }
@@ -742,7 +888,7 @@ async function downloadDirectMedia({ url, item, fetchImpl, maxBytes, timeoutMs }
     }
     if (!response.body) throw new MediaPipelineError(502, { error: 'Media URL returned an empty body' });
 
-    const originFilename = filenameFromResponse(response, url);
+    const originFilename = filenameFromResponse(response, finalUrl);
     const temporaryPath = join(item.dir, 'download.part');
     const handle = await open(temporaryPath, 'wx');
     const headChunks = [];
@@ -785,7 +931,7 @@ async function downloadDirectMedia({ url, item, fetchImpl, maxBytes, timeoutMs }
     if (error?.name === 'AbortError') {
       throw new MediaPipelineError(504, { error: 'Media download timed out' }, error);
     }
-    throw new MediaPipelineError(502, { error: `Media download failed: ${error.message}` }, error);
+    throw new MediaPipelineError(502, { error: 'Media download failed' }, error);
   } finally {
     clearTimeout(timer);
   }

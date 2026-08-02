@@ -114,6 +114,170 @@ test('classifyMediaUrl accepts only HTTP(S) direct and supported YouTube URLs', 
   assert.equal(classifyMediaUrl('not a url').kind, 'invalid');
 });
 
+test('direct media rejects private literal and DNS destinations before fetch', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-ssrf-test-'));
+  const fetchCalls = [];
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'private-destination-id',
+      lookupImpl: async hostname => {
+        assert.equal(hostname, 'private.example.test');
+        return [{ address: '169.254.169.254', family: 4 }];
+      },
+      fetchImpl: async url => {
+        fetchCalls.push(url);
+        return new Response('must not be fetched', { status: 200 });
+      },
+    });
+
+    for (const url of [
+      'http://127.0.0.1/private.mp4',
+      'http://10.0.0.1/private.mp4',
+      'http://192.168.1.10/private.mp4',
+      'http://169.254.169.254/private.mp4',
+      'http://[::1]/private.mp4',
+      'http://[fe80::1]/private.mp4',
+      'http://[fc00::1]/private.mp4',
+      'http://[::ffff:127.0.0.1]/private.mp4',
+    ]) {
+      const literal = await invokeRoute(routes, 'POST', '/link', { body: { url } });
+      assert.equal(literal.statusCode, 400, url);
+      assert.deepEqual(
+        literal.body,
+        { error: 'Media URL must resolve to a public address' },
+        url,
+      );
+    }
+
+    const resolved = await invokeRoute(routes, 'POST', '/link', {
+      body: { url: 'https://private.example.test/private.mp4' },
+    });
+    assert.equal(resolved.statusCode, 400);
+    assert.deepEqual(resolved.body, { error: 'Media URL must resolve to a public address' });
+    assert.deepEqual(fetchCalls, []);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('direct media revalidates redirect destinations and uses manual redirects', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-redirect-test-'));
+  const fetchCalls = [];
+  const lookupCalls = [];
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'redirect-destination-id',
+      lookupImpl: async hostname => {
+        lookupCalls.push(hostname);
+        return [{ address: '93.184.216.34', family: 4 }];
+      },
+      fetchImpl: async (url, options) => {
+        fetchCalls.push({ url, redirect: options.redirect });
+        return new Response(null, {
+          status: 302,
+          headers: { location: 'http://169.254.169.254/latest/meta-data/' },
+        });
+      },
+    });
+
+    const response = await invokeRoute(routes, 'POST', '/link', {
+      body: { url: 'https://public.example.test/movie.mp4' },
+    });
+    assert.equal(response.statusCode, 400);
+    assert.deepEqual(response.body, { error: 'Media URL must resolve to a public address' });
+    assert.deepEqual(fetchCalls, [{
+      url: 'https://public.example.test/movie.mp4',
+      redirect: 'manual',
+    }]);
+    assert.deepEqual(lookupCalls, ['public.example.test']);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('direct media follows a bounded redirect when both DNS destinations are public', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-public-redirect-test-'));
+  const fetchCalls = [];
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'public-redirect-id',
+      lookupImpl: async () => [{ address: '93.184.216.34', family: 4 }],
+      fetchImpl: async (url, options) => {
+        fetchCalls.push({ url, redirect: options.redirect });
+        if (fetchCalls.length === 1) {
+          return new Response(null, {
+            status: 302,
+            headers: { location: 'https://cdn.example.test/movie.mp4' },
+          });
+        }
+        return new Response('upstream unavailable', { status: 503 });
+      },
+    });
+    const response = await invokeRoute(routes, 'POST', '/link', {
+      body: { url: 'https://public.example.test/movie.mp4' },
+    });
+    assert.equal(response.statusCode, 502);
+    assert.deepEqual(response.body, { error: 'Media URL returned HTTP 503' });
+    assert.deepEqual(fetchCalls, [
+      { url: 'https://public.example.test/movie.mp4', redirect: 'manual' },
+      { url: 'https://cdn.example.test/movie.mp4', redirect: 'manual' },
+    ]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('direct media does not expose upstream network error details', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-media-error-test-'));
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'network-error-id',
+      lookupImpl: async () => [{ address: '93.184.216.34', family: 4 }],
+      fetchImpl: async () => {
+        throw new Error('internal upstream detail must stay private');
+      },
+    });
+    const response = await invokeRoute(routes, 'POST', '/link', {
+      body: { url: 'https://public.example.test/movie.mp4' },
+    });
+    assert.equal(response.statusCode, 502);
+    assert.deepEqual(response.body, { error: 'Media download failed' });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('YouTube ingestion validates the allowlisted hostname before yt-dlp', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'llama-youtube-ssrf-test-'));
+  let spawnCalls = 0;
+  try {
+    const routes = createRouterHarness({
+      dataDir,
+      idFactory: () => 'youtube-private-id',
+      lookupImpl: async hostname => {
+        assert.equal(hostname, 'www.youtube.com');
+        return [{ address: '127.0.0.1', family: 4 }];
+      },
+      spawnImpl: () => {
+        spawnCalls += 1;
+        throw new Error('yt-dlp must not start');
+      },
+    });
+    const response = await invokeRoute(routes, 'POST', '/youtube', {
+      body: { url: 'https://www.youtube.com/watch?v=abcdefghijk' },
+    });
+    assert.equal(response.statusCode, 400);
+    assert.deepEqual(response.body, { error: 'Media URL must resolve to a public address' });
+    assert.equal(spawnCalls, 0);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('media ids reject separators, traversal, dots, and empty values', () => {
   for (const id of ['abc123', 'AbC_123-x', '0']) assert.equal(isSafeMediaId(id), true);
   for (const id of ['', '.', '..', '../x', 'x/y', 'x\\y', 'space here', '%2e%2e']) {

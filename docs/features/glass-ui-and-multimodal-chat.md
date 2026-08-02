@@ -28,7 +28,7 @@
 
 Mounted at `/api/media` (2-line hook in `server.js`, storage under the runtime data dir), this is now the common lower-level ingestion pipeline for both the UI and external API clients:
 
-- `POST /api/media/upload` (multipart), `POST /api/media/link` `{url}`, `POST /api/media/youtube` `{url}` (yt-dlp, ≤720p mp4) → media metadata containing frames, duration, and normalized audio segments when present.
+- `POST /api/media/upload` (multipart), `POST /api/media/link` `{url}`, `POST /api/media/youtube` `{url}` (yt-dlp, ≤720p mp4) → media metadata containing frames, duration, and normalized audio segments when present. Outbound URL ingestion rejects non-public literal or DNS-resolved addresses, revalidates every bounded redirect hop, and returns generic network failures without upstream body details.
 - `GET /api/media/:id`, `/:id/file`, `/:id/frames/:n.jpg`, and `/:id/audio/:n.wav`. Safe-id validation, bounded process runner (ffmpeg 5 min / yt-dlp 10 min timeouts), ≤16 frames per 600-second window scaled to a 768px longest edge, LRU pruning (20 items), graceful `501` with hint when yt-dlp/ffmpeg are absent. Audio is extracted separately as 16 kHz mono WAV; the frame command remains intentionally silent.
 - `POST /v1/chat/completions` and `/api/v1/chat/completions` expand `video_url` and `audio_url` parts through this pipeline. Sources longer than one window use timestamped map-reduce digests and report `metadata.llama_manager_media` (`x-llama-manager-media` for streams). See [multimodal-api.md](multimodal-api.md) for the public contract.
 
