@@ -695,6 +695,87 @@ const PREPARED_CONTEXT_OPTIONS = {
   responseSchema: CONTEXT_PREPARE_RESPONSE_SCHEMA,
 };
 
+/** One `{host, model}` entry of an alias group. */
+const ALIAS_TARGET_SCHEMA = {
+  type: 'object',
+  required: ['host', 'model'],
+  properties: {
+    host: { type: 'string', description: "'local', or the id of a configured remote backend." },
+    model: { type: 'string', description: 'Exact model name, or a glob using * (any run) and ? (one character).' },
+  },
+};
+
+/** A resolved routing candidate, as previewed on the alias read paths. */
+const ALIAS_CANDIDATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    host: { type: 'string' },
+    model: { type: 'string', description: 'Concrete model name; any glob is already expanded.' },
+    kind: { type: 'string', enum: ['model', 'preset', 'ds4'] },
+    backendId: { type: ['string', 'null'] },
+    order: { type: 'integer', description: 'Index of the authored target that produced this candidate.' },
+  },
+};
+
+/** One alias group plus the live preview of what it currently resolves to. */
+const ALIAS_GROUP_SCHEMA = {
+  type: 'object',
+  properties: {
+    name: { type: 'string' },
+    targets: { type: 'array', items: ALIAS_TARGET_SCHEMA },
+    candidates: { type: 'array', items: ALIAS_CANDIDATE_SCHEMA },
+    warm: { type: 'array', items: ALIAS_CANDIDATE_SCHEMA, description: 'Candidates servable right now: a resident local model, or a reachable remote.' },
+    cold: { type: 'array', items: ALIAS_CANDIDATE_SCHEMA, description: 'Candidates needing a local load, used only when warm is empty.' },
+    resolvable: { type: 'boolean', description: 'False when no target currently resolves to anything.' },
+    localTarget: { type: ['string', 'null'], description: 'The concrete model the local engine would serve, or null for a remote-only alias.' },
+  },
+};
+
+/** Documentation overrides for listing every configured alias group. */
+const ALIAS_LIST_OPTIONS = {
+  description: [
+    'Lists every configured model alias group with a live preview of what it resolves to right now.',
+    'An alias maps one client-facing name onto an ORDERED list of targets, each naming a host (\'local\' or a backend id) and a model.',
+    'Routing ranks the warm tier only and falls through to cold just when nothing is warm, so an alias never evicts a resident model while a warm member can serve.',
+    'Alias names are exact — they never glob — and an alias shadows a real model of the same name.',
+  ].join(' '),
+  responseSchema: {
+    type: 'object',
+    properties: {
+      aliases: { type: 'array', items: ALIAS_GROUP_SCHEMA },
+      reserved: { type: 'array', items: { type: 'string' }, description: 'Names owned by the chat-router classifier and rejected as alias names.' },
+    },
+  },
+};
+
+/** Documentation overrides for creating or replacing one alias group. */
+const ALIAS_PUT_OPTIONS = {
+  description: [
+    'Creates or replaces one model alias group. The body carries the COMPLETE target list, so this is a replace and not a merge — remove a target by omitting it.',
+    'Target order is authored intent and is the final tiebreak when ranking produces a tie.',
+    'A target model may be a glob, which expands against the local model catalog or that backend\'s model list at resolve time.',
+    'Rejected with 400: a blank name, a name reserved by the chat router, an empty target list, or two targets sharing a host and model.',
+    'Accepted with a warnings array: a name that shadows a preset or a real local model, and a target naming an unconfigured host.',
+  ].join(' '),
+  body: { targets: [{ host: 'local', model: 'Qwen_Qwen3-8B-GGUF' }, { host: 'borethrax-ollama', model: 'qwen3:8b' }] },
+  requestSchema: {
+    type: 'object',
+    required: ['targets'],
+    properties: {
+      targets: { type: 'array', minItems: 1, items: ALIAS_TARGET_SCHEMA },
+    },
+  },
+  responseSchema: {
+    type: 'object',
+    properties: {
+      success: { type: 'boolean' },
+      created: { type: 'boolean', description: 'True when the group did not exist before this call.' },
+      alias: ALIAS_GROUP_SCHEMA,
+      warnings: { type: 'array', items: { type: 'string' } },
+    },
+  },
+};
+
 const ROUTES = [
   // Media ingestion and artifacts.
   ['POST', '/api/media/upload', 'media', 'Upload image, audio, or video media'],
@@ -719,6 +800,12 @@ const ROUTES = [
   ['GET', '/api/backends/stats', 'backends', 'Get backend request statistics'],
   ['GET', '/api/backends/routing', 'backends', 'Get backend routing rules'],
   ['POST', '/api/backends/routing', 'backends', 'Update backend routing rules'],
+
+  // Model alias groups: the routing table mapping one client-facing name onto an
+  // ordered list of local and remote targets.
+  ['GET', '/api/aliases', 'backends', 'List model alias groups', ALIAS_LIST_OPTIONS],
+  ['PUT', '/api/aliases/{name}', 'backends', 'Create or replace a model alias group', ALIAS_PUT_OPTIONS],
+  ['DELETE', '/api/aliases/{name}', 'backends', 'Delete a model alias group'],
 
   // Health, status, and request queue.
   ['GET', '/api/status', 'system', 'Get detailed manager status'],
