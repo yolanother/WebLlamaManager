@@ -145,7 +145,35 @@ Otherwise:
    `config.aliases['default-big'] = {targets:[{host:'local', model:config.defaultBigModel.trim()}]}`,
    likewise `default-small`. Do not overwrite a group of that name already built
    in step 2 — append instead, and warn.
-4. `delete config.defaultBigModel; delete config.defaultSmallModel;`
+4. **Preserve local serving.** For every group built in step 2 whose alias name
+   matches a known local reference, UNSHIFT `{host:'local', model:<aliasName>}`
+   as its FIRST target, unless a `host:'local'` target is already present.
+   The known-local set is `Object.keys(config.presets ?? {})`, plus the
+   `localModels` argument, plus the pre-deletion values of `defaultBigModel` and
+   `defaultSmallModel`. Push a warning naming each alias so seeded.
+5. `delete config.defaultBigModel; delete config.defaultSmallModel;`
+
+> **Why step 4 exists.** Verified against the operator's real `config.json`:
+> two backends both map the key `Qwen_Qwen3-8B-GGUF`, which is ALSO a real local
+> model (it is the configured `defaultSmallModel`). Folding those mappings alone
+> produces a remote-only alias, and because an alias shadows a same-named real
+> model, requests for it could no longer be served locally at all. The old
+> `modelMapping` semantics were "local is primary; translate the name only IF we
+> offload", so dropping the local target is a silent regression. Seeding it first
+> reproduces the old behavior under the warm gate — resident local wins, remote
+> absorbs when local is cold — and is strictly better, since a cold local model
+> previously had no remote fallback outside the offload policy.
+
+The signature therefore takes an optional second argument:
+
+```js
+migrateModelMappings(config, localModels = []) -> { migrated, warnings }
+```
+
+`localModels` is the caller's list of known local model names. It is optional
+because `loadConfig()` may run before the local model list is available; with it
+omitted, the preset ids and the two legacy default targets still cover the
+common cases (including the real one above).
 
 ### `synthesizeModelMapping(config, backendId) -> Object<string,string>`
 
