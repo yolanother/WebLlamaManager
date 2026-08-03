@@ -4,6 +4,8 @@
 // Pure helpers build and validate the small-model classification request, while
 // routeAutoModel provides the single injectable async seam used by server.js.
 
+import { BIG_ALIAS, SMALL_ALIAS } from './model-aliases.js';
+
 /** Request-time model aliases that invoke the small-brain classifier. */
 export const AUTO_MODEL_ALIASES = Object.freeze(['auto', 'default-router']);
 
@@ -207,9 +209,9 @@ function capabilityHints(model, config) {
   if (isVisionModel(model, config)) hints.push('vision-capable');
   if (/code|coder|codestral|starcoder|devstral/i.test(id)) hints.push('coder');
   const size = Number(id.match(/(\d+(?:\.\d+)?)\s*b/i)?.[1]);
-  if (id === 'default-big' || /large|big|gpt-oss|deepseek/i.test(id) || size >= 14) {
+  if (id === BIG_ALIAS || /large|big|gpt-oss|deepseek/i.test(id) || size >= 14) {
     hints.push('big/general');
-  } else if (id === 'default-small' || /small|mini|flash|fast|tiny/i.test(id) || (size > 0 && size <= 9)) {
+  } else if (id === SMALL_ALIAS || /small|mini|flash|fast|tiny/i.test(id) || (size > 0 && size <= 9)) {
     hints.push('small/fast');
   }
   if (!hints.length) hints.push('general');
@@ -292,8 +294,8 @@ export function parseRouterChoice(completion, candidates) {
  */
 export function fallbackModel(body) {
   return !attachmentPresence(body).any && lastUserText(body).length < 200
-    ? 'default-small'
-    : 'default-big';
+    ? SMALL_ALIAS
+    : BIG_ALIAS;
 }
 
 /**
