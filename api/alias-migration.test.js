@@ -97,6 +97,9 @@ test('migrateModelMappings: folds the live config shape into alias groups', () =
   assert.deepEqual(config.aliases, {
     'Qwen_Qwen3-8B-GGUF': {
       targets: [
+        // Seeded by contract step 4: this key is also the legacy defaultSmallModel,
+        // i.e. a real local model, so it keeps local as its primary target.
+        { host: 'local', model: 'Qwen_Qwen3-8B-GGUF' },
         { host: 'borethrax-ollama-mnfmirep', model: 'qwen3-vl:8b' },
         { host: 'dahaka-ollama-mngx88pk', model: 'qwen3:8b' },
       ],
@@ -122,9 +125,13 @@ test('migrateModelMappings: two backends mapping one key share a group in direct
   migrateModelMappings(config);
 
   const group = config.aliases['Qwen_Qwen3-8B-GGUF'];
-  assert.equal(group.targets.length, 2);
+  // Three targets, not two: contract step 4 prepends the local one, and the two
+  // remote targets still follow in backend-directory order behind it.
+  assert.equal(group.targets.length, 3);
   assert.deepEqual(group.targets.map(t => t.host),
-    ['borethrax-ollama-mnfmirep', 'dahaka-ollama-mngx88pk']);
+    ['local', 'borethrax-ollama-mnfmirep', 'dahaka-ollama-mngx88pk']);
+  assert.deepEqual(group.targets.filter(t => t.host !== 'local').map(t => t.model),
+    ['qwen3-vl:8b', 'qwen3:8b']);
 });
 
 test('migrateModelMappings: "*" becomes backend.acceptsAny and creates no alias', () => {
@@ -227,6 +234,113 @@ test('migrateModelMappings: a legacy default colliding with a folded group appen
     { host: 'local', model: 'local-big' },     // legacy default appended after it
   ]);
   assert.ok(result.warnings.length >= 1, 'expected a warning for the collision');
+});
+
+// ── migrateModelMappings: preserving local serving (contract step 4) ─────────
+
+// A folded alias shadows the real model of the same name, so a mapping key that is
+// also a local model must keep a `local` target or migration silently ends local
+// serving for it. See the rationale block in the contract.
+
+test('migrateModelMappings: an alias name matching a preset id gets a local first target', () => {
+  const config = oneBackend(
+    { 'coder-preset': 'qwen3-coder:30b' },
+    { presets: { 'coder-preset': { model: 'Qwen3-Coder' } } },
+  );
+  const result = migrateModelMappings(config);
+
+  assert.deepEqual(config.aliases['coder-preset'].targets, [
+    { host: 'local', model: 'coder-preset' },
+    { host: 'host-a', model: 'qwen3-coder:30b' },
+  ]);
+  assert.ok(result.warnings.some(w => w.includes('coder-preset')),
+    'seeding a local target must warn, naming the alias');
+});
+
+test('migrateModelMappings: an alias name matching the localModels argument gets a local first target', () => {
+  const config = oneBackend({ 'Llama-3-8B': 'llama3:8b' });
+  migrateModelMappings(config, ['Llama-3-8B', 'some-other-local']);
+
+  assert.deepEqual(config.aliases['Llama-3-8B'].targets, [
+    { host: 'local', model: 'Llama-3-8B' },
+    { host: 'host-a', model: 'llama3:8b' },
+  ]);
+});
+
+test('migrateModelMappings: an alias name matching the legacy defaultSmallModel gets a local first target', () => {
+  // The real motivating case: LIVE_CONFIG's defaultSmallModel is `Qwen_Qwen3-8B-GGUF`,
+  // which BOTH ollama hosts also map. `localModels` is deliberately not passed —
+  // loadConfig() may run before the local model list exists, and the legacy default
+  // alone must still be enough to save local serving.
+  const config = clone(LIVE_CONFIG);
+  migrateModelMappings(config);
+
+  assert.deepEqual(config.aliases['Qwen_Qwen3-8B-GGUF'].targets, [
+    { host: 'local', model: 'Qwen_Qwen3-8B-GGUF' },
+    { host: 'borethrax-ollama-mnfmirep', model: 'qwen3-vl:8b' },
+    { host: 'dahaka-ollama-mngx88pk', model: 'qwen3:8b' },
+  ]);
+  // The legacy key it was matched against is still deleted afterwards.
+  assert.ok(!('defaultSmallModel' in config));
+});
+
+test('migrateModelMappings: an alias name matching nothing local stays remote-only', () => {
+  const config = clone(LIVE_CONFIG);
+  migrateModelMappings(config);
+
+  // `gemini-4-12b` is only ever a remote mapping key — no preset, no local model, and
+  // neither legacy default names it.
+  assert.deepEqual(config.aliases['gemini-4-12b'].targets, [
+    { host: 'borethrax-ollama-mnfmirep', model: 'gemma4:12b' },
+  ]);
+  assert.ok(!config.aliases['gemini-4-12b'].targets.some(t => t.host === 'local'));
+});
+
+test('migrateModelMappings: no duplicate local target when the group already has one', () => {
+  // `default-big` is folded from a mapping AND seeded from the legacy default, so it
+  // already carries a local target by the time step 4 runs.
+  const config = oneBackend(
+    { 'default-big': 'remote-big', 'shared-name': 'remote-shared' },
+    { defaultBigModel: 'default-big', presets: { 'shared-name': {} } },
+  );
+  migrateModelMappings(config, ['shared-name']);
+
+  const big = config.aliases['default-big'].targets;
+  assert.equal(big.filter(t => t.host === 'local').length, 1, 'exactly one local target');
+  assert.deepEqual(big, [
+    { host: 'host-a', model: 'remote-big' },
+    { host: 'local', model: 'default-big' },   // appended by the legacy seed, not moved
+  ]);
+  // `shared-name` matches both a preset and localModels, but is still seeded once.
+  assert.equal(
+    config.aliases['shared-name'].targets.filter(t => t.host === 'local').length, 1);
+});
+
+test('migrateModelMappings: the seeded local target is FIRST, never appended', () => {
+  const config = oneBackend({ 'shared-name': 'remote-a' });
+  config.backends.directory.push({
+    id: 'host-b', enabled: true, tested: true, modelMapping: { 'shared-name': 'remote-b' },
+  });
+  migrateModelMappings(config, ['shared-name']);
+
+  const targets = config.aliases['shared-name'].targets;
+  assert.deepEqual(targets[0], { host: 'local', model: 'shared-name' });
+  assert.deepEqual(targets.map(t => t.host), ['local', 'host-a', 'host-b']);
+});
+
+test('migrateModelMappings: idempotency still holds with the local re-seed in place', () => {
+  const once = clone(LIVE_CONFIG);
+  migrateModelMappings(once, ['Qwen_Qwen3-8B-GGUF']);
+
+  const twice = clone(LIVE_CONFIG);
+  migrateModelMappings(twice, ['Qwen_Qwen3-8B-GGUF']);
+  const second = migrateModelMappings(twice, ['Qwen_Qwen3-8B-GGUF']);
+
+  assert.deepEqual(second, { migrated: false, warnings: [] });
+  assert.deepEqual(twice, once);
+  // Specifically: the second pass did not stack a second local target.
+  assert.equal(
+    twice.aliases['Qwen_Qwen3-8B-GGUF'].targets.filter(t => t.host === 'local').length, 1);
 });
 
 // ── migrateModelMappings: idempotency ────────────────────────────────────────

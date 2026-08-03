@@ -7,9 +7,11 @@
 // `modelMapping` into global alias groups, diverts the `"*"` catch-all key to
 // `backend.acceptsAny` (which was never an alias, only a host policy), seeds the
 // `default-big` / `default-small` groups from the legacy `defaultBigModel` /
-// `defaultSmallModel` keys, and deletes all three legacy sources so the alias table
-// becomes the single source of truth. It is idempotent, keyed on `config.aliases`
-// already being present, because it runs on every server boot.
+// `defaultSmallModel` keys, re-seeds a `local` first target on any folded group whose
+// name is also a real local model or preset (so migration never silently drops local
+// serving), and deletes all three legacy sources so the alias table becomes the single
+// source of truth. It is idempotent, keyed on `config.aliases` already being present,
+// because it runs on every server boot.
 //
 // The other two exports back the deprecation shim that keeps `GET /api/backends` and
 // `PUT /api/backends/:id` speaking `modelMapping` for a release cycle:
@@ -105,23 +107,41 @@ function appendTarget(aliases, name, host, model) {
  *     migrates under its literal name, with a warning that alias names no longer glob.
  * The backend's `modelMapping` is then deleted.
  *
- * Finally `defaultBigModel` / `defaultSmallModel`, when set and non-blank, seed
+ * Then `defaultBigModel` / `defaultSmallModel`, when set and non-blank, seed
  * `default-big` / `default-small` with a single `local` target (appending, with a
- * warning, if a group of that name was already built from a mapping), and both legacy
- * keys are deleted.
+ * warning, if a group of that name was already built from a mapping).
  *
- * @param {{aliases?: object, backends?: {directory?: Array<object>}, defaultBigModel?: string, defaultSmallModel?: string}|null|undefined} config
+ * Local serving is then preserved: every group built from a mapping whose alias name
+ * is also a known local reference — a preset id, an entry of `localModels`, or the
+ * pre-deletion `defaultBigModel` / `defaultSmallModel` value — gains
+ * `{host:'local', model:<aliasName>}` as its FIRST target unless it already carries a
+ * `local` target. Without this an alias shadows the same-named real model and the
+ * config becomes remote-only for it, which the old `modelMapping` semantics ("local is
+ * primary; translate the name only if we offload") never did. Both legacy default keys
+ * are deleted last.
+ *
+ * @param {{aliases?: object, backends?: {directory?: Array<object>}, presets?: object, defaultBigModel?: string, defaultSmallModel?: string}|null|undefined} config
  *   the persisted server configuration; MUTATED in place.
+ * @param {string[]} [localModels] known local model names, used to decide which folded
+ *   aliases must keep a local target. Optional because `loadConfig()` may run before
+ *   the local model list exists; preset ids and the legacy default values still cover
+ *   the common cases without it.
  * @returns {{migrated: boolean, warnings: string[]}} `migrated` is false when the
  *   config was already migrated (or unusable); `warnings` describes every skipped or
- *   surprising entry encountered.
+ *   surprising entry encountered, including each alias given a local target.
  */
-export function migrateModelMappings(config) {
+export function migrateModelMappings(config, localModels = []) {
   if (!config || typeof config !== 'object') return { migrated: false, warnings: [] };
   if (config.aliases) return { migrated: false, warnings: [] };
 
   const warnings = [];
   config.aliases = {};
+
+  // Only groups folded out of a `modelMapping` are eligible for the local re-seed
+  // below; the `default-big` / `default-small` groups seeded from the legacy keys
+  // already name a local model directly and must not gain a second one.
+  /** @type {Set<string>} alias names created by the mapping fold. */
+  const foldedNames = new Set();
 
   const directory = Array.isArray(config.backends?.directory) ? config.backends.directory : [];
   for (const backend of directory) {
@@ -145,6 +165,7 @@ export function migrateModelMappings(config) {
           warnings.push(`backend '${backend.id}': mapping key '${key}' looks like a glob; alias names no longer glob, so it migrated under that literal name`);
         }
         appendTarget(config.aliases, key, backend.id, target);
+        foldedNames.add(key);
       }
     }
     delete backend.modelMapping;
@@ -152,10 +173,59 @@ export function migrateModelMappings(config) {
 
   seedDefaultAlias(config, warnings, BIG_ALIAS, config.defaultBigModel, 'defaultBigModel');
   seedDefaultAlias(config, warnings, SMALL_ALIAS, config.defaultSmallModel, 'defaultSmallModel');
+
+  preserveLocalServing(config, warnings, foldedNames, localModels);
+
   delete config.defaultBigModel;
   delete config.defaultSmallModel;
 
   return { migrated: true, warnings };
+}
+
+/**
+ * Give every folded alias that names a real local model a `local` first target.
+ *
+ * A `modelMapping` entry only ever meant "call this remote model *instead*, if we
+ * offload" — local remained the primary. An alias, by contrast, shadows the real model
+ * of the same name, so folding the mapping alone would make such a model remote-only
+ * and silently end local serving for it. Re-seeding the local target restores the old
+ * behavior under the warm gate (a resident local model wins; remote absorbs while it is
+ * cold) and is strictly better, because a cold local model now has a remote fallback.
+ *
+ * A group that already carries a `local` target is left alone — the operator (or the
+ * legacy-default seed) has already expressed which local model it should use.
+ *
+ * @param {{aliases: Object<string, {targets: Array<{host: string, model: string}>}>, presets?: object, defaultBigModel?: string, defaultSmallModel?: string}} config
+ *   config being migrated, with the legacy default keys still present; MUTATED.
+ * @param {string[]} warnings warning accumulator; MUTATED.
+ * @param {Set<string>} foldedNames alias names created by the mapping fold.
+ * @param {string[]} localModels caller-supplied local model names, possibly empty.
+ * @returns {void}
+ */
+function preserveLocalServing(config, warnings, foldedNames, localModels) {
+  /** @type {Set<string>} every name that denotes something servable locally. */
+  const knownLocal = new Set();
+  if (config.presets && typeof config.presets === 'object') {
+    for (const id of Object.keys(config.presets)) knownLocal.add(id);
+  }
+  if (Array.isArray(localModels)) {
+    for (const name of localModels) {
+      if (isUsableTarget(name)) knownLocal.add(name.trim());
+    }
+  }
+  // The legacy defaults are read before step 5 deletes them; they are the reason this
+  // step exists (the real config's defaultSmallModel is also a mapped alias name).
+  if (isUsableTarget(config.defaultBigModel)) knownLocal.add(config.defaultBigModel.trim());
+  if (isUsableTarget(config.defaultSmallModel)) knownLocal.add(config.defaultSmallModel.trim());
+
+  for (const name of foldedNames) {
+    if (!knownLocal.has(name)) continue;
+    const group = config.aliases[name];
+    if (!group || !Array.isArray(group.targets)) continue;
+    if (group.targets.some((t) => t && t.host === 'local')) continue;
+    group.targets.unshift({ host: 'local', model: name });
+    warnings.push(`alias '${name}' also names a local model or preset; seeded a local target first so migration does not drop local serving`);
+  }
 }
 
 /**
