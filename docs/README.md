@@ -28,6 +28,7 @@ hardware-specific gotchas of the AMD Strix Halo (gfx1151) box it targets.
 ## Features & design
 
 - [Designs.md](Designs.md) — architecture overview + design-doc index
+- [features/model-alias-groups.md](features/model-alias-groups.md) — `config.aliases`: one name → an ordered list of local/remote targets, the warm gate, migration from `modelMapping`
 - [features/multimodal-api.md](features/multimodal-api.md) — OpenAI-compatible image, audio, video/YouTube, long-media digest, transcription, capability-discovery, and agent-readable documentation contracts
 - [features/glass-ui-and-multimodal-chat.md](features/glass-ui-and-multimodal-chat.md) — glass UI and the shared UI/API multimodal media pipeline
 - [Designs/ChatPage.md](Designs/ChatPage.md) · [Designs/ApiDocs.md](Designs/ApiDocs.md) · [Designs/DocsPage.md](Designs/DocsPage.md) — UI page designs
@@ -41,7 +42,7 @@ hardware-specific gotchas of the AMD Strix Halo (gfx1151) box it targets.
 ```
 client (OpenAI-compatible) ── /api/v1/* on :5250
         │
-        ├─ resolve default-big / default-small alias → real model
+        ├─ resolve alias group (config.aliases) → warm candidates, else cold
         │
         └─ route:
              ├─ local llama.cpp   (router: many models · or single preset)   :5251

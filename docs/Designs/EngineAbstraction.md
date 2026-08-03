@@ -253,20 +253,30 @@ MemAvailable to a headroom target) before llama-server starts. Gated on
 
 ### Preferred big model: `default-big` → a ds4 preset
 
-The `default-big` / `default-small` request aliases (see
-[default-model aliases](../superpowers/specs/2026-06-22-default-model-aliases-design.md))
-can point at a **ds4 preset id** so every client pinned to `default-big` is served
-DeepSeek V4 Flash with no architecture thrash. Because a ds4 model's OpenAI id **is**
-its preset id, the raw ds4 model name and the `default-big` alias resolve to the same
-target and hit one resident ds4-server (no double activation).
+`default-big` / `default-small` are now ordinary rows in the global alias table
+(`config.aliases`) — see
+[model alias groups](../superpowers/specs/2026-08-03-model-alias-groups-design.md)
+and the operator guide [`features/model-alias-groups.md`](../features/model-alias-groups.md).
+(The retired two-scalar design is
+[2026-06-22-default-model-aliases-design.md](../superpowers/specs/2026-06-22-default-model-aliases-design.md).)
 
-Pure helpers (`api/default-models.js`):
+A **local** target may name a **ds4 preset id**, so every client pinned to
+`default-big` is served DeepSeek V4 Flash with no architecture thrash. Because a ds4
+model's OpenAI id **is** its preset id, the raw ds4 model name and the `default-big`
+alias resolve to the same target and hit one resident ds4-server (no double
+activation).
 
-| Helper | Purpose |
-| --- | --- |
-| `ds4PresetForModel(config, name)` | Returns `{ presetId, preset }` when `name` is an existing ds4 preset id, else `null`. |
-| `validateDefaultModelTarget(config, target)` | Config-API validator. Accepts a ds4 preset id (`engine:'ds4'`) or a plain llama model name (`engine:'llama'`, even if not yet downloaded); clears on null/blank; rejects a non-string or an existing **non-ds4 (llama) preset id** (`default-big` maps to a model name or a ds4 preset id, never a llama preset id). |
-| `defaultModelListEntries(config, now)` | Now tags each alias entry with `engine` (`'ds4'` when the target names a ds4 preset) so `GET /api/v1/models` surfaces a ds4-backed `default-big`. |
+| Helper | Where | Purpose |
+| --- | --- | --- |
+| `ds4PresetForModel(config, name)` | `api/server.js` | Returns `{ presetId, preset }` when `name` is an existing ds4 preset id, else `null`. This is the `kind: 'ds4'` classification from alias resolution, expressed over a single concrete name so the direct-model path (which never resolves an alias) behaves identically. |
+| `defaultAliasTarget(name)` / `setDefaultAliasTarget(name, target)` | `api/server.js` | The scalar read/write views `GET`/`POST /api/settings` expose as `defaultBigModel` / `defaultSmallModel`. Read projects the alias's first usable target; write stores `{host: 'local', model}` in single-target form, and a blank/null value deletes the group (matching the old "empty string clears the alias" behavior). |
+| `aliasListEntries(config, now)` | `api/model-aliases.js` | Replaces `defaultModelListEntries()`. Tags each alias row with `engine` (`'ds4'` when the **first** target is a local ds4 preset) so `GET /api/v1/models` surfaces a ds4-backed `default-big`, and adds the full `targets` array. |
+
+> **Changed with alias groups.** `api/default-models.js` is deleted;
+> `validateDefaultModelTarget()` is gone and its restriction is **lifted** — an alias
+> target may now name a plain model, a **llama** preset id, or a ds4 preset id.
+> Validation runs through `validateAlias()` instead. The `config.defaultBigModel` /
+> `config.defaultSmallModel` keys no longer exist on disk.
 
 Server wiring (`ensureDs4ForModel(rawModel, resolvedModel)` in `server.js`), called at
 the top of `/api/v1/chat/completions` and `/api/v1/completions` before the mid-swap gate:
@@ -281,8 +291,9 @@ the top of `/api/v1/chat/completions` and `/api/v1/completions` before the mid-s
   is active still **offloads to a remote backend** (task-3 exclusivity), it does not tear
   ds4 down.
 
-Config PUT (`PUT /api/config`) validates `defaultBigModel`/`defaultSmallModel` through
-`validateDefaultModelTarget`.
+`POST /api/settings` writes `defaultBigModel`/`defaultSmallModel` through
+`setDefaultAliasTarget()`, which validates via `validateAlias()` and stores the value
+as the alias's single `{host: 'local'}` target.
 
 ### Tuning knobs (env)
 
@@ -377,10 +388,11 @@ coexist), so end-to-end verification is performed manually after merge:
    answered after ds4 readiness, not errored.
 5. Deactivate (activate a llama preset / router): confirm ds4 stops, its ~81GB is
    released, and llama routing resumes.
-6. `default-big` → ds4 preset: `PUT /api/config { "defaultBigModel": "<ds4-preset-id>" }`,
+6. `default-big` → ds4 preset: `POST /api/settings { "defaultBigModel": "<ds4-preset-id>" }`
+   (equivalently, `PUT /api/aliases/default-big` with a single `{host:'local'}` target),
    then a chat completion for model `default-big` must (a) trigger exclusive activation
    if ds4 isn't already active, (b) return a DeepSeek V4 Flash completion, and (c) show
    `default-big` → the ds4 preset id with `engine:"ds4"` in `GET /api/v1/models`. A raw
    request for the ds4 preset id must hit the same resident ds4-server (no second spawn).
-7. Flip back: `PUT /api/config { "defaultBigModel": "<llama-model-name>" }`, then a
+7. Flip back: `POST /api/settings { "defaultBigModel": "<llama-model-name>" }`, then a
    `default-big` request while ds4 is active must deactivate ds4 and serve the llama model.

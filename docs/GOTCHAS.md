@@ -14,6 +14,7 @@ When you hit a new one: add an entry below, drop a script under
 | llama.cpp on Strix Halo logs `failed to initialize ROCm: no ROCm-capable device is detected`; tok/s < 1 even on small models; `rocminfo` says `Unable to open /dev/kfd read-write: Invalid argument` | Blacklist the `amdxdna` NPU driver — it claims `/dev/kfd` before `amdgpu` can | [`scripts/fix-strix-halo-npu-conflict.sh`](../scripts/fix-strix-halo-npu-conflict.sh) |
 | `/dev/kfd` permissions look fine but container `rocminfo` returns EINVAL anyway | Full `amdgpu` reload (or host reboot) — the in-kernel KFD state is wedged | [`scripts/fix-gpu-passthrough.sh`](../scripts/fix-gpu-passthrough.sh) |
 | Model loaded but only a few hundred MB land in GTT; HIP backend logs `cudaMalloc failed` on Strix Halo for models larger than the BIOS-reserved VRAM partition | Export `GGML_HIP_UMA=1` and `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` before launching `llama-server` (already wired into `container-start.sh`) | n/a — config |
+| `node --test api/` hangs forever with no output (or dies with `ERR_MODULE_NOT_FOUND: express`), and stray `node api` processes pile up | The bare directory arg spawns `node api` → `api/server.js` → a **real server**. Run [`node --test api/*.test.js`](#node---test-api-boots-a-real-server-and-hangs-forever) instead | n/a — invocation |
 
 ---
 
@@ -196,8 +197,9 @@ fix and the NPU blacklist applied, a 27B Q4 model should produce
 ## Working around local GPU outages while you wait for a reboot
 
 When local GPU is broken (KFD wedged, ROCm down, etc.) the manager
-automatically routes requests with a matching `modelMapping` to a
-remote backend — see `config.json.backends.directory`. The
+automatically routes a request to a remote backend when the requested
+name is an **alias group** with a reachable remote target — see
+`config.aliases` and `config.json.backends.directory`. The
 [`_llama_manager.compute`](#response-metadata) field tells callers
 which path ran their request.
 
@@ -220,8 +222,33 @@ Returns:
 ```
 
 When `kfd != "ok"`, the local accelerator is down and any local-only
-model will fall back to CPU. Either reboot, or add a `modelMapping`
-to a healthy remote backend for the affected model.
+model will fall back to CPU. Either reboot, or **add a remote target to
+the affected model's alias group** so requests have somewhere healthy
+to land:
+
+```bash
+# Give the model an alias group whose members are local FIRST, remote second.
+# Local first keeps normal (healthy-GPU) behavior identical; while the GPU is
+# wedged the local member is never resident, so the warm gate routes remote.
+curl -sS -X PUT http://127.0.0.1:5250/api/aliases/Qwen_Qwen3-8B-GGUF \
+  -H 'content-type: application/json' \
+  -d '{"targets":[
+        {"host":"local","model":"Qwen_Qwen3-8B-GGUF"},
+        {"host":"borethrax-ollama-mnfmirep","model":"qwen3-vl:8b"}]}'
+
+# Confirm which members are warm right now:
+curl -sS http://127.0.0.1:5250/api/aliases | jq '.aliases[] | {name, warm, cold}'
+```
+
+Naming the alias after the local model is intentional here — an alias
+**shadows** a real model of the same name, so existing clients need no
+change. Keeping the local target first is what preserves local serving;
+see [`features/model-alias-groups.md`](features/model-alias-groups.md).
+
+The old per-backend `modelMapping` field still works for this through a
+**deprecated** compatibility shim on `GET`/`PUT /api/backends` (it is
+synthesized from, and folded back into, the alias table), but it cannot
+express a local target or a multi-host group. Use `/api/aliases`.
 
 ### Response metadata
 
@@ -242,6 +269,93 @@ slow-path runs without polling another endpoint:
 
 Callers should treat `slow: true` as an alarm signal — the request
 almost certainly ran on CPU. Dashboards can surface it directly.
+
+---
+
+## `node --test api/` boots a real server and hangs forever
+
+**Affects:** anyone (human or agent) running the API test suite in this
+repo, in the primary checkout or in a git worktree.
+
+**Symptom**
+
+- `node --test api/` never returns. No test output, no failure — it
+  just sits there.
+- Or, in a fresh worktree, it fails immediately with something that
+  looks like a broken test but is not:
+  ```
+  Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'express'
+  ```
+- Afterwards, orphan processes are left behind:
+  ```
+  $ ps -eo pid,args | grep "node api"
+  1234567 node api
+  ```
+- Symptoms of a second llama-manager: port-bind errors, a config file
+  written by a process you did not start, unexplained model loads.
+
+**Why**
+
+Node treats the bare directory argument as a **test file**, so it spawns
+`node api`. Node resolves that directory to its entry point,
+`api/server.js`, and **starts an actual llama-manager server** — which
+by design never exits. The test runner then waits on a "test file" that
+is really a running server.
+
+The `ERR_MODULE_NOT_FOUND` variant is the same bug wearing a disguise:
+a fresh worktree has no `api/node_modules`, so the server fails to
+import `express` while starting. It is the server failing to boot, not
+a test failing.
+
+This cost two agent sessions roughly 40 minutes and left three orphan
+servers running on a box with a documented history of OOM and thermal
+lockups — an extra unattended `llama-server` parent is not harmless
+here.
+
+**Fix**
+
+Always glob the test files explicitly:
+
+```bash
+node --test api/*.test.js       # 601 tests, ~350 ms
+cd ui && npm test               # 86 tests
+cd ui && npm run build
+```
+
+Never `node --test api/`, and never `node --test` on any directory in
+this repo.
+
+In a fresh worktree, link the dependencies first — tests that import
+server code need them:
+
+```bash
+ln -s /home/yolan/workspace/ai/llama-server/api/node_modules \
+      /path/to/worktree/api/node_modules
+cd /path/to/worktree/ui && npm install    # ui tests need their own tree
+```
+
+Note also that `./scripts/dev-build.sh check` **does not exist** in this
+repo — it is an orchestrator-template convention. The real gate is the
+node test suite above plus the ui build.
+
+**Recovery**
+
+```bash
+ps -eo pid,args | grep "node api"     # find strays
+kill <pid>
+```
+
+> ⚠️ **Never kill whatever holds port 5250** — that is the live dev
+> server. Check before killing anything:
+> ```bash
+> ss -lptn 'sport = :5250'
+> ```
+
+**Verify**
+
+`node --test api/*.test.js` completes in well under a second and prints
+a pass/fail summary. `ps -eo pid,args | grep "node api"` returns
+nothing afterwards.
 
 ## Reporting a new gotcha
 
