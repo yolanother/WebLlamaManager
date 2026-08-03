@@ -107,8 +107,12 @@ export function aliasesToRows(aliases) {
  * preserving each name's first-appearance order and the row order within it, so
  * authored target order survives the round trip. Names, hosts, and models are
  * trimmed to match the server's normalization, and each target is reduced to
- * `{host, model}` so editor-only fields never reach the API. Rows with a blank
- * alias name are dropped — they have no group to belong to.
+ * `{host, model}` so editor-only fields never reach the API. A row is dropped
+ * unless its alias name, host, and model are all non-blank after trimming: a
+ * blank name has no group to belong to, and a blank host or model would be
+ * serialized into `config.aliases` only for the server's `validateAlias()` to
+ * reject the PUT, surfacing a confusing save failure instead of the row simply
+ * being filtered out. An alias whose every row is dropped is omitted entirely.
  *
  * Duplicate targets are preserved rather than collapsed; detecting them is
  * {@link validateRows}'s job, and a save is expected to be blocked before this
@@ -125,12 +129,11 @@ export function rowsToAliases(rows) {
 
   for (const row of rows) {
     const aliasName = String(row?.aliasName ?? '').trim();
-    if (!aliasName) continue;
+    const host = String(row?.host ?? '').trim();
+    const model = String(row?.model ?? '').trim();
+    if (!aliasName || !host || !model) continue;
     if (!aliases[aliasName]) aliases[aliasName] = { targets: [] };
-    aliases[aliasName].targets.push({
-      host: String(row?.host ?? '').trim(),
-      model: String(row?.model ?? '').trim()
-    });
+    aliases[aliasName].targets.push({ host, model });
   }
   return aliases;
 }
