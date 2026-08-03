@@ -1021,6 +1021,25 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false, ali
     if (queue && queue.active >= queue.concurrency) return false;
     return true;
   });
+
+  // ── Alias warm gate ──────────────────────────────────────────────────────────
+  // An alias ranks its WARM members only (see partitionByWarmth): a local target is
+  // warm while it is resident, a remote target is warm while its backend is reachable.
+  // The cold tier is a last resort, consulted only when nothing in the group is warm.
+  //
+  // The candidate filter below enforces that for remote members implicitly, because
+  // remoteTargetModel() searches `alias.ranked`. This is the other half: when the warm
+  // tier holds no LOCAL candidate, the alias's local target is cold, and loading it
+  // would evict whatever is currently resident — so offload to the warm member instead.
+  // That is what stops a conversational alias from evicting a resident 65GB model.
+  //
+  // Deliberately additive: it only ever sets shouldOffload, so an explicitly desired
+  // resident model (checked immediately below) still outranks it.
+  if (alias && hasViableRemote && alias.warm.length > 0 && !alias.warm.some(c => c.host === 'local')) {
+    shouldOffload = true;
+    console.log(`[routing] alias warm-gate: '${alias.name}' has no warm local target; serving from a warm remote member rather than loading "${requestedModel}"`);
+  }
+
   if (residencyApplies) {
     const residency = modelResidencyDecision({
       requestedModel,
