@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, DEFAULTS } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS } from './resource-guard.js';
 
 const GiB = 2 ** 30;
 
@@ -306,4 +306,100 @@ test('dispatchPreference: thermal reason takes priority over preferLocal=false',
   const r = dispatchPreference({ preferLocal: false, thermalPaused: true });
   assert.equal(r.tryRemoteFirst, true);
   assert.match(r.reason, /thermal/i);
+});
+
+// --- memoryPressureDecision -------------------------------------------------
+// Regression cover for the Jul 30 / Aug 2 2026 kernel panics: OOM-killing
+// llama-server NULL-derefs amdgpu_hmm_range_valid and takes the whole box down,
+// so the governor must shed the model GRACEFULLY before the kernel intervenes.
+
+test('memoryPressureDecision: ample memory stays normal and sheds nothing', () => {
+  const r = memoryPressureDecision({ availableBytes: 80 * GiB, modelLoaded: true });
+  assert.equal(r.state, 'normal');
+  assert.equal(r.shed, false);
+  assert.equal(r.pauseDispatch, false);
+});
+
+test('memoryPressureDecision: watch band pauses dispatch but does not shed yet', () => {
+  const r = memoryPressureDecision({ availableBytes: 20 * GiB, modelLoaded: true });
+  assert.equal(r.state, 'watch');
+  assert.equal(r.shed, false);
+  assert.equal(r.pauseDispatch, true);
+});
+
+test('memoryPressureDecision: below the shed threshold sheds the model', () => {
+  const r = memoryPressureDecision({ availableBytes: 12 * GiB, modelLoaded: true });
+  assert.equal(r.state, 'shed');
+  assert.equal(r.shed, true);
+  assert.match(r.reason, /memory/i);
+});
+
+test('memoryPressureDecision: nothing loaded means there is nothing to shed', () => {
+  const r = memoryPressureDecision({ availableBytes: 4 * GiB, modelLoaded: false });
+  assert.equal(r.shed, false);
+  assert.equal(r.pauseDispatch, true, 'still refuses new local work while starved');
+});
+
+test('memoryPressureDecision: unreadable MemAvailable (0) fails open, never sheds', () => {
+  // Mirrors the thermal governor ignoring all-zero telemetry. A failed
+  // /proc/meminfo read must not be mistaken for an out-of-memory box.
+  const r = memoryPressureDecision({ availableBytes: 0, modelLoaded: true });
+  assert.equal(r.shed, false);
+  assert.equal(r.state, 'normal');
+  assert.match(r.reason, /unknown|unreadable|telemetry/i);
+});
+
+test('memoryPressureDecision: cooldown prevents re-shedding before the unload lands', () => {
+  // Freeing ~60 GiB is not instant; MemAvailable lags. Without a cooldown the
+  // next tick would shed again and stampede the unload path.
+  const r = memoryPressureDecision({
+    availableBytes: 12 * GiB, modelLoaded: true,
+    prevState: 'shed', lastShedAt: 1_000, now: 6_000, cooldownMs: 60_000,
+  });
+  assert.equal(r.shed, false);
+  assert.match(r.reason, /cooldown/i);
+});
+
+test('memoryPressureDecision: sheds again once the cooldown has elapsed', () => {
+  const r = memoryPressureDecision({
+    availableBytes: 12 * GiB, modelLoaded: true,
+    prevState: 'shed', lastShedAt: 1_000, now: 90_000, cooldownMs: 60_000,
+  });
+  assert.equal(r.shed, true);
+});
+
+test('memoryPressureDecision: hysteresis holds the shed state through the watch band', () => {
+  // Recovering to 20 GiB is NOT enough to declare normal — flapping back would
+  // let the residency restorer reload 60 GiB straight back into a strained box.
+  const r = memoryPressureDecision({ availableBytes: 20 * GiB, modelLoaded: false, prevState: 'shed' });
+  assert.equal(r.state, 'shed');
+  assert.equal(r.allowResidencyRestore, false);
+});
+
+test('memoryPressureDecision: clears to normal only above the resume threshold', () => {
+  const r = memoryPressureDecision({ availableBytes: 40 * GiB, modelLoaded: false, prevState: 'shed' });
+  assert.equal(r.state, 'normal');
+  assert.equal(r.allowResidencyRestore, true);
+});
+
+test('memoryPressureDecision: suppresses residency restore while shedding', () => {
+  // The desired-residency restorer would otherwise immediately reload exactly
+  // the model the governor just freed, and the box would oscillate.
+  const r = memoryPressureDecision({ availableBytes: 12 * GiB, modelLoaded: true });
+  assert.equal(r.allowResidencyRestore, false);
+});
+
+test('memoryPressureDecision: thresholds are operator-tunable', () => {
+  const r = memoryPressureDecision({
+    availableBytes: 30 * GiB, modelLoaded: true,
+    shedBelowBytes: 32 * GiB, watchBelowBytes: 48 * GiB, resumeAboveBytes: 64 * GiB,
+  });
+  assert.equal(r.shed, true);
+});
+
+test('memoryPressureDecision: exposes defaults for the 16/24/32 GiB policy', () => {
+  assert.equal(DEFAULTS.memShedBelowBytes, 16 * GiB);
+  assert.equal(DEFAULTS.memWatchBelowBytes, 24 * GiB);
+  assert.equal(DEFAULTS.memResumeAboveBytes, 32 * GiB);
+  assert.ok(DEFAULTS.memShedCooldownMs > 0);
 });
