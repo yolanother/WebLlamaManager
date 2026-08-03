@@ -885,7 +885,7 @@ function setDefaultAliasTarget(name, target) {
     if (config.aliases) delete config.aliases[name];
     return { ok: true, warnings: [] };
   }
-  const result = validateAlias(config, name, [{ host: 'local', model }]);
+  const result = validateAlias(config, name, [{ host: 'local', model }], localModelNames());
   if (!result.ok) return result;
   if (!config.aliases || typeof config.aliases !== 'object') config.aliases = {};
   config.aliases[name] = result.value;
@@ -3949,7 +3949,7 @@ app.get('/api/aliases', (req, res) => {
 // Create or replace an alias group. The body carries the full target list; a PUT is a
 // replace, not a merge, so removing a target is expressed by omitting it.
 app.put('/api/aliases/:name', (req, res) => {
-  const result = validateAlias(config, req.params.name, req.body?.targets);
+  const result = validateAlias(config, req.params.name, req.body?.targets, localModelNames());
   if (!result.ok) return res.status(400).json({ error: result.error });
 
   const name = req.params.name.trim();

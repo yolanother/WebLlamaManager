@@ -55,17 +55,24 @@ trap cleanup EXIT INT TERM
 port_free() { ! ( exec 3<>"/dev/tcp/127.0.0.1/$1" ) 2>/dev/null; }
 
 # Print an unused high loopback port, avoiding the dev server's normal ports.
+# Args: zero or more ports already handed out in this run — nothing is listening
+# on them yet, so port_free alone would happily hand the same number out twice
+# and the second server would fail to bind with a confusing error.
 pick_port() {
-    local p
+    local p taken
     while :; do
         p=$(( 20000 + RANDOM % 9000 ))
-        if port_free "$p"; then printf '%s' "$p"; return; fi
+        port_free "$p" || continue
+        for taken in "$@"; do
+            [ "$p" = "$taken" ] && continue 2
+        done
+        printf '%s' "$p"; return
     done
 }
 
 API_PORT="$(pick_port)"
-LLAMA_PORT="$(pick_port)"
-EMBED_PORT="$(pick_port)"
+LLAMA_PORT="$(pick_port "$API_PORT")"
+EMBED_PORT="$(pick_port "$API_PORT" "$LLAMA_PORT")"
 
 # Write a fresh pre-alias config over the disposable CONFIG_PATH.
 seed_config() { node "$FIXTURES/seed-config.mjs" "$CFG"; }
@@ -241,8 +248,13 @@ test_boot_migration() {
     assert_has "seeded default-small alias" "$names" "default-small"
     assert_not_has "catch-all is not migrated as an alias" "$names" '*'
 
-    assert_eq "both hosts fold into one alias, in directory order" \
-        "$BORETHRAX|qwen3-vl:8b
+    # The shared key is also the legacy defaultSmallModel, i.e. a known local
+    # reference, so step 4 of migrateModelMappings (contract amended 2026-08-03)
+    # unshifts a local target ahead of the folded remote ones — otherwise the
+    # alias would shadow the same-named local model and make it unservable.
+    assert_eq "local serving is preserved ahead of both hosts, in directory order" \
+        "local|$SMALL_TARGET
+$BORETHRAX|qwen3-vl:8b
 $DAHAKA|qwen3:8b" "$(aliases_of "$CFG" "$SMALL_TARGET")"
     assert_eq "single-host alias keeps its target" \
         "$BORETHRAX|gemma4:12b" "$(aliases_of "$CFG" 'gemini-4-12b')"
