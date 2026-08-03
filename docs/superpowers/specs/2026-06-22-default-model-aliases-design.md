@@ -2,6 +2,30 @@
 
 Date: 2026-06-22
 
+> ## ⚠️ SUPERSEDED — historical record only
+>
+> **Superseded by** [2026-08-03-model-alias-groups-design.md](2026-08-03-model-alias-groups-design.md)
+> (shipped 2026-08-03). Do not implement against this document.
+>
+> Everything below describes retired code. Specifically:
+>
+> - `api/default-models.js` and `api/default-models.test.js` are **deleted**.
+>   `resolveDefaultModel()`, `validateDefaultModelTarget()`, and
+>   `defaultModelListEntries()` no longer exist; `api/model-aliases.js` replaces
+>   them.
+> - The top-level `config.defaultBigModel` / `config.defaultSmallModel` keys are
+>   **deleted from the config** by a one-time migration. `default-big` and
+>   `default-small` are now ordinary rows in the global `config.aliases` table,
+>   each an ordered list of targets rather than one scalar name.
+>   `GET`/`POST /api/settings` keep the two field names as read/write **views**
+>   onto those aliases, so the General settings tab and existing clients are
+>   unaffected.
+> - The restriction that a default-model target may not be a **llama** preset id
+>   (only a model name or a ds4 preset id) was deliberately **lifted** — an alias
+>   target may name a model, a llama preset, or a ds4 preset.
+>
+> Current operator documentation: [`docs/features/model-alias-groups.md`](../../features/model-alias-groups.md).
+
 ## Problem
 
 Clients pin a specific model name in their requests. When that name doesn't match

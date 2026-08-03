@@ -1,12 +1,18 @@
 # Shared module contract — Model Alias Groups
 
-**This contract is authoritative and frozen.** Both the test worker and the
-implementation worker in each pair code against it independently, without
-talking to each other. If you believe the contract is wrong, DO NOT silently
-deviate — post an `orch tasks progress` comment on your task naming the problem,
-and comment on your pair partner's task too.
+**Status: SHIPPED 2026-08-03** (local `main` @ `c5a7e60`). This document has been
+**reconciled with what shipped** — every amendment the four convergence tasks
+recorded is folded in below and marked as such. It now describes the code as
+built, not only as designed.
+
+**This contract was authoritative and frozen** during implementation. Both the
+test worker and the implementation worker in each pair coded against it
+independently, without talking to each other. If you believe the contract is
+wrong, DO NOT silently deviate — post an `orch tasks progress` comment on your
+task naming the problem, and comment on your pair partner's task too.
 
 Spec: `docs/superpowers/specs/2026-08-03-model-alias-groups-design.md`
+Operator guide: `docs/features/model-alias-groups.md`
 
 ---
 
@@ -55,7 +61,7 @@ Exported for direct testing. When `pattern` contains no `*` or `?`, returns
 `[pattern]` **unconditionally** — an exact target is never filtered against the
 inventory (a model may be valid but not yet listed). When it does contain a
 wildcard, returns every entry of `names` that matches, in `names` order.
-Translation matches the outgoing `resolveModelMapping()`: `*` → `.*`, `?` → `.`,
+Translation matches the now-retired `resolveModelMapping()`: `*` → `.*`, `?` → `.`,
 anchored `^...$`. Regex metacharacters in the rest of the pattern are escaped.
 
 ### `resolveAliasCandidates(name, config, inventory) -> Candidate[]`
@@ -122,6 +128,12 @@ or scanned records (`{name}` / `{id}`).
 >
 > **`[3I]` must pass the `scanLocalModels()` names as the fourth argument** when
 > wiring the alias CRUD endpoint; omitting it silently disables the warning.
+>
+> **Shipped (`[3C]`).** The gap was real: `[3I]` called `validateAlias` with only
+> three arguments at both `setDefaultAliasTarget()` and `PUT /api/aliases/:name`,
+> leaving the warning dead in production. Both now pass `localModelNames()` — a
+> 30s-cached projection of `scanLocalModels()` names — and the warning fires (it is
+> what surfaces the `Qwen_Qwen3-8B-GGUF` shadowing notice in the UI).
 
 `value.targets` are trimmed and normalized to `{host, model}` only — any extra
 keys on an input target are dropped.
@@ -147,7 +159,10 @@ keeps that function's field shape so `/v1/models` consumers do not break:
 
 ## `api/alias-migration.js`
 
-### `migrateModelMappings(config) -> { migrated: boolean, warnings: string[] }`
+### `migrateModelMappings(config, localModels = []) -> { migrated: boolean, warnings: string[] }`
+
+*(Signature amended by `[2C]`; see step 4 and the note after it. The second
+argument was added with step 4 and is optional.)*
 
 **Mutates `config` in place.** No-op returning `{migrated:false, warnings:[]}`
 when `config.aliases` is already present (this is the idempotency key).
@@ -199,6 +214,28 @@ because `loadConfig()` may run before the local model list is available; with it
 omitted, the preset ids and the two legacy default targets still cover the
 common cases (including the real one above).
 
+> **Shipped.** `api/alias-migration.js` implements step 4 as `preserveLocalServing()`,
+> running after step 3 and before the step-5 deletes, and the fold records
+> `foldedNames` so only groups built in step 2 are eligible. `api/server.js` calls
+> `migrateModelMappings(cfg, localModelNames(true))` inside `loadConfig()`. Verified
+> against the operator's real config (on a copy): one warning, `Qwen_Qwen3-8B-GGUF`
+> led with its local target followed by borethrax then dahaka, `gemini-4-12b` stayed
+> remote-only, ember's `"*"` became `acceptsAny` with no alias created, both legacy
+> default keys were deleted, and a second run returned `migrated: false`.
+>
+> `[2T]` was already in flight against the unamended contract, so `[2C]` added the
+> coverage: preset-id match, `localModels`-argument match, legacy-`defaultSmallModel`
+> match (asserted deliberately WITHOUT passing `localModels`, proving the legacy
+> default alone rescues local serving at load time), a non-matching name staying
+> remote-only, no duplicate when a local target already exists, the seeded target
+> being FIRST, and idempotency not stacking a second local target. Two pre-existing
+> assertions that required the `Qwen_Qwen3-8B-GGUF` group to be remote-only were
+> updated — that is precisely the behavior step 4 exists to change — and the
+> directory-order test now additionally asserts the remote targets' models and full
+> host ordering, so it checks strictly more than before. `[3T]`'s smoke assertion
+> "both hosts fold into one alias, in directory order" was updated for the same
+> reason and now requires the local target first.
+
 ### `synthesizeModelMapping(config, backendId) -> Object<string,string>`
 
 The back-compat view for `GET /api/backends`. Walks `config.aliases` and returns
@@ -217,3 +254,39 @@ targets belonging to other hosts untouched. Removing a key from `mapping` that
 previously existed removes that backend's target from the corresponding group
 (and removes the group entirely if it becomes empty). Always returns at least
 one warning naming `modelMapping` as deprecated.
+
+---
+
+## `ui/src/pages/alias-editor.js`
+
+The pair-4 contract, frozen in the `[4T]`/`[4I]` task descriptions rather than in
+this file. Recorded here so the shipped module surface lives in one place. Pure
+state transforms only — no React, no I/O; `Settings.jsx` owns every fetch and all
+component state.
+
+| Export | Purpose |
+|---|---|
+| `aliasesToRows(aliases)` | flatten the alias table into flat `{rowId, aliasName, host, model}` rows, grouped and ordered |
+| `rowsToAliases(rows)` | fold edited rows back into an alias map, preserving row order within each alias |
+| `diffAliases(original, edited)` | `{changed, removed}` — which aliases a save must `PUT` and which it must `DELETE` |
+| `validateRows(rows, inventory)` | client-side errors/warnings mirroring the server's `validateAlias()` |
+
+`RESERVED_ALIAS_NAMES` is duplicated from `api/model-aliases.js` because the UI
+bundle cannot import from the server tree.
+
+> **Amended (`[4C]`) — `rowsToAliases` blank-field handling.** The contract clause
+> "Rows with a blank `aliasName`, host, or model are dropped" shipped implemented as
+> dropping only on a blank `aliasName`; rows with a blank `host` or `model` survived
+> into the output, and an alias whose every row was blank still appeared in the map.
+> **The implementation was wrong and was fixed; the tests were right and were left
+> untouched.** A row is now dropped unless `aliasName`, `host`, AND `model` are all
+> non-blank after trimming, and because a group is only created once a valid row is
+> seen, an all-blank alias is never created and is omitted for free.
+>
+> This matters beyond the unit test: a blank `host` would have been serialized into
+> `config.aliases` and `PUT` to `/api/aliases`, where the server's `validateAlias()`
+> rejects it — the user would have seen a confusing save failure instead of the
+> incomplete row simply being filtered out client-side. Cross-checked against
+> `Settings.jsx`: `validateRows()` already errors on a blank name/host/model and
+> `save()` early-returns while `errorCount > 0`, so the stricter fold can never
+> silently discard a row the user meant to keep.

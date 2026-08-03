@@ -116,19 +116,44 @@ credentials. Clocks, units, lifecycle ordering, cache semantics, version
 compatibility, and privacy guarantees are defined in
 [ContextTimingEvidence.md](Designs/ContextTimingEvidence.md).
 
-## 4. Model aliasing & preferred big/small models
+## 4. Model alias groups
 
-Two request-time aliases let clients pin a stable name while the operator retargets
-centrally (`api/default-models.js`):
+One global table, `config.aliases`, maps a client-facing **alias name** onto an
+**ordered list of targets**, each naming a host (`local` or a backend id) and a model
+on it (`api/model-aliases.js`). The router expands the alias into concrete candidates
+and prefers whichever is **already warm**. Full operator guide:
+[`features/model-alias-groups.md`](features/model-alias-groups.md).
 
-- **`default-big`** → `config.defaultBigModel`
-- **`default-small`** → `config.defaultSmallModel`
+- **Names are exact** — an alias is a literal string the client sends, never a glob,
+  so every alias is advertised as a concrete `/v1/models` row (`status: 'alias'`).
+- **Target models may glob** (`*`, `?`) and expand against that host's model list at
+  resolve time; an exact target resolves whether or not the host lists it yet.
+- **Local targets** may name a model, a llama preset id, or a ds4 preset id (a
+  ds4-backed first target transparently triggers exclusive DS4 activation).
+- **Warm gate** — a local candidate is warm only while **resident**; a remote
+  candidate is warm while its backend is reachable. Ranking happens inside the warm
+  tier; the cold tier (a local load, and therefore possibly an eviction) is a last
+  resort. This is what stops a conversational alias from evicting a resident 120B.
+  It is **soft** protection, conditioned on a remote member having queue capacity —
+  hard pinning is `config.modelResidency.desiredModels`.
+- **An alias shadows a real model of the same name**, since resolution runs at
+  request entry. `auto` / `default-router` are rejected; a collision with a real
+  local model or preset id warns.
+- `default-big` / `default-small` are now **ordinary rows in this table**.
+  `GET`/`POST /api/settings` keep `defaultBigModel`/`defaultSmallModel` as read/write
+  views onto them, so a client pinned to `default-big` still gets whatever the
+  operator has chosen — gpt-oss-120b today, DeepSeek V4 Flash tomorrow — with **no
+  client change**.
 
-A client that always asks for `default-big` gets whatever the operator has chosen —
-gpt-oss-120b today, DeepSeek V4 Flash tomorrow — with **no client change**. This is
-how you migrate a fleet between models (and between engines: a ds4-backed
-`default-big` transparently triggers exclusive DS4 activation). Set them via
-`POST /api/settings` (`defaultBigModel` / `defaultSmallModel`).
+CRUD at `/api/aliases` (`GET` returns each group with its live warm/cold candidate
+preview; `PUT` replaces a group's targets; `DELETE` removes it), edited from
+**Settings ▸ Aliases**. The retired per-backend `modelMapping` and the
+`defaultBigModel`/`defaultSmallModel` keys are folded into this table by a one-time
+idempotent migration in `loadConfig()` (`api/alias-migration.js`), which also seeds a
+`local` first target on any folded group whose name is a real local model so
+migration never drops local serving. `modelMapping` remains **deprecated but
+accepted** on `GET`/`PUT /api/backends` for one release cycle, synthesized from and
+folded back into the alias table.
 
 Separately, **display aliases** (`config.modelAliases`) rename models in the UI /
 `/v1/models` without changing routing.
@@ -152,9 +177,15 @@ decision (`resolveBackend`) layers several triggers:
   first response wins.
 
 Candidates are ranked by priority → measured tokens/sec (EMA) → shared-resource
-weight → queue depth. Backends have per-model `modelMapping` (exact/glob/`*`),
-API-key env vars, cost/concurrency/timeout, and health/circuit-breaker state.
-Managed at `/api/backends*`.
+weight → queue depth. When the request names an **alias**, the eligible candidates
+are that alias's own targets (see §4) — a backend the alias does not name cannot
+serve it, and the [warm gate](features/model-alias-groups.md#the-warm-gate) filters
+them before ranking. For a **direct** model request, the only per-host mechanism left
+is `backend.acceptsAny` (a model name to rewrite anything to, migrated from the old
+`modelMapping["*"]` key). `acceptsAny` is a **host policy, not an alias fallback**:
+an alias whose targets are all down never spills onto a catch-all host. Backends also
+carry API-key env vars, cost/concurrency/timeout, and health/circuit-breaker state.
+Managed at `/api/backends*`; their model translation lives in the alias table.
 
 Local and remote inference lanes release capacity by the exact identifier
 returned from queue acquisition. Unknown, missing, or duplicate releases are
@@ -255,7 +286,7 @@ Turn the host into a full-screen dashboard appliance (gdm autologin → a Waylan
 |---|---|
 | Server monolith / all endpoints | `api/server.js` |
 | Engine abstraction, DS4 config/validation | `api/engines.js` |
-| default-big/small aliases | `api/default-models.js` |
+| Model alias groups (incl. default-big/small) | `api/model-aliases.js`, `api/alias-migration.js`, `ui/src/pages/alias-editor.js` |
 | Offload / protect-resident | `api/protect-resident.js` |
 | DS4 engine | `api/ds4-supervisor.js`, `api/ds4-exclusive.js`, `api/ds4-adaptive.js`, `api/ds4-updater.js`, `start-ds4.sh` |
 | Guards | `api/mem-watchdog.js`, `resource-guard.js`, `restart-governor.js`, `queue-admission.js`, `slot-reaper.js`, `engine-kill.js`, `upstream-retry.js` |
@@ -267,6 +298,7 @@ Turn the host into a full-screen dashboard appliance (gdm autologin → a Waylan
 
 ## Related docs
 
+- [`features/model-alias-groups.md`](features/model-alias-groups.md) — alias groups: config shape, the warm gate, migration from `modelMapping`
 - [`ds4-engine.md`](ds4-engine.md) — DeepSeek V4 Flash engine (this feature set's centerpiece)
 - [`ds4-build.md`](ds4-build.md) / [`ds4-auto-update.md`](ds4-auto-update.md) — build + self-updater
 - [`Designs/EngineAbstraction.md`](Designs/EngineAbstraction.md) — engine-seam design
