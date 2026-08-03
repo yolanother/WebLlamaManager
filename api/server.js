@@ -724,20 +724,122 @@ function cacheRemoteModels(backendId, models) {
   remoteModelsCache.set(backendId, models.filter(m => typeof m === 'string' && m));
 }
 
-// Resolve a model name against a mapping (supports exact match, glob patterns, * catch-all)
-function resolveModelMapping(mapping, requestedModel) {
-  if (!mapping) return null;
-  // 1. Exact match
-  if (mapping[requestedModel]) return mapping[requestedModel];
-  // 2. Glob pattern match (e.g. "qwen*" matches "qwen-32b")
-  for (const [pattern, target] of Object.entries(mapping)) {
-    if (pattern === '*' || pattern === requestedModel) continue;
-    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
-    if (regex.test(requestedModel)) return target;
+/**
+ * Snapshot the live world alias resolution needs injected: the local model catalog,
+ * the preset table, what the local router currently has resident, and every backend's
+ * eligibility plus its cached model catalog.
+ *
+ * `available` maps onto the circuit breaker: a backend whose circuit is open is not
+ * reachable right now, so its candidates land in the COLD tier and stop counting as a
+ * warm alternative that could hold a cold local load back.
+ *
+ * @returns {import('./model-aliases.js').Inventory} the inventory for this instant.
+ */
+function buildAliasInventory() {
+  return {
+    localModels: localModelNames(),
+    presets: config.presets || {},
+    residentModels: loadedModelsSnapshot.map(m => m.id),
+    backends: (config.backends?.directory || []).map(b => ({
+      id: b.id,
+      enabled: !!b.enabled,
+      tested: !!b.tested,
+      remoteModels: remoteModelsCache.get(b.id) || [],
+      available: !isBackendCircuitOpen(b.id),
+    })),
+  };
+}
+
+/**
+ * @typedef {{
+ *   name: string,
+ *   candidates: import('./model-aliases.js').Candidate[],
+ *   warm: import('./model-aliases.js').Candidate[],
+ *   cold: import('./model-aliases.js').Candidate[],
+ *   ranked: import('./model-aliases.js').Candidate[],
+ *   localTarget: (string|null)
+ * }} AliasRouting the resolved routing tiers for one alias request.
+ *   ranked      — the tier routing may choose from: `warm` unless it is empty, else `cold`.
+ *   localTarget — the concrete local model/preset the local engine would serve, or null
+ *                 for a remote-only alias.
+ */
+
+/**
+ * Resolve a requested name through the alias table into its warm/cold routing tiers.
+ *
+ * This is the entry point every routing decision goes through. A name that is not a
+ * configured alias — or an alias whose targets all resolve away (backend disabled,
+ * untested, or a glob matching nothing) — returns null, and the caller treats the name
+ * as a literal model exactly as it did before alias groups existed.
+ *
+ * @param {string} name the requested model name, which may be an alias.
+ * @returns {AliasRouting|null} the routing tiers, or null when `name` is not a live alias.
+ */
+function resolveAliasRouting(name) {
+  const inventory = buildAliasInventory();
+  const candidates = resolveAliasCandidates(name, config, inventory);
+  if (!candidates.length) return null;
+  const { warm, cold } = partitionByWarmth(candidates, inventory);
+  const ranked = warm.length ? warm : cold;
+  const localTarget = (ranked.find(c => c.host === 'local') ?? candidates.find(c => c.host === 'local'))?.model ?? null;
+  return { name, candidates, warm, cold, ranked, localTarget };
+}
+
+/**
+ * Resolve an incoming request's model name through the alias table.
+ *
+ * Replaces `resolveDefaultModel()`: where that mapped two hardcoded aliases onto a
+ * single configured target, this maps ANY configured alias onto the concrete name the
+ * LOCAL engine would serve, and hands back the routing tiers so the caller can pass
+ * them into `resolveBackend()` instead of making it re-derive them from a name that no
+ * longer identifies the alias.
+ *
+ * @param {string} rawModel the model name exactly as the client sent it.
+ * @returns {{requestedModel: string, aliasRouting: AliasRouting|null}} the name to serve
+ *   locally (unchanged for a non-alias or remote-only alias) and the routing tiers.
+ */
+function resolveRequestModel(rawModel) {
+  const aliasRouting = typeof rawModel === 'string' ? resolveAliasRouting(rawModel) : null;
+  return { requestedModel: aliasRouting?.localTarget ?? rawModel, aliasRouting };
+}
+
+/**
+ * The model name `backend` must be sent for this request, or null when it cannot serve it.
+ *
+ * This replaces the retired per-backend mapping resolver and splits its two jobs cleanly:
+ *
+ * - For an ALIAS request the answer comes from the alias's own candidates, restricted to
+ *   the tier being ranked. A backend not named by the alias cannot serve it — in
+ *   particular `acceptsAny` is deliberately NOT consulted, so a catch-all host never
+ *   absorbs an alias whose own targets are all down.
+ * - For a DIRECT model request the only remaining mechanism is `backend.acceptsAny` (the
+ *   migrated `'*'` mapping key), which names the model to send for anything.
+ *
+ * @param {{id: string, acceptsAny?: string}} backend the backend under consideration.
+ * @param {AliasRouting|null|undefined} aliasRouting routing tiers when the request is an alias.
+ * @returns {string|null} the remote model name to send, or null when this backend is out.
+ */
+function remoteTargetModel(backend, aliasRouting) {
+  if (aliasRouting) {
+    return aliasRouting.ranked.find(c => c.backendId === backend?.id)?.model ?? null;
   }
-  // 3. Wildcard catch-all
-  if (mapping['*']) return mapping['*'];
-  return null;
+  const anyModel = typeof backend?.acceptsAny === 'string' ? backend.acceptsAny.trim() : '';
+  return anyModel || null;
+}
+
+/**
+ * Lowest authored target index this backend contributes to the ranked tier, used as the
+ * final ranking tiebreak so an operator's target ordering decides between otherwise
+ * indistinguishable backends.
+ *
+ * @param {{id: string}} backend the backend under consideration.
+ * @param {AliasRouting|null|undefined} aliasRouting routing tiers when the request is an alias.
+ * @returns {number} the authored order, or 0 when the request is not an alias.
+ */
+function aliasOrderFor(backend, aliasRouting) {
+  if (!aliasRouting) return 0;
+  const orders = aliasRouting.ranked.filter(c => c.backendId === backend?.id).map(c => c.order);
+  return orders.length ? Math.min(...orders) : Number.MAX_SAFE_INTEGER;
 }
 
 // Conservative queue/offload estimates. Image cost is a fixed placeholder,
@@ -836,8 +938,22 @@ function estimateLocalProcessingMs(inputTokens) {
   return promptMs + queueWaitMs;
 }
 
-// Resolve which backend should handle a request
-function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = {}) {
+/**
+ * Resolve which backend should handle a request: the local engine, or one of the remote
+ * backends the request's alias (or `acceptsAny` policy) makes eligible.
+ *
+ * @param {string} requestedModel the concrete model the LOCAL engine would serve.
+ * @param {string} endpoint the OpenAI endpoint path, e.g. 'chat/completions'.
+ * @param {object|null} body the request body, used only for size-based offload estimates.
+ * @param {{localOnly?: boolean, aliasRouting?: AliasRouting|null}} [options] `aliasRouting`
+ *   is the tiers resolved from the ORIGINAL request name; pass it explicitly whenever the
+ *   alias name differs from `requestedModel`, since it cannot be re-derived from the
+ *   resolved name. Omit it and it is derived from `requestedModel`.
+ * @returns {object} a routing decision: `{remote:false}` for local, a remote routing
+ *   envelope from `buildRemoteRouting()`, or a blocked-residency marker.
+ */
+function resolveBackend(requestedModel, endpoint, body, { localOnly = false, aliasRouting } = {}) {
+  const alias = aliasRouting !== undefined ? aliasRouting : resolveAliasRouting(requestedModel);
   const backends = config.backends || {};
   const desiredModels = desiredResidentModels();
   const residencyApplies = endpoint !== 'embeddings';
@@ -900,8 +1016,7 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = 
     if (!b.enabled || !b.tested) return false;
     if (isBackendCircuitOpen(b.id)) return false;
     if (b.supportedEndpoints && !b.supportedEndpoints.includes(viableRemoteEndpointKey)) return false;
-    if (!b.modelMapping) return false;
-    if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
+    if (!remoteTargetModel(b, alias)) return false;
     const queue = backendQueues.get(b.id);
     if (queue && queue.active >= queue.concurrency) return false;
     return true;
@@ -1040,16 +1155,16 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = 
     return { remote: false, localOnly: true, offloadSuppressed: true, suppressionReason: 'local_only' };
   }
 
-  // Pick best backend (must be enabled, tested, have capacity, and have a model mapping)
+  // Pick best backend (must be enabled, tested, have capacity, and be able to serve the model)
   const endpointKey = endpoint.replace(/\//g, '/');
   const candidates = backends.directory.filter(b => {
     if (!b.enabled) return false;
     if (!b.tested) return false; // Must pass a connectivity test before use
     if (isBackendCircuitOpen(b.id)) return false; // Skip backends with tripped circuit breaker
     if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
-    // Check model mapping (exact match, glob patterns, or * catch-all)
-    if (!b.modelMapping) return false;
-    if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
+    // Alias request → this backend must be one of the alias's own ranked targets.
+    // Direct request → only an acceptsAny host can serve it.
+    if (!remoteTargetModel(b, alias)) return false;
     // Backpressure: skip backends whose queue is at capacity so we don't pile
     // work onto an overloaded endpoint. If ALL backends are full, we fall through
     // to local processing rather than making things worse.
@@ -1082,15 +1197,16 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = 
     if (wa !== wb) return wa - wb;
     const qa = backendQueues.get(a.id)?.active || 0;
     const qb = backendQueues.get(b.id)?.active || 0;
-    return qa - qb;
+    if (qa !== qb) return qa - qb;
+    // Final tiebreak: the operator's authored target order within the alias group.
+    return aliasOrderFor(a, alias) - aliasOrderFor(b, alias);
   });
 
   const chosen = candidates[0];
   const chosenQueue = backendQueues.get(chosen.id);
   const chosenStats = backendStats.get(chosen.id);
   console.log(`[routing] Selected backend: ${chosen.name} (${chosenQueue?.active || 0}/${chosenQueue?.concurrency || '?'} active, ${Math.round(chosenStats?.avgTokPerSec || 0)} tok/s, priority=${chosen.priority ?? 50})`);
-  const remoteModel = resolveModelMapping(chosen.modelMapping, requestedModel);
-  return buildRemoteRouting(chosen, remoteModel, endpoint);
+  return buildRemoteRouting(chosen, remoteTargetModel(chosen, alias), endpoint);
 }
 
 /** Return a stable routing rejection for a local load that would evict a desired model. */
@@ -1149,9 +1265,18 @@ function buildRemoteRouting(backend, remoteModel, endpoint) {
   };
 }
 
-// Find the fastest available remote backend with capacity for a given model and endpoint.
-// Returns the best candidate backend config object, or null if none available.
-function findFastestAvailableBackend(requestedModel, endpoint) {
+/**
+ * Find the fastest available remote backend with capacity for a given model and endpoint.
+ *
+ * @param {string} requestedModel the model to serve; used to derive the alias tiers when
+ *   `aliasRouting` is omitted.
+ * @param {string} endpoint the OpenAI endpoint path, e.g. 'chat/completions'.
+ * @param {AliasRouting|null} [aliasRouting] pre-resolved alias tiers from the ORIGINAL
+ *   request name. Pass it whenever the alias name differs from `requestedModel`.
+ * @returns {object|null} the best candidate backend config object, or null if none available.
+ */
+function findFastestAvailableBackend(requestedModel, endpoint, aliasRouting) {
+  const alias = aliasRouting !== undefined ? aliasRouting : resolveAliasRouting(requestedModel);
   const backends = config.backends || {};
   if (!backends.enabled || !backends.directory?.length) return null;
 
@@ -1160,8 +1285,7 @@ function findFastestAvailableBackend(requestedModel, endpoint) {
     if (!b.enabled || !b.tested) return false;
     if (isBackendCircuitOpen(b.id)) return false;
     if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
-    if (!b.modelMapping) return false;
-    if (!resolveModelMapping(b.modelMapping, requestedModel)) return false;
+    if (!remoteTargetModel(b, alias)) return false;
     const queue = backendQueues.get(b.id);
     if (queue && queue.active >= queue.concurrency) return false;
     return true;
@@ -1182,7 +1306,7 @@ function findFastestAvailableBackend(requestedModel, endpoint) {
 // Backfill race: when a request stalls with no output, race it against the fastest
 // available remote backend. Whichever produces a response first wins; the loser is aborted.
 // Called from the local handler path. Also triggered event-driven when other requests complete.
-function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isStreaming, startTime, activeReqId }) {
+function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isStreaming, startTime, activeReqId, aliasRouting }) {
   const backends = config.backends || {};
   if (!backends.enabled || !backends.directory?.length) return null;
 
@@ -1196,13 +1320,18 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
     if (entry.tokens > 0) return;
     entry._backfillStarted = true;
 
-    const chosen = findFastestAvailableBackend(requestedModel, endpoint);
+    // Re-resolve the tiers at STALL time, not at setup time: a backend may have come
+    // back (or the local model may have been evicted) during the stall window.
+    const alias = aliasRouting !== undefined
+      ? (aliasRouting && resolveAliasRouting(aliasRouting.name))
+      : resolveAliasRouting(requestedModel);
+    const chosen = findFastestAvailableBackend(requestedModel, endpoint, alias);
     if (!chosen) {
       entry._backfillStarted = false; // allow retry when another request completes
       return;
     }
 
-    const remoteModel = resolveModelMapping(chosen.modelMapping, requestedModel);
+    const remoteModel = remoteTargetModel(chosen, alias);
     const routing = buildRemoteRouting(chosen, remoteModel, endpoint);
     const remoteBody = { ...proxyBody, model: remoteModel };
     const elapsed = Date.now() - startTime;
@@ -1990,7 +2119,7 @@ function broadcastActiveRequest(event, data) {
   }
 }
 
-function startActiveRequest({ model, endpoint, messages, prompt, backend, priority = 'interactive', routing = 'auto' }) {
+function startActiveRequest({ model, endpoint, messages, prompt, backend, priority = 'interactive', routing = 'auto', aliasModel = null }) {
   const id = ++activeRequestIdCounter;
   // Extract last user message for display
   let userMessage = '';
@@ -2018,7 +2147,10 @@ function startActiveRequest({ model, endpoint, messages, prompt, backend, priori
   // actual upstream work.
   // upstreamProbe captures the latest llama.cpp /slots state for this request —
   // proof-of-life during long prompt processing (no tokens yet but slot busy).
-  const entry = { id, model, endpoint, userMessage, fullContext, responseText: '', startTime: now, lastActivityAt: now, slotAcquiredAt: null, upstreamProbe: null, status: 'processing', tokens: 0, backend: backend || 'local', priority, routing, abortController };
+  // aliasModel keeps the ORIGINAL alias name when the request came in through one, so
+  // the reroute scanner can re-resolve the alias group later — `model` by then holds the
+  // concrete local target and no longer identifies the group.
+  const entry = { id, model, aliasModel, endpoint, userMessage, fullContext, responseText: '', startTime: now, lastActivityAt: now, slotAcquiredAt: null, upstreamProbe: null, status: 'processing', tokens: 0, backend: backend || 'local', priority, routing, abortController };
   activeRequests.set(id, entry);
   // Track which model is actively being processed on the local backend
   // This is used by the offload logic to detect model-switch conflicts while a model is still loading
@@ -8865,6 +8997,7 @@ async function handleChatCompletions(req, res) {
   // engine seam can tell an alias request from a direct model request.
   const rawModel = req.body.model || 'default';
   const requestedModel = resolveDefaultModel(rawModel, config);
+  const aliasRouting = resolveAliasRouting(requestedModel);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
@@ -8915,7 +9048,7 @@ async function handleChatCompletions(req, res) {
     const decision = ds4RequestTarget({
       requestedModel,
       ds4ModelIds: ds4ModelIdsForPreset(currentPreset),
-      hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'chat/completions'),
+      hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'chat/completions', aliasRouting),
     });
     if (decision.target === 'local-ds4') {
       req.body = proxyBody;
@@ -8940,13 +9073,13 @@ async function handleChatCompletions(req, res) {
       return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
     }
     // Force remote (never local): build routing from the fastest viable backend.
-    const backend = findFastestAvailableBackend(requestedModel, 'chat/completions');
-    const remoteModel = resolveModelMapping(backend.modelMapping, requestedModel);
+    const backend = findFastestAvailableBackend(requestedModel, 'chat/completions', aliasRouting);
+    const remoteModel = remoteTargetModel(backend, aliasRouting);
     routing = buildRemoteRouting(backend, remoteModel, 'chat/completions');
     console.log(`[chat/completions] ds4 exclusive: offloading non-ds4 model '${requestedModel}' to ${backend.name} (${remoteModel})`);
   } else {
     // Resolve backend routing (local vs remote) the normal way.
-    routing = resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly });
+    routing = resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
   }
   if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
@@ -9031,6 +9164,7 @@ async function handleChatCompletions(req, res) {
 
   const activeReqId = startActiveRequest({
     model: requestedModel,
+    aliasModel: aliasRouting?.name ?? null,
     endpoint: 'chat/completions',
     messages: req.body.messages,
     backend: routing.remote ? routing.backend.id : 'local',
@@ -9485,7 +9619,7 @@ async function handleChatCompletions(req, res) {
   // Start backfill race timer — if this request stalls (no tokens after backfillStallMs),
   // race it against the fastest available remote backend. Whoever responds first wins.
   const backfillTimer = requestPolicy.localOnly ? null : setupBackfillRace(req, res, {
-    requestedModel, endpoint: 'chat/completions', proxyBody, isStreaming, startTime, activeReqId
+    requestedModel, endpoint: 'chat/completions', proxyBody, isStreaming, startTime, activeReqId, aliasRouting
   });
 
   // Helper: send a JSON error response if we haven't started the real body yet.
@@ -9988,6 +10122,7 @@ async function handleCompletions(req, res) {
   // Resolve default-big/default-small aliases and forward the resolved name downstream.
   const rawModel = req.body.model || 'unknown';
   const requestedModel = resolveDefaultModel(rawModel, config);
+  const aliasRouting = resolveAliasRouting(requestedModel);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
   const isStreaming = req.body.stream === true;
 
@@ -10008,7 +10143,7 @@ async function handleCompletions(req, res) {
     const decision = ds4RequestTarget({
       requestedModel,
       ds4ModelIds: ds4ModelIdsForPreset(currentPreset),
-      hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'completions'),
+      hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'completions', aliasRouting),
     });
     if (decision.target === 'local-ds4') {
       return proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, startTime });
@@ -10022,12 +10157,12 @@ async function handleCompletions(req, res) {
       const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
       return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
     }
-    const backend = findFastestAvailableBackend(requestedModel, 'completions');
-    routing = buildRemoteRouting(backend, resolveModelMapping(backend.modelMapping, requestedModel), 'completions');
+    const backend = findFastestAvailableBackend(requestedModel, 'completions', aliasRouting);
+    routing = buildRemoteRouting(backend, remoteTargetModel(backend, aliasRouting), 'completions');
     console.log(`[completions] ds4 exclusive: offloading non-ds4 model '${requestedModel}' to ${backend.name}`);
   } else {
     // Route to remote backend if applicable
-    routing = resolveBackend(requestedModel, 'completions', req.body, { localOnly: requestPolicy.localOnly });
+    routing = resolveBackend(requestedModel, 'completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
   }
   if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
@@ -11186,13 +11321,15 @@ setInterval(() => {
     if (!entry || entry._rerouteHint || entry.routing === 'local_only') continue;
     const model = entry.model;
     if (!model) continue;
-    // Find a remote backend that maps this model AND has capacity AND circuit
-    // is closed. If found, mark the entry and cancel the queue position.
+    // Find a remote backend that can serve this model AND has capacity AND circuit
+    // is closed. If found, mark the entry and cancel the queue position. The alias is
+    // re-resolved from the entry's original request name when it came in through one,
+    // since the queued entry's `model` is the LOCAL target and no longer names the group.
+    const alias = resolveAliasRouting(entry.aliasModel || model);
     const viable = dir.find(b => {
       if (!b.enabled || !b.tested) return false;
       if (isBackendCircuitOpen(b.id)) return false;
-      if (!b.modelMapping) return false;
-      if (!resolveModelMapping(b.modelMapping, model)) return false;
+      if (!remoteTargetModel(b, alias)) return false;
       const q = backendQueues.get(b.id);
       return !q || q.active < q.concurrency;
     });
