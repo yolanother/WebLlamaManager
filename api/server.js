@@ -49,6 +49,10 @@ import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots } from './slot-reaper.js';
 import { resolveDefaultModel, defaultModelListEntries, ds4PresetForModel, validateDefaultModelTarget, BIG_ALIAS, SMALL_ALIAS } from './default-models.js';
+import {
+  resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries,
+} from './model-aliases.js';
+import { migrateModelMappings, synthesizeModelMapping, foldModelMapping } from './alias-migration.js';
 import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
 import { addModelCapabilityMetadata, createModelCapabilityResolver } from './model-capabilities.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
@@ -666,6 +670,58 @@ function initBackendQueues() {
       });
     }
   }
+}
+
+// ── Alias inventory sources ──────────────────────────────────────────────────
+// Alias resolution is pure (see api/model-aliases.js): it needs the world injected
+// as an `Inventory`. The two pieces that are expensive or not otherwise persisted
+// are cached here so the routing hot path never touches the filesystem or network.
+
+/** TTL for the cached local model-name list used to expand `host:'local'` globs. */
+const LOCAL_MODEL_NAMES_TTL_MS = 30_000;
+
+/** @type {{names: string[], at: number}} last scan of the models directory. */
+let localModelNamesCache = { names: [], at: 0 };
+
+/**
+ * Bare local model names for alias glob expansion, cached for
+ * {@link LOCAL_MODEL_NAMES_TTL_MS} because `scanLocalModels()` walks the models
+ * directory. A failed scan keeps the previous list rather than reporting "no local
+ * models", which would silently strip every local target out of every alias.
+ *
+ * @param {boolean} [force] rescan immediately, ignoring the TTL.
+ * @returns {string[]} local model names (possibly empty on a cold, failed first scan).
+ */
+function localModelNames(force = false) {
+  const now = Date.now();
+  if (!force && now - localModelNamesCache.at < LOCAL_MODEL_NAMES_TTL_MS) return localModelNamesCache.names;
+  try {
+    localModelNamesCache = { names: scanLocalModels().map(m => m.name).filter(Boolean), at: now };
+  } catch {
+    localModelNamesCache = { names: localModelNamesCache.names, at: now };
+  }
+  return localModelNamesCache.names;
+}
+
+/**
+ * Per-backend model catalogs, keyed by backend id, populated whenever a backend is
+ * probed or tested. Only glob targets (`{host:'<backend>', model:'qwen*'}`) consult
+ * it — an exact target expands to itself without any inventory lookup — so an empty
+ * cache degrades to "exact alias targets still route, globs match nothing yet".
+ * @type {Map<string, string[]>}
+ */
+const remoteModelsCache = new Map();
+
+/**
+ * Record a backend's advertised model list for alias glob expansion.
+ *
+ * @param {string} backendId backend the list belongs to.
+ * @param {string[]|undefined} models model names reported by the backend.
+ * @returns {void}
+ */
+function cacheRemoteModels(backendId, models) {
+  if (!backendId || !Array.isArray(models)) return;
+  remoteModelsCache.set(backendId, models.filter(m => typeof m === 'string' && m));
 }
 
 // Resolve a model name against a mapping (supports exact match, glob patterns, * catch-all)
@@ -2200,6 +2256,21 @@ function loadConfig() {
 
     cfg.presetsSeeded = true;
     // Save if we seeded presets or if we're upgrading an old config to include the flag
+    saveConfig(cfg);
+  }
+
+  // Migration: fold the per-backend `modelMapping` tables and the legacy
+  // defaultBigModel/defaultSmallModel keys into the unified `config.aliases` table,
+  // which is now the only routing mechanism (see api/alias-migration.js). Idempotent
+  // — keyed on `aliases` already existing — so every boot after the first is a no-op.
+  // The local model list is passed so a mapping key that names a real local model
+  // keeps a local target and does not become remote-only.
+  const aliasMigration = migrateModelMappings(cfg, localModelNames(true));
+  if (aliasMigration.migrated) {
+    for (const warning of aliasMigration.warnings) {
+      console.warn(`[aliases] migration: ${warning}`);
+    }
+    console.log(`[aliases] migrated ${Object.keys(cfg.aliases || {}).length} alias group(s) from modelMapping / default-model config`);
     saveConfig(cfg);
   }
 
