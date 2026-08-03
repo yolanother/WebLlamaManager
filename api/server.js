@@ -50,7 +50,7 @@ import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent
 import { findLeakedSlots } from './slot-reaper.js';
 import {
   resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries,
-  BIG_ALIAS, SMALL_ALIAS,
+  BIG_ALIAS, SMALL_ALIAS, RESERVED_ALIAS_NAMES,
 } from './model-aliases.js';
 import { migrateModelMappings, synthesizeModelMapping, foldModelMapping } from './alias-migration.js';
 import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
@@ -3906,6 +3906,78 @@ app.post('/api/settings', (req, res) => {
     ...(aliasWarnings.length ? { warnings: aliasWarnings } : {}),
     message: 'Settings saved. Restart the server for changes to take effect.'
   });
+});
+
+// ========== Model Alias Groups ==========
+// The single routing mechanism: an alias name maps to an ORDERED list of targets, each
+// naming a host ('local' or a backend id) and a model (exact or a */? glob). These three
+// endpoints are the operator's editor for config.aliases; everything else in the server
+// only reads it. See api/model-aliases.js for resolution and the warm gate.
+
+/**
+ * Render one alias group with a live preview of what it currently resolves to, so the
+ * operator can see whether a target is reachable without issuing a request.
+ *
+ * @param {string} name the alias name.
+ * @param {{targets: Array<{host: string, model: string}>}} group the stored group.
+ * @returns {object} the group plus its resolved candidates split into warm and cold.
+ */
+function aliasView(name, group) {
+  const routing = resolveAliasRouting(name);
+  return {
+    name,
+    targets: Array.isArray(group?.targets) ? group.targets : [],
+    candidates: routing?.candidates ?? [],
+    warm: routing?.warm ?? [],
+    cold: routing?.cold ?? [],
+    resolvable: !!routing,
+    localTarget: routing?.localTarget ?? null,
+  };
+}
+
+// List every configured alias group with its resolved candidate preview.
+app.get('/api/aliases', (req, res) => {
+  const aliases = config.aliases && typeof config.aliases === 'object' ? config.aliases : {};
+  res.json({
+    aliases: Object.keys(aliases).map(name => aliasView(name, aliases[name])),
+    reserved: RESERVED_ALIAS_NAMES,
+  });
+});
+
+// Create or replace an alias group. The body carries the full target list; a PUT is a
+// replace, not a merge, so removing a target is expressed by omitting it.
+app.put('/api/aliases/:name', (req, res) => {
+  const result = validateAlias(config, req.params.name, req.body?.targets);
+  if (!result.ok) return res.status(400).json({ error: result.error });
+
+  const name = req.params.name.trim();
+  if (!config.aliases || typeof config.aliases !== 'object') config.aliases = {};
+  const existed = Object.prototype.hasOwnProperty.call(config.aliases, name);
+  config.aliases[name] = result.value;
+  saveConfig(config);
+  addLog('backends', `${existed ? 'Updated' : 'Created'} alias '${name}' -> ${result.value.targets.map(t => `${t.host}/${t.model}`).join(', ')}`);
+  for (const warning of result.warnings) addLog('backends', `Alias '${name}': ${warning}`);
+
+  res.json({
+    success: true,
+    created: !existed,
+    alias: aliasView(name, config.aliases[name]),
+    warnings: result.warnings,
+  });
+});
+
+// Delete an alias group. Clients requesting the name afterwards fall back to treating it
+// as a literal model name, which is the pre-alias behavior.
+app.delete('/api/aliases/:name', (req, res) => {
+  const name = String(req.params.name || '').trim();
+  if (!config.aliases || !Object.prototype.hasOwnProperty.call(config.aliases, name)) {
+    return res.status(404).json({ error: 'Alias not found' });
+  }
+  const removed = config.aliases[name];
+  delete config.aliases[name];
+  saveConfig(config);
+  addLog('backends', `Removed alias '${name}'`);
+  res.json({ success: true, removed: { name, targets: removed?.targets ?? [] } });
 });
 
 // ========== Remote Backend Management ==========
