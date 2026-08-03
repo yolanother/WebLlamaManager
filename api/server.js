@@ -3763,6 +3763,8 @@ app.get('/api/settings', (req, res) => {
         preferLocal: config.backends?.preferLocal !== false,
         directory: (config.backends?.directory || []).map(b => ({
           ...b,
+          // Deprecated view synthesized from the alias table (see GET /api/backends).
+          modelMapping: synthesizeModelMapping(config, b.id),
           apiKeyConfigured: !!(b.apiKeyEnvVar && process.env[b.apiKeyEnvVar])
         }))
       }
@@ -3982,11 +3984,16 @@ app.delete('/api/aliases/:name', (req, res) => {
 
 // ========== Remote Backend Management ==========
 
-// List all backends with status
+// List all backends with status.
+// `modelMapping` is DEPRECATED and no longer stored on the backend: it is synthesized
+// from the global alias table so existing clients keep working for a release cycle.
+// Use GET /api/aliases instead — it shows local targets and multi-host groups, which a
+// flat per-backend mapping cannot express.
 app.get('/api/backends', (req, res) => {
   const dir = config.backends?.directory || [];
   const result = dir.map(b => ({
     ...b,
+    modelMapping: synthesizeModelMapping(config, b.id),
     apiKeyConfigured: !!(b.apiKeyEnvVar && process.env[b.apiKeyEnvVar]),
     queue: {
       active: backendQueues.get(b.id)?.active || 0,
@@ -4021,7 +4028,6 @@ app.post('/api/backends', (req, res) => {
     enabled: enabled !== false,
     priority: Math.max(1, Math.min(100, parseInt(priority) || 10)),
     apiKeyEnvVar: apiKeyEnvVar || '',
-    modelMapping: modelMapping || { '*': '' },
     supportedEndpoints: supportedEndpoints || ['chat/completions', 'completions', 'embeddings'],
     costs: {
       inputTokenCostPer1M: parseFloat(costs?.inputTokenCostPer1M) || 0,
@@ -4038,10 +4044,17 @@ app.post('/api/backends', (req, res) => {
     config.backends = { enabled: false, offloadPolicy: 'overflow', offloadThresholdQueueDepth: 2, offloadThresholdWaitMs: 5000, offloadPercentage: 0, preferLocal: true, directory: [] };
   }
   config.backends.directory.push(backend);
+  // Deprecated: a mapping supplied at creation folds straight into the alias table.
+  const mappingWarnings = modelMapping ? foldModelMapping(config, backend.id, modelMapping).warnings : [];
+  for (const warning of mappingWarnings) addLog('backends', `Backend '${backend.id}': ${warning}`);
   saveConfig(config);
   initBackendQueues();
   addLog('backends', `Added backend: ${backend.name} (${backend.id})`);
-  res.json({ success: true, backend });
+  res.json({
+    success: true,
+    backend: { ...backend, modelMapping: synthesizeModelMapping(config, backend.id) },
+    ...(mappingWarnings.length ? { warnings: mappingWarnings } : {}),
+  });
 });
 
 // Update a backend
@@ -4063,7 +4076,15 @@ app.put('/api/backends/:id', (req, res) => {
   if (updates.enabled !== undefined) existing.enabled = Boolean(updates.enabled);
   if (updates.priority !== undefined) existing.priority = Math.max(1, Math.min(100, parseInt(updates.priority) || 10));
   if (updates.apiKeyEnvVar !== undefined) existing.apiKeyEnvVar = updates.apiKeyEnvVar;
-  if (updates.modelMapping !== undefined) existing.modelMapping = updates.modelMapping;
+  // Deprecated write path: fold the flat mapping into the global alias table rather than
+  // storing it on the backend. Each key becomes or joins an alias group with this backend
+  // as a target, and '*' is diverted to backend.acceptsAny.
+  const mappingWarnings = [];
+  if (updates.modelMapping !== undefined) {
+    mappingWarnings.push(...foldModelMapping(config, existing.id, updates.modelMapping).warnings);
+    for (const warning of mappingWarnings) addLog('backends', `Backend '${existing.id}': ${warning}`);
+    delete existing.modelMapping;
+  }
   if (updates.supportedEndpoints !== undefined) existing.supportedEndpoints = updates.supportedEndpoints;
   if (updates.costs !== undefined) {
     existing.costs = {
@@ -4081,7 +4102,11 @@ app.put('/api/backends/:id', (req, res) => {
   saveConfig(config);
   initBackendQueues();
   addLog('backends', `Updated backend: ${existing.name} (${existing.id})`);
-  res.json({ success: true, backend: existing });
+  res.json({
+    success: true,
+    backend: { ...existing, modelMapping: synthesizeModelMapping(config, existing.id) },
+    ...(mappingWarnings.length ? { warnings: mappingWarnings } : {}),
+  });
 });
 
 // Delete a backend
@@ -4125,6 +4150,7 @@ app.get('/api/backends/:id/models', async (req, res) => {
     }
     const data = await response.json();
     const models = (data.data || data.models || []).map(m => typeof m === 'string' ? m : m.id || m.name || '').filter(Boolean);
+    cacheRemoteModels(backend.id, models);   // feed the alias inventory for glob targets
     res.json({ models });
   } catch (err) {
     res.json({ models: [], error: err.message });
@@ -4180,11 +4206,14 @@ app.post('/api/backends/:id/refresh-models', async (req, res) => {
   const backend = config.backends?.directory?.find(b => b.id === req.params.id);
   const url = req.body?.url || backend?.url;
   if (!url) return res.status(404).json({ error: 'Backend not found and no url in body' });
-  res.json(await probeBackendModels({
+  const probe = await probeBackendModels({
     url,
     apiKeyEnvVar: req.body?.apiKeyEnvVar ?? backend?.apiKeyEnvVar,
     extraHeaders: req.body?.extraHeaders ?? backend?.extraHeaders
-  }));
+  });
+  // Feed the alias inventory so glob targets on this backend can expand.
+  if (probe.success && backend) cacheRemoteModels(backend.id, probe.remoteModels);
+  res.json(probe);
 });
 
 // Unsaved backend — caller supplies the URL in the body.
@@ -4221,6 +4250,7 @@ app.post('/api/backends/:id/test', async (req, res) => {
       if (modelsRes.ok) {
         const modelsData = await modelsRes.json();
         remoteModels = (modelsData.data || modelsData.models || []).map(m => typeof m === 'string' ? m : m.id || m.name || '').filter(Boolean);
+        cacheRemoteModels(backend.id, remoteModels);   // feed the alias inventory for glob targets
       }
     } catch {
       clearTimeout(modelsTimeout);
