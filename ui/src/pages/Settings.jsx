@@ -2,11 +2,12 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Provides appearance, general configuration, model mappings, remote backends,
-// and llama.cpp update controls in glass-aligned settings panels.
+// Provides appearance, general configuration, model alias groups, remote
+// backends, and llama.cpp update controls in glass-aligned settings panels.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { API_BASE } from '../api.js';
+import { aliasesToRows, rowsToAliases, diffAliases, validateRows } from './alias-editor.js';
 import { resolveLlamaUpdateView } from '../llama-update-policy.js';
 import { DEFAULT_THEME_ID } from '../theme/manifest.js';
 import {
@@ -168,7 +169,7 @@ function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
-  const [activeTab, setActiveTab] = useState('general'); // 'general' | 'hosts' | 'mapping'
+  const [activeTab, setActiveTab] = useState('general'); // 'general' | 'hosts' | 'aliases'
   // Real model ids for the default-big/default-small target dropdowns (the synthetic
   // alias entries are excluded so an alias can't be pointed at itself).
   const [modelOptions, setModelOptions] = useState([]);
@@ -275,7 +276,7 @@ function SettingsPage() {
       <div className="settings-tabs">
         <button className={`tab-btn glass-btn ${activeTab === 'general' ? 'active' : ''}`} onClick={() => setActiveTab('general')}>General</button>
         <button className={`tab-btn glass-btn ${activeTab === 'hosts' ? 'active' : ''}`} onClick={() => setActiveTab('hosts')}>Remote Hosts</button>
-        <button className={`tab-btn glass-btn ${activeTab === 'mapping' ? 'active' : ''}`} onClick={() => setActiveTab('mapping')}>Model Mapping</button>
+        <button className={`tab-btn glass-btn ${activeTab === 'aliases' ? 'active' : ''}`} onClick={() => setActiveTab('aliases')}>Aliases</button>
       </div>
 
       {activeTab === 'general' && (
@@ -625,65 +626,117 @@ function SettingsPage() {
       )}
 
       {activeTab === 'hosts' && (
-        <BackendsSection settings={settings} updateSetting={updateSetting} setMessage={setMessage} />
+        <BackendsSection
+          settings={settings}
+          updateSetting={updateSetting}
+          setMessage={setMessage}
+          onShowAliases={() => setActiveTab('aliases')}
+        />
       )}
 
-      {activeTab === 'mapping' && (
-        <ModelMappingSection setMessage={setMessage} />
+      {activeTab === 'aliases' && (
+        <AliasesSection setMessage={setMessage} />
       )}
     </div>
   );
 }
 
-// Model Mapping Section — unified table mapping local model ids to a remote host's model.
-// Rows are flattened from every backend's modelMapping; saving rebuilds each
-// backend's mapping and PUTs it back. Local and remote fields are datalist
-// comboboxes (pick a known model or free-type a custom id for models that may not
-// be on the local server).
-function ModelMappingSection({ setMessage }) {
+// Host value meaning "this manager" rather than a remote backend id. Mirrors the
+// `local` sentinel the server uses in api/model-aliases.js.
+const LOCAL_HOST = 'local';
+
+/**
+ * Normalizes the `GET /api/aliases` body into the keyed alias table the editor
+ * works with. Accepts both the keyed-object and array-of-entries shapes and
+ * ignores envelope fields such as `success`, so the tab keeps working whichever
+ * shape the endpoint settles on.
+ *
+ * @param {object} payload The parsed JSON body of `GET /api/aliases`.
+ * @returns {Object<string, {targets: Array<{host: string, model: string}>}>}
+ *   The alias table, or `{}` when the payload carries none.
+ */
+function normalizeAliasPayload(payload) {
+  const raw = payload?.aliases ?? {};
+  const aliases = {};
+
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      const name = entry?.name ?? entry?.id;
+      if (typeof name === 'string' && name) aliases[name] = { targets: entry?.targets || [] };
+    }
+    return aliases;
+  }
+
+  if (raw && typeof raw === 'object') {
+    for (const [name, group] of Object.entries(raw)) {
+      if (!name || !Array.isArray(group?.targets)) continue;
+      aliases[name] = { targets: group.targets };
+    }
+  }
+  return aliases;
+}
+
+// Aliases Section — editor for the global alias table (`config.aliases`).
+// An alias name maps to an ordered list of targets, each naming a host ("Local"
+// or a remote backend id) and a model on it; the router expands the alias and
+// prefers whichever target is already warm. Rows are flattened out of the alias
+// table by alias-editor.js, edited here, folded back, and saved as one PUT per
+// changed alias plus one DELETE per removed alias. The model field is a
+// free-text combobox so a glob such as `gemma4:*` can be typed even when the
+// host's model list does not offer it.
+function AliasesSection({ setMessage }) {
   const [backends, setBackends] = React.useState([]);
-  const [localModels, setLocalModels] = React.useState([]);
+  const [localModels, setLocalModels] = React.useState([]); // bare local model ids
+  const [presets, setPresets] = React.useState({}); // presetId -> preset
   const [remoteByBackend, setRemoteByBackend] = React.useState({}); // backendId -> string[]
-  const [rows, setRows] = React.useState([]); // { rowId, backendId, localKey, remoteValue }
+  const [rows, setRows] = React.useState([]); // { rowId, aliasName, host, model }
+  const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(false);
   const rowIdRef = React.useRef(1);
-  // Snapshot of each backend's mapping at load time, so save only rewrites the
-  // hosts whose mapping actually changed — existing mappings are never clobbered.
+  // The alias table as loaded, so a save only writes the aliases that actually
+  // changed and never rewrites untouched ones.
   const originalRef = React.useRef({});
 
   const loadAll = React.useCallback(async () => {
+    setLoading(true);
+
     let bks = [];
-    try { const r = await fetch(`${API_BASE}/backends`); bks = (await r.json()).backends || []; } catch { /* ignore */ }
+    try { bks = (await (await fetch(`${API_BASE}/backends`)).json()).backends || []; } catch { /* ignore */ }
     setBackends(bks);
 
-    // Flatten existing mappings into editable rows + snapshot the originals.
-    const rs = [];
-    const orig = {};
-    for (const b of bks) {
-      orig[b.id] = { ...(b.modelMapping || {}) };
-      for (const [k, v] of Object.entries(b.modelMapping || {})) {
-        rs.push({ rowId: rowIdRef.current++, backendId: b.id, localKey: k, remoteValue: v });
-      }
-    }
-    originalRef.current = orig;
+    let aliases = {};
+    try { aliases = normalizeAliasPayload(await (await fetch(`${API_BASE}/aliases`)).json()); } catch { /* ignore */ }
+    originalRef.current = aliases;
+    const rs = aliasesToRows(aliases);
+    rowIdRef.current = rs.reduce((max, r) => Math.max(max, r.rowId), 0) + 1;
     setRows(rs);
 
-    // Local model suggestions: /v1/models ids (now includes downloaded models)
-    // unioned with any model ids already used as mapping keys.
+    // Local suggestions: real model ids only — the synthesized alias rows are
+    // excluded so an alias can't be pointed at itself.
     let lm = [];
-    try { const r = await fetch(`${API_BASE}/v1/models`); lm = ((await r.json()).data || []).map(m => m.id).filter(Boolean); } catch { /* ignore */ }
-    const keys = new Set(lm);
-    for (const b of bks) for (const k of Object.keys(b.modelMapping || {})) if (k && k !== '*') keys.add(k);
-    setLocalModels([...keys].sort());
+    try {
+      lm = ((await (await fetch(`${API_BASE}/v1/models`)).json()).data || [])
+        .filter(m => m.status !== 'alias').map(m => m.id).filter(Boolean);
+    } catch { /* ignore */ }
+    setLocalModels([...new Set(lm)].sort());
 
-    // Seed remote-model suggestions per host from the cached /models endpoint.
+    const ps = {};
+    try {
+      for (const p of (await (await fetch(`${API_BASE}/presets`)).json()).presets || []) {
+        if (p?.id) ps[p.id] = p;
+      }
+    } catch { /* ignore */ }
+    setPresets(ps);
+
     const rm = {};
     await Promise.all(bks.map(async b => {
       try { rm[b.id] = (await (await fetch(`${API_BASE}/backends/${b.id}/models`)).json()).models || []; }
       catch { rm[b.id] = []; }
     }));
     setRemoteByBackend(rm);
+
+    setLoading(false);
   }, []);
 
   React.useEffect(() => { loadAll(); }, [loadAll]);
@@ -704,122 +757,275 @@ function ModelMappingSection({ setMessage }) {
     setRefreshing(false);
   };
 
+  // Alias names in first-appearance order, each with its target rows. Keyed on
+  // the first row's id rather than the name so renaming doesn't remount (and
+  // unfocus) the name input on every keystroke.
+  const groups = React.useMemo(() => {
+    const byName = new Map();
+    for (const r of rows) {
+      if (!byName.has(r.aliasName)) byName.set(r.aliasName, []);
+      byName.get(r.aliasName).push(r);
+    }
+    return [...byName.entries()].map(([name, groupRows]) => ({ key: groupRows[0].rowId, name, rows: groupRows }));
+  }, [rows]);
+
+  const issues = React.useMemo(
+    () => validateRows(rows, { presets, localModels, backendIds: backends.map(b => b.id) }),
+    [rows, presets, localModels, backends]
+  );
+  const issuesByRow = React.useMemo(() => {
+    const byRow = new Map();
+    for (const i of issues) {
+      if (!byRow.has(i.rowId)) byRow.set(i.rowId, []);
+      byRow.get(i.rowId).push(i);
+    }
+    return byRow;
+  }, [issues]);
+  const errorCount = issues.filter(i => i.level === 'error').length;
+
   const updateRow = (rowId, patch) => setRows(rs => rs.map(r => r.rowId === rowId ? { ...r, ...patch } : r));
   const removeRow = (rowId) => setRows(rs => rs.filter(r => r.rowId !== rowId));
-  const addRow = () => setRows(rs => [...rs, { rowId: rowIdRef.current++, backendId: backends[0]?.id || '', localKey: '', remoteValue: '' }]);
+  const renameAlias = (oldName, newName) =>
+    setRows(rs => rs.map(r => r.aliasName === oldName ? { ...r, aliasName: newName } : r));
+  const removeAlias = (name) => setRows(rs => rs.filter(r => r.aliasName !== name));
+  const addAlias = () =>
+    setRows(rs => [...rs, { rowId: rowIdRef.current++, aliasName: '', host: LOCAL_HOST, model: '' }]);
 
-  // Stable stringify (sorted keys) so key-order differences don't read as changes.
-  const norm = (m) => JSON.stringify(Object.fromEntries(Object.entries(m || {}).sort(([a], [b]) => a.localeCompare(b))));
+  // Append a target directly below the alias's last existing target so the
+  // authored order stays contiguous in the flat row list.
+  const addTarget = (name) => setRows(rs => {
+    let last = -1;
+    rs.forEach((r, i) => { if (r.aliasName === name) last = i; });
+    const next = [...rs];
+    next.splice(last < 0 ? next.length : last + 1, 0,
+      { rowId: rowIdRef.current++, aliasName: name, host: LOCAL_HOST, model: '' });
+    return next;
+  });
+
+  // Swap a target with its neighbour inside its own alias. Order is the ranking
+  // tiebreak, so this is a real edit, not just presentation.
+  const moveTarget = (rowId, delta) => setRows(rs => {
+    const row = rs.find(r => r.rowId === rowId);
+    if (!row) return rs;
+    const positions = rs.reduce((acc, r, i) => { if (r.aliasName === row.aliasName) acc.push(i); return acc; }, []);
+    const at = positions.indexOf(rs.indexOf(row));
+    const to = at + delta;
+    if (to < 0 || to >= positions.length) return rs;
+    const next = [...rs];
+    const a = positions[at];
+    const b = positions[to];
+    [next[a], next[b]] = [next[b], next[a]];
+    return next;
+  });
 
   const save = async () => {
-    if (!backends.length) { setMessage({ type: 'error', text: 'Add a remote host first (Remote Hosts tab).' }); return; }
-    setSaving(true);
-    // Rebuild each host's mapping from its rows.
-    const mapByBackend = {};
-    for (const b of backends) mapByBackend[b.id] = {};
-    for (const r of rows) {
-      if (!r.backendId || !r.localKey) continue;
-      (mapByBackend[r.backendId] = mapByBackend[r.backendId] || {})[r.localKey] = r.remoteValue || '';
-    }
-    // Only PUT hosts whose mapping actually changed — never rewrite untouched ones.
-    const changed = backends.filter(b => norm(mapByBackend[b.id]) !== norm(originalRef.current[b.id]));
-    if (changed.length === 0) {
-      setSaving(false);
-      setMessage({ type: 'info', text: 'No mapping changes to save.' });
+    if (errorCount > 0) {
+      setMessage({ type: 'error', text: 'Fix the highlighted errors before saving.' });
       return;
     }
-    let ok = 0, fail = 0;
-    for (const b of changed) {
+    const edited = rowsToAliases(rows);
+    const { changed, removed } = diffAliases(originalRef.current, edited);
+    if (changed.length === 0 && removed.length === 0) {
+      setMessage({ type: 'info', text: 'No alias changes to save.' });
+      return;
+    }
+
+    setSaving(true);
+    let ok = 0;
+    let fail = 0;
+    const notes = [];
+    for (const name of changed) {
       try {
-        const res = await fetch(`${API_BASE}/backends/${b.id}`, {
+        const res = await fetch(`${API_BASE}/aliases/${encodeURIComponent(name)}`, {
           method: 'PUT', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ modelMapping: mapByBackend[b.id] })
+          body: JSON.stringify({ targets: edited[name].targets })
         });
-        (await res.json()).success ? ok++ : fail++;
-      } catch { fail++; }
+        const d = await res.json();
+        if (d.success) {
+          ok++;
+          for (const w of d.warnings || []) notes.push(`${name}: ${w}`);
+        } else {
+          fail++;
+          notes.push(`${name}: ${d.error || `HTTP ${res.status}`}`);
+        }
+      } catch (err) {
+        fail++;
+        notes.push(`${name}: ${err.message}`);
+      }
+    }
+    for (const name of removed) {
+      try {
+        const res = await fetch(`${API_BASE}/aliases/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        const d = await res.json();
+        if (d.success) ok++;
+        else { fail++; notes.push(`${name}: ${d.error || `HTTP ${res.status}`}`); }
+      } catch (err) {
+        fail++;
+        notes.push(`${name}: ${err.message}`);
+      }
     }
     setSaving(false);
+
+    const suffix = notes.length ? ` — ${notes.join('; ')}` : '';
     setMessage(fail
-      ? { type: 'error', text: `Saved ${ok} host(s); ${fail} failed` }
-      : { type: 'success', text: `Model mappings saved (${ok} host${ok === 1 ? '' : 's'} updated)` });
+      ? { type: 'error', text: `Saved ${ok} alias change(s); ${fail} failed${suffix}` }
+      : { type: 'success', text: `Aliases saved (${ok} change${ok === 1 ? '' : 's'})${suffix}` });
     loadAll();
+  };
+
+  const hostLabel = (host) => {
+    if (host === LOCAL_HOST) return 'Local';
+    return backends.find(b => b.id === host)?.name || host;
   };
 
   return (
     <section className="page-section glass-panel">
-      <h3>Model Mapping</h3>
+      <h3>Aliases</h3>
       <p className="setting-hint" style={{ marginBottom: '12px' }}>
-        Map a local model id (what clients request) to the model name on a remote host. Pick from the list or
-        type a custom id for models that aren&apos;t on the local server. Use <code>*</code> as the local model to
-        match all models for that host.
+        An alias is a name clients can request that resolves to whichever of its targets is
+        already warm. Each target names a host — <strong>Local</strong> or a remote host — and a
+        model on it. <strong>Target order matters</strong>: it is the tiebreak when several
+        targets rank equally, so list them by preference. A model may be a glob such as{' '}
+        <code>gemma4:*</code> — pick one from the list or type your own.{' '}
+        <code>default-big</code> and <code>default-small</code> appear here as ordinary aliases.
       </p>
-      {backends.length === 0 ? (
-        <p className="setting-hint">No remote hosts configured. Add one in the <strong>Remote Hosts</strong> tab first.</p>
-      ) : (
-        <>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', gap: '8px' }}>
-            <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={refreshRemote} disabled={refreshing}>
-              {refreshing ? 'Refreshing…' : '↻ Refresh remote models'}
-            </button>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={addRow}>+ Add Mapping</button>
-              <button className="btn-primary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={save} disabled={saving}>{saving ? 'Saving…' : 'Save Mappings'}</button>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', gap: '8px', flexWrap: 'wrap' }}>
+        <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={refreshRemote} disabled={refreshing || backends.length === 0}>
+          {refreshing ? 'Refreshing…' : '↻ Refresh remote models'}
+        </button>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={addAlias}>+ Add Alias</button>
+          <button className="btn-primary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={save} disabled={saving || errorCount > 0} title={errorCount > 0 ? 'Fix the errors below first' : undefined}>
+            {saving ? 'Saving…' : 'Save Aliases'}
+          </button>
+        </div>
+      </div>
+
+      {errorCount > 0 && (
+        <p className="setting-hint" style={{ color: 'var(--error, #f87171)' }}>
+          {errorCount} error{errorCount === 1 ? '' : 's'} must be fixed before saving.
+        </p>
+      )}
+
+      <datalist id="alias-models-local">
+        {[...new Set([...localModels, ...Object.keys(presets)])].sort().map(m => <option key={m} value={m} />)}
+      </datalist>
+      {backends.map(b => (
+        <datalist key={b.id} id={`alias-models-${b.id}`}>
+          {(remoteByBackend[b.id] || []).map(m => <option key={m} value={m} />)}
+        </datalist>
+      ))}
+
+      {loading ? (
+        <p className="setting-hint">Loading aliases…</p>
+      ) : groups.length === 0 ? (
+        <p className="setting-hint">No aliases yet — click “+ Add Alias”.</p>
+      ) : groups.map(group => {
+        // Name issues repeat on every row of the group; show each message once.
+        const nameMessages = [];
+        const seenNameMessages = new Set();
+        for (const groupRow of group.rows) {
+          for (const issue of issuesByRow.get(groupRow.rowId) || []) {
+            if (issue.field !== 'aliasName' || seenNameMessages.has(issue.message)) continue;
+            seenNameMessages.add(issue.message);
+            nameMessages.push(issue);
+          }
+        }
+
+        return (
+          <div key={group.key} className="alias-group" style={{ border: '1px solid var(--glass-border)', borderRadius: 'var(--radius-sm)', padding: '10px', marginBottom: '10px' }}>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <input
+                className="glass-input"
+                value={group.name}
+                placeholder="alias name (e.g. conversational-model)"
+                aria-label="Alias name"
+                onChange={e => renameAlias(group.name, e.target.value)}
+                style={{ flex: '1 1 240px', maxWidth: '360px' }}
+              />
+              <button className="btn-secondary glass-btn" style={{ padding: '2px 10px', fontSize: '0.85em' }} onClick={() => addTarget(group.name)}>+ Target</button>
+              <button className="btn-secondary glass-btn" style={{ padding: '2px 10px', fontSize: '0.85em' }} onClick={() => removeAlias(group.name)}>Remove alias</button>
+            </div>
+
+            {nameMessages.map(issue => (
+              <p key={issue.message} className="setting-hint" style={{ margin: '4px 0 0', color: issue.level === 'error' ? 'var(--error, #f87171)' : 'var(--warning, #fbbf24)' }}>
+                {issue.message}
+              </p>
+            ))}
+
+            <div className="model-map-table-wrap" style={{ marginTop: '8px' }}>
+              <table className="model-map-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', color: 'var(--text-secondary)', fontSize: '0.8em' }}>
+                    <th style={{ padding: '4px 6px', width: '5%' }}>#</th>
+                    <th style={{ padding: '4px 6px', width: '27%' }}>Host</th>
+                    <th style={{ padding: '4px 6px', width: '48%' }}>Model (name or glob)</th>
+                    <th style={{ padding: '4px 6px', width: '12%' }}>Order</th>
+                    <th style={{ width: '8%' }}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {group.rows.map((r, idx) => {
+                    const rowIssues = (issuesByRow.get(r.rowId) || []).filter(i => i.field !== 'aliasName');
+                    return (
+                      <React.Fragment key={r.rowId}>
+                        <tr>
+                          <td style={{ padding: '4px 6px', color: 'var(--text-muted)' }}>{idx + 1}</td>
+                          <td style={{ padding: '4px 6px' }}>
+                            <select className="glass-input" value={r.host} aria-label="Target host" onChange={e => updateRow(r.rowId, { host: e.target.value })} style={{ width: '100%' }}>
+                              <option value={LOCAL_HOST}>Local</option>
+                              {backends.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                              {r.host && r.host !== LOCAL_HOST && !backends.some(b => b.id === r.host) && (
+                                <option value={r.host}>{r.host} (unknown host)</option>
+                              )}
+                            </select>
+                          </td>
+                          <td style={{ padding: '4px 6px' }}>
+                            <input
+                              className="glass-input"
+                              list={r.host === LOCAL_HOST ? 'alias-models-local' : `alias-models-${r.host}`}
+                              value={r.model}
+                              aria-label={`Model on ${hostLabel(r.host)}`}
+                              placeholder="model id or glob (e.g. gemma4:*)"
+                              onChange={e => updateRow(r.rowId, { model: e.target.value })}
+                              style={{ width: '100%' }}
+                            />
+                          </td>
+                          <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
+                            <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => moveTarget(r.rowId, -1)} disabled={idx === 0} title="Move up">↑</button>{' '}
+                            <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => moveTarget(r.rowId, 1)} disabled={idx === group.rows.length - 1} title="Move down">↓</button>
+                          </td>
+                          <td style={{ padding: '4px 6px' }}>
+                            <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => removeRow(r.rowId)} title="Remove target">×</button>
+                          </td>
+                        </tr>
+                        {rowIssues.length > 0 && (
+                          <tr>
+                            <td colSpan={5} style={{ padding: '0 6px 6px' }}>
+                              {rowIssues.map(i => (
+                                <span key={`${i.field}-${i.message}`} style={{ marginRight: '12px', fontSize: '0.8em', color: i.level === 'error' ? 'var(--error, #f87171)' : 'var(--warning, #fbbf24)' }}>
+                                  {i.message}
+                                </span>
+                              ))}
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           </div>
-
-          <datalist id="mapping-local-models">
-            <option value="*" />
-            {localModels.map(m => <option key={m} value={m} />)}
-          </datalist>
-          {backends.map(b => (
-            <datalist key={b.id} id={`mapping-remote-${b.id}`}>
-              {(remoteByBackend[b.id] || []).map(m => <option key={m} value={m} />)}
-            </datalist>
-          ))}
-
-          <div className="model-map-table-wrap">
-          <table className="model-map-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr style={{ textAlign: 'left', color: 'var(--text-secondary)', fontSize: '0.8em' }}>
-                <th style={{ padding: '4px 6px', width: '38%' }}>Local model (requested)</th>
-                <th style={{ padding: '4px 6px', width: '24%' }}>Remote host</th>
-                <th style={{ padding: '4px 6px', width: '34%' }}>Remote model</th>
-                <th style={{ width: '4%' }}></th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.length === 0 && (
-                <tr><td colSpan={4} style={{ padding: '8px 6px', color: 'var(--text-muted)' }}>No mappings yet — click “+ Add Mapping”.</td></tr>
-              )}
-              {rows.map(r => (
-                <tr key={r.rowId}>
-                  <td style={{ padding: '4px 6px' }}>
-                    <input className="glass-input" list="mapping-local-models" value={r.localKey} placeholder="local model id or *" onChange={e => updateRow(r.rowId, { localKey: e.target.value })} style={{ width: '100%' }} />
-                  </td>
-                  <td style={{ padding: '4px 6px' }}>
-                    <select className="glass-input" value={r.backendId} onChange={e => updateRow(r.rowId, { backendId: e.target.value })} style={{ width: '100%' }}>
-                      {backends.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
-                    </select>
-                  </td>
-                  <td style={{ padding: '4px 6px' }}>
-                    <input className="glass-input" list={`mapping-remote-${r.backendId}`} value={r.remoteValue} placeholder="remote model id" onChange={e => updateRow(r.rowId, { remoteValue: e.target.value })} style={{ width: '100%' }} />
-                  </td>
-                  <td style={{ padding: '4px 6px' }}>
-                    <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => removeRow(r.rowId)} title="Remove mapping">×</button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          </div>
-        </>
-      )}
+        );
+      })}
     </section>
   );
 }
 
 // Remote Backends Management Section
-function BackendsSection({ settings, updateSetting, setMessage }) {
+function BackendsSection({ settings, updateSetting, setMessage, onShowAliases }) {
   const [backends, setBackends] = useState([]);
   const [backendsStats, setBackendsStats] = useState({});
   const [showAddForm, setShowAddForm] = useState(false);
@@ -1193,7 +1399,7 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
                   </div>
                 )}
 
-                {/* Model mappings */}
+                {/* Model mappings — read-only view synthesized from the alias table */}
                 {b.modelMapping && Object.keys(b.modelMapping).length > 0 && (
                   <div style={{ marginTop: '8px', fontSize: '0.85em' }}>
                     <span style={{ color: 'var(--text-muted)' }}>Model mapping: </span>
@@ -1202,6 +1408,17 @@ function BackendsSection({ settings, updateSetting, setMessage }) {
                         <code>{k === '*' ? '* (all models)' : k}</code> {'→'} <code>{v || '(not set)'}</code>
                       </span>
                     ))}
+                    <div style={{ color: 'var(--text-muted)', marginTop: '4px' }}>
+                      Synthesized from the alias table — edit it on the{' '}
+                      <button
+                        type="button"
+                        onClick={onShowAliases}
+                        style={{ padding: 0, border: 'none', background: 'none', font: 'inherit', color: 'var(--accent, #60a5fa)', textDecoration: 'underline', cursor: 'pointer' }}
+                      >
+                        Aliases
+                      </button>{' '}
+                      tab.
+                    </div>
                   </div>
                 )}
 
@@ -1287,25 +1504,6 @@ function BackendFormFields({ values, onChange, localModels = [], remoteModels: r
     } catch (err) {
       setRefreshState({ loading: false, error: err.message, ts: Date.now() });
     }
-  };
-
-  // Model mapping editor
-  const mappingEntries = Object.entries(values.modelMapping || { '*': '' });
-  const addMapping = () => onChange({ ...values, modelMapping: { ...values.modelMapping, '': '' } });
-  const removeMapping = (key) => {
-    const m = { ...values.modelMapping };
-    delete m[key];
-    onChange({ ...values, modelMapping: m });
-  };
-  const updateMappingKey = (oldKey, newKey) => {
-    const m = {};
-    for (const [k, v] of Object.entries(values.modelMapping)) {
-      m[k === oldKey ? newKey : k] = v;
-    }
-    onChange({ ...values, modelMapping: m });
-  };
-  const updateMappingValue = (key, value) => {
-    onChange({ ...values, modelMapping: { ...values.modelMapping, [key]: value } });
   };
 
   return (
