@@ -418,6 +418,36 @@ test('validateAlias: warns but accepts a name colliding with a local model', () 
   assert.ok(r.warnings.length >= 1, 'a model-shadowing alias name must warn');
 });
 
+// The known-local set comes from the localModels ARGUMENT, falling back to
+// config.localModels. The argument is the path that matters in production: local models
+// are scanned at runtime (scanLocalModels()) and are not a field on the persisted config,
+// so a server calling validateAlias(config, ...) without it would silently lose the
+// shadowing warning that guards the documented Qwen_Qwen3-8B-GGUF footgun.
+// See the contract, § validateAlias (amended 2026-08-03).
+test('validateAlias: warns on a local-model collision supplied via the localModels argument', () => {
+  const bare = { presets: {}, backends: { directory: [] } };   // no config.localModels at all
+  const r = validateAlias(bare, 'Qwen_Qwen3-8B-GGUF', OK_TARGETS, ['Qwen_Qwen3-8B-GGUF']);
+  assert.equal(r.ok, true);
+  assert.ok(
+    r.warnings.some(w => w.includes('Qwen_Qwen3-8B-GGUF')),
+    'the injected local model list must drive the shadowing warning'
+  );
+});
+
+test('validateAlias: accepts scanned records as well as bare strings in localModels', () => {
+  const bare = { presets: {}, backends: { directory: [] } };
+  const r = validateAlias(bare, 'scanned-model', OK_TARGETS, [{ name: 'scanned-model' }]);
+  assert.equal(r.ok, true);
+  assert.ok(r.warnings.length >= 1, 'a {name} record must count as a known local model');
+});
+
+test('validateAlias: a name absent from the localModels argument does not warn', () => {
+  const bare = { presets: {}, backends: { directory: [] } };
+  const r = validateAlias(bare, 'not-a-real-model', OK_TARGETS, ['some-other-model']);
+  assert.equal(r.ok, true);
+  assert.equal(r.warnings.length, 0, 'no collision means no warning');
+});
+
 test('validateAlias: warns but accepts a target naming an unconfigured host', () => {
   const r = validateAlias(CONFIG, 'my-alias', [{ host: 'nowhere-host', model: 'gemma4:12b' }]);
   assert.equal(r.ok, true);

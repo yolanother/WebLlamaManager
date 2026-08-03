@@ -106,16 +106,17 @@ function classifyLocal(presets, model) {
 }
 
 /**
- * Collect the local model names carried by `config`, used only for the
- * alias-shadows-a-real-model warning in {@link validateAlias}. Accepts either bare
- * strings or scanned records (`{name}` / `{id}`), and yields an empty list when the
- * caller did not inject one.
+ * Collect the known local model names used for the alias-shadows-a-real-model warning in
+ * {@link validateAlias}. Prefers the caller-injected list and falls back to
+ * `config.localModels`; accepts either bare strings or scanned records (`{name}` / `{id}`),
+ * and yields an empty list when neither source supplies one.
  *
  * @param {object|null|undefined} config server config, optionally carrying `localModels`
+ * @param {Array<string|object>} [localModels] caller's local model list (takes precedence)
  * @returns {string[]} known local model names (possibly empty)
  */
-function knownLocalModelNames(config) {
-  const raw = config?.localModels;
+function knownLocalModelNames(config, localModels) {
+  const raw = Array.isArray(localModels) && localModels.length ? localModels : config?.localModels;
   if (!Array.isArray(raw)) return [];
   const names = [];
   for (const entry of raw) {
@@ -258,13 +259,19 @@ export function partitionByWarmth(candidates, inventory) {
  * alias shadows the real model, since alias resolution runs first), and a target naming a
  * host that is neither 'local' nor a configured backend id.
  *
+ * The known-local-model list comes from the `localModels` argument, falling back to
+ * `config.localModels`. Callers MUST pass it explicitly (the server's `scanLocalModels()`
+ * names): local models are scanned at runtime and are not a field on the persisted config,
+ * so relying on the fallback silently disables the shadowing warning.
+ *
  * @param {{presets?: Object<string, object>, backends?: {directory?: Array<{id?: string}>}, localModels?: Array<string|object>}|null|undefined} config server config
  * @param {*} name the proposed alias name
  * @param {*} targets the proposed target list
+ * @param {Array<string|object>} [localModels] known local model names, bare or scanned records
  * @returns {{ok: true, value: AliasGroup, warnings: string[]}|{ok: false, error: string}}
  *   on success `value.targets` are trimmed and normalized to `{host, model}` only.
  */
-export function validateAlias(config, name, targets) {
+export function validateAlias(config, name, targets, localModels = []) {
   if (typeof name !== 'string') return { ok: false, error: 'alias name must be a string' };
   const alias = name.trim();
   if (!alias) return { ok: false, error: 'alias name must not be blank' };
@@ -295,7 +302,7 @@ export function validateAlias(config, name, targets) {
   if (hasOwn(config?.presets, alias)) {
     warnings.push(`alias '${alias}' shadows the preset of the same name`);
   }
-  if (knownLocalModelNames(config).includes(alias)) {
+  if (knownLocalModelNames(config, localModels).includes(alias)) {
     warnings.push(`alias '${alias}' shadows the local model of the same name`);
   }
   const backendIds = new Set(

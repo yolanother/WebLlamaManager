@@ -88,7 +88,7 @@ Preserves input order within each bucket.
 Remote candidates are warm unconditionally when their backend is available; the
 manager does not control remote residency.
 
-### `validateAlias(config, name, targets) -> {ok:true, value:AliasGroup, warnings:string[]} | {ok:false, error:string}`
+### `validateAlias(config, name, targets, localModels = []) -> {ok:true, value:AliasGroup, warnings:string[]} | {ok:false, error:string}`
 
 Rejects (`ok:false`): a non-string or blank/whitespace name; a name in
 `RESERVED_ALIAS_NAMES`; `targets` not an array or empty; any target that is not
@@ -98,6 +98,30 @@ the same `host` + `model`.
 Warns (`ok:true` with a non-empty `warnings`): the name collides with a key in
 `config.presets` or with a known local model (an alias shadows a real model);
 a target names a host that is not `local` and not a configured backend id.
+
+**Source of the known-local-model list (amended 2026-08-03, see below).** The
+known-local set is the `localModels` argument, falling back to
+`config.localModels` when the argument is omitted. Entries may be bare strings
+or scanned records (`{name}` / `{id}`).
+
+> **Why this was amended.** As originally frozen this clause said "a known local
+> model" without saying where that list comes from, and `validateAlias` — unlike
+> `resolveAliasCandidates` — takes no `Inventory`. Both pair-1 workers
+> independently defaulted to reading `config.localModels`, so they agreed and
+> the suite went green, but `config.localModels` does not exist on the real
+> persisted config: local models are produced at runtime by `scanLocalModels()`
+> (`api/server.js`). Called as `validateAlias(config, name, targets)` against a
+> real loaded config, the known-local set is always empty and the
+> alias-shadows-a-real-local-model warning can never fire. That warning guards
+> the exact footgun documented in step 4 of `migrateModelMappings` (the real
+> `Qwen_Qwen3-8B-GGUF` case, where an alias shadowing a same-named local model
+> makes it unservable locally), so it must not be dead code. The explicit
+> argument mirrors the convention this contract already sets for
+> `migrateModelMappings(config, localModels = [])`, for the same reason: the
+> caller owns the local model list, and it may not be available at load time.
+>
+> **`[3I]` must pass the `scanLocalModels()` names as the fourth argument** when
+> wiring the alias CRUD endpoint; omitting it silently disables the warning.
 
 `value.targets` are trimmed and normalized to `{host, model}` only — any extra
 keys on an input target are dropped.
