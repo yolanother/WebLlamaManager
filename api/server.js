@@ -44,7 +44,7 @@ const PROJECT_ROOT = dirname(__dirname);
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
-import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots } from './slot-reaper.js';
@@ -833,7 +833,9 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false } = 
   // back to local automatically if no remote candidate is viable (mapping
   // missing, circuit open, queue full, etc.).
   const preferLocal = backends.preferLocal !== false;
-  const pref = dispatchPreference({ preferLocal, thermalPaused: guardDispatchPaused });
+  // Memory pressure offloads for the same reason thermal pressure does: keep
+  // clients served from a remote while the local box is too starved to take work.
+  const pref = dispatchPreference({ preferLocal, thermalPaused: guardDispatchPaused || guardMemPaused });
   // Whether some enabled/tested/non-tripped/under-capacity remote backend can serve the
   // requested model. Computed once here and reused by both the try-remote-first path and the
   // protect-resident gate below (which both need it).
@@ -2229,6 +2231,16 @@ let guardThermalState = 'normal';
 let guardDispatchPaused = false;
 let guardLast = { state: 'normal', maxTempC: 0, gpuC: 0, cpuC: 0, paused: false, at: 0 };
 
+// Memory-pressure governor state. Separate from the thermal state above because
+// the two shed differently: thermal NEVER unloads (an idle model is not a heat
+// source), whereas memory pressure MUST unload — on kernel 7.0.0-28 letting the
+// kernel OOM-kill llama-server panics the whole box (NULL deref in
+// amdgpu_hmm_range_valid via the KFD SVM teardown race).
+let guardMemState = 'normal';
+let guardMemPaused = false;
+let guardMemLastShedAt = 0;
+let guardMemLast = { state: 'normal', availableBytes: 0, shed: false, at: 0, reason: '' };
+
 /** Resolve guard config merged with conservative defaults. */
 function guardCfg() {
   const g = (config && config.guard) || {};
@@ -2247,6 +2259,12 @@ function guardCfg() {
     overheadBytes: g.overheadBytes ?? GUARD_DEFAULTS.overheadBytes,
     minContext: g.minContext ?? GUARD_DEFAULTS.minContext,
     memThresholdPct: g.memThresholdPct ?? 90,
+    // Runtime memory-pressure governor (see memoryPressureDecision). Bytes of
+    // MemAvailable; configured in GiB for operator sanity.
+    memShedBelowBytes: (g.memShedBelowGb ?? 16) * (2 ** 30),
+    memWatchBelowBytes: (g.memWatchBelowGb ?? 24) * (2 ** 30),
+    memResumeAboveBytes: (g.memResumeAboveGb ?? 32) * (2 ** 30),
+    memShedCooldownMs: g.memShedCooldownMs ?? GUARD_DEFAULTS.memShedCooldownMs,
     // ds4-server memory watchdog: ds4 holds ~81GB resident by design, so a system
     // memory threshold breach at its baseline is NOT a leak (a restart reloads the
     // same 81GB). The watchdog only restarts ds4 when its RSS exceeds its expected
@@ -2395,6 +2413,13 @@ async function restoreDesiredResidentModels() {
   desiredResidencyRestorePromise = (async () => {
     const desiredModels = desiredResidentModels();
     if (desiredModels.length === 0 || currentEngine !== ENGINE_TYPES.LLAMA) return;
+    // Never restore residency while the memory governor is shedding — it would
+    // reload the exact weights just freed and oscillate the box back toward the
+    // OOM kill we are avoiding. Recovery is lazy: the next request reloads.
+    if (guardMemState !== 'normal') {
+      addLog('models', `Desired residency restore deferred: memory governor is ${guardMemState} (${guardMemLast.reason})`);
+      return;
+    }
     const ready = await waitForServerReady({ maxWait: 60_000, label: 'residency-restore' });
     if (!ready) {
       addLog('models', 'Desired residency restore deferred: llama router is not ready');
@@ -2811,6 +2836,7 @@ async function getSystemStats() {
     ds4Runtime: ds4SettledRuntime,
     engine: currentEngine,
     guard: guardLast,
+    memoryGuard: guardMemLast,
     context: contextStats,
     queue: {
       active: llamaQueue.active,
@@ -11422,6 +11448,112 @@ setInterval(async () => {
     thermalPollInFlight = false;
   }
 }, THERMAL_INTERVAL);
+
+// Memory-pressure governor — shed resident models BEFORE the kernel OOM-kills them.
+//
+// This is the counterpart to the thermal governor above, and it is a hard safety
+// mechanism rather than a performance one. On kernel 7.0.0-28 an OOM kill of
+// llama-server does not merely lose the model: the dying process's in-flight KFD
+// SVM ioctl races with mmu-notifier teardown, range->notifier goes NULL, and
+// amdgpu_hmm_range_valid dereferences NULL+0x50, panicking the host. Four hard
+// resets (2026-07-30, 2026-08-02 x3) carry that identical trace, and in each one
+// the PID chosen by the OOM killer is the PID that oopsed 0.4-0.8s later.
+//
+// A graceful `POST /models/unload` frees the weights in-process with an orderly
+// teardown and never enters that race — so the governor's whole job is to win the
+// race against the kernel. It polls fast (1s) because a parallel build can
+// allocate tens of GiB in seconds, and freeing ~60 GiB is not instant.
+const MEMORY_GOVERNOR_INTERVAL = 1_000;
+let memGovernorInFlight = false;
+setInterval(async () => {
+  if (memGovernorInFlight) return;
+  const cfg = guardCfg();
+  if (!cfg.enabled) {
+    guardMemPaused = false;
+    guardMemState = 'normal';
+    return;
+  }
+  memGovernorInFlight = true;
+  try {
+    const availableBytes = memAvailableBytes();
+    const prev = guardMemState;
+    const decision = memoryPressureDecision({
+      availableBytes,
+      modelLoaded: loadedModelsSnapshot.length > 0,
+      prevState: prev,
+      lastShedAt: guardMemLastShedAt,
+      cooldownMs: cfg.memShedCooldownMs,
+      shedBelowBytes: cfg.memShedBelowBytes,
+      watchBelowBytes: cfg.memWatchBelowBytes,
+      resumeAboveBytes: cfg.memResumeAboveBytes,
+    });
+
+    guardMemState = decision.state;
+    guardMemPaused = decision.pauseDispatch;
+    guardMemLast = {
+      state: decision.state, availableBytes, shed: decision.shed,
+      at: Date.now(), reason: decision.reason,
+    };
+
+    // Log transitions only — this ticks every second.
+    if (decision.state !== prev) {
+      addLog('system', `[memory] ${prev} -> ${decision.state}: ${decision.reason}`);
+    }
+
+    if (decision.shed) {
+      guardMemLastShedAt = Date.now();
+      addLog('system', `[memory] SHEDDING resident models — ${decision.reason}`);
+      await shedResidentModelsForMemory(cfg);
+    }
+  } catch (error) {
+    console.error(`[memory-governor] tick failed: ${error.message}`);
+  } finally {
+    memGovernorInFlight = false;
+  }
+}, MEMORY_GOVERNOR_INTERVAL);
+
+/**
+ * Gracefully free resident models until MemAvailable clears the resume threshold.
+ *
+ * Unloads largest-first so the first unload buys the most headroom, and re-measures
+ * between unloads so a small embedding model is not evicted needlessly once the big
+ * one has already relieved the pressure. Uses the router's in-process unload
+ * endpoint — never SIGTERM/SIGKILL, which is precisely the path that panics the box.
+ *
+ * @param {ReturnType<typeof guardCfg>} cfg Resolved guard configuration.
+ * @returns {Promise<void>}
+ */
+async function shedResidentModelsForMemory(cfg) {
+  const victims = [...loadedModelsSnapshot].sort((a, b) => (b.sizeBytes || 0) - (a.sizeBytes || 0));
+  if (victims.length === 0) return;
+
+  for (const model of victims) {
+    try {
+      const res = await fetch(`http://localhost:${LLAMA_PORT}/models/unload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: model.id }),
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        addLog('system', `[memory] failed to shed ${model.id}: ${detail}`);
+        continue;
+      }
+      addLog('system', `[memory] shed ${model.id} (~${((model.sizeBytes || 0) / (2 ** 30)).toFixed(1)} GiB)`);
+    } catch (error) {
+      addLog('system', `[memory] error shedding ${model.id}: ${error.message}`);
+      continue;
+    }
+
+    // Re-measure: stop as soon as we are clear, so we shed the minimum needed.
+    await refreshLoadedModelsSnapshot();
+    if (memAvailableBytes() >= cfg.memResumeAboveBytes) {
+      addLog('system', '[memory] pressure relieved — stopping shed');
+      return;
+    }
+  }
+  await refreshLoadedModelsSnapshot();
+}
 
 // Idle shutdown — stop llama-server after 15 min with no requests
 const IDLE_SHUTDOWN_MINUTES = 15;

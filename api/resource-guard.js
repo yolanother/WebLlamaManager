@@ -7,6 +7,13 @@
 // thermal redline (98-99 C). `checkModelFit` estimates whether a model+context
 // fits a memory budget (recommending a smaller context when it doesn't), and
 // `thermalDecision` is a hysteresis state machine for throttling on temperature.
+//
+// `memoryPressureDecision` is the RUNTIME counterpart to the admission-time
+// checks above: it watches a box whose model is ALREADY resident and decides
+// when to shed it gracefully. This exists because on kernel 7.0.0-28 an OOM kill
+// of llama-server panics the host outright (NULL deref in
+// amdgpu_hmm_range_valid, KFD SVM teardown race) — so the manager must free
+// memory before the kernel's OOM killer ever fires.
 
 export const DEFAULTS = {
   // Conservative, operator-tunable knobs (overridable via config.guard).
@@ -28,7 +35,15 @@ export const DEFAULTS = {
   // Absolute die-temperature ceiling. Because it is a shared die, at/above this we
   // pause dispatch REGARDLESS of the heat source to protect the hardware — but even
   // then we only pause/offload, we never unload (an idle model is not a heat source).
-  hardCriticalC: 105
+  hardCriticalC: 105,
+  // Runtime memory-pressure thresholds (bytes of MemAvailable). Deliberately
+  // generous: freeing ~60 GiB is not instantaneous, so the governor must win the
+  // race against a build that allocates fast. At the Aug 2 panics MemAvailable had
+  // reached the kernel watermark floor (~100 MiB) before anything reacted.
+  memShedBelowBytes: 16 * (2 ** 30),   // shed the model below this
+  memWatchBelowBytes: 24 * (2 ** 30),  // stop taking new local work below this
+  memResumeAboveBytes: 32 * (2 ** 30), // only declare recovery above this (hysteresis)
+  memShedCooldownMs: 60_000            // grace period for an in-flight unload to land
 };
 
 /**
@@ -177,6 +192,117 @@ export function planMemoryRecovery({
     action: 'reclaim', requiredBytes: cur.requiredBytes, budgetBytes: cur.budgetBytes,
     reclaimableBudgetBytes: freed.budgetBytes,
     reason: 'fits after reclaiming memory held by other models'
+  };
+}
+
+/**
+ * Runtime memory-pressure state machine: decide when to GRACEFULLY shed an
+ * already-resident model, before the kernel's OOM killer resolves the pressure
+ * for us.
+ *
+ * Why this is not optional on this host: an OOM kill of `llama-server` does not
+ * merely lose the model — on kernel 7.0.0-28 it panics the entire box. The dying
+ * process's in-flight KFD SVM ioctl races with mmu-notifier teardown,
+ * `range->notifier` goes NULL, and `amdgpu_hmm_range_valid` dereferences
+ * NULL+0x50. Four hard resets (2026-07-30, and 2026-08-02 x3) share that exact
+ * trace, and in every one the PID the OOM killer chose is the PID that oopsed
+ * 0.4-0.8 s later. A graceful unload (`POST /models/unload`) frees the weights
+ * in-process with an orderly teardown and never enters that race.
+ *
+ * Three bands with hysteresis, so a box hovering near the threshold neither
+ * flaps nor reloads 60 GiB back into a still-strained system:
+ *   - `normal` : plenty of headroom; residency restore is permitted.
+ *   - `watch`  : below `watchBelowBytes` — refuse new local work (offload it),
+ *                but the model stays resident because the pressure may pass.
+ *   - `shed`   : below `shedBelowBytes` — free the model now. Held until
+ *                MemAvailable climbs back above `resumeAboveBytes`.
+ *
+ * Fails OPEN: `availableBytes <= 0` means /proc/meminfo was unreadable, not that
+ * the box is out of memory — shedding a healthy model on dark telemetry would be
+ * a self-inflicted outage. This mirrors `thermalDecision` ignoring all-zero reads.
+ *
+ * @param {object} a
+ * @param {number} a.availableBytes Current MemAvailable in bytes (0 = unreadable -> fail open).
+ * @param {boolean} [a.modelLoaded] Whether anything is actually resident to shed.
+ * @param {string} [a.prevState] 'normal' | 'watch' | 'shed' — previous tick's state.
+ * @param {number} [a.lastShedAt] Epoch ms of the last shed, for cooldown accounting.
+ * @param {number} [a.now] Current epoch ms (injectable for tests).
+ * @param {number} [a.cooldownMs] Grace period before a repeat shed is allowed.
+ * @param {number} [a.shedBelowBytes]
+ * @param {number} [a.watchBelowBytes]
+ * @param {number} [a.resumeAboveBytes]
+ * @returns {{state:string, shed:boolean, pauseDispatch:boolean, allowResidencyRestore:boolean, reason:string}}
+ */
+export function memoryPressureDecision({
+  availableBytes,
+  modelLoaded = false,
+  prevState = 'normal',
+  lastShedAt = 0,
+  now = Date.now(),
+  cooldownMs = DEFAULTS.memShedCooldownMs,
+  shedBelowBytes = DEFAULTS.memShedBelowBytes,
+  watchBelowBytes = DEFAULTS.memWatchBelowBytes,
+  resumeAboveBytes = DEFAULTS.memResumeAboveBytes
+}) {
+  // Telemetry dark -> fail open. Never shed on a reading we could not take.
+  if (!(availableBytes > 0)) {
+    return {
+      state: 'normal', shed: false, pauseDispatch: false, allowResidencyRestore: true,
+      reason: 'MemAvailable unreadable (telemetry dark) — failing open'
+    };
+  }
+
+  // Band selection, with hysteresis: once shedding we hold that state until
+  // memory recovers past the resume threshold, so the residency restorer cannot
+  // reload the model straight back into a box that is still under pressure.
+  let state;
+  if (availableBytes >= resumeAboveBytes) state = 'normal';
+  else if (availableBytes < shedBelowBytes) state = 'shed';
+  else if (prevState === 'shed') state = 'shed';
+  else if (availableBytes < watchBelowBytes) state = 'watch';
+  else state = 'normal';
+
+  const gib = (b) => (b / (2 ** 30)).toFixed(1);
+
+  if (state === 'normal') {
+    return {
+      state, shed: false, pauseDispatch: false, allowResidencyRestore: true,
+      reason: `MemAvailable ${gib(availableBytes)} GiB — healthy`
+    };
+  }
+
+  if (state === 'watch') {
+    return {
+      state, shed: false, pauseDispatch: true, allowResidencyRestore: false,
+      reason: `MemAvailable ${gib(availableBytes)} GiB < ${gib(watchBelowBytes)} GiB — holding new local work`
+    };
+  }
+
+  // state === 'shed'. Three reasons we may still not act: nothing is resident,
+  // a previous unload is still landing (MemAvailable lags), or memory is in the
+  // hysteresis band above the shed threshold and we already shed.
+  if (!modelLoaded) {
+    return {
+      state, shed: false, pauseDispatch: true, allowResidencyRestore: false,
+      reason: `MemAvailable ${gib(availableBytes)} GiB — nothing resident left to shed`
+    };
+  }
+  if (lastShedAt > 0 && now - lastShedAt < cooldownMs) {
+    return {
+      state, shed: false, pauseDispatch: true, allowResidencyRestore: false,
+      reason: `shed cooldown — ${Math.round((cooldownMs - (now - lastShedAt)) / 1000)}s left for the previous unload to land`
+    };
+  }
+  if (availableBytes >= shedBelowBytes) {
+    return {
+      state, shed: false, pauseDispatch: true, allowResidencyRestore: false,
+      reason: `MemAvailable ${gib(availableBytes)} GiB recovering, below resume threshold ${gib(resumeAboveBytes)} GiB`
+    };
+  }
+
+  return {
+    state, shed: true, pauseDispatch: true, allowResidencyRestore: false,
+    reason: `low memory: MemAvailable ${gib(availableBytes)} GiB < ${gib(shedBelowBytes)} GiB — shedding resident model before the kernel OOM-kills it`
   };
 }
 
