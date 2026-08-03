@@ -48,9 +48,9 @@ import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference,
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots } from './slot-reaper.js';
-import { resolveDefaultModel, defaultModelListEntries, ds4PresetForModel, validateDefaultModelTarget, BIG_ALIAS, SMALL_ALIAS } from './default-models.js';
 import {
   resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries,
+  BIG_ALIAS, SMALL_ALIAS,
 } from './model-aliases.js';
 import { migrateModelMappings, synthesizeModelMapping, foldModelMapping } from './alias-migration.js';
 import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
@@ -788,7 +788,7 @@ function resolveAliasRouting(name) {
 /**
  * Resolve an incoming request's model name through the alias table.
  *
- * Replaces `resolveDefaultModel()`: where that mapped two hardcoded aliases onto a
+ * Replaces the retired two-alias default-model resolver: where that mapped two hardcoded aliases onto a
  * single configured target, this maps ANY configured alias onto the concrete name the
  * LOCAL engine would serve, and hands back the routing tiers so the caller can pass
  * them into `resolveBackend()` instead of making it re-derive them from a name that no
@@ -825,6 +825,71 @@ function remoteTargetModel(backend, aliasRouting) {
   }
   const anyModel = typeof backend?.acceptsAny === 'string' ? backend.acceptsAny.trim() : '';
   return anyModel || null;
+}
+
+/**
+ * Classify a resolved LOCAL model name against the configured presets: when it names an
+ * existing ds4-engine preset, return the activation ref so callers can trigger exclusive
+ * DS4 activation instead of a llama load; otherwise null (a llama model name or a llama
+ * preset takes the normal llama path).
+ *
+ * This is the `kind: 'ds4'` classification from alias resolution, expressed over a single
+ * concrete name so the direct-model-request path (which never resolves an alias) keeps
+ * behaving identically.
+ *
+ * @param {{presets?: Object<string, object>}|null|undefined} cfg server config.
+ * @param {string} modelName the already alias-resolved local model or preset name.
+ * @returns {{presetId: string, preset: object}|null} the ds4 activation ref, or null.
+ */
+function ds4PresetForModel(cfg, modelName) {
+  if (!cfg || typeof modelName !== 'string') return null;
+  const preset = cfg.presets?.[modelName];
+  if (preset && isDs4Preset(preset)) return { presetId: modelName, preset };
+  return null;
+}
+
+/**
+ * Project a `default-big` / `default-small` alias group back down to the single scalar
+ * target `/api/settings` has always carried, so the General tab keeps working unchanged.
+ * The first usable target's model wins.
+ *
+ * @param {string} name the alias name (`default-big` or `default-small`).
+ * @returns {string|null} the target model name, or null when the alias is unset.
+ */
+function defaultAliasTarget(name) {
+  const targets = config.aliases?.[name]?.targets;
+  if (!Array.isArray(targets)) return null;
+  const hit = targets.find(t => typeof t?.model === 'string' && t.model.trim());
+  return hit ? hit.model.trim() : null;
+}
+
+/**
+ * Write a `/api/settings` scalar `defaultBigModel` / `defaultSmallModel` value through to
+ * its alias group in single-target form. A blank or null value deletes the group, matching
+ * the old "empty string clears the alias" behavior.
+ *
+ * The target is stored as `{host:'local', model}` because both legacy keys always named a
+ * local model or preset. Unlike the retired default-model target validator, a llama preset
+ * id is now accepted: an alias target may legitimately name a tuned launch config.
+ *
+ * @param {string} name the alias name to write (`default-big` or `default-small`).
+ * @param {*} target the requested scalar target.
+ * @returns {{ok: true, warnings: string[]}|{ok: false, error: string}} validation outcome.
+ */
+function setDefaultAliasTarget(name, target) {
+  if (target !== null && target !== undefined && typeof target !== 'string') {
+    return { ok: false, error: 'target must be a string or null' };
+  }
+  const model = typeof target === 'string' ? target.trim() : '';
+  if (!model) {
+    if (config.aliases) delete config.aliases[name];
+    return { ok: true, warnings: [] };
+  }
+  const result = validateAlias(config, name, [{ host: 'local', model }]);
+  if (!result.ok) return result;
+  if (!config.aliases || typeof config.aliases !== 'object') config.aliases = {};
+  config.aliases[name] = result.value;
+  return { ok: true, warnings: result.warnings };
 }
 
 /**
@@ -3678,9 +3743,11 @@ app.get('/api/settings', (req, res) => {
       localStallMs: config.localStallMs ?? DEFAULT_LOCAL_STALL_MS,
       defaultReasoningEffort: config.defaultReasoningEffort || null,
       modelReasoningEffort: config.modelReasoningEffort || {},
-      // Targets for the default-big / default-small request-time model aliases.
-      defaultBigModel: config.defaultBigModel || null,
-      defaultSmallModel: config.defaultSmallModel || null,
+      // Scalar read-views onto the default-big / default-small alias groups. The alias
+      // table is the source of truth; these two fields are kept so the General tab and
+      // existing API clients need no change.
+      defaultBigModel: defaultAliasTarget(BIG_ALIAS),
+      defaultSmallModel: defaultAliasTarget(SMALL_ALIAS),
       fullscreenInterval: config.fullscreenInterval || 30000,
       // HuggingFace token: never return the raw value — only whether one is set
       // and a masked preview for display.
@@ -3805,21 +3872,20 @@ app.post('/api/settings', (req, res) => {
     }
   }
 
-  // Targets for the default-big / default-small aliases. Accept a plain (possibly
-  // not-yet-loaded) llama model name — matching direct requests to such a model —
-  // OR a ds4-engine preset id (which migrates default clients onto DeepSeek V4
-  // Flash); an empty/blank string clears the alias (stored as null). Reject only a
-  // non-string or an existing non-ds4 (llama) preset id. See validateDefaultModelTarget.
+  // Scalar write-views onto the default-big / default-small alias groups. Accept a plain
+  // (possibly not-yet-downloaded) model name, a llama preset id, or a ds4 preset id — an
+  // empty/blank string deletes the group. Stored as a single {host:'local'} target.
+  const aliasWarnings = [];
   if (defaultBigModel !== undefined) {
-    const r = validateDefaultModelTarget(config, defaultBigModel);
+    const r = setDefaultAliasTarget(BIG_ALIAS, defaultBigModel);
     if (!r.ok) return res.status(400).json({ error: `defaultBigModel: ${r.error}` });
-    config.defaultBigModel = r.value;
+    aliasWarnings.push(...r.warnings);
   }
 
   if (defaultSmallModel !== undefined) {
-    const r = validateDefaultModelTarget(config, defaultSmallModel);
+    const r = setDefaultAliasTarget(SMALL_ALIAS, defaultSmallModel);
     if (!r.ok) return res.status(400).json({ error: `defaultSmallModel: ${r.error}` });
-    config.defaultSmallModel = r.value;
+    aliasWarnings.push(...r.warnings);
   }
 
   // HuggingFace token: store in config (preferred over the HF_TOKEN env var).
@@ -3837,6 +3903,7 @@ app.post('/api/settings', (req, res) => {
   res.json({
     success: true,
     settings: redactConfig(config), // strip raw hfToken from the response
+    ...(aliasWarnings.length ? { warnings: aliasWarnings } : {}),
     message: 'Settings saved. Restart the server for changes to take effect.'
   });
 });
@@ -7601,7 +7668,7 @@ async function handleModels(req, res) {
     if (ds4List) {
       const ds4Capabilities = contextCapabilities('ds4');
       const out = { object: 'list', data: ds4List.map(entry => ({ ...entry, context_management: ds4Capabilities })) };
-      for (const entry of defaultModelListEntries(config, Math.floor(Date.now() / 1000))) {
+      for (const entry of aliasListEntries(config, Math.floor(Date.now() / 1000))) {
         out.data.push({
           ...entry,
           context_management: contextCapabilities(entry.engine, { slotCacheEnabled: slotCacheCfg().enabled }),
@@ -7678,7 +7745,7 @@ async function handleModels(req, res) {
     const data = { object: 'list', data: [...byId.values()] };
     // Advertise the configured default-big/default-small aliases so clients can
     // discover them (only those with a configured target are listed).
-    for (const entry of defaultModelListEntries(config, Math.floor(Date.now() / 1000))) {
+    for (const entry of aliasListEntries(config, Math.floor(Date.now() / 1000))) {
       const aliasTarget = byId.get(entry.aliasTarget);
       data.data.push({
         ...entry,
@@ -7727,7 +7794,7 @@ app.get('/v1/models', handleModels);
  */
 async function handleExactInputTokenRequest(kind, req, res) {
   const rawModel = req.body?.model || 'default';
-  const resolvedModel = resolveDefaultModel(rawModel, config);
+  const { requestedModel: resolvedModel } = resolveRequestModel(rawModel);
   const endpoint = kind === 'chat' ? 'chat/completions' : 'responses';
 
   if (currentEngine !== ENGINE_TYPES.LLAMA || ds4PresetForModel(config, resolvedModel)) {
@@ -7969,7 +8036,7 @@ async function schedulePreparedPrefill(leaseId, scopeId) {
 /** Prepare an exact counted prefix and optionally schedule cancellable resident-only prefill. */
 app.post('/api/v1/context/prepare', async (req, res) => {
   const requestedModel = req.body?.model || 'default';
-  const resolvedModel = resolveDefaultModel(requestedModel, config);
+  const { requestedModel: resolvedModel } = resolveRequestModel(requestedModel);
   const scope = deriveCacheScope(req.headers);
   const mode = req.body?.mode || 'count';
   const timing = createRequestTimingRecorder({
@@ -8210,7 +8277,7 @@ app.post('/api/v1/context/prepare', async (req, res) => {
 /** Delete all prepared and persisted cache state owned by the caller scope. */
 app.delete('/api/v1/context/cache', async (req, res) => {
   const scope = deriveCacheScope(req.headers);
-  const resolvedModel = req.body?.model ? resolveDefaultModel(req.body.model, config) : undefined;
+  const resolvedModel = req.body?.model ? resolveRequestModel(req.body.model).requestedModel : undefined;
   const ownedSlots = slotAffinity.listScope(scope.id, resolvedModel);
   let deletedPrepared = 0;
   for (const lease of preparedContexts.list(scope.id)) {
@@ -9015,8 +9082,7 @@ async function handleChatCompletions(req, res) {
   // llama.cpp as an unknown model name. rawModel keeps the pre-resolution name so the
   // engine seam can tell an alias request from a direct model request.
   const rawModel = req.body.model || 'default';
-  const requestedModel = resolveDefaultModel(rawModel, config);
-  const aliasRouting = resolveAliasRouting(requestedModel);
+  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
@@ -10140,8 +10206,7 @@ async function handleCompletions(req, res) {
   req.body = stripManagerRequestFields(req.body);
   // Resolve default-big/default-small aliases and forward the resolved name downstream.
   const rawModel = req.body.model || 'unknown';
-  const requestedModel = resolveDefaultModel(rawModel, config);
-  const aliasRouting = resolveAliasRouting(requestedModel);
+  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
   const isStreaming = req.body.stream === true;
 
@@ -10403,11 +10468,11 @@ async function handleEmbeddings(req, res) {
   catch (error) { return res.status(400).json({ error: { message: error.message, code: 'invalid_manager_policy' } }); }
   req.body = stripManagerRequestFields(req.body);
   // Resolve default-big/default-small aliases and forward the resolved name downstream.
-  const requestedModel = resolveDefaultModel(req.body.model || 'default', config);
+  const { requestedModel, aliasRouting } = resolveRequestModel(req.body.model || 'default');
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   // Route to a remote backend if configured (e.g. an Ollama host).
-  const routing = resolveBackend(requestedModel, 'embeddings', req.body, { localOnly: requestPolicy.localOnly });
+  const routing = resolveBackend(requestedModel, 'embeddings', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;
     return res.status(409).json({ error: { message: 'local_only conflicts with an explicit remote backend prefix', code: 'LOCAL_ONLY_REMOTE_CONFLICT' } });
