@@ -146,3 +146,66 @@ test('requestRenderedPrefix hashes the exact upstream template without returning
   assert.equal(result.prefix_hash.startsWith('prefix_'), true);
   assert.equal('prompt' in result, false);
 });
+
+test('contextPrefixRequestHash pins the documented canonical request-hash algorithm', () => {
+  // Pinned vector: the exact downstream certification probe. Changing this value
+  // is a breaking contract change and must bump the context-cache contract.
+  const hash = contextPrefixRequestHash({
+    model: 'alias-ignored',
+    messages: [
+      { role: 'system', content: 'Live contract probe.' },
+      { role: 'developer', content: 'Count only.' },
+    ],
+  }, 'google_gemma-4-E2B-it-qat-q4_0-gguf');
+
+  assert.equal(hash, 'request_420109ab0e99f605a112758cc53f33a73311544d');
+  assert.equal(/^request_[0-9a-f]{40}$/.test(hash), true);
+});
+
+test('contextPrefixRequestHash is stable across key order and exact over Unicode', () => {
+  const ordered = contextPrefixRequestHash({
+    messages: [{ role: 'user', content: 'hello' }],
+    tools: [{ type: 'function', function: { name: 'a' } }],
+    response_format: { type: 'json_object' },
+  }, 'gemma-real');
+  const reordered = contextPrefixRequestHash({
+    response_format: { type: 'json_object' },
+    tools: [{ type: 'function', function: { name: 'a' } }],
+    messages: [{ role: 'user', content: 'hello' }],
+  }, 'gemma-real');
+  assert.equal(ordered, reordered);
+
+  assert.equal(
+    contextPrefixRequestHash({ messages: [{ role: 'user', content: 'héllo — ünïcode ✅' }] }, 'gemma-real'),
+    'request_85e1049e2e481490b8cb2f769ec06f6233e44161',
+  );
+  assert.notEqual(
+    contextPrefixRequestHash({ messages: [{ role: 'user', content: 'héllo' }] }, 'gemma-real'),
+    contextPrefixRequestHash({ messages: [{ role: 'user', content: 'hello' }] }, 'gemma-real'),
+  );
+});
+
+test('contextPrefixRequestHash binds input-affecting fields and the resolved model only', () => {
+  const body = { messages: [{ role: 'user', content: 'hello' }] };
+  const base = contextPrefixRequestHash(body, 'gemma-real');
+
+  // Input mutation changes identity.
+  assert.notEqual(base, contextPrefixRequestHash({ messages: [{ role: 'user', content: 'hello!' }] }, 'gemma-real'));
+  assert.notEqual(base, contextPrefixRequestHash({ ...body, tools: [{ type: 'function' }] }, 'gemma-real'));
+  assert.notEqual(base, contextPrefixRequestHash({ ...body, chat_template_kwargs: { thinking: true } }, 'gemma-real'));
+
+  // Resolved-model mutation changes identity even when the alias is unchanged.
+  assert.notEqual(base, contextPrefixRequestHash(body, 'gemma-other'));
+
+  // Output-only and transport-only controls do not: they are published separately
+  // as priority / residentOnly / residencySource.
+  assert.equal(base, contextPrefixRequestHash({
+    ...body, model: 'voice-fast', stream: true, max_tokens: 128, temperature: 0.9,
+    priority: 'background', request_priority: 'background', resident_only: true,
+    routing: 'local_only', mode: 'count', id_slot: 3, prepared_context_id: 'ctx-secret',
+  }, 'gemma-real'));
+
+  // The hash is opaque: no prompt text or credential material survives into it.
+  assert.equal(base.includes('hello'), false);
+  assert.equal(base.includes('gemma-real'), false);
+});

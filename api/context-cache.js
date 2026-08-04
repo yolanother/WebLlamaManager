@@ -127,6 +127,12 @@ const PREPARED_CONTEXT_STATES = new Set([
  * Return the safe, externally observable portion of an internal lease record.
  * Every public record is stamped with the canonical contract version so clients
  * can never infer the prepared-context contract from field presence alone.
+ *
+ * `requestHash` is deliberately published: it is a non-reversible fingerprint of
+ * the resolved model plus the input-affecting request subset, so a downstream
+ * verifier can bind the returned count and timing evidence to the exact request
+ * that produced them. Fields that would expose caller isolation, prompt text, or
+ * raw llama.cpp slot ownership stay stripped.
  */
 function publicPreparedRecord(record) {
   if (!record) return null;
@@ -134,7 +140,6 @@ function publicPreparedRecord(record) {
     scopeId: _scopeId,
     internalSlotId: _internalSlotId,
     abortController: _abortController,
-    requestHash: _requestHash,
     lineageKey: _lineageKey,
     slotNeedsReset: _slotNeedsReset,
     preparationBody: _preparationBody,
@@ -234,7 +239,9 @@ export class PreparedContextStore {
    *
    * @param {string} id Opaque lease id.
    * @param {string} scopeId Authorization-derived scope id.
-   * @param {Object} patch Internal fields to merge.
+   * @param {Object} patch Internal fields to merge. `requestHash` is fixed at
+   *   creation and is ignored here so no later lifecycle transition can make the
+   *   published request identity drift from the request that created the lease.
    * @returns {Object|null} Updated public metadata or null when not owned.
    * @throws {TypeError} If a supplied status is invalid.
    */
@@ -244,7 +251,8 @@ export class PreparedContextStore {
     if (patch.status && !PREPARED_CONTEXT_STATES.has(patch.status)) {
       throw new TypeError(`invalid prepared-context status: ${patch.status}`);
     }
-    Object.assign(record, patch, { updatedAt: this.now() });
+    const { requestHash: _immutableRequestHash, ...mutable } = patch;
+    Object.assign(record, mutable, { updatedAt: this.now() });
     return publicPreparedRecord(record);
   }
 

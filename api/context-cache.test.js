@@ -154,3 +154,42 @@ test('fallback conversation identity stays stable as turns grow', () => {
   assert.equal(firstRequest.key, grownRequest.key);
   assert.equal(firstRequest.source, 'conversation_head');
 });
+
+test('prepared records publish requestHash as immutable lease identity', () => {
+  const store = new PreparedContextStore({ createId: () => 'ctx_test_hash' });
+  const created = store.create({
+    scopeId: 'scope_a', requestedModel: 'voice-fast', resolvedModel: 'gemma-real',
+    engine: 'llama', inputTokens: 42, prefixHash: 'prefix_a', compatibilityHash: 'compat_a',
+    requestHash: 'request_abc', status: 'ready', internalSlotId: 3,
+    lineageKey: 'lineage_a', preparationBody: { messages: [{ role: 'user', content: 'secret prompt' }] },
+  });
+
+  // Downstream certification binds evidence to the request that produced it.
+  assert.equal(created.requestHash, 'request_abc');
+  assert.equal(store.get('ctx_test_hash', 'scope_a').requestHash, 'request_abc');
+  assert.deepEqual(
+    store.list('scope_a').map(record => record.requestHash),
+    ['request_abc'],
+  );
+
+  // Genuinely internal state stays stripped alongside it.
+  assert.equal('scopeId' in created, false);
+  assert.equal('internalSlotId' in created, false);
+  assert.equal('lineageKey' in created, false);
+  assert.equal('preparationBody' in created, false);
+  assert.equal(JSON.stringify(created).includes('secret prompt'), false);
+
+  // A later transition can never make the published hash drift from the request.
+  const updated = store.update('ctx_test_hash', 'scope_a', {
+    status: 'prefilling', requestHash: 'request_tampered',
+  });
+  assert.equal(updated.status, 'prefilling');
+  assert.equal(updated.requestHash, 'request_abc');
+  assert.equal(store.getInternal('ctx_test_hash', 'scope_a').requestHash, 'request_abc');
+});
+
+test('a lease created without a request hash never invents one', () => {
+  const store = new PreparedContextStore({ createId: () => 'ctx_test_nohash' });
+  const created = store.create({ scopeId: 'scope_a', resolvedModel: 'gemma-real', status: 'queued' });
+  assert.equal('requestHash' in created, false);
+});

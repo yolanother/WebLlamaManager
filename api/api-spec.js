@@ -584,6 +584,18 @@ const CONTEXT_PREPARE_RESPONSE_SCHEMA = {
     },
     inputTokens: { type: 'integer', minimum: 0, description: 'Exact production-template input token count. Present when preparation succeeded.' },
     prefixHash: { type: 'string', description: 'Hash of the exact rendered prefix.' },
+    requestHash: {
+      type: 'string',
+      pattern: '^request_[0-9a-f]{40}$',
+      description: [
+        'Non-reversible fingerprint of the request that produced this lease: `request_` followed by the first 40 hex characters of a canonical SHA-256.',
+        'It covers the resolved model plus only the input-affecting request subset (messages, input, prompt, tools, tool_choice, response_format, chat_template, chat_template_kwargs, reasoning_format).',
+        'Output controls (stream, max_tokens, temperature) and transport-only scheduling controls are excluded — the latter are published separately as priority, residentOnly, and residencySource.',
+        'Privacy: it is one-way and carries no prompt text, authorization credential, or token array; it is safe to embed in a sanitized downstream artifact.',
+        'Versioning: the algorithm is pinned by contextCacheContract. It is fixed when the lease is created and never changes across lifecycle transitions, so a downstream verifier can recompute it and fail closed on any mismatch.',
+        'Present on every lease this route returns, including terminal skipped/cancelled outcomes.',
+      ].join(' '),
+    },
     compatibilityHash: { type: 'string', description: 'Versioned fingerprint of model, engine, template, tokenizer, projector, adapters, and runtime.' },
     capabilities: {
       type: 'object',

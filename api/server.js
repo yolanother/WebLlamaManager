@@ -7520,6 +7520,11 @@ app.post('/api/v1/context/prepare', async (req, res) => {
 
   const slotOperationsSupported = await modelHasSlotOperations(resolvedModel);
   const capabilities = { exact_count: true, exact_render: true, kv_prefill: slotOperationsSupported };
+  // Request identity is derived once, before any lease can be built, so every
+  // projection this route can return — counted, prefilled, skipped, cancelled —
+  // binds to the same request. A downstream verifier can then attest a refusal
+  // as precisely as a successful count.
+  const requestHash = contextPrefixRequestHash(req.body, resolvedModel);
   /** Build a terminal lease describing preparation that never touched the model. */
   const terminalLease = decision => preparedContexts.create({
     scopeId: scope.id,
@@ -7533,6 +7538,7 @@ app.post('/api/v1/context/prepare', async (req, res) => {
     status: decision.status,
     preparationOutcome: decision.preparationOutcome,
     capabilities,
+    requestHash,
     compatibilityHash: compatibilityFingerprint({ resolvedModel, engine: ENGINE_TYPES.LLAMA }),
     // A lease that never touched the model still publishes evidence: whatever
     // was measured (queue wait, when admission was reached) plus typed reasons
@@ -7628,7 +7634,6 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       cachedTokens: 0,
       source: 'exact_input_tokens_endpoint',
     });
-    const requestHash = contextPrefixRequestHash(req.body, resolvedModel);
     const lease = preparedContexts.create({
       scopeId: scope.id,
       requestedModel,
