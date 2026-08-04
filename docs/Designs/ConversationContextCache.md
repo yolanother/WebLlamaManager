@@ -160,6 +160,34 @@ one the caller asked for. Successful leases additionally report `mode`,
 `status`, `preparationOutcome`, `priority`, `residentOnly`, `residencySource`,
 `inputTokens`, and the `capabilities.exact_count` flag.
 
+**Request attestation (`requestHash`).** Every lease this route returns — the
+successful `count` and `prefill` projections, the cached `GET /api/v1/context/:id`
+projection, `list`, and the terminal `skipped`/`cancelled` outcomes — publishes
+`requestHash`: `request_` followed by the first 40 hex characters of the canonical
+SHA-256 produced by `contextPrefixRequestHash()` (`api/context-endpoints.js`). A
+downstream verifier recomputes it and fails closed on any mismatch, which binds
+the returned token count and timing evidence to the exact input that produced
+them.
+
+What it covers is deliberately narrow: the **resolved** model plus only the
+input-affecting request subset — `messages`, `input`, `prompt`, `tools`,
+`tool_choice`, `response_format`, `chat_template`, `chat_template_kwargs`,
+`reasoning_format`. Output controls (`stream`, `max_tokens`, `temperature`) and
+transport-only scheduling controls are excluded; the latter stay separately
+observable as `priority`, `residentOnly`, and `residencySource`, so a scheduling
+decision can never be mistaken for a different input. Binding to the resolved
+model means an alias that repoints to a different concrete model yields a
+different hash even when the caller's request bytes are identical.
+
+The value is one-way and non-reversible: it carries no prompt text, no
+authorization credential, and no token array, so it is safe to embed in a
+sanitized artifact published outside the manager. It is fixed when the lease is
+created — `PreparedContextStore.update()` ignores any `requestHash` in a patch —
+so no lifecycle transition can make a projection drift from its originating
+request. The algorithm is pinned by `contextCacheContract` and by a checked-in
+test vector; changing either is a breaking contract change that must bump the
+contract version.
+
 **Legacy compatibility.** `allow_model_load: true` remains supported and keeps
 its original meaning — it permits `prefill` to load a nonresident model — and
 omitting `resident_only` preserves the previous defaults (`count` may load,
