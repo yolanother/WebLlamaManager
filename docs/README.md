@@ -18,6 +18,7 @@ hardware-specific gotchas of the AMD Strix Halo (gfx1151) box it targets.
 - [ds4-build.md](ds4-build.md) — building the ds4 binaries for gfx1151 (build vs run container, `-fPIC`)
 - [ds4-auto-update.md](ds4-auto-update.md) — the ds4 self-updater (out-of-place rebuild → smoke → atomic swap)
 - [llama-cpp-rocm-build-and-deployment.md](llama-cpp-rocm-build-and-deployment.md) — building/deploying the llama.cpp engine on ROCm
+- [Benchmarks/Qwen3.8-27B-Strix-Halo.md](Benchmarks/Qwen3.8-27B-Strix-Halo.md) — reproducible Qwen3.8-27B install, MTP/n-gram profile, and honest 100+ tok/s measurement contract
 - [Designs/EngineAbstraction.md](Designs/EngineAbstraction.md) — the two-engine seam, exclusive mode, adaptive plan (design)
 - [Designs/ModelManagement.md](Designs/ModelManagement.md) — model lifecycle, presets, download
 
