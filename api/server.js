@@ -99,6 +99,11 @@ import {
 import { PriorityRequestQueue } from './request-queue.js';
 import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
 import {
+  QUESTION_MARK_ONLY_OUTPUT_ERROR,
+  createChatCompletionStreamGuard,
+  validateChatCompletionPayload,
+} from './completion-output-guard.js';
+import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
@@ -1108,13 +1113,14 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
+        const outputGuard = createChatCompletionStreamGuard();
         let completionTokens = 0, promptTokens = 0, responseText = '';
 
         try {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = decoder.decode(value);
+            const chunk = decoder.decode(value, { stream: true });
 
             // Normalize model field in streaming chunks
             const lines = chunk.split('\n');
@@ -1142,8 +1148,12 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
                 rewrittenLines.push(line);
               }
             }
-            res.write(needsRewrite ? rewrittenLines.join('\n') : chunk);
+            const outputChunk = needsRewrite ? rewrittenLines.join('\n') : chunk;
+            writeGuardedCompletionFragments(res, outputGuard.push(outputChunk));
           }
+          const decoderTail = decoder.decode();
+          if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
+          writeGuardedCompletionFragments(res, outputGuard.finish());
           res.end();
 
           const duration = Date.now() - startTime;
@@ -1165,6 +1175,22 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
       } else {
         // Non-streaming backfill response
         const data = await response.json();
+        if (validateChatCompletionPayload(data)) {
+          const duration = Date.now() - startTime;
+          addLlmLog({
+            endpoint, model: requestedModel, stream: false,
+            status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration,
+            promptTokens: data.usage?.prompt_tokens || 0,
+            completionTokens: data.usage?.completion_tokens || 0,
+            tokensPerSecond: 0,
+            messages: req.body.messages || null, prompt: null, response: null,
+            error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+            backend: chosen.id, requestBody: req.body, backfill: true,
+          });
+          endActiveRequest(activeReqId, { status: 'error' });
+          sendQuestionMarkOnlyOutputError(res);
+          return;
+        }
         const duration = Date.now() - startTime;
         const usage = data.usage || {};
         const bfPromptTokens = usage.prompt_tokens || 0;
@@ -8211,6 +8237,31 @@ function injectModelSamplingDefaults(body) {
 }
 
 /**
+ * Send the standard corrupted-upstream error through either an uncommitted JSON
+ * response or a heartbeat-committed JSON body.
+ *
+ * @param {import('express').Response} res Express response.
+ * @returns {void}
+ */
+function sendQuestionMarkOnlyOutputError(res) {
+  const { status, body } = QUESTION_MARK_ONLY_OUTPUT_ERROR;
+  if (!res.headersSent) {
+    res.status(status).json(body);
+    return;
+  }
+  res.statusCode = status;
+  if (!res.writableEnded) {
+    res.write(JSON.stringify(body));
+    res.end();
+  }
+}
+
+/** Write each raw fragment released by an incremental completion stream guard. */
+function writeGuardedCompletionFragments(res, fragments) {
+  for (const fragment of fragments) res.write(fragment);
+}
+
+/**
  * Forward an OpenAI chat-completions request straight to the ds4-server, bypassing
  * ALL llama.cpp machinery (slot assignment, prefix cache, tokenize, resolveBackend,
  * fetchWithRetry error-sniffing). ds4 is a single-model OpenAI-compatible server, so
@@ -8257,13 +8308,14 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
       res.flushHeaders();
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
+      const outputGuard = createChatCompletionStreamGuard();
       let responseText = '';
       let completionTokens = 0;
       let promptTokens = 0;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value);
+        const chunk = decoder.decode(value, { stream: true });
         for (const line of chunk.split('\n')) {
           if (line.startsWith('data: ') && line !== 'data: [DONE]') {
             try {
@@ -8274,8 +8326,11 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
             } catch { /* non-JSON keepalive line */ }
           }
         }
-        res.write(chunk);
+        writeGuardedCompletionFragments(res, outputGuard.push(chunk));
       }
+      const decoderTail = decoder.decode();
+      if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
+      writeGuardedCompletionFragments(res, outputGuard.finish());
       try { res.end(); } catch { /* ignore */ }
       const dur = Date.now() - startTime;
       addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: 200, duration: dur, promptTokens, completionTokens, tokensPerSecond: completionTokens / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
@@ -8285,6 +8340,13 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
 
     // Non-streaming.
     const data = await upstream.json();
+    if (validateChatCompletionPayload(data)) {
+      const dur = Date.now() - startTime;
+      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration: dur, promptTokens: data.usage?.prompt_tokens || 0, completionTokens: data.usage?.completion_tokens || 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message, backend: 'ds4', requestBody: req.body });
+      endActiveRequest(activeReqId, { status: 'error' });
+      sendQuestionMarkOnlyOutputError(res);
+      return;
+    }
     if (mediaMetadata) {
       data.metadata = { ...data.metadata, llama_manager_media: mediaMetadata };
     }
@@ -8777,6 +8839,7 @@ async function handleChatCompletions(req, res) {
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
+        const outputGuard = createChatCompletionStreamGuard();
         let completionTokens = 0;
         let promptTokens = 0;
         let model = routing.targetModel;
@@ -8799,7 +8862,7 @@ async function handleChatCompletions(req, res) {
               const { done, value } = await reader.read();
               if (done) break;
               lastChunkAt = Date.now();
-              const chunk = decoder.decode(value);
+              const chunk = decoder.decode(value, { stream: true });
               // Normalize model field in remote streaming chunks to match requested model
               const lines = chunk.split('\n');
               const rewrittenLines = [];
@@ -8830,8 +8893,12 @@ async function handleChatCompletions(req, res) {
                   rewrittenLines.push(line);
                 }
               }
-              res.write(needsRewrite ? rewrittenLines.join('\n') : chunk);
+              const outputChunk = needsRewrite ? rewrittenLines.join('\n') : chunk;
+              writeGuardedCompletionFragments(res, outputGuard.push(outputChunk));
             }
+            const decoderTail = decoder.decode();
+            if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
+            writeGuardedCompletionFragments(res, outputGuard.finish());
             clearInterval(keepaliveTicker);
             res.end();
             const duration = Date.now() - startTime;
@@ -8882,6 +8949,22 @@ async function handleChatCompletions(req, res) {
           data = await response.json();
         } finally {
           clearInterval(heartbeatTicker);
+        }
+        if (validateChatCompletionPayload(data)) {
+          const duration = Date.now() - startTime;
+          addLlmLog({
+            endpoint: 'chat/completions', model: requestedModel, stream: false,
+            status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration,
+            promptTokens: data.usage?.prompt_tokens || 0,
+            completionTokens: data.usage?.completion_tokens || 0,
+            tokensPerSecond: 0,
+            messages: req.body.messages || null, prompt: null, response: null,
+            error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+            backend: backend.id, requestBody: req.body,
+          });
+          endActiveRequest(activeReqId, { status: 'error' });
+          sendQuestionMarkOnlyOutputError(res);
+          return;
         }
         const duration = Date.now() - startTime;
         const usage = data.usage || {};
@@ -9302,6 +9385,7 @@ async function handleChatCompletions(req, res) {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      const outputGuard = createChatCompletionStreamGuard();
       let completionTokens = 0;
       let promptTokens = 0;
       let model = req.body.model || 'unknown';
@@ -9316,7 +9400,7 @@ async function handleChatCompletions(req, res) {
             if (done) break;
             lastChunkAt = Date.now();
 
-            const chunk = decoder.decode(value);
+            const chunk = decoder.decode(value, { stream: true });
 
             // Normalize model field in streaming chunks: replace llama-server's
             // reported model (which may be a different loaded model) with what was requested
@@ -9381,8 +9465,11 @@ async function handleChatCompletions(req, res) {
             if (needsRewrite) {
               outputChunk = rewrittenLines.join('\n');
             }
-            res.write(outputChunk);
+            writeGuardedCompletionFragments(res, outputGuard.push(outputChunk));
           }
+          const decoderTail = decoder.decode();
+          if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
+          writeGuardedCompletionFragments(res, outputGuard.finish());
           if (streamingKeepaliveTicker) {
             clearInterval(streamingKeepaliveTicker);
             streamingKeepaliveTicker = null;
@@ -9475,6 +9562,23 @@ async function handleChatCompletions(req, res) {
       const data = await response.json();
       clearInterval(nonStreamingHeartbeatTicker);
       nonStreamingHeartbeatTicker = null;
+
+      if (validateChatCompletionPayload(data)) {
+        const wallDuration = Date.now() - startTime;
+        logLlm({
+          endpoint: 'chat/completions', model: requestedModel,
+          stream: false, status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status,
+          duration: wallDuration,
+          promptTokens: data.usage?.prompt_tokens || 0,
+          completionTokens: data.usage?.completion_tokens || 0,
+          tokensPerSecond: 0,
+          messages: req.body.messages || null, prompt: null, response: null,
+          error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+        });
+        endActiveRequest(activeReqId, { status: 'error' });
+        sendQuestionMarkOnlyOutputError(res);
+        return;
+      }
 
       // Extract token stats — prefer server-reported timings (excludes queue wait)
       const wallDuration = Date.now() - startTime;
