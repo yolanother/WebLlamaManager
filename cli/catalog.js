@@ -269,8 +269,8 @@ const COMMANDS = [
 /** Generic and documentation commands implemented by the execution engine. */
 const SPECIAL_COMMANDS = [
   { path: ['api', 'list'], usage: 'llm api list', summary: 'Fetch the OpenAPI operation catalog.', options: [] },
-  { path: ['api', 'call'], usage: 'llm api call OPERATION_ID [REQUEST OPTIONS]', summary: 'Call an operation by OpenAPI operationId.', options: ['--param NAME=VALUE', '--query NAME=VALUE', '--body JSON', '--form NAME=VALUE|@FILE', '--output FILE'] },
-  { path: ['request'], usage: 'llm request METHOD PATH [REQUEST OPTIONS]', summary: 'Call a future-safe raw manager path.', options: ['--param NAME=VALUE', '--query NAME=VALUE', '--body JSON', '--form NAME=VALUE|@FILE', '--output FILE'] },
+  { path: ['api', 'call'], usage: 'llm api call OPERATION_ID [REQUEST OPTIONS]', summary: 'Call an operation by OpenAPI operationId.', options: ['--param NAME=VALUE', '--query NAME=VALUE', '--header NAME=VALUE', '--body JSON', '--form NAME=VALUE|@FILE', '--output FILE'] },
+  { path: ['request'], usage: 'llm request METHOD PATH [REQUEST OPTIONS]', summary: 'Call a future-safe raw manager path.', options: ['--param NAME=VALUE', '--query NAME=VALUE', '--header NAME=VALUE', '--body JSON', '--form NAME=VALUE|@FILE', '--output FILE'] },
   { path: ['help'], usage: 'llm help [--json]', summary: 'Show concise help or emit JSON command metadata.', options: [] },
   { path: ['docs'], usage: 'llm docs [--full]', summary: 'Emit a generated Markdown command reference.', options: ['--full'] },
 ];

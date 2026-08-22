@@ -64,20 +64,24 @@ Credential-like response fields are masked before output.
 # Discover operation IDs from /api/openapi.json
 llm api list --graphql '{ operations { operationId method path summary } }'
 
-# Resolve an operation ID; repeat path/query inputs as needed
+# Resolve an operation ID; repeat path/query/header inputs as needed
 llm api call getRequestStats --query window=24h --json
 llm api call getDownload --param downloadId=AUTHOR/MODEL:Q4_K_XL --json
 
-# JSON request through the future-safe raw route
-llm request POST /api/settings --body '{"maxConcurrentRequests":1}' --json
+# JSON request through the future-safe raw route, labeled for analytics
+llm request POST /api/v1/chat/completions \
+  --header X-Llama-Manager-Workload=repetition-assisted \
+  --body '{"model":"qwen","messages":[{"role":"user","content":"Repeat A B C."}]}' \
+  --json
 
 # Multipart text/files and binary response output
 llm api call createMediaArtifact --form purpose=vision --form file=@./image.png
 llm request GET /api/media/artifacts/example/content --output ./artifact.bin
 ```
 
-`--param` replaces an OpenAPI path parameter. `--query` is repeatable. `--body`
-accepts JSON. `--form NAME=VALUE` adds multipart text and
+`--param` replaces an OpenAPI path parameter. `--query` and
+`--header NAME=VALUE` are repeatable; headers with invalid names or embedded
+newlines are rejected before HTTP. `--body` accepts JSON. `--form NAME=VALUE` adds multipart text and
 `--form NAME=@FILE` adds file data. `--output FILE` writes response bytes
 without corrupting them through terminal formatting.
 
@@ -90,12 +94,15 @@ llm search 'Qwen3.8 27B' --graphql '{ results { id downloads likes } }'
 llm repo files unsloth/Qwen3.8-27B-GGUF \
   --graphql '{ quantizations { name files { name size } } }'
 
-DOWNLOAD_ID=$(llm download unsloth/Qwen3.8-27B-GGUF \
-  --quantization UD-Q4_K_XL --get downloadId)
-llm downloads status "$DOWNLOAD_ID" --graphql '{ status progress error }'
+PRIMARY_ID=$(llm download unsloth/Qwen3.8-27B-GGUF \
+  --filename Qwen3.8-27B-UD-Q4_K_XL.gguf --get downloadId)
+llm download unsloth/Qwen3.8-27B-GGUF --filename mmproj-F16.gguf --json
+llm download unsloth/Qwen3.8-27B-GGUF \
+  --filename MTP/mtp-Qwen3.8-27B-Q4_0.gguf --json
+llm downloads status "$PRIMARY_ID" --graphql '{ status progress error }'
 
 llm models list --get 'localModels.*.name'
-MODEL='unsloth_Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf'
+MODEL='unsloth_Qwen3.8-27B-GGUF'
 llm models load "$MODEL"
 llm chat "$MODEL" 'Reply with exactly: Qwen is ready.'
 ```

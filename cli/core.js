@@ -18,7 +18,7 @@ const VALUE_OPTIONS = new Set([
   'url', 'get', 'graphql', 'minutes', 'body', 'context-size', 'models-max',
   'gpu-layers', 'auto-start', 'no-warmup', 'flash-attn', 'quantization',
   'filename', 'pattern', 'limit', 'messages', 'message', 'temperature',
-  'max-tokens', 'param', 'query', 'form', 'output',
+  'max-tokens', 'param', 'query', 'header', 'form', 'output',
 ]);
 const FLAG_OPTIONS = new Set(['json', 'yes', 'help', 'full']);
 
@@ -126,6 +126,22 @@ function pairOptions(options, name) {
 }
 
 /**
+ * Parses repeatable HTTP headers while rejecting request-splitting input.
+ *
+ * @param {Map<string,string[]>} options Parsed options.
+ * @returns {Array<[string,string]>} Ordered header name/value pairs.
+ * @throws {UsageError} When a name is invalid or a value contains a newline.
+ */
+function headerOptions(options) {
+  return pairOptions(options, 'header').map(([name, value]) => {
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || /[\r\n]/.test(value)) {
+      throw new UsageError('--header must be NAME=VALUE without newlines');
+    }
+    return [name, value];
+  });
+}
+
+/**
  * Parses a JSON body option with a deterministic usage error.
  *
  * @param {string|undefined} serialized Optional JSON text.
@@ -191,7 +207,7 @@ function renderDocs(full) {
   if (full) {
     lines.push(
       '## Complete API access', '',
-      '`llm api list` fetches `/api/openapi.json`. `llm api call OPERATION_ID` resolves the operation and accepts repeatable `--param NAME=VALUE`, `--query NAME=VALUE`, `--form NAME=VALUE|@FILE`, JSON `--body`, and `--output FILE`.', '',
+      '`llm api list` fetches `/api/openapi.json`. `llm api call OPERATION_ID` resolves the operation and accepts repeatable `--param NAME=VALUE`, `--query NAME=VALUE`, `--header NAME=VALUE`, `--form NAME=VALUE|@FILE`, JSON `--body`, and `--output FILE`.', '',
       '`llm request METHOD PATH` exposes the same request options without relying on the current OpenAPI catalog.', '',
       'Destructive requests require `--yes`; the CLI never prompts interactively.', '',
     );
@@ -396,18 +412,20 @@ function responseDetail(data, text) {
  * Executes one manager HTTP request and parses or writes its response.
  *
  * @param {string} base Manager base URL.
- * @param {{method:string,path:string,query?:Array<[string,string]>,body?:unknown,form?:Array<[string,string]>,output?:string}} request Request definition.
+ * @param {{method:string,path:string,query?:Array<[string,string]>,headers?:Array<[string,string]>,body?:unknown,form?:Array<[string,string]>,output?:string}} request Request definition.
  * @returns {Promise<unknown>} Parsed JSON or text response, or output-file result.
  * @throws {HttpError|UsageError} For HTTP, connection, or response failures.
  */
 async function executeHttp(base, request) {
   const url = buildUrl(base, request.path, request.query);
-  const init = { method: request.method.toUpperCase(), headers: {} };
+  const headers = new Headers();
+  for (const [name, value] of request.headers ?? []) headers.append(name, value);
+  const init = { method: request.method.toUpperCase(), headers };
   if (request.form?.length) {
     if (request.body !== undefined) throw new UsageError('--body and --form are mutually exclusive');
     init.body = buildForm(request.form);
   } else if (request.body !== undefined) {
-    init.headers['Content-Type'] = 'application/json';
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
     init.body = JSON.stringify(request.body);
   }
   let response;
@@ -493,6 +511,7 @@ function genericRequest(method, requestPath, options) {
     method: normalized,
     path: requestPath,
     query: pairOptions(options, 'query'),
+    headers: headerOptions(options),
     body: parseBody(lastOption(options, 'body')),
     form: pairOptions(options, 'form'),
     output: lastOption(options, 'output'),

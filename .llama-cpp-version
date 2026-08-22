@@ -1,11 +1,10 @@
 # Pinned llama.cpp source for the ROCm (AMD Strix Halo, gfx1151) llama-server build.
 #
-# scripts/build-llama-cpp.sh checks out exactly this commit, builds it inside the
-# llama-rocm-7rc-rocwmma distrobox, and installs the binary to ~/.local/bin where
-# container-start.sh's router picks it up. Bump LLAMA_CPP_REF deliberately to adopt
-# new upstream model support (e.g. gemma4 multimodal), then re-run the build script.
+# scripts/build-llama-cpp.sh checks out exactly this commit for a reproducible
+# gfx1151 ROCm build. Bump LLAMA_CPP_REF deliberately only after validating text,
+# vision, and speculative decoding through the managed production runtime.
 #
-# Current pin chosen for: Gemma 4 (gemma4) architecture + multimodal mmproj support
-# and the re-architected --models-preset router (per-model mmproj). 2026-06-24 upstream.
+# Current pin validated on Frostburn for Qwen3.8-27B text + mmproj image inference,
+# MTP/ngram-mod speculative decoding, and the models-preset router. 2026-08-22.
 LLAMA_CPP_REPO=https://github.com/ggerganov/llama.cpp.git
-LLAMA_CPP_REF=8be759e6f70d629638a7eb70db3824cbdcea370b
+LLAMA_CPP_REF=b21e4de74567f5eef213765c9476a843c2e43f0d

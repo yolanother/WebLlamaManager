@@ -267,6 +267,46 @@ test('api call resolves an operation ID and applies repeatable path, query, and 
   assert.deepEqual(request.body, body);
 });
 
+test('raw and OpenAPI requests send repeatable headers and reject malformed values before HTTP', async t => {
+  const document = {
+    openapi: '3.1.0',
+    paths: {
+      '/api/benchmark': {
+        post: { operationId: 'runBenchmark' },
+      },
+    },
+  };
+  const manager = await startManager(request => {
+    if (request.pathname === '/api/openapi.json') return { body: document };
+    return { body: { accepted: true } };
+  });
+  t.after(manager.close);
+
+  successfulOutput(await runAt(manager.url, [
+    'request', 'POST', '/api/benchmark',
+    '--header', 'X-Llama-Manager-Workload=repetition-assisted',
+    '--header', 'X-Benchmark-Run=cold',
+    '--body', '{"prompt":"repeat"}',
+  ]));
+  successfulOutput(await runAt(manager.url, [
+    'api', 'call', 'runBenchmark',
+    '--header', 'X-Llama-Manager-Workload=general',
+  ]));
+
+  assert.equal(manager.requests[0].headers['x-llama-manager-workload'], 'repetition-assisted');
+  assert.equal(manager.requests[0].headers['x-benchmark-run'], 'cold');
+  assert.equal(manager.requests[1].pathname, '/api/openapi.json');
+  assert.equal(manager.requests[2].headers['x-llama-manager-workload'], 'general');
+
+  for (const value of ['missing-separator', '=missing-name', 'X-Test=ok\r\nInjected: true']) {
+    const before = manager.requests.length;
+    const result = await runAt(manager.url, ['request', 'GET', '/api/benchmark', '--header', value]);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /header/i);
+    assert.equal(manager.requests.length, before);
+  }
+});
+
 test('api call supports multipart fields, @FILE data, and binary --output', async t => {
   const temp = await mkdtemp(join(tmpdir(), 'llm-cli-form-'));
   const upload = join(temp, 'projector.gguf');

@@ -330,8 +330,11 @@ llm status --graphql '{ running mode loadedModels { id } }'`}
 llm api list --graphql '{ operations { operationId method path summary } }'
 llm api call getStatus --json
 
-# Future-safe raw requests, multipart uploads, and binary downloads
-llm request GET /api/analytics/request-stats --query window=24h --json
+# Future-safe raw requests with repeatable query/header inputs
+llm request GET /api/analytics/request-stats --query window=24h \
+  --header X-Llama-Manager-Workload=general --json
+
+# Multipart uploads and binary downloads
 llm api call createMediaArtifact --form file=@./image.png --output ./artifact.bin`}
               />
 
@@ -343,14 +346,16 @@ llm api call createMediaArtifact --form file=@./image.png --output ./artifact.bi
 llm search 'Qwen3.8 27B' --graphql '{ results { id downloads likes } }'
 llm repo files unsloth/Qwen3.8-27B-GGUF --graphql '{ quantizations { name files { name size } } }'
 
-# Start the managed download and poll it
-DOWNLOAD_ID=$(llm download unsloth/Qwen3.8-27B-GGUF --quantization UD-Q4_K_XL --get downloadId)
-llm downloads status "$DOWNLOAD_ID" --graphql '{ status progress error }'
+# Download the primary model, vision projector, and MTP draft
+PRIMARY_ID=$(llm download unsloth/Qwen3.8-27B-GGUF --filename Qwen3.8-27B-UD-Q4_K_XL.gguf --get downloadId)
+llm download unsloth/Qwen3.8-27B-GGUF --filename mmproj-F16.gguf --json
+llm download unsloth/Qwen3.8-27B-GGUF --filename MTP/mtp-Qwen3.8-27B-Q4_0.gguf --json
+llm downloads status "$PRIMARY_ID" --graphql '{ status progress error }'
 
-# Copy the downloaded name from this list, then load and verify it
+# Load by router model key, then verify text inference
 llm models list --get 'localModels.*.name'
-llm models load 'unsloth_Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf'
-llm chat 'unsloth_Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf' 'Reply with exactly: Qwen is ready.'`}
+llm models load 'unsloth_Qwen3.8-27B-GGUF'
+llm chat 'unsloth_Qwen3.8-27B-GGUF' 'Reply with exactly: Qwen is ready.'`}
               />
 
               <h3>Agent-readable reference</h3>

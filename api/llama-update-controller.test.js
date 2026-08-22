@@ -55,9 +55,36 @@ test('source update spec uses HOME-derived checkout as positional argv without a
   );
 
   assert.deepEqual(spec.command, '/usr/local/bin/distrobox');
-  assert.equal(spec.args.at(-1), '/srv/llama-manager/llama.cpp');
-  assert.match(spec.args.at(-3), /cd -- "\$1"/);
+  assert.equal(spec.args.at(-3), '/srv/llama-manager/llama.cpp');
+  assert.equal(spec.args.at(-2), '/srv/llama-manager/llama.cpp/build');
+  assert.equal(spec.args.at(-1), '/srv/llama-manager/.local');
+  assert.match(spec.args.at(-5), /cd -- "\$checkout"/);
   assert.doesNotMatch(JSON.stringify(spec), /\/home\/yolan/);
+});
+
+test('source update spec configures ROCm and installs the complete build at the managed runtime prefix', () => {
+  const spec = createLlamaSourceUpdateSpec(
+    {
+      HOME: '/srv/llama-manager',
+      LLAMA_CPP_DIR: '/opt/src/llama.cpp',
+      LLAMA_CPP_BUILD_DIR: '/opt/build/llama-rocm',
+      LLAMA_SERVER_BIN: '/usr/local/bin/llama-server',
+    },
+    { distrobox: 'distrobox', containerName: 'llama-rocm' },
+  );
+
+  assert.deepEqual(spec.args.slice(-3), [
+    '/opt/src/llama.cpp',
+    '/opt/build/llama-rocm',
+    '/usr/local',
+  ]);
+  const script = spec.args.at(-5);
+  assert.match(script, /cmake.*-S.*-B/s);
+  assert.match(script, /AMDGPU_TARGETS.*gfx1151/);
+  assert.match(script, /cmake.*--build.*build_dir/s);
+  assert.match(script, /cmake.*--install.*install_prefix/s);
+  assert.match(script, /install_prefix.*bin\/llama-server.*--version/s);
+  assert.doesNotMatch(script, /--target\s+llama-server/);
 });
 
 test('the management API contains no developer-specific home path', () => {
