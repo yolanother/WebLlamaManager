@@ -2403,6 +2403,54 @@
         }
       }
     },
+    "/api/models/{model}": {
+      "delete": {
+        "operationId": "delete_api_models_model",
+        "summary": "Delete an installed local model",
+        "description": "Delete an installed local model through the Llama Manager HTTP API.",
+        "tags": [
+          "models"
+        ],
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "description": "model path identifier.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X DELETE 'http://localhost:5250/api/models/gemma-4'"
+          },
+          {
+            "lang": "Python",
+            "source": "import requests\n\nresponse = requests.delete('http://localhost:5250/api/models/gemma-4')\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/models/gemma-4', { method: 'DELETE' });\nconsole.log(await response.json());"
+          }
+        ]
+      }
+    },
     "/api/ds4/update/status": {
       "get": {
         "operationId": "get_api_ds4_update_status",
@@ -2879,6 +2927,52 @@
       }
     },
     "/api/downloads/{downloadId}": {
+      "get": {
+        "operationId": "get_api_downloads_downloadId",
+        "summary": "Get one model download",
+        "description": "Get one model download through the Llama Manager HTTP API.",
+        "tags": [
+          "models"
+        ],
+        "parameters": [
+          {
+            "name": "downloadId",
+            "in": "path",
+            "required": true,
+            "description": "downloadId path identifier.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X GET 'http://localhost:5250/api/downloads/download-123'"
+          },
+          {
+            "lang": "Python",
+            "source": "import requests\n\nresponse = requests.get('http://localhost:5250/api/downloads/download-123')\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/downloads/download-123');\nconsole.log(await response.json());"
+          }
+        ]
+      },
       "delete": {
         "operationId": "delete_api_downloads_downloadId",
         "summary": "Cancel a model download",

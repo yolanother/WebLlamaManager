@@ -18,7 +18,7 @@ import cors from 'cors';
 import { spawn, exec, execSync } from 'child_process';
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { dirname, join, basename } from 'path';
+import { dirname, join, basename, isAbsolute, relative, resolve } from 'path';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { cpus, totalmem, freemem, loadavg } from 'os';
@@ -4964,6 +4964,88 @@ app.get('/api/models', async (req, res) => {
   }
 });
 
+/**
+ * Return every GGUF path represented by one exact local-model inventory row.
+ * Split paths are reconstructed from the scanner's declared part count;
+ * regular models contain only their one scanned path.
+ *
+ * @param {Object} model Exact entry returned by {@link scanLocalModels}.
+ * @returns {string[]} Existing GGUF paths owned by that model entry.
+ */
+function localModelFiles(model) {
+  if (!model?.isSplit) return model?.path ? [model.path] : [];
+  const match = model.path?.match(/^(.*)-(\d{5})-of-(\d{5})\.gguf$/i);
+  if (!match) return model.path ? [model.path] : [];
+  const total = Number(model.partCount) || Number(match[3]);
+  return Array.from({ length: total }, (_unused, index) =>
+    `${match[1]}-${String(index + 1).padStart(5, '0')}-of-${match[3]}.gguf`
+  ).filter(path => existsSync(path));
+}
+
+/**
+ * Verify a scanned model path remains strictly inside the configured model
+ * directory. This is defense in depth: callers also resolve only exact names
+ * returned by the inventory scanner.
+ *
+ * @param {string} path Candidate file path.
+ * @returns {boolean} True only for a descendant of MODELS_DIR.
+ */
+function isManagedModelPath(path) {
+  const child = relative(resolve(MODELS_DIR), resolve(path));
+  return child.length > 0 && !child.startsWith('..') && !isAbsolute(child);
+}
+
+// Delete exactly one installed model selected from the filesystem inventory.
+// Loaded and desired-resident models are protected so removal never races an
+// engine or violates the configured residency contract.
+app.delete('/api/models/:model(*)', async (req, res) => {
+  const modelName = req.params.model;
+  if (!modelName || modelName.startsWith('/') || modelName.split('/').includes('..')) {
+    return res.status(400).json({ error: 'Invalid installed model name' });
+  }
+
+  const installed = scanLocalModels().find(model => model.name === modelName);
+  if (!installed) return res.status(404).json({ error: `Installed model not found: ${modelName}` });
+
+  await refreshLoadedModelsSnapshot();
+  const protectedIds = new Set([
+    modelName,
+    installed.name,
+    installed.firstPartName,
+    basename(installed.path || ''),
+  ].filter(Boolean));
+  const isLoaded = loadedModelsSnapshot.some(model => protectedIds.has(model.id))
+    || [...activeRequests.values()].some(request => protectedIds.has(request.model));
+  const isDesired = desiredResidentModels().some(model => protectedIds.has(model));
+  if (isLoaded || isDesired) {
+    return res.status(409).json({
+      error: `Model is ${isDesired ? 'desired-resident' : 'loaded'}; unload it and remove residency before deletion`,
+      model: modelName,
+    });
+  }
+
+  const files = localModelFiles(installed);
+  if (files.length === 0 || files.some(path => !isManagedModelPath(path))) {
+    return res.status(400).json({ error: 'Installed model resolved outside the managed model directory' });
+  }
+
+  try {
+    const bytes = files.reduce((total, path) => total + statSync(path).size, 0);
+    for (const path of files) unlinkSync(path);
+    localModelNamesCache = { names: localModelNamesCache.names.filter(name => name !== modelName), at: 0 };
+    addLog('models', `Deleted installed model: ${modelName} (${files.length} file${files.length === 1 ? '' : 's'})`);
+    return res.json({
+      success: true,
+      model: modelName,
+      deletedFiles: files.map(path => relative(resolve(MODELS_DIR), resolve(path))),
+      deletedBytes: bytes,
+    });
+  } catch (error) {
+    console.error(`[models/delete] ${modelName}: ${error.message}`);
+    return res.status(500).json({ error: `Failed to delete installed model: ${error.message}` });
+  }
+});
+
 /** Return current desired-model residency readiness from the last router snapshot. */
 function currentModelResidencyStatus() {
   return modelResidencyStatus({
@@ -6732,6 +6814,7 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
       try {
         const cp = spawn(HF_CLI_PATH, hfArgs, { cwd: PROJECT_ROOT, env: downloadEnv });
         cp.on('error', (e) => {
+          if (downloadInfo.status === 'cancelled') return;
           downloadInfo.status = 'failed';
           downloadInfo.error = e.code === 'ENOENT'
             ? `huggingface-cli not found. Run ./install.sh to set up the Python environment.`
@@ -6755,6 +6838,7 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
     downloadInfo.process = downloadProcess;
 
     downloadProcess.onData((data) => {
+      if (downloadInfo.status === 'cancelled') return;
       // Strip ANSI escape sequences before storing output for web UI display
       const cleanData = stripAnsi(data);
       downloadInfo.output += cleanData;
@@ -6789,6 +6873,10 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
     });
 
     downloadProcess.onExit(({ exitCode }) => {
+      if (downloadInfo.status === 'cancelled') {
+        downloadInfo.process = null;
+        return;
+      }
       if (exitCode === 0) {
         // Flatten any nested GGUF files to one level deep
         const flattened = flattenGgufFiles(targetDir);
@@ -6919,6 +7007,7 @@ app.get('/api/pull/:downloadId(*)', (req, res) => {
     status: info.status,
     error: info.error,
     output: info.output,
+    cancelledAt: info.cancelledAt || null,
     gatedUrl: info.gatedUrl || null
   });
 });
@@ -6932,12 +7021,36 @@ app.get('/api/downloads', (req, res) => {
     error: info.error,
     output: info.output,
     startedAt: info.startedAt,
+    cancelledAt: info.cancelledAt || null,
     gatedUrl: info.gatedUrl || null
   }));
   res.json({ downloads });
 });
 
-// Clear a completed/failed download
+// Get one canonical download record. /api/pull/:downloadId remains available
+// for compatibility, while this route keeps collection and item operations
+// under the same resource for CLI and OpenAPI consumers.
+app.get('/api/downloads/:downloadId(*)', (req, res) => {
+  const downloadId = req.params.downloadId;
+  const info = downloadProcesses.get(downloadId);
+
+  if (!info) return res.status(404).json({ error: 'Download not found' });
+
+  res.json({
+    downloadId,
+    progress: info.progress,
+    status: info.status,
+    error: info.error,
+    output: info.output,
+    startedAt: info.startedAt,
+    cancelledAt: info.cancelledAt || null,
+    gatedUrl: info.gatedUrl || null,
+  });
+});
+
+// Cancel active work or clear an existing completed/failed record. Cancelled
+// records remain visible during the normal retention period and repeated
+// cancellation is idempotent.
 app.delete('/api/downloads/:downloadId(*)', (req, res) => {
   const downloadId = req.params.downloadId;
   const info = downloadProcesses.get(downloadId);
@@ -6947,11 +7060,25 @@ app.delete('/api/downloads/:downloadId(*)', (req, res) => {
   }
 
   if (info.status === 'downloading' || info.status === 'starting') {
-    return res.status(400).json({ error: 'Cannot clear active download' });
+    info.status = 'cancelled';
+    info.error = 'Cancelled by operator';
+    info.cancelledAt = new Date().toISOString();
+    try { info.process?.kill('SIGTERM'); } catch (error) {
+      console.error(`[download] Failed to signal cancellation for ${downloadId}: ${error.message}`);
+    }
+    addLog('download', `Download cancelled: ${downloadId}`);
+    setTimeout(() => {
+      if (downloadProcesses.get(downloadId)?.status === 'cancelled') downloadProcesses.delete(downloadId);
+    }, 300000);
+    return res.json({ success: true, downloadId, status: 'cancelled', progress: info.progress, error: info.error });
+  }
+
+  if (info.status === 'cancelled') {
+    return res.json({ success: true, downloadId, status: 'cancelled', progress: info.progress, error: info.error });
   }
 
   downloadProcesses.delete(downloadId);
-  res.json({ success: true });
+  res.json({ success: true, downloadId, status: 'cleared' });
 });
 
 // Search HuggingFace for GGUF models
