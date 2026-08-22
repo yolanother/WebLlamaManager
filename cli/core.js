@@ -180,6 +180,8 @@ function renderDocs(full) {
   const lines = [
     '# `llm` command reference', '',
     'This reference is generated from the same catalog used by the command parser and terminal help.', '',
+    '## Global options', '',
+    ...metadata.globalOptions.map(item => `- \`${item.name}\` — ${item.description}`), '',
   ];
   for (const command of metadata.commands) {
     lines.push(`## \`${command.path.join(' ')}\``, '', command.summary, '', `Usage: \`${command.usage}\``);
@@ -187,7 +189,6 @@ function renderDocs(full) {
     lines.push('');
   }
   if (full) {
-    lines.push('## Global options', '', ...metadata.globalOptions.map(item => `- \`${item.name}\` — ${item.description}`), '');
     lines.push(
       '## Complete API access', '',
       '`llm api list` fetches `/api/openapi.json`. `llm api call OPERATION_ID` resolves the operation and accepts repeatable `--param NAME=VALUE`, `--query NAME=VALUE`, `--form NAME=VALUE|@FILE`, JSON `--body`, and `--output FILE`.', '',
@@ -296,6 +297,9 @@ function formatOutput(data, options) {
   if (get && (safe === null || ['string', 'number', 'boolean'].includes(typeof safe))) {
     return safe === null ? 'null' : String(safe);
   }
+  if (get && Array.isArray(safe) && safe.every(item => item === null || ['string', 'number', 'boolean'].includes(typeof item))) {
+    return safe.map(item => item === null ? 'null' : String(item)).join('\n');
+  }
   if (typeof safe === 'string' && !options.has('json') && !graphql) return safe;
   return JSON.stringify(safe, null, 2);
 }
@@ -378,7 +382,11 @@ function responseDetail(data, text) {
   if (data && typeof data === 'object') {
     const safe = redactSecrets(data);
     const preferred = safe.error?.message ?? safe.error ?? safe.message ?? safe.detail;
-    if (preferred !== undefined) return typeof preferred === 'string' ? preferred : JSON.stringify(preferred);
+    if (preferred !== undefined) {
+      const message = typeof preferred === 'string' ? preferred : JSON.stringify(preferred);
+      const context = Object.fromEntries(Object.entries(safe).filter(([key]) => !['error', 'message', 'detail'].includes(key)));
+      return Object.keys(context).length > 0 ? `${message}: ${JSON.stringify(context)}` : message;
+    }
     return JSON.stringify(safe);
   }
   return text.trim().slice(0, 2000);
