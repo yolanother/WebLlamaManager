@@ -7,7 +7,8 @@
 // from it. This module is the aggregation half of the per-request store that
 // fixes that: api/server.js appends one compact record per completed
 // generation to data/requests.jsonl, and the functions here turn those raw
-// samples into the per-model summary the dashboard renders — request count,
+// samples into both the per-model summary and chronological performance series
+// the dashboard renders — request count,
 // average / median / min / max tok/s, average generation duration and average
 // TTFT — plus the same statistics bucketed by how many generations were
 // running concurrently ("slots").
@@ -148,6 +149,29 @@ function splitModelKey(name) {
 }
 
 /**
+ * Return a finite stored measurement without manufacturing a zero for missing
+ * values.
+ *
+ * @param {unknown} value - Candidate stored measurement.
+ * @returns {number|null} The finite number, or null when unavailable.
+ * @private
+ */
+function nullableNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Normalize an authored benchmark workload to the two scenarios understood by
+ * the performance dashboard.
+ *
+ * @param {unknown} value - Stored workload marker.
+ * @returns {'general'|'repetition-assisted'} A safe workload label.
+ */
+export function normalizeWorkload(value) {
+  return value === 'repetition-assisted' ? value : 'general';
+}
+
+/**
  * Aggregate raw request samples into the per-model performance breakdown the
  * dashboard table renders, busiest model first, each with a per-slot-count
  * breakdown in ascending concurrency order.
@@ -195,4 +219,64 @@ export function aggregateRequestStats(samples, { now = Date.now(), window = 'all
   models.sort((a, b) => (b.requests - a.requests) || a.name.localeCompare(b.name));
 
   return { window, models };
+}
+
+/**
+ * Build a chronological, filterable per-request performance series for the
+ * dashboard. Slots are derived across the complete selected time window before
+ * the optional model filter is applied, preserving the actual peak contention
+ * each request experienced.
+ *
+ * @param {Array<Object>} samples - Compact records persisted in requests.jsonl.
+ * @param {Object} [options] - Series filtering options.
+ * @param {number} [options.now=Date.now()] - Reference time for window filtering.
+ * @param {string} [options.window='all'] - One of the WINDOW_MS keys.
+ * @param {string|null} [options.model=null] - Exact stored model key to include.
+ * @returns {{window:string, model:string|null, models:Array<Object>, workloads:string[], points:Array<Object>}}
+ *   Series metadata and chronological points with nullable measurements.
+ */
+export function buildRequestSeries(samples, { now = Date.now(), window = 'all', model = null } = {}) {
+  const normalizedWindow = Object.hasOwn(WINDOW_MS, window) ? window : 'all';
+  const windowMs = WINDOW_MS[normalizedWindow];
+  const cutoff = windowMs == null ? -Infinity : now - windowMs;
+  const inWindow = (samples || []).filter(sample =>
+    sample && typeof sample.m === 'string' && sample.m.length > 0 &&
+    Number.isFinite(Number(sample.ts)) && Number(sample.ts) >= cutoff
+  );
+  const withSlots = assignSlots(inWindow);
+
+  const modelsByName = new Map();
+  for (const sample of withSlots) {
+    if (!modelsByName.has(sample.m)) modelsByName.set(sample.m, splitModelKey(sample.m));
+  }
+  const models = [...modelsByName.values()].sort((a, b) => a.name.localeCompare(b.name));
+
+  const selected = model ? withSlots.filter(sample => sample.m === model) : withSlots;
+  const points = selected
+    .sort((a, b) => Number(a.ts) - Number(b.ts))
+    .map(sample => {
+      const display = splitModelKey(sample.m);
+      const promptTps = nullableNumber(sample.pps ?? sample.prompt_per_second);
+      const draftAccepted = nullableNumber(sample.da ?? sample.draft_n_accepted);
+      const draftTotal = nullableNumber(sample.dt ?? sample.draft_n);
+      const cachedTokens = nullableNumber(sample.cached);
+      return {
+        timestamp: Number(sample.ts),
+        ...display,
+        slots: sample.slots,
+        decodeTps: nullableNumber(sample.tps),
+        promptTps,
+        ttftMs: nullableNumber(sample.ttft),
+        draftAccepted,
+        draftTotal,
+        draftAcceptance: draftTotal != null && draftTotal > 0 && draftAccepted != null
+          ? draftAccepted / draftTotal
+          : null,
+        cacheState: cachedTokens == null ? 'unknown' : (cachedTokens > 0 ? 'warm-prefix' : 'cold'),
+        workload: normalizeWorkload(sample.wl ?? sample.workload),
+      };
+    });
+
+  const workloads = [...new Set(points.map(point => point.workload))].sort();
+  return { window: normalizedWindow, model: model || null, models, workloads, points };
 }

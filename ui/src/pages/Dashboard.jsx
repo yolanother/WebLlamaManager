@@ -3,7 +3,8 @@
 // LICENSE file in the repository root.
 //
 // Renders the glass bento landing view and kiosk dashboard, including live
-// resource, request, model, and historical analytics views.
+// resource, request, model, and historical analytics views, including distinct
+// per-model decode, prompt, first-token, and speculative-decoding histories.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
@@ -24,6 +25,7 @@ import {
   ModelTpsRankChart,
   ModelPerformanceBreakdown,
   ModelRequestStatsTable,
+  ModelPerformanceHistory,
   UsageChart,
   PowerChart,
   MemoryChart,
@@ -112,6 +114,7 @@ const MemoTemperatureChart = React.memo(TemperatureChart);
 const MemoModelTpsRankChart = React.memo(ModelTpsRankChart);
 const MemoModelPerformanceBreakdown = React.memo(ModelPerformanceBreakdown);
 const MemoModelRequestStatsTable = React.memo(ModelRequestStatsTable);
+const MemoModelPerformanceHistory = React.memo(ModelPerformanceHistory);
 const MemoUsageChart = React.memo(UsageChart);
 const MemoPowerChart = React.memo(PowerChart);
 const MemoMemoryChart = React.memo(MemoryChart);
@@ -133,6 +136,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const [modelBreakdown, setModelBreakdown] = useState(null);
   const [requestStats, setRequestStats] = useState(null);
   const [requestStatsWindow, setRequestStatsWindow] = useState('24h');
+  const [requestSeries, setRequestSeries] = useState(null);
+  const [requestSeriesLoading, setRequestSeriesLoading] = useState(true);
+  const [requestSeriesError, setRequestSeriesError] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [fullscreenPage, setFullscreenPage] = useState(0);
   const [showAllModels, setShowAllModels] = useState(false);
@@ -143,6 +149,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const crashJsonRef = useRef(JSON.stringify(null));
   const modelBreakdownJsonRef = useRef(JSON.stringify(null));
   const requestStatsJsonRef = useRef(JSON.stringify(null));
+  const requestSeriesJsonRef = useRef(JSON.stringify(null));
   const fullscreenTimerRef = useRef(null);
   const FULLSCREEN_PAGES = 3;
 
@@ -197,6 +204,21 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     }
   }, [requestStatsWindow]);
 
+  const fetchRequestSeries = useCallback(async () => {
+    setRequestSeriesLoading(true);
+    setRequestSeriesError('');
+    try {
+      const res = await fetch(`${API_BASE}/analytics/request-series?window=${requestStatsWindow}`);
+      if (!res.ok) throw new Error(`Performance history returned HTTP ${res.status}`);
+      setJsonStateIfChanged(setRequestSeries, requestSeriesJsonRef, await res.json());
+    } catch (err) {
+      console.error('Failed to fetch performance history:', err);
+      setRequestSeriesError('Performance history is temporarily unavailable.');
+    } finally {
+      setRequestSeriesLoading(false);
+    }
+  }, [requestStatsWindow]);
+
   const fetchHistory = useCallback(async () => {
     try {
       const [histRes, crashRes] = await Promise.all([
@@ -217,6 +239,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   useVisiblePolling(fetchModelBreakdown, 30000);
   // Request stats aggregate the per-request store — equally slow refresh.
   useVisiblePolling(fetchRequestStats, 30000, { refreshKey: requestStatsWindow });
+  useVisiblePolling(fetchRequestSeries, 30000, { refreshKey: requestStatsWindow });
 
   // Fullscreen mode
   const enterFullscreen = useCallback(() => {
@@ -1632,6 +1655,18 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             requestStats={requestStats}
             window={requestStatsWindow}
             onWindowChange={setRequestStatsWindow}
+          />
+        </div>
+
+        <div className="chart-card-wide glass-panel model-breakdown-card">
+          <h4>
+            Per-model Performance History
+            <span className="chart-value">distinct measurements · scenario-aware</span>
+          </h4>
+          <MemoModelPerformanceHistory
+            requestSeries={requestSeries}
+            loading={requestSeriesLoading}
+            error={requestSeriesError}
           />
         </div>
 

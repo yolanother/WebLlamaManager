@@ -4,7 +4,9 @@
 //
 // This process serves the dashboard and OpenAI-compatible API, supervises the
 // llama.cpp and DS4 inference engines, manages models and configuration, and
-// persists operational analytics. Mutable resources are resolved through the
+// persists operational analytics, including distinct per-request decode,
+// prefill, first-token, cache, workload, and speculative-decoding evidence.
+// Mutable resources are resolved through the
 // package-safe runtime path contract so installed application files stay immutable.
 // Engine shutdown is ownership-scoped so passive secondary manager instances
 // cannot terminate workers supervised by a different manager.
@@ -67,7 +69,7 @@ import {
   normalizeDesiredModels,
   residencyMutationDecision,
 } from './model-residency.js';
-import { aggregateRequestStats } from './request-stats.js';
+import { aggregateRequestStats, buildRequestSeries, normalizeWorkload } from './request-stats.js';
 import { createMediaRouter } from './media.js';
 import { createAudioTranscriptionHandler } from './audio-transcriptions.js';
 import { renderLlmsFullReference, renderLlmsIndex } from './api-spec.js';
@@ -1882,10 +1884,12 @@ loadCrashHistory();
 // Per-request performance samples. The minute-level analytics records above
 // only keep per-model AVERAGE tok/s, which cannot yield median/min/max or
 // TTFT, so every completed generation also appends one compact record here:
-//   { ts, m, b, tps, ttft, dur, pt, ct }
+//   { ts, m, b, tps, pps, ttft, da, dt, dur, pt, ct, cached, wl }
 // ts = completion time, m = model key, b = backend, tps = tok/s, ttft =
-// prompt-processing (prefill) ms when the engine reported timings, dur =
-// generation duration ms, pt/ct = prompt/completion tokens.
+// prompt-processing (prefill) ms when the engine reported timings, pps =
+// prompt tok/s, da/dt = accepted/total speculative draft tokens, dur =
+// generation duration ms, pt/ct = prompt/completion tokens, cached = measured
+// cached tokens (null when unavailable), and wl = workload/scenario label.
 const REQUEST_SAMPLES_FILE = join(ANALYTICS_DIR, 'requests.jsonl');
 const MAX_REQUEST_SAMPLES = 200000;
 let requestSamples = [];
@@ -2317,11 +2321,41 @@ function addAnalyticsPoint(category, data) {
   }
 }
 
-// Record token stats from a completion
+/**
+ * Return the first finite engine measurement while preserving an explicit zero.
+ *
+ * @param {...unknown} values Candidate values in preference order.
+ * @returns {number|null} The first finite number, or null when unreported.
+ */
+function firstFiniteMeasurement(...values) {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+/**
+ * Read and safely normalize the optional dashboard benchmark scenario header.
+ *
+ * @param {import('express').Request} req Express request.
+ * @returns {'general'|'repetition-assisted'} Supported workload label.
+ */
+function requestWorkload(req) {
+  return normalizeWorkload(req.get('X-Llama-Manager-Workload'));
+}
+
+/**
+ * Record aggregate counters and append one compact durable generation sample.
+ * Engine-only measurements stay nullable so remote and historical rows do not
+ * acquire invented zero values.
+ *
+ * @param {Object} stats Completed request measurements and routing metadata.
+ */
 function recordTokenStats(stats) {
   const {
     promptTokens, completionTokens, tokensPerSecond, model, duration, backend, ttftMs,
     queueWaitMs, priority, cachedTokens, cacheHitKind, routingOutcome,
+    promptTokensPerSecond, draftAccepted, draftTotal, workload,
   } = stats;
 
   tokenStats.totalPromptTokens += promptTokens || 0;
@@ -2366,15 +2400,21 @@ function recordTokenStats(stats) {
       m: modelKey,
       b: backend || 'local',
       tps: Math.round((tokensPerSecond || 0) * 10) / 10,
+      pps: Number.isFinite(promptTokensPerSecond)
+        ? Math.round(promptTokensPerSecond * 10) / 10
+        : null,
       ttft: Number.isFinite(ttftMs) ? Math.round(ttftMs) : null,
+      da: Number.isFinite(draftAccepted) ? draftAccepted : null,
+      dt: Number.isFinite(draftTotal) ? draftTotal : null,
       dur: Math.round(duration || 0),
       pt: promptTokens || 0,
       ct: completionTokens || 0,
       qw: Number.isFinite(queueWaitMs) ? Math.round(queueWaitMs) : null,
       pc: priority || 'interactive',
-      cached: Number(cachedTokens) || 0,
+      cached: Number.isFinite(cachedTokens) ? cachedTokens : null,
       cache: cacheHitKind || 'none',
       routing: routingOutcome || (backend && backend !== 'local' ? 'offloaded' : 'local'),
+      wl: normalizeWorkload(workload),
     });
   }
 }
@@ -7725,6 +7765,17 @@ app.get('/api/analytics/request-stats', (req, res) => {
   res.json(aggregateRequestStats(requestSamples, { now: Date.now(), window }));
 });
 
+// Chronological per-request measurements for one model or all models. This is
+// intentionally separate from request-stats so the established aggregate
+// response remains backward-compatible for existing dashboard/CLI consumers.
+app.get('/api/analytics/request-series', (req, res) => {
+  const window = req.query.window || '24h';
+  const model = typeof req.query.model === 'string' && req.query.model.length > 0
+    ? req.query.model
+    : null;
+  res.json(buildRequestSeries(requestSamples, { now: Date.now(), window, model }));
+});
+
 app.get('/api/analytics/crashes', (req, res) => {
   const range = req.query.range || '1w';
   const now = Date.now();
@@ -9143,6 +9194,7 @@ function finalizeChatTiming(recorder, {
  */
 async function handleChatCompletions(req, res) {
   const startTime = Date.now();
+  const workload = requestWorkload(req);
   const chatTiming = new TimingEvidenceRecorder({ profile: TIMING_EVIDENCE_PROFILES.GENERATION });
   chatTiming.mark('received');
   const isStreaming = req.body.stream === true;
@@ -9175,7 +9227,10 @@ async function handleChatCompletions(req, res) {
       },
       complete: async (model, messages, { signal, ...opts }) => {
         const r = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/chat/completions`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, signal, body: JSON.stringify({ model, messages, ...opts }),
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Llama-Manager-Workload': workload },
+          signal,
+          body: JSON.stringify({ model, messages, ...opts }),
         });
         if (!r.ok) throw new Error(`router completion returned ${r.status}`);
         return r.json();
@@ -9517,7 +9572,7 @@ async function handleChatCompletions(req, res) {
             res.end();
             const duration = Date.now() - startTime;
             const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration, backend: backend.name });
+            recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration, backend: backend.name, workload });
             updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
             addLlmLog({
               endpoint: 'chat/completions', model, stream: true, status: 200, duration, promptTokens, completionTokens,
@@ -9571,7 +9626,7 @@ async function handleChatCompletions(req, res) {
         const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
         recordTokenStats({
           promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: backend.name,
-          priority: requestPolicy.priority, routingOutcome: 'offloaded',
+          priority: requestPolicy.priority, routingOutcome: 'offloaded', workload,
         });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({
@@ -10089,11 +10144,15 @@ async function handleChatCompletions(req, res) {
             model,
             duration: inferDuration,
             ttftMs: serverTimings?.prompt_ms,
+            promptTokensPerSecond: serverTimings?.prompt_per_second,
+            draftAccepted: serverTimings?.draft_n_accepted,
+            draftTotal: serverTimings?.draft_n,
             queueWaitMs: totalQueueWait,
             priority: requestPolicy.priority,
-            cachedTokens: serverTimings?.cache_n || serverTimings?.prompt_n_cached || 0,
+            cachedTokens: firstFiniteMeasurement(serverTimings?.cache_n, serverTimings?.prompt_n_cached),
             cacheHitKind: diskRestored ? 'disk_restore' : (slotAssignment?.prepared ? 'prepared' : (slotAssignment?.hit ? 'affinity' : 'none')),
             routingOutcome: routing.offloadSuppressed ? 'offload-suppressed(local_only)' : 'local',
+            workload,
           });
           logLlm({
             endpoint: 'chat/completions', model, stream: true,
@@ -10176,11 +10235,19 @@ async function handleChatCompletions(req, res) {
         model: requestedModel,
         duration: inferDuration,
         ttftMs: timings.prompt_ms,
+        promptTokensPerSecond: timings.prompt_per_second,
+        draftAccepted: timings.draft_n_accepted,
+        draftTotal: timings.draft_n,
         queueWaitMs: totalQueueWait,
         priority: requestPolicy.priority,
-        cachedTokens: usage.prompt_tokens_details?.cached_tokens || timings.cache_n || timings.prompt_n_cached || 0,
+        cachedTokens: firstFiniteMeasurement(
+          usage.prompt_tokens_details?.cached_tokens,
+          timings.cache_n,
+          timings.prompt_n_cached,
+        ),
         cacheHitKind: diskRestored ? 'disk_restore' : (slotAssignment?.prepared ? 'prepared' : (slotAssignment?.hit ? 'affinity' : 'none')),
         routingOutcome: routing.offloadSuppressed ? 'offload-suppressed(local_only)' : 'local',
+        workload,
       });
 
       // The non-streaming path has no per-token stream to observe, so the
@@ -10307,6 +10374,7 @@ app.post('/v1/chat/completions', handleChatCompletions);
  */
 async function handleCompletions(req, res) {
   const startTime = Date.now();
+  const workload = requestWorkload(req);
   let requestPolicy;
   try { requestPolicy = managerRequestPolicy(req.body, req.headers); }
   catch (error) { return res.status(400).json({ error: { message: error.message, code: 'invalid_manager_policy' } }); }
@@ -10386,7 +10454,7 @@ async function handleCompletions(req, res) {
             res.end();
             const duration = Date.now() - startTime;
             const tokensPerSecond = duration > 0 ? tokens / (duration / 1000) : 0;
-            recordTokenStats({ promptTokens: 0, completionTokens: tokens, tokensPerSecond, model: requestedModel, duration, backend: backend.name });
+            recordTokenStats({ promptTokens: 0, completionTokens: tokens, tokensPerSecond, model: requestedModel, duration, backend: backend.name, workload });
             updateBackendTokenStats(backend.id, 0, tokens, duration, backend);
             addLlmLog({ endpoint: 'completions', model: requestedModel, stream: true, status: 200, duration, promptTokens: 0, completionTokens: tokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: req.body.prompt || null, response: responseText, error: null, backend: backend.id, requestBody: req.body });
           } catch { res.end(); }
@@ -10399,7 +10467,7 @@ async function handleCompletions(req, res) {
         const promptTokens = usage.prompt_tokens || 0;
         const completionTokens = usage.completion_tokens || 0;
         const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
-        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: backend.name });
+        recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: backend.name, workload });
         updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
         addLlmLog({ endpoint: 'completions', model: requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages: null, prompt: req.body.prompt || null, response: data.choices?.[0]?.text || null, error: null, backend: backend.id, requestBody: req.body });
         if (data.model) data.model = requestedModel;
@@ -10456,6 +10524,7 @@ async function handleCompletions(req, res) {
       const decoder = new TextDecoder();
       let tokens = 0;
       let responseText = '';
+      let completionsServerTimings = null;
 
       const processStream = async () => {
         try {
@@ -10465,7 +10534,6 @@ async function handleCompletions(req, res) {
             const chunk = decoder.decode(value);
             res.write(chunk);
 
-            let completionsServerTimings = null;
             const lines = chunk.split('\n');
             for (const line of lines) {
               if (line.startsWith('data: ') && line !== 'data: [DONE]') {
@@ -10489,12 +10557,20 @@ async function handleCompletions(req, res) {
           const tokensPerSecond = completionsServerTimings?.predicted_per_second
             || (inferDuration > 0 ? (tokens / (inferDuration / 1000)) : 0);
           recordTokenStats({
-            promptTokens: 0,
+            promptTokens: completionsServerTimings?.prompt_n || 0,
             completionTokens: completionsServerTimings?.predicted_n || tokens,
             tokensPerSecond,
             model: requestedModel,
             duration: inferDuration,
-            ttftMs: completionsServerTimings?.prompt_ms
+            ttftMs: completionsServerTimings?.prompt_ms,
+            promptTokensPerSecond: completionsServerTimings?.prompt_per_second,
+            draftAccepted: completionsServerTimings?.draft_n_accepted,
+            draftTotal: completionsServerTimings?.draft_n,
+            cachedTokens: firstFiniteMeasurement(
+              completionsServerTimings?.cache_n,
+              completionsServerTimings?.prompt_n_cached,
+            ),
+            workload,
           });
           addLlmLog({
             endpoint: 'completions', model: requestedModel, stream: true,
@@ -10528,7 +10604,16 @@ async function handleCompletions(req, res) {
         tokensPerSecond,
         model: requestedModel,
         duration: inferDuration,
-        ttftMs: timings.prompt_ms
+        ttftMs: timings.prompt_ms,
+        promptTokensPerSecond: timings.prompt_per_second,
+        draftAccepted: timings.draft_n_accepted,
+        draftTotal: timings.draft_n,
+        cachedTokens: firstFiniteMeasurement(
+          usage.prompt_tokens_details?.cached_tokens,
+          timings.cache_n,
+          timings.prompt_n_cached,
+        ),
+        workload,
       });
 
       addLlmLog({

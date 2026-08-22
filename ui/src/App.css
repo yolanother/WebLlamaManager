@@ -4,7 +4,8 @@
  * root for license terms.
  *
  * Defines themeable ambient backgrounds, shared glass controls and surfaces,
- * the responsive dashboard, and the full-screen appliance presentation.
+ * the responsive dashboard, accessible performance-history controls, and the
+ * full-screen appliance presentation.
  */
 
 /* CSS Variables */
@@ -5640,6 +5641,156 @@ input::placeholder {
   color: var(--text-secondary, #9ca3af);
 }
 
+/* Per-model performance history keeps unlike units on separate views and
+   pairs the graph with a fully readable chronological table. */
+.performance-history {
+  position: relative;
+}
+
+.performance-history-controls,
+.performance-history-toolbar,
+.performance-history-tabs,
+.performance-history-view,
+.performance-history-labels {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.performance-history-controls,
+.performance-history-toolbar {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.performance-history-field {
+  display: grid;
+  gap: 5px;
+  min-width: min(280px, 100%);
+  color: var(--text-secondary);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.performance-history-field select {
+  min-height: 44px;
+  color: var(--text-primary);
+  text-transform: none;
+}
+
+.performance-history-tabs,
+.performance-history-view {
+  flex-wrap: wrap;
+}
+
+.performance-history-tabs button,
+.performance-history-view button {
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--glass-border, var(--border));
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: var(--glass-sheen), var(--glass-bg-elevated, var(--bg-secondary));
+  cursor: pointer;
+}
+
+.performance-history-tabs button:hover,
+.performance-history-view button:hover,
+.performance-history-tabs button:focus-visible,
+.performance-history-view button:focus-visible {
+  color: var(--text-primary);
+  border-color: var(--accent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 2px;
+}
+
+.performance-history-tabs button.active,
+.performance-history-view button.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--glass-bg-elevated, var(--bg-secondary)));
+}
+
+.performance-history-chart {
+  width: 100%;
+  height: 280px;
+}
+
+.performance-history-state {
+  min-height: 180px;
+}
+
+.performance-history-tooltip {
+  min-width: 220px;
+}
+
+.performance-history-labels {
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.performance-scenario {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  margin: 2px 4px 2px 0;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.performance-scenario.cold {
+  color: var(--info);
+  border-color: color-mix(in srgb, var(--info) 55%, var(--border));
+}
+
+.performance-scenario.warm-prefix {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 55%, var(--border));
+}
+
+.performance-scenario.repetition-assisted {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
+}
+
+.performance-history-table {
+  min-width: 900px;
+}
+
+.performance-history-table td:first-child {
+  white-space: nowrap;
+}
+
+.performance-history-refresh {
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.performance-history-refresh.error {
+  color: var(--error);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .model-breakdown-toggle {
   margin-top: 8px;
   background: transparent;
@@ -7304,6 +7455,19 @@ html[data-effects="simple"] .searchable-select-search {
   .history-summary {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .performance-history-controls,
+  .performance-history-toolbar,
+  .performance-history-field,
+  .performance-history-tabs,
+  .performance-history-view {
+    width: 100%;
+  }
+
+  .performance-history-tabs button,
+  .performance-history-view button {
+    flex: 1 1 auto;
   }
 
   .query-header {

@@ -788,6 +788,64 @@ const ALIAS_PUT_OPTIONS = {
   },
 };
 
+/** Documentation and machine schema for chronological request performance. */
+const REQUEST_SERIES_OPTIONS = {
+  description: 'Returns chronological per-request performance measurements without combining unlike units. Optional filters select a fixed time window and exact stored model key; missing engine evidence remains null.',
+  params: [
+    {
+      name: 'window',
+      in: 'query',
+      required: false,
+      description: 'History window. Defaults to 24h.',
+      schema: { type: 'string', enum: ['24h', '7d', '30d', 'all'], default: '24h' },
+    },
+    {
+      name: 'model',
+      in: 'query',
+      required: false,
+      description: 'Exact stored model key, including a remote backend prefix when present.',
+      schema: { type: 'string' },
+    },
+  ],
+  responseSchema: {
+    type: 'object',
+    required: ['window', 'model', 'models', 'workloads', 'points'],
+    properties: {
+      window: { type: 'string', enum: ['24h', '7d', '30d', 'all'] },
+      model: { type: ['string', 'null'] },
+      models: { type: 'array', items: { type: 'object', additionalProperties: true } },
+      workloads: { type: 'array', items: { type: 'string', enum: ['general', 'repetition-assisted'] } },
+      points: {
+        type: 'array',
+        items: {
+          type: 'object',
+          required: [
+            'timestamp', 'name', 'model', 'backend', 'isRemote', 'slots',
+            'decodeTps', 'promptTps', 'ttftMs', 'draftAccepted', 'draftTotal',
+            'draftAcceptance', 'cacheState', 'workload',
+          ],
+          properties: {
+            timestamp: { type: 'integer' },
+            name: { type: 'string' },
+            model: { type: 'string' },
+            backend: { type: ['string', 'null'] },
+            isRemote: { type: 'boolean' },
+            slots: { type: 'integer', minimum: 1 },
+            decodeTps: { type: ['number', 'null'] },
+            promptTps: { type: ['number', 'null'] },
+            ttftMs: { type: ['number', 'null'] },
+            draftAccepted: { type: ['number', 'null'] },
+            draftTotal: { type: ['number', 'null'] },
+            draftAcceptance: { type: ['number', 'null'] },
+            cacheState: { type: 'string', enum: ['cold', 'warm-prefix', 'unknown'] },
+            workload: { type: 'string', enum: ['general', 'repetition-assisted'] },
+          },
+        },
+      },
+    },
+  },
+};
+
 const ROUTES = [
   // Media ingestion and artifacts.
   ['POST', '/api/media/upload', 'media', 'Upload image, audio, or video media'],
@@ -885,6 +943,7 @@ const ROUTES = [
   ['GET', '/api/analytics/history', 'analytics', 'Get inference analytics history'],
   ['GET', '/api/analytics/models', 'analytics', 'Get per-model analytics'],
   ['GET', '/api/analytics/request-stats', 'analytics', 'Get request outcome statistics'],
+  ['GET', '/api/analytics/request-series', 'analytics', 'Get chronological per-model performance measurements', REQUEST_SERIES_OPTIONS],
   ['GET', '/api/analytics/crashes', 'analytics', 'Get inference crash analytics'],
 
   // OpenAI-, Anthropic-, and reranking-compatible inference APIs.

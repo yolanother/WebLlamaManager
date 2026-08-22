@@ -2,8 +2,9 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Contains reusable stat cards, progress rings, charts, tooltips, and thermal
-// severity helpers consumed by dashboard-adjacent views.
+// Contains reusable stat cards, progress rings, charts, tooltips, per-model
+// performance-history controls, and thermal severity helpers consumed by
+// dashboard-adjacent views.
 
 import React, { useState, useEffect, useRef } from 'react';
 import {
@@ -556,6 +557,256 @@ function ModelRequestStatsTable({ requestStats, window, onWindowChange }) {
   );
 }
 
+const PERFORMANCE_METRICS = [
+  { key: 'decodeTps', label: 'Decode', longLabel: 'Decode throughput', unit: 'tok/s' },
+  { key: 'promptTps', label: 'Prompt', longLabel: 'Prompt throughput', unit: 'tok/s' },
+  { key: 'ttftMs', label: 'TTFT', longLabel: 'Time to first token', unit: 'ms' },
+  { key: 'draftAcceptance', label: 'Draft acceptance', longLabel: 'Speculative draft acceptance', unit: '%' },
+];
+
+/**
+ * Format one performance measurement for the chart and table.
+ *
+ * @param {number|null} value Stored value.
+ * @param {string} metric Metric key.
+ * @returns {string} Human-readable value or an unavailable label.
+ */
+function formatPerformanceValue(value, metric) {
+  if (value == null || !Number.isFinite(value)) return 'Unavailable';
+  if (metric === 'draftAcceptance') return `${(value * 100).toFixed(1)}%`;
+  if (metric === 'ttftMs') return `${Math.round(value)} ms`;
+  return `${value.toFixed(1)} tok/s`;
+}
+
+/**
+ * Format a performance timestamp with enough date context for its window.
+ *
+ * @param {number} timestamp Epoch milliseconds.
+ * @param {string} window Performance history window.
+ * @returns {string} Compact axis label.
+ */
+function formatPerformanceTime(timestamp, window) {
+  const historyRange = { '24h': '1d', '7d': '1w', '30d': '1m', all: '1y' }[window] || '1d';
+  return formatHistoryTime(timestamp, historyRange);
+}
+
+/**
+ * Render the selected per-request measurement and its scenario evidence.
+ *
+ * @param {Object} props Recharts tooltip props plus metric metadata.
+ * @returns {React.ReactNode} Tooltip content or null when inactive.
+ */
+function PerformanceHistoryTooltip({ active, payload, metric }) {
+  if (!active || !payload?.length) return null;
+  const point = payload[0].payload;
+  return (
+    <div className="chart-tooltip performance-history-tooltip">
+      <div className="chart-tooltip-time">{new Date(point.timestamp).toLocaleString()}</div>
+      <div className="chart-tooltip-row">
+        <span className="chart-tooltip-label">{metric.longLabel}:</span>
+        <span className="chart-tooltip-value">{formatPerformanceValue(point.rawValue, metric.key)}</span>
+      </div>
+      <div className="performance-history-labels">
+        <span className={`performance-scenario ${point.cacheState}`}>{point.cacheState}</span>
+        <span className={`performance-scenario ${point.workload}`}>{point.workload}</span>
+        <span className="performance-scenario">{point.slots} {point.slots === 1 ? 'slot' : 'slots'}</span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Display distinct inference measurements for one model over time with
+ * scenario filtering and a chronological table alternative.
+ *
+ * @param {Object} props Component props.
+ * @param {Object|null} props.requestSeries API response from request-series.
+ * @param {boolean} [props.loading=false] Whether fresh series data is loading.
+ * @param {string} [props.error=''] Fetch error message, when present.
+ * @returns {React.ReactNode} Accessible performance-history controls and data.
+ */
+function ModelPerformanceHistory({ requestSeries, loading = false, error = '' }) {
+  const [selectedModel, setSelectedModel] = useState('');
+  const [selectedMetric, setSelectedMetric] = useState('decodeTps');
+  const [scenario, setScenario] = useState('all');
+  const [view, setView] = useState('chart');
+  const models = requestSeries?.models || [];
+  const effectiveModel = models.some(model => model.name === selectedModel)
+    ? selectedModel
+    : (models[0]?.name || '');
+  const metric = PERFORMANCE_METRICS.find(item => item.key === selectedMetric) || PERFORMANCE_METRICS[0];
+
+  const filteredPoints = (requestSeries?.points || []).filter(point => {
+    if (point.name !== effectiveModel) return false;
+    if (scenario === 'all') return true;
+    if (scenario === 'general' || scenario === 'repetition-assisted') return point.workload === scenario;
+    return point.cacheState === scenario;
+  });
+  const chartPoints = filteredPoints
+    .filter(point => point[selectedMetric] != null)
+    .slice(-500)
+    .map(point => ({
+      ...point,
+      rawValue: point[selectedMetric],
+      value: selectedMetric === 'draftAcceptance' ? point[selectedMetric] * 100 : point[selectedMetric],
+    }));
+  const tablePoints = filteredPoints.slice(-100);
+
+  if (loading && !requestSeries) {
+    return <div className="chart-empty performance-history-state" role="status">Loading performance history…</div>;
+  }
+  if (error && !requestSeries) {
+    return <div className="chart-empty performance-history-state" role="alert">{error}</div>;
+  }
+  if (models.length === 0) {
+    return <div className="chart-empty performance-history-state">No per-request performance history yet.</div>;
+  }
+
+  return (
+    <div className="performance-history">
+      <div className="performance-history-controls">
+        <label className="performance-history-field">
+          <span>Model</span>
+          <select value={effectiveModel} onChange={event => setSelectedModel(event.target.value)}>
+            {models.map(model => (
+              <option key={model.name} value={model.name}>
+                {model.isRemote ? `${model.backend} / ${model.model}` : model.model}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="performance-history-field">
+          <span>Workload / scenario</span>
+          <select value={scenario} onChange={event => setScenario(event.target.value)}>
+            <option value="all">All scenarios</option>
+            <option value="general">General workload</option>
+            <option value="repetition-assisted">Repetition-assisted</option>
+            <option value="cold">Cold cache</option>
+            <option value="warm-prefix">Warm prefix</option>
+            <option value="unknown">Unknown cache</option>
+          </select>
+        </label>
+      </div>
+
+      <div className="performance-history-toolbar">
+        <div className="performance-history-tabs" role="group" aria-label="Performance metric">
+          {PERFORMANCE_METRICS.map(item => (
+            <button
+              key={item.key}
+              type="button"
+              aria-pressed={selectedMetric === item.key}
+              className={selectedMetric === item.key ? 'active' : ''}
+              onClick={() => setSelectedMetric(item.key)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+        <div className="performance-history-view" role="group" aria-label="Performance history view">
+          {['chart', 'table'].map(option => (
+            <button
+              key={option}
+              type="button"
+              aria-pressed={view === option}
+              className={view === option ? 'active' : ''}
+              onClick={() => setView(option)}
+            >
+              {option === 'chart' ? 'Chart' : 'Table'}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {view === 'chart' ? (
+        chartPoints.length > 0 ? (
+          <div
+            className="performance-history-chart"
+            role="img"
+            aria-label={`${metric.longLabel} history for ${effectiveModel}, in ${metric.unit}`}
+          >
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={chartPoints} margin={{ top: 10, right: 16, left: 4, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+                <XAxis
+                  dataKey="timestamp"
+                  type="number"
+                  domain={['dataMin', 'dataMax']}
+                  tickFormatter={value => formatPerformanceTime(value, requestSeries.window)}
+                  tick={{ fill: 'var(--text-secondary)', fontSize: 10 }}
+                  tickLine={false}
+                />
+                <YAxis
+                  tick={{ fill: 'var(--text-secondary)', fontSize: 10 }}
+                  tickLine={false}
+                  axisLine={false}
+                  unit={metric.unit === '%' ? '%' : undefined}
+                  domain={selectedMetric === 'draftAcceptance' ? [0, 100] : ['auto', 'auto']}
+                />
+                <Tooltip content={<PerformanceHistoryTooltip metric={metric} />} />
+                <Line
+                  type="monotone"
+                  dataKey="value"
+                  name={metric.longLabel}
+                  stroke="var(--accent)"
+                  strokeWidth={2}
+                  dot={{ r: 3 }}
+                  connectNulls={false}
+                  isAnimationActive={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        ) : (
+          <div className="chart-empty performance-history-state">
+            {metric.longLabel} is unavailable for this model and scenario.
+          </div>
+        )
+      ) : (
+        <div className="model-breakdown-table-wrap performance-history-table-wrap">
+          <table className="model-breakdown-table performance-history-table">
+            <caption className="sr-only">Chronological inference measurements for {effectiveModel}</caption>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Scenario</th>
+                <th className="num">Slots</th>
+                <th className="num">Decode</th>
+                <th className="num">Prompt</th>
+                <th className="num">TTFT</th>
+                <th className="num">Draft</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tablePoints.length === 0 ? (
+                <tr><td colSpan={7} className="model-breakdown-none">No requests match this scenario.</td></tr>
+              ) : tablePoints.map((point, index) => (
+                <tr key={`${point.timestamp}:${index}`}>
+                  <td>{new Date(point.timestamp).toLocaleString()}</td>
+                  <td>
+                    <span className={`performance-scenario ${point.cacheState}`}>{point.cacheState}</span>
+                    <span className={`performance-scenario ${point.workload}`}>{point.workload}</span>
+                  </td>
+                  <td className="num">{point.slots}</td>
+                  <td className="num">{formatPerformanceValue(point.decodeTps, 'decodeTps')}</td>
+                  <td className="num">{formatPerformanceValue(point.promptTps, 'promptTps')}</td>
+                  <td className="num">{formatPerformanceValue(point.ttftMs, 'ttftMs')}</td>
+                  <td className="num">
+                    {point.draftAcceptance == null
+                      ? 'Unavailable'
+                      : `${formatPerformanceValue(point.draftAcceptance, 'draftAcceptance')} (${point.draftAccepted}/${point.draftTotal})`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {loading && requestSeries && <div className="performance-history-refresh" role="status">Refreshing…</div>}
+      {error && requestSeries && <div className="performance-history-refresh error" role="alert">{error}</div>}
+    </div>
+  );
+}
+
 // GPU/CPU compute-usage chart. Mirrors TemperatureChart but plots
 // utilization % so users can see when the iGPU is actually loaded
 // (and how that correlates with CPU spikes during prompt processing).
@@ -898,6 +1149,7 @@ export {
   ModelTpsRankChart,
   ModelPerformanceBreakdown,
   ModelRequestStatsTable,
+  ModelPerformanceHistory,
   UsageChart,
   PowerChart,
   MemoryChart,
