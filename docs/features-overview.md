@@ -259,7 +259,9 @@ dir so ds4 GGUFs can never pollute `~/models`.
 - **LLM request log** — every request's model/status/latency/tokens/tok-s/backend,
   streamed live (`/api/llm-logs`).
 - **Crash & performance analytics** — time-series ring buffers and crash events
-  (`/api/analytics*`), plus process monitoring (`/api/processes*`).
+  (`/api/analytics*`), durable per-model prompt/decode/TTFT/speculative history
+  with scenario labels, plus process monitoring (`/api/processes*`). See
+  [`features/model-performance-history.md`](features/model-performance-history.md).
 - **Server logs** with configurable filters (`/api/logs`).
 
 ## 12. Kiosk mode (optional)

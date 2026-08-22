@@ -32,6 +32,7 @@ hardware-specific gotchas of the AMD Strix Halo (gfx1151) box it targets.
 - [features/model-alias-groups.md](features/model-alias-groups.md) — `config.aliases`: one name → an ordered list of local/remote targets, the warm gate, migration from `modelMapping`
 - [features/multimodal-api.md](features/multimodal-api.md) — OpenAI-compatible image, audio, video/YouTube, long-media digest, transcription, capability-discovery, and agent-readable documentation contracts
 - [features/glass-ui-and-multimodal-chat.md](features/glass-ui-and-multimodal-chat.md) — glass UI and the shared UI/API multimodal media pipeline
+- [features/model-performance-history.md](features/model-performance-history.md) — per-model prompt/decode/TTFT/speculative history, scenario labels, and the dashboard/API contract
 - [Designs/ChatPage.md](Designs/ChatPage.md) · [Designs/ApiDocs.md](Designs/ApiDocs.md) · [Designs/DocsPage.md](Designs/DocsPage.md) — UI page designs
 - [Designs/OpenCode.md](Designs/OpenCode.md) — OpenCode provider integration
 - [Designs/ConversationContextCache.md](Designs/ConversationContextCache.md) — exact input counts, stable conversation affinity, KV preparation, lifecycle, and cache telemetry
