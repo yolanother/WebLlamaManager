@@ -6667,8 +6667,14 @@ app.post('/api/llama/update', async (req, res) => {
   res.status(result.status).json(result.body);
 });
 
-// Helper: Flatten nested GGUF files to one level deep
-// Moves any .gguf files from subdirectories to the target directory root
+/**
+ * Flattens nested GGUF files into a managed model directory and removes empty
+ * non-cache subdirectories after all placement succeeds.
+ *
+ * @param {string} targetDir Managed model directory to finalize.
+ * @returns {number} Number of nested GGUF files discovered.
+ * @throws {Error} When local filesystem traversal or placement fails.
+ */
 function flattenGgufFiles(targetDir) {
   try {
     const findGgufRecursive = (dir, depth = 0) => {
@@ -6722,8 +6728,26 @@ function flattenGgufFiles(targetDir) {
     return nestedFiles.length;
   } catch (error) {
     console.error(`[download] Error flattening files: ${error.message}`);
-    return 0;
+    throw error;
   }
+}
+
+/**
+ * Reports whether another managed download may still write beneath a target.
+ * Completed, failed, and cancelled peers no longer rely on its nested paths.
+ *
+ * @param {string} downloadId Current download identifier.
+ * @param {string} targetDir Shared managed model directory.
+ * @returns {boolean} True while a same-target peer is starting or downloading.
+ */
+function hasActiveDownloadPeer(downloadId, targetDir) {
+  for (const [peerId, peer] of downloadProcesses) {
+    if (peerId !== downloadId && peer.targetDir === targetDir &&
+        (peer.status === 'starting' || peer.status === 'downloading')) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -6750,7 +6774,14 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
     }
   }
 
-  const downloadInfo = { progress: 0, status: 'starting', output: '', error: null, startedAt: new Date().toISOString() };
+  const downloadInfo = {
+    progress: 0,
+    status: 'starting',
+    output: '',
+    error: null,
+    startedAt: new Date().toISOString(),
+    targetDir
+  };
   downloadProcesses.set(downloadId, downloadInfo);
 
   try {
@@ -6878,14 +6909,26 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
         return;
       }
       if (exitCode === 0) {
-        // Flatten any nested GGUF files to one level deep
-        const flattened = flattenGgufFiles(targetDir);
-        if (flattened > 0) {
-          addLog('download', `Flattened ${flattened} nested GGUF file(s)`);
+        try {
+          // Finalization mutates nested directories, so only the last active
+          // writer for this target may flatten files and remove empty paths.
+          if (!hasActiveDownloadPeer(downloadId, targetDir)) {
+            const flattened = flattenGgufFiles(targetDir);
+            if (flattened > 0) {
+              addLog('download', `Flattened ${flattened} nested GGUF file(s)`);
+            }
+          } else {
+            addLog('download', `Deferring model directory finalization while a peer download is active: ${repo}`);
+          }
+          downloadInfo.status = 'completed';
+          downloadInfo.progress = 100;
+          addLog('download', `Download completed: ${repo}`);
+        } catch (error) {
+          downloadInfo.status = 'failed';
+          downloadInfo.error = `Local download filesystem finalization failed: ${error.message}`;
+          downloadInfo.output += `\nError: ${downloadInfo.error}`;
+          addLog('download', `Download finalization failed: ${repo} (${error.message})`);
         }
-        downloadInfo.status = 'completed';
-        downloadInfo.progress = 100;
-        addLog('download', `Download completed: ${repo}`);
       } else if (downloadInfo.status !== 'failed') {
         // Only update if status wasn't already set to 'failed' earlier
         downloadInfo.status = 'failed';
