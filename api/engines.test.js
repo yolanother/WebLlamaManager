@@ -1,8 +1,10 @@
-// Llama Manager — unit tests for api/engines.js (engine-abstraction helpers).
+// Llama Manager — unit tests for engine abstraction and router preset helpers.
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
+// Verifies engine selection, process configuration, and pure generation of
+// independent Gemma and Qwen3.8 MTP/ngram model-router INI sections.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readdirSync, statSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, statSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -14,6 +16,7 @@ import {
   buildLocalServerRegistry,
   renderModelsPresetIni,
   gemmaMtpPresetSection,
+  qwen38MtpPresetSection,
   validatePresetEngineFields,
   resolveDs4ModelPath,
   ds4ModelEntry,
@@ -496,4 +499,92 @@ test('renderModelsPresetIni round-trips the gemma section into a valid child arg
   for (const k of ['model-draft', 'spec-type', 'spec-draft-n-max', 'gpu-layers-draft']) {
     assert.match(ini, new RegExp(`^${k} = `, 'm'), `missing ${k}`);
   }
+});
+
+test('gemmaMtpPresetSection: existing descriptor and rendered bytes remain unchanged', () => {
+  const section = gemmaMtpPresetSection({ modelsDir: '/home/u/models', draftExists: true });
+
+  assert.deepEqual(section, {
+    name: 'google_gemma-4-E2B-it-qat-q4_0-gguf',
+    options: {
+      'model-draft': '/home/u/models/google_gemma-4-E2B-it-assistant/gemma-4-E2B-it-assistant-BF16.gguf',
+      'spec-type': 'draft-mtp',
+      'spec-draft-n-max': '1',
+      'gpu-layers-draft': '99',
+    },
+  });
+  assert.equal(
+    renderModelsPresetIni([section]),
+    '[google_gemma-4-E2B-it-qat-q4_0-gguf]\n'
+      + 'model-draft = /home/u/models/google_gemma-4-E2B-it-assistant/gemma-4-E2B-it-assistant-BF16.gguf\n'
+      + 'spec-type = draft-mtp\n'
+      + 'spec-draft-n-max = 1\n'
+      + 'gpu-layers-draft = 99\n',
+  );
+});
+
+test('qwen38MtpPresetSection: flattened draft produces the combined MTP/ngram descriptor', () => {
+  const section = qwen38MtpPresetSection({ modelsDir: '/home/u/models', draftExists: true });
+
+  assert.deepEqual(section, {
+    name: 'unsloth_Qwen3.8-27B-GGUF',
+    options: {
+      'model-draft': '/home/u/models/unsloth_Qwen3.8-27B-GGUF/mtp-Qwen3.8-27B-Q4_0.gguf',
+      'spec-type': 'draft-mtp,ngram-mod',
+      'spec-draft-n-max': '12',
+      'spec-ngram-mod-n-min': '24',
+      parallel: '1',
+      'gpu-layers-draft': '99',
+    },
+  });
+});
+
+test('qwen38MtpPresetSection: missing flattened draft emits no Qwen preset section', () => {
+  const section = qwen38MtpPresetSection({ modelsDir: '/home/u/models', draftExists: false });
+
+  assert.equal(section, null);
+  assert.equal(renderModelsPresetIni([section]), '');
+});
+
+test('Qwen and Gemma descriptors render as independent valid INI sections', () => {
+  const gemma = gemmaMtpPresetSection({ modelsDir: '/home/u/models', draftExists: true });
+  const qwen = qwen38MtpPresetSection({ modelsDir: '/home/u/models', draftExists: true });
+  const ini = renderModelsPresetIni([gemma, qwen]);
+  const blocks = ini.trimEnd().split('\n\n');
+
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0],
+    '[google_gemma-4-E2B-it-qat-q4_0-gguf]\n'
+      + 'model-draft = /home/u/models/google_gemma-4-E2B-it-assistant/gemma-4-E2B-it-assistant-BF16.gguf\n'
+      + 'spec-type = draft-mtp\n'
+      + 'spec-draft-n-max = 1\n'
+      + 'gpu-layers-draft = 99');
+  assert.match(blocks[1], /^\[unsloth_Qwen3\.8-27B-GGUF\]$/m);
+  assert.match(blocks[1], /^model-draft = \/home\/u\/models\/unsloth_Qwen3\.8-27B-GGUF\/mtp-Qwen3\.8-27B-Q4_0\.gguf$/m);
+  assert.match(blocks[1], /^spec-type = draft-mtp,ngram-mod$/m);
+  assert.match(blocks[1], /^spec-draft-n-max = 12$/m);
+  assert.match(blocks[1], /^spec-ngram-mod-n-min = 24$/m);
+  assert.match(blocks[1], /^parallel = 1$/m);
+  assert.match(blocks[1], /^gpu-layers-draft = 99$/m);
+  assert.doesNotMatch(blocks[0], /Qwen3\.8/);
+  assert.doesNotMatch(blocks[1], /gemma-4/);
+});
+
+test('qwen38MtpPresetSection: public helper is documented and trusts explicit filesystem state', () => {
+  const nonexistentRoot = '/definitely/not/a/real/models-directory';
+  const section = qwen38MtpPresetSection({ modelsDir: nonexistentRoot, draftExists: true });
+  const source = readFileSync(new URL('./engines.js', import.meta.url), 'utf8');
+  const documentation = source.match(
+    /\/\*\*([\s\S]*?)\*\/\s*export function qwen38MtpPresetSection\b/,
+  );
+
+  assert.equal(
+    section.options['model-draft'],
+    `${nonexistentRoot}/unsloth_Qwen3.8-27B-GGUF/mtp-Qwen3.8-27B-Q4_0.gguf`,
+    'the pure helper should trust caller-supplied existence state rather than touching the filesystem',
+  );
+  assert.ok(documentation, 'the public Qwen preset helper must have adjacent JSDoc');
+  assert.match(documentation[1], /pure|filesystem/i);
+  assert.match(documentation[1], /@param/);
+  assert.match(documentation[1], /@returns?/);
 });
