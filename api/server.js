@@ -119,7 +119,8 @@ import {
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, validateDs4DownloadRequest,
-  buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection
+  buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
+  qwen38MtpPresetSection
 } from './engines.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { createDs4Updater } from './ds4-updater.js';
@@ -5712,17 +5713,26 @@ async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
 
 /**
  * Write the router's `--models-preset` INI (into the cache dir, shared into the
- * distrobox via $HOME) enabling MTP speculative decode for gemma-4-E2B when its
- * 78M drafter GGUF is present. The router auto-detects --mmproj but cannot infer
- * a draft model, so this is how gemma gets served at ~124-140 tok/s instead of
- * ~100. Returns the file path, or '' when there is nothing to configure (caller
- * then omits MODELS_PRESET so the router behaves exactly as before).
+ * distrobox via $HOME) enabling model-specific speculative decode when a known
+ * draft GGUF is present. The router auto-detects primary models and --mmproj but
+ * cannot infer separate draft models, so this file adds Gemma MTP and Qwen3.8
+ * MTP/n-gram profiles without changing unaccelerated serving when drafts are
+ * absent. Returns the file path, or '' when there is nothing to configure
+ * (caller then omits MODELS_PRESET so the router behaves exactly as before).
  * @returns {string}
  */
 function writeModelsPresetFile() {
   try {
-    const draftPath = join(MODELS_DIR, 'google_gemma-4-E2B-it-assistant', 'gemma-4-E2B-it-assistant-BF16.gguf');
-    const sections = [gemmaMtpPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(draftPath) })].filter(Boolean);
+    const gemmaDraftPath = join(MODELS_DIR, 'google_gemma-4-E2B-it-assistant', 'gemma-4-E2B-it-assistant-BF16.gguf');
+    const qwenDir = join(MODELS_DIR, 'unsloth_Qwen3.8-27B-GGUF');
+    const qwenDraftPath = join(qwenDir, 'mtp-Qwen3.8-27B-Q4_0.gguf');
+    const sections = [
+      gemmaMtpPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(gemmaDraftPath) }),
+      qwen38MtpPresetSection({
+        modelsDir: MODELS_DIR,
+        draftExists: existsSync(qwenDir) && existsSync(qwenDraftPath),
+      }),
+    ].filter(Boolean);
     const ini = renderModelsPresetIni(sections);
     if (!ini) return '';
     const path = join(RUNTIME_PATHS.cacheDir, 'models-preset.ini');

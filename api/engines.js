@@ -9,9 +9,10 @@
 // top-level `config.ds4` block (+ DS4_* env overrides), produce an engine
 // descriptor ({ type, binPath, port, startScript, supportsSlots, supportsRouter,
 // healthPath, modelsShape }), validate ds4 preset fields, resolve a ds4 GGUF
-// model path under the dedicated ds4 gguf dir, and shape the OpenAI `/v1/models`
-// entry/list for an active ds4 model. Kept out of server.js so it is unit-testable
-// without booting the server.
+// model path under the dedicated ds4 gguf dir, shape the OpenAI `/v1/models`
+// entry/list for an active ds4 model, and build pure llama.cpp router preset
+// descriptors for model-specific speculative acceleration. Kept out of server.js
+// so it is unit-testable without booting the server.
 
 /** Canonical engine type identifiers. */
 export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4' };
@@ -344,6 +345,33 @@ export function gemmaMtpPresetSection({ modelsDir, draftExists } = {}) {
       'model-draft': `${modelsDir}/google_gemma-4-E2B-it-assistant/gemma-4-E2B-it-assistant-BF16.gguf`,
       'spec-type': 'draft-mtp',
       'spec-draft-n-max': '1',
+      'gpu-layers-draft': '99',
+    },
+  };
+}
+
+/**
+ * Build the models-preset section that enables Qwen3.8's MTP draft model and
+ * modified n-gram speculation. The router discovers the primary and multimodal
+ * projector itself, while this descriptor supplies the separately downloaded,
+ * flattened MTP GGUF and the measured Strix Halo starting profile. Returns null
+ * when the server reports that draft unavailable so Qwen remains normally
+ * servable without speculative acceleration. This helper performs no filesystem
+ * access; callers own all availability checks.
+ *
+ * @param {{modelsDir:string, draftExists:boolean}} params Model root and caller-verified draft availability.
+ * @returns {{name:string, options:Object<string,string>}|null} Router section descriptor or null.
+ */
+export function qwen38MtpPresetSection({ modelsDir, draftExists } = {}) {
+  if (!draftExists) return null;
+  return {
+    name: 'unsloth_Qwen3.8-27B-GGUF',
+    options: {
+      'model-draft': `${modelsDir}/unsloth_Qwen3.8-27B-GGUF/mtp-Qwen3.8-27B-Q4_0.gguf`,
+      'spec-type': 'draft-mtp,ngram-mod',
+      'spec-draft-n-max': '12',
+      'spec-ngram-mod-n-min': '24',
+      'parallel': '1',
       'gpu-layers-draft': '99',
     },
   };
