@@ -4,7 +4,8 @@
 # gfx1151 ROCm build. Bump LLAMA_CPP_REF deliberately only after validating text,
 # vision, and speculative decoding through the managed production runtime.
 #
-# Current pin validated on Frostburn for Qwen3.8-27B text + mmproj image inference,
-# MTP/ngram-mod speculative decoding, and the models-preset router. 2026-08-22.
+# Rollback pin restored after the 2026-08-22 update produced question-mark-only
+# Qwen3-8B output on the Frostburn AMD GPU path. Keep this pin until a newer
+# runtime passes both Qwen3-8B and Qwen3.8 validation.
 LLAMA_CPP_REPO=https://github.com/ggerganov/llama.cpp.git
-LLAMA_CPP_REF=b21e4de74567f5eef213765c9476a843c2e43f0d
+LLAMA_CPP_REF=8be759e6f70d629638a7eb70db3824cbdcea370b
