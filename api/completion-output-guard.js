@@ -7,7 +7,7 @@
 // withholds suspect SSE output until the stream is proven valid or replaced by a
 // structured upstream-output error.
 
-const ERROR_MESSAGE = 'The inference backend returned corrupted question-mark-only output.';
+const ERROR_MESSAGE = 'Inference backend returned invalid question-mark-only output';
 
 /**
  * Frozen HTTP/error descriptor used when generated text contains only question
@@ -52,9 +52,6 @@ function chatCompletionText(payload) {
   for (const choice of payload.choices) {
     const message = choice?.message;
     output += contentText(message?.content);
-    output += contentText(message?.reasoning_content);
-    output += contentText(message?.reasoning);
-    output += contentText(message?.thinking);
     output += contentText(message?.text);
     output += contentText(choice?.text);
   }
@@ -84,9 +81,6 @@ function streamPayloadText(payload) {
   for (const choice of payload.choices) {
     const delta = choice?.delta;
     output += contentText(delta?.content);
-    output += contentText(delta?.reasoning_content);
-    output += contentText(delta?.reasoning);
-    output += contentText(delta?.thinking);
     output += contentText(delta?.text);
     output += contentText(choice?.text);
   }
@@ -129,7 +123,8 @@ function corruptedStreamEnd() {
  * the buffered fragments are discarded and a single structured error followed by
  * `[DONE]` is returned.
  *
- * @returns {{push:(chunk:string)=>string[],finish:()=>string[]}} Incremental guard.
+ * @returns {{push:(chunk:string)=>string[],finish:()=>string[],readonly corrupted:boolean}}
+ *   Incremental guard and its terminal corruption classification.
  * @throws {TypeError} When push receives a non-string chunk.
  */
 export function createChatCompletionStreamGuard() {
@@ -138,6 +133,7 @@ export function createChatCompletionStreamGuard() {
   let suspect = false;
   let safe = false;
   let finished = false;
+  let corrupted = false;
 
   const processLine = (line) => {
     const text = streamLineText(line);
@@ -191,9 +187,17 @@ export function createChatCompletionStreamGuard() {
         output.push(...processLine(lineBuffer));
         lineBuffer = '';
       }
-      if (suspect) return corruptedStreamEnd();
+      if (suspect) {
+        corrupted = true;
+        return corruptedStreamEnd();
+      }
       if (suspectBuffer) output.push(suspectBuffer);
       return output;
+    },
+
+    /** True after finish replaces question-mark-only output with an error. */
+    get corrupted() {
+      return corrupted;
     },
   };
 }

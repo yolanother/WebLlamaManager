@@ -85,6 +85,11 @@ test('empty, whitespace-only, and tool-call-only assistant messages are valid', 
   })), null);
 });
 
+test('valid hidden reasoning does not excuse corrupted visible assistant content', () => {
+  const payload = completion('????', { reasoning_content: 'A coherent hidden analysis.' });
+  assert.equal(validateChatCompletionPayload(payload), QUESTION_MARK_ONLY_OUTPUT_ERROR);
+});
+
 test('normal and mixed-question-mark text passes without mutating the payload', () => {
   for (const text of ['All systems nominal.', 'What???', '¿Qué?', '？']) {
     const payload = completion(text);
@@ -109,6 +114,7 @@ test('streaming withholds candidate output across arbitrary chunks then releases
 
   assert.equal(forwardedAfterProof, candidate + valid);
   assert.equal(forwardedAfterRelease + forwardedAtFinish, continued + done);
+  assert.equal(guard.corrupted, false);
 });
 
 test('a question-mark-only stream suppresses corrupt content and ends with one error then DONE', () => {
@@ -120,6 +126,7 @@ test('a question-mark-only stream suppresses corrupt content and ends with one e
 
   assert.equal(forwarded, expected);
   assert.doesNotMatch(forwarded, /"content":"[? ]/);
+  assert.equal(guard.corrupted, true);
 });
 
 test('a tool-call-only stream passes through unchanged and is not replaced with an error', () => {
@@ -151,6 +158,7 @@ test('local, remote, DS4, and backfill chat exits all invoke JSON and SSE guards
 
   for (const [name, body] of Object.entries(exits)) {
     assert.match(body, /createChatCompletionStreamGuard\s*\(/, `${name} streaming exit is unguarded`);
+    assert.match(body, /outputGuard\.corrupted/, `${name} streaming exit records corruption as success`);
     assert.match(body, /validateChatCompletionPayload\s*\(/, `${name} JSON exit is unguarded`);
   }
 });

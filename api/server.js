@@ -1154,9 +1154,22 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
           const decoderTail = decoder.decode();
           if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
           writeGuardedCompletionFragments(res, outputGuard.finish());
+          const outputCorrupted = outputGuard.corrupted;
           res.end();
 
           const duration = Date.now() - startTime;
+          if (outputCorrupted) {
+            addLlmLog({
+              endpoint, model: requestedModel, stream: true,
+              status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration,
+              promptTokens, completionTokens, tokensPerSecond: 0,
+              messages: req.body.messages || null, prompt: null, response: null,
+              error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+              backend: chosen.id, requestBody: req.body, backfill: true,
+            });
+            endActiveRequest(activeReqId, { status: 'error' });
+            return;
+          }
           const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
           recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: chosen.name });
           updateBackendTokenStats(chosen.id, promptTokens, completionTokens, duration, chosen);
@@ -8331,8 +8344,14 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
       const decoderTail = decoder.decode();
       if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
       writeGuardedCompletionFragments(res, outputGuard.finish());
+      const outputCorrupted = outputGuard.corrupted;
       try { res.end(); } catch { /* ignore */ }
       const dur = Date.now() - startTime;
+      if (outputCorrupted) {
+        addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration: dur, promptTokens, completionTokens, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message, backend: 'ds4', requestBody: req.body });
+        endActiveRequest(activeReqId, { status: 'error' });
+        return;
+      }
       addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: 200, duration: dur, promptTokens, completionTokens, tokensPerSecond: completionTokens / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
       endActiveRequest(activeReqId, { status: 'complete' });
       return;
@@ -8899,9 +8918,22 @@ async function handleChatCompletions(req, res) {
             const decoderTail = decoder.decode();
             if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
             writeGuardedCompletionFragments(res, outputGuard.finish());
+            const outputCorrupted = outputGuard.corrupted;
             clearInterval(keepaliveTicker);
             res.end();
             const duration = Date.now() - startTime;
+            if (outputCorrupted) {
+              addLlmLog({
+                endpoint: 'chat/completions', model, stream: true,
+                status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration,
+                promptTokens, completionTokens, tokensPerSecond: 0,
+                messages: req.body.messages || null, prompt: null, response: null,
+                error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+                backend: backend.id, requestBody: req.body,
+              });
+              endActiveRequest(activeReqId, { status: 'error' });
+              return;
+            }
             const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
             recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration, backend: backend.name });
             updateBackendTokenStats(backend.id, promptTokens, completionTokens, duration, backend);
@@ -9470,6 +9502,7 @@ async function handleChatCompletions(req, res) {
           const decoderTail = decoder.decode();
           if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
           writeGuardedCompletionFragments(res, outputGuard.finish());
+          const outputCorrupted = outputGuard.corrupted;
           if (streamingKeepaliveTicker) {
             clearInterval(streamingKeepaliveTicker);
             streamingKeepaliveTicker = null;
@@ -9479,6 +9512,17 @@ async function handleChatCompletions(req, res) {
           // Record stats after stream completes
           // Prefer server-reported timings (accurate inference time) over wall-clock (includes queue wait)
           const wallDuration = Date.now() - startTime;
+          if (outputCorrupted) {
+            logLlm({
+              endpoint: 'chat/completions', model, stream: true,
+              status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration: wallDuration,
+              promptTokens, completionTokens, tokensPerSecond: 0,
+              messages: req.body.messages || null, prompt: null, response: null,
+              error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+            });
+            endActiveRequest(activeReqId, { status: 'error' });
+            return;
+          }
           const inferDuration = serverTimings
             ? (serverTimings.prompt_ms || 0) + (serverTimings.predicted_ms || 0)
             : wallDuration - totalQueueWait;
