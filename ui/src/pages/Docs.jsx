@@ -290,6 +290,15 @@ Set reasonable context limits based on the model names (32k for most, 128k for m
                 complete Manager HTTP API from a terminal or local agent. A source install links it
                 into <code>~/.local/bin</code>; Debian packages install it as <code>/usr/bin/llm</code>.
               </p>
+              <CodeBlock
+                id="cli-install"
+                language="bash"
+                code={`# A normal source installation includes the CLI
+./install.sh
+
+# Or install only the CLI link
+scripts/install-llm-cli.sh install`}
+              />
 
               <h3>Connection and output</h3>
               <CodeBlock

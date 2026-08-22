@@ -26,6 +26,7 @@ rm -f ~/.config/systemd/user/${SERVICE_NAME}.service
 
 echo "Removing local CLI link..."
 "$SCRIPT_DIR/scripts/install-llm-cli.sh" uninstall
+echo "The source checkout's llm command has been removed when it was owned by this installation."
 
 echo "Reloading systemd..."
 systemctl --user daemon-reload

@@ -22,7 +22,7 @@ Usage: scripts/install-llm-cli.sh [install|uninstall|--help]
 
 Install or remove this source checkout's dependency-free `llm` command.
 The destination defaults to $HOME/.local/bin/llm. Set LLAMA_MANAGER_BIN_DIR
-to choose another bin directory without requiring root.
+to choose another bin directory. This user-scoped helper works without root.
 EOF
 }
 

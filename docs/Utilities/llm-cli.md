@@ -54,8 +54,9 @@ same catalog used by the parser, so agents do not need to scrape this page.
 
 Destructive ergonomic commands require `--yes`; the CLI never opens an
 interactive confirmation prompt. HTTP, connection, JSON, command, and usage
-failures write concise diagnostics to stderr and exit nonzero. Credential-like
-response fields are masked before output.
+failures write concise diagnostics to stderr and use a nonzero exit code. A zero
+exit code means the command and any requested output projection succeeded.
+Credential-like response fields are masked before output.
 
 ## Complete API, multipart, and binary operations
 
