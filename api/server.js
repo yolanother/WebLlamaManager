@@ -1884,12 +1884,14 @@ loadCrashHistory();
 // Per-request performance samples. The minute-level analytics records above
 // only keep per-model AVERAGE tok/s, which cannot yield median/min/max or
 // TTFT, so every completed generation also appends one compact record here:
-//   { ts, m, b, tps, pps, ttft, da, dt, dur, pt, ct, cached, wl }
+//   { ts, m, b, tps, prompt_per_second, ttft, draft_n_accepted, draft_n,
+//     dur, pt, ct, cached, workload }
 // ts = completion time, m = model key, b = backend, tps = tok/s, ttft =
-// prompt-processing (prefill) ms when the engine reported timings, pps =
-// prompt tok/s, da/dt = accepted/total speculative draft tokens, dur =
-// generation duration ms, pt/ct = prompt/completion tokens, cached = measured
-// cached tokens (null when unavailable), and wl = workload/scenario label.
+// prompt-processing (prefill) ms when the engine reported timings,
+// prompt_per_second = prompt tok/s, draft_n_accepted/draft_n = accepted/total
+// speculative draft tokens, dur = generation duration ms, pt/ct =
+// prompt/completion tokens, cached = measured cached tokens (null when
+// unavailable), and workload = the disclosed benchmark scenario.
 const REQUEST_SAMPLES_FILE = join(ANALYTICS_DIR, 'requests.jsonl');
 const MAX_REQUEST_SAMPLES = 200000;
 let requestSamples = [];
@@ -2400,12 +2402,12 @@ function recordTokenStats(stats) {
       m: modelKey,
       b: backend || 'local',
       tps: Math.round((tokensPerSecond || 0) * 10) / 10,
-      pps: Number.isFinite(promptTokensPerSecond)
+      prompt_per_second: Number.isFinite(promptTokensPerSecond)
         ? Math.round(promptTokensPerSecond * 10) / 10
         : null,
       ttft: Number.isFinite(ttftMs) ? Math.round(ttftMs) : null,
-      da: Number.isFinite(draftAccepted) ? draftAccepted : null,
-      dt: Number.isFinite(draftTotal) ? draftTotal : null,
+      draft_n_accepted: Number.isFinite(draftAccepted) ? draftAccepted : null,
+      draft_n: Number.isFinite(draftTotal) ? draftTotal : null,
       dur: Math.round(duration || 0),
       pt: promptTokens || 0,
       ct: completionTokens || 0,
@@ -2414,7 +2416,7 @@ function recordTokenStats(stats) {
       cached: Number.isFinite(cachedTokens) ? cachedTokens : null,
       cache: cacheHitKind || 'none',
       routing: routingOutcome || (backend && backend !== 'local' ? 'offloaded' : 'local'),
-      wl: normalizeWorkload(workload),
+      workload: normalizeWorkload(workload),
     });
   }
 }

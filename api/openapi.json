@@ -4171,6 +4171,207 @@
         ]
       }
     },
+    "/api/analytics/request-series": {
+      "get": {
+        "operationId": "get_api_analytics_request_series",
+        "summary": "Get chronological per-model performance measurements",
+        "description": "Returns chronological per-request performance measurements without combining unlike units. Optional filters select a fixed time window and exact stored model key; missing engine evidence remains null.",
+        "tags": [
+          "analytics"
+        ],
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "description": "History window. Defaults to 24h.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "24h",
+                "7d",
+                "30d",
+                "all"
+              ],
+              "default": "24h"
+            }
+          },
+          {
+            "name": "model",
+            "in": "query",
+            "required": false,
+            "description": "Exact stored model key, including a remote backend prefix when present.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "window",
+                    "model",
+                    "models",
+                    "workloads",
+                    "points"
+                  ],
+                  "properties": {
+                    "window": {
+                      "type": "string",
+                      "enum": [
+                        "24h",
+                        "7d",
+                        "30d",
+                        "all"
+                      ]
+                    },
+                    "model": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "models": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "workloads": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "general",
+                          "repetition-assisted"
+                        ]
+                      }
+                    },
+                    "points": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "timestamp",
+                          "name",
+                          "model",
+                          "backend",
+                          "isRemote",
+                          "slots",
+                          "decodeTps",
+                          "promptTps",
+                          "ttftMs",
+                          "draftAccepted",
+                          "draftTotal",
+                          "draftAcceptance",
+                          "cacheState",
+                          "workload"
+                        ],
+                        "properties": {
+                          "timestamp": {
+                            "type": "integer"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "model": {
+                            "type": "string"
+                          },
+                          "backend": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "isRemote": {
+                            "type": "boolean"
+                          },
+                          "slots": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "decodeTps": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "promptTps": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "ttftMs": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "draftAccepted": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "draftTotal": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "draftAcceptance": {
+                            "type": [
+                              "number",
+                              "null"
+                            ]
+                          },
+                          "cacheState": {
+                            "type": "string",
+                            "enum": [
+                              "cold",
+                              "warm-prefix",
+                              "unknown"
+                            ]
+                          },
+                          "workload": {
+                            "type": "string",
+                            "enum": [
+                              "general",
+                              "repetition-assisted"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X GET 'http://localhost:5250/api/analytics/request-series'"
+          },
+          {
+            "lang": "Python",
+            "source": "import requests\n\nresponse = requests.get('http://localhost:5250/api/analytics/request-series')\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/analytics/request-series');\nconsole.log(await response.json());"
+          }
+        ]
+      }
+    },
     "/api/analytics/crashes": {
       "get": {
         "operationId": "get_api_analytics_crashes",

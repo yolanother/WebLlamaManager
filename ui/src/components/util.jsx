@@ -558,8 +558,8 @@ function ModelRequestStatsTable({ requestStats, window, onWindowChange }) {
 }
 
 const PERFORMANCE_METRICS = [
-  { key: 'decodeTps', label: 'Decode', longLabel: 'Decode throughput', unit: 'tok/s' },
-  { key: 'promptTps', label: 'Prompt', longLabel: 'Prompt throughput', unit: 'tok/s' },
+  { key: 'decodeTps', label: 'Decode tok/s', longLabel: 'Decode throughput', unit: 'tok/s' },
+  { key: 'promptTps', label: 'Prompt tok/s', longLabel: 'Prompt throughput', unit: 'tok/s' },
   { key: 'ttftMs', label: 'TTFT', longLabel: 'Time to first token', unit: 'ms' },
   { key: 'draftAcceptance', label: 'Draft acceptance', longLabel: 'Speculative draft acceptance', unit: '%' },
 ];

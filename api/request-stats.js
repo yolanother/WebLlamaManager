@@ -223,9 +223,9 @@ export function aggregateRequestStats(samples, { now = Date.now(), window = 'all
 
 /**
  * Build a chronological, filterable per-request performance series for the
- * dashboard. Slots are derived across the complete selected time window before
- * the optional model filter is applied, preserving the actual peak contention
- * each request experienced.
+ * dashboard. Slots are derived within each stored model key before the optional
+ * model filter is applied, so another backend/model does not masquerade as
+ * same-model parallelism.
  *
  * @param {Array<Object>} samples - Compact records persisted in requests.jsonl.
  * @param {Object} [options] - Series filtering options.
@@ -243,7 +243,12 @@ export function buildRequestSeries(samples, { now = Date.now(), window = 'all', 
     sample && typeof sample.m === 'string' && sample.m.length > 0 &&
     Number.isFinite(Number(sample.ts)) && Number(sample.ts) >= cutoff
   );
-  const withSlots = assignSlots(inWindow);
+  const samplesByModel = new Map();
+  for (const sample of inWindow) {
+    if (!samplesByModel.has(sample.m)) samplesByModel.set(sample.m, []);
+    samplesByModel.get(sample.m).push(sample);
+  }
+  const withSlots = [...samplesByModel.values()].flatMap(group => assignSlots(group));
 
   const modelsByName = new Map();
   for (const sample of withSlots) {
