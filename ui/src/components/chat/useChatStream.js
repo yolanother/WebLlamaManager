@@ -3,11 +3,33 @@
 // LICENSE file in the repository root.
 //
 // Owns cancellation, incremental SSE parsing, 50 ms render batching, usage
-// accounting, and capture of the router-selected model response header.
+// accounting, structured upstream-error surfacing, and capture of the
+// router-selected model response header.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { API_BASE } from '../../api.js';
+
+/**
+ * Parse one OpenAI-compatible SSE data payload and surface structured upstream
+ * errors as JavaScript errors that retain the server's type and code.
+ *
+ * @param {string} data JSON text from an SSE `data:` line.
+ * @returns {object} Parsed ordinary OpenAI streaming event.
+ * @throws {Error} When JSON is malformed or the event contains an error envelope.
+ */
+function parseChatSseEvent(data) {
+  const parsed = JSON.parse(data);
+  if (parsed?.error && typeof parsed.error === 'object') {
+    const streamError = new Error(parsed.error.message || 'Chat stream failed.');
+    streamError.type = parsed.error.type;
+    streamError.code = parsed.error.code;
+    streamError.status = parsed.error.status;
+    streamError.isChatSseError = true;
+    throw streamError;
+  }
+  return parsed;
+}
 
 /**
  * Stream one chat completion while exposing render-friendly incremental state.
@@ -93,7 +115,7 @@ function useChatStream() {
         const data = line.slice(5).trimStart();
         if (!data || data === '[DONE]') return;
         try {
-          const parsed = JSON.parse(data);
+          const parsed = parseChatSseEvent(data);
           const delta = parsed.choices?.[0]?.delta?.content;
           if (delta) {
             latestContentRef.current += delta;
@@ -102,7 +124,8 @@ function useChatStream() {
           }
           if (parsed.usage) usage = parsed.usage;
           if (parsed.model) modelUsed = parsed.model;
-        } catch {
+        } catch (parseError) {
+          if (parseError?.isChatSseError) throw parseError;
           // Ignore keepalives and malformed partial event data.
         }
       };
@@ -165,4 +188,4 @@ function useChatStream() {
   };
 }
 
-export { useChatStream };
+export { parseChatSseEvent, useChatStream };
