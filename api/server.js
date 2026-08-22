@@ -6936,6 +6936,8 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
         let errorMsg;
         if (exitCode === 127) {
           errorMsg = `Command not found (exit code 127). Run ./install.sh to set up the Python environment.`;
+        } else if (/No such file or directory.*placing downloaded artifact/is.test(downloadInfo.output || '')) {
+          errorMsg = `Local download filesystem placement failed (exit code ${exitCode}). Check the output for the missing destination path.`;
         } else {
           // Inspect output for gated/auth indicators and whether a token is set,
           // and point the operator at Settings when a token is needed.
