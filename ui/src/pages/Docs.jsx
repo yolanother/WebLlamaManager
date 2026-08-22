@@ -102,6 +102,7 @@ function DocsPage() {
   const sections = [
     { id: 'overview', title: 'Overview' },
     { id: 'opencode', title: 'OpenCode Setup' },
+    { id: 'local-cli', title: 'Local CLI' },
     { id: 'mcp-setup', title: 'MCP Setup' },
     { id: 'api-usage', title: 'API Usage' },
     { id: 'features', title: 'Features' },
@@ -278,6 +279,77 @@ Set reasonable context limits based on the model names (32k for most, 128k for m
                   </tr>
                 </tbody>
               </table>
+            </section>
+          )}
+
+          {activeSection === 'local-cli' && (
+            <section className="docs-section">
+              <h2>Local CLI</h2>
+              <p>
+                The dependency-free <code>llm</code> command exposes every MCP workflow and the
+                complete Manager HTTP API from a terminal or local agent. A source install links it
+                into <code>~/.local/bin</code>; Debian packages install it as <code>/usr/bin/llm</code>.
+              </p>
+
+              <h3>Connection and output</h3>
+              <CodeBlock
+                id="cli-output"
+                language="bash"
+                code={`# Human-readable output is the default
+llm status
+
+# Select another manager for one command or the whole shell
+llm --url ${window.location.origin} models list
+export LLAMA_MANAGER_URL=${window.location.origin}
+
+# Stable machine projections
+llm models list --json
+llm models list --get 'localModels.*.name'
+llm status --graphql '{ running mode loadedModels { id } }'`}
+              />
+              <p className="docs-hint">
+                <code>--get</code> and <code>--graphql</code> are mutually exclusive. Destructive
+                commands such as <code>models delete</code> and <code>downloads cancel</code> require
+                explicit <code>--yes</code> and never prompt interactively.
+              </p>
+
+              <h3>Complete API access</h3>
+              <CodeBlock
+                id="cli-api"
+                language="bash"
+                code={`# Discover operation IDs, then call one with typed request inputs
+llm api list --graphql '{ operations { operationId method path summary } }'
+llm api call getStatus --json
+
+# Future-safe raw requests, multipart uploads, and binary downloads
+llm request GET /api/analytics/request-stats --query window=24h --json
+llm api call createMediaArtifact --form file=@./image.png --output ./artifact.bin`}
+              />
+
+              <h3>Install Qwen3.8-27B</h3>
+              <CodeBlock
+                id="cli-qwen-workflow"
+                language="bash"
+                code={`# Search and inspect exact repository files
+llm search 'Qwen3.8 27B' --graphql '{ results { id downloads likes } }'
+llm repo files unsloth/Qwen3.8-27B-GGUF --graphql '{ quantizations { name files { name size } } }'
+
+# Start the managed download and poll it
+DOWNLOAD_ID=$(llm download unsloth/Qwen3.8-27B-GGUF --quantization UD-Q4_K_XL --get downloadId)
+llm downloads status "$DOWNLOAD_ID" --graphql '{ status progress error }'
+
+# Copy the downloaded name from this list, then load and verify it
+llm models list --get 'localModels.*.name'
+llm models load 'unsloth_Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf'
+llm chat 'unsloth_Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf' 'Reply with exactly: Qwen is ready.'`}
+              />
+
+              <h3>Agent-readable reference</h3>
+              <p>
+                Run <code>llm help --json</code> for structured command metadata or
+                <code>llm docs --full</code> for the complete generated Markdown reference. Both
+                come from the same command catalog used by the parser.
+              </p>
             </section>
           )}
 

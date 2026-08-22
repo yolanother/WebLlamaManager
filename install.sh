@@ -217,7 +217,7 @@ SERVICE_WAS_ENABLED=false
 
 if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     SERVICE_WAS_RUNNING=true
-    echo "[0/6] Stopping existing service..."
+    echo "[0/7] Stopping existing service..."
     # Use timeout to prevent hanging if the graceful shutdown takes too long
     timeout 15 systemctl --user stop "$SERVICE_NAME" 2>/dev/null || {
         echo "  Graceful stop timed out, force killing..."
@@ -232,23 +232,27 @@ if systemctl --user is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
 fi
 
 echo
-echo "[1/6] Creating models directory..."
+echo "[1/7] Creating models directory..."
 mkdir -p "$MODELS_DIR"
 echo "  Models will be stored in: $MODELS_DIR"
 
 echo
-echo "[2/6] Installing API dependencies..."
+echo "[2/7] Installing API dependencies..."
 cd "$SCRIPT_DIR/api"
 npm install
 
 echo
-echo "[3/6] Installing UI dependencies and building..."
+echo "[3/7] Installing UI dependencies and building..."
 cd "$SCRIPT_DIR/ui"
 npm install
 npm run build
 
 echo
-echo "[4/6] Setting up systemd user service..."
+echo "[4/7] Installing local CLI..."
+"$SCRIPT_DIR/scripts/install-llm-cli.sh" install
+
+echo
+echo "[5/7] Setting up systemd user service..."
 mkdir -p ~/.config/systemd/user
 CREDENTIAL_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/llama-manager/credentials.env"
 write_service_credentials "$CREDENTIAL_ENV" "$HF_TOKEN"
@@ -316,7 +320,7 @@ fi
 systemctl --user daemon-reload
 
 echo
-echo "[5/6] Restarting service..."
+echo "[6/7] Restarting service..."
 
 # Re-enable if it was enabled before
 if [ "$SERVICE_WAS_ENABLED" = true ]; then
@@ -343,7 +347,7 @@ else
 fi
 
 echo
-echo "[6/6] Installation complete!"
+echo "[7/7] Installation complete!"
 echo
 
 # Get IP address for network access
@@ -354,6 +358,7 @@ echo "  Web UI:     http://localhost:$API_PORT"
 echo "              http://${IP_ADDRESS}:$API_PORT"
 echo "  Llama API:  http://localhost:$LLAMA_PORT"
 echo "              http://${IP_ADDRESS}:$LLAMA_PORT"
+echo "  Local CLI:  llm status"
 echo
 
 if [ "$SERVICE_WAS_RUNNING" = false ]; then

@@ -8,6 +8,7 @@ hardware-specific gotchas of the AMD Strix Halo (gfx1151) box it targets.
 | Doc | What it covers |
 |---|---|
 | [**features-overview.md**](features-overview.md) | The complete feature map — engines, routing/offload, aliasing, presets, guards, embeddings, monitoring. **Read this first.** |
+| [**Utilities/llm-cli.md**](Utilities/llm-cli.md) | Human and agent reference for the local `llm` CLI, projections, full API access, and model installation workflows. |
 | [**ds4-engine.md**](ds4-engine.md) | The DeepSeek V4 Flash (DS4) engine — exclusive mode, adaptive context + SSD-streaming, how it fits an 80&nbsp;GB model onto the box. |
 | [`../README.md`](../README.md) | Project README — install, quick start, requirements, service management, troubleshooting. |
 

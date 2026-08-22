@@ -4,11 +4,12 @@ In-app documentation for Llama Manager features and configuration.
 
 ## Motivation
 
-Users need accessible documentation without leaving the application. Key topics include MCP setup, API usage, and feature explanations.
+Users need accessible documentation without leaving the application. Key topics include local CLI and agent usage, MCP setup, API usage, and feature explanations.
 
 ## User Stories
 
 - As a user, I want to learn how to set up MCP integration with Claude Desktop
+- As a user or local agent, I want complete CLI workflows and machine-readable help
 - As a user, I want to see API examples without switching to external docs
 - As a user, I want to understand the difference between router and single mode
 
@@ -52,13 +53,19 @@ A documentation page with section navigation and formatted content including cod
    - Environment variables
    - Available MCP tools
 
-3. **API Usage**
+3. **Local CLI**
+   - Source and package installation locations
+   - Human, JSON, dotted, and GraphQL-shaped output
+   - Ergonomic commands plus complete OpenAPI/raw request access
+   - Search, download, load, and verify workflow for Qwen3.8-27B
+
+4. **API Usage**
    - Base URLs
    - Authentication (none required)
    - curl examples
    - OpenAI SDK usage
 
-4. **Features**
+5. **Features**
    - Router mode explanation
    - Single-model mode
    - Presets configuration
