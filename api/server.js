@@ -12,6 +12,8 @@
 // cannot terminate workers supervised by a different manager.
 // OpenAI routes support both /api/v1 and bare /v1 paths, with URL-based media
 // expanded into standard multimodal parts before chat inference.
+// The same application is served on API_PORT and, best-effort, on the appliance
+// mirror port ALT_PORT (default 80) when the process is allowed to bind it.
 
 import express from 'express';
 import cors from 'cors';
@@ -148,6 +150,7 @@ import {
 import { beginLlamaUpdate, createLlamaSourceUpdateSpec } from './llama-update-controller.js';
 import { applyConfigDefaults } from './config-defaults.js';
 import { scheduleAutoStart } from './auto-start.js';
+import { resolveAltPort, listenBestEffort } from './alt-port.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -11777,6 +11780,22 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   // router) when one is configured. No user command required.
   setTimeout(() => { startEmbedServer(); }, 1500);
 });
+
+// Appliance installs also answer on port 80 so a plain http://localhost lands on
+// the dashboard. Best-effort only: an unprivileged run (dev box, container)
+// simply logs the skip and keeps serving API_PORT.
+const ALT_PORT = resolveAltPort({ env: process.env, primaryPort: API_PORT });
+if (ALT_PORT !== null) {
+  const altServer = createServer(app);
+  altServer.on('upgrade', (req, socket, head) => {
+    if (!wss.shouldHandle(req)) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  });
+  listenBestEffort({ server: altServer, port: ALT_PORT });
+}
 
 // Memory watchdog — restart llama-server if system memory >= 95% and it's the heaviest process
 const MEM_WATCHDOG_INTERVAL = 30_000; // check every 30s

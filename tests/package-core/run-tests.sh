@@ -185,7 +185,8 @@ test_canonical_service_assets_are_package_safe() {
   assert_contains "service retains setuid/setgid creation restrictions" "$service" "RestrictSUIDSGID=yes"
   assert_contains "service bounds mapping helper capabilities to uid and gid setup" "$service" \
     "CapabilityBoundingSet=CAP_SETUID CAP_SETGID"
-  assert_contains "service grants no ambient capabilities to Node" "$service" "AmbientCapabilities="
+  assert_contains "service grants Node only the port 80 bind capability" "$service" \
+    "AmbientCapabilities=CAP_NET_BIND_SERVICE"
   if [[ "$service" == *"/home/yolan"* ]]; then
     printf '  FAIL canonical service contains a developer home path\n'
     failures=$((failures + 1))
