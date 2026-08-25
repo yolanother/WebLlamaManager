@@ -31,6 +31,9 @@ NAME_FILE="${LLAMA_MANAGER_NODE_NAME_FILE:-/var/lib/llama-manager/node-name}"
 # without touching the machine running the tests.
 HOSTNAMECTL="${LLAMA_MANAGER_HOSTNAMECTL:-hostnamectl}"
 
+# avahi's own configuration, edited so it never publishes on loopback.
+AVAHI_CONF="${LLAMA_MANAGER_AVAHI_CONF:-/etc/avahi/avahi-daemon.conf}"
+
 # Tool used to hand the persistent store back to the service account, and the
 # account it is handed to. Overridable so the handover is observable in tests.
 CHOWN="${LLAMA_MANAGER_CHOWN:-chown}"
@@ -127,6 +130,43 @@ read_name_file() {
   normalize_name "$(cat "$path" 2>/dev/null)"
 }
 
+# Stops avahi publishing this host on loopback, which makes it collide with
+# itself and rename the node out from under us.
+#
+# MEASURED ON HARDWARE. avahi joins mDNS on `lo` seconds before the real
+# interface exists, publishes the hostname there, and then re-probes when the
+# real interface appears -- at which point it finds its OWN loopback record and
+# treats it as another machine:
+#
+#   Host name conflict, retrying with setup-llama-manager-2
+#   Server startup complete. Host name is setup-llama-manager-2.local.
+#
+# The node is then reachable only at a name nobody would guess. Nothing detects
+# it either: this script compares the SYSTEM hostname, which is still correct,
+# and the /etc/hosts alias makes on-box resolution succeed, so every local check
+# passes while every remote one fails.
+#
+# An existing deny list is extended rather than replaced -- an operator may have
+# denied an interface deliberately, and silently dropping that would be its own
+# defect.
+deny_loopback_publication() {
+  local conf="$AVAHI_CONF" existing
+  [[ -f "$conf" ]] || return 0
+
+  existing="$(sed -n 's/^deny-interfaces=//p' "$conf" | head -n 1)"
+  if [[ -n "$existing" ]]; then
+    case ",${existing//[[:space:]]/}," in
+      *,lo,*) return 0 ;;
+    esac
+    sed -i "s|^deny-interfaces=.*|deny-interfaces=${existing},lo|" "$conf" || return 0
+  elif grep -q '^\[server\]' "$conf"; then
+    sed -i '0,/^\[server\]/s//[server]\ndeny-interfaces=lo/' "$conf" || return 0
+  else
+    printf '[server]\ndeny-interfaces=lo\n' >> "$conf" || return 0
+  fi
+  printf 'llama-manager-identity: avahi will not publish on loopback\n'
+}
+
 # Prints the name this node should answer to, applying the resolution order
 # documented at the top of this file. Never prints an empty string.
 resolve_name() {
@@ -204,6 +244,7 @@ apply_identity() {
   # touched by root, so it is deliberately not handed over.
   persist_name "$MIRROR_PATH" "$name"
 
+  deny_loopback_publication
   update_hosts_alias "$hostname"
 
   current="$("$HOSTNAMECTL" hostname 2>/dev/null)"

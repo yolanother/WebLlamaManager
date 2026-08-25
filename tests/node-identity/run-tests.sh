@@ -316,6 +316,44 @@ FAKE
   drop_sandbox
 }
 
+test_avahi_does_not_publish_on_loopback() {
+  printf 'test_avahi_does_not_publish_on_loopback\n'
+  # MEASURED ON HARDWARE, where this silently broke the whole feature. avahi
+  # joins mDNS on `lo` seconds before the real interface appears, publishes the
+  # hostname there, then re-probes when eno1 comes up and CONFLICTS WITH ITS OWN
+  # loopback record:
+  #   Host name conflict, retrying with setup-llama-manager-2
+  # The node was then reachable only at a name nobody would guess, while this
+  # script reported "already published as setup-llama-manager.local" -- it checks
+  # the SYSTEM HOSTNAME, not what avahi published. The /etc/hosts alias made
+  # on-box getent succeed too, so every local check passed while remote
+  # resolution failed. That is exactly how it survived a hardware verification.
+  new_sandbox llama
+  printf '[server]\nuse-ipv4=yes\n' > "$SANDBOX/avahi-daemon.conf"
+  LLAMA_MANAGER_AVAHI_CONF="$SANDBOX/avahi-daemon.conf" "$IDENTITY" apply >/dev/null 2>&1
+  if grep -qE '^deny-interfaces=([^=]*,)?lo(,[^=]*)?$' "$SANDBOX/avahi-daemon.conf"; then
+    printf '  ok   avahi is told not to publish on loopback\n'
+  else
+    printf '  FAIL avahi still publishes on loopback; it will rename itself to -2\n'
+    failures=$((failures + 1))
+  fi
+  drop_sandbox
+}
+
+test_an_operator_deny_list_is_extended_not_replaced() {
+  printf 'test_an_operator_deny_list_is_extended_not_replaced\n'
+  new_sandbox llama
+  printf '[server]\ndeny-interfaces=docker0\n' > "$SANDBOX/avahi-daemon.conf"
+  LLAMA_MANAGER_AVAHI_CONF="$SANDBOX/avahi-daemon.conf" "$IDENTITY" apply >/dev/null 2>&1
+  if grep -qE '^deny-interfaces=.*docker0' "$SANDBOX/avahi-daemon.conf"; then
+    printf '  ok   an existing deny-interfaces entry survives\n'
+  else
+    printf '  FAIL an operator deny-interfaces entry was discarded\n'
+    failures=$((failures + 1))
+  fi
+  drop_sandbox
+}
+
 test_a_hostname_failure_never_blocks_the_manager() {
   printf 'test_a_hostname_failure_never_blocks_the_manager\n'
   new_sandbox llama
@@ -354,6 +392,8 @@ test_a_missing_loopback_alias_is_added
 test_avahi_is_told_to_republish_after_a_rename
 test_avahi_is_left_alone_when_the_name_did_not_change
 test_the_mirror_is_written_at_the_partition_root
+test_avahi_does_not_publish_on_loopback
+test_an_operator_deny_list_is_extended_not_replaced
 test_a_hostname_failure_never_blocks_the_manager
 
 if ((failures > 0)); then
