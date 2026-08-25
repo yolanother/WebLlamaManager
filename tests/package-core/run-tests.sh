@@ -383,6 +383,20 @@ test_packaged_service_uses_declared_offline_node_runtime() {
   contract="$(cat "$REPO_ROOT/packaging/runtime-contract.env" 2>/dev/null || true)"
   assert_contains "service executes only through clean environment launcher" "$service" "ExecStart=/usr/bin/env -i /usr/lib/llama-manager/scripts/run-packaged-service"
   assert_contains "service validates package-owned Node before startup" "$service" "/usr/lib/llama-manager/node/bin/node /usr/lib/llama-manager/scripts/check-node-runtime.mjs"
+  # distrobox-enter reads $USER directly and aborts with
+  # "distrobox-enter: 341: USER: parameter not set" when it is absent. The
+  # launcher rebuilds the environment with `env -i`, and a system service has no
+  # login session to supply it, so every engine start failed with podman exit
+  # 125 on a booted appliance -- the kiosk sat with no engine and the error
+  # never reached the manager's log. Verified on hardware: adding USER alone
+  # takes the router from exit 125 to listening on 8080.
+  local launcher
+  launcher="$(cat "$REPO_ROOT/scripts/run-packaged-service")"
+  assert_contains "launcher passes USER through for distrobox" "$launcher" "[USER]=llama-manager"
+  assert_contains "launcher passes LOGNAME through for distrobox" "$launcher" "[LOGNAME]=llama-manager"
+  # The slot cache must resolve INSIDE the engine container, where /var/cache is
+  # the container's own filesystem. Only $HOME is mounted through.
+  assert_contains "slot cache lives under the mounted service home" "$launcher" "[SLOT_SAVE_PATH]=/var/lib/llama-manager/.cache/llama-slots"
   assert_contains "manifest declares minimum Node" "$contract" "LLAMA_MANAGER_NODE_VERSION_MIN=20.18.1"
   assert_contains "manifest declares bundled Node path" "$contract" "LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node"
   assert_contains "manifest declares sanitized launcher" "$contract" "LLAMA_MANAGER_SERVICE_LAUNCHER=/usr/lib/llama-manager/scripts/run-packaged-service"

@@ -151,6 +151,7 @@ import { beginLlamaUpdate, createLlamaSourceUpdateSpec } from './llama-update-co
 import { applyConfigDefaults } from './config-defaults.js';
 import { scheduleAutoStart } from './auto-start.js';
 import { resolveAltPort, listenBestEffort } from './alt-port.js';
+import { shouldIdleShutdown } from './idle-shutdown.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -346,6 +347,10 @@ let ds4SwapPromise = null;
 let ds4SettledRuntime = null;
 let lastUsedModel = null;   // most recently used model name
 let lastUsedModelTime = 0;  // timestamp of last use
+// When the router process last started. Idle time is measured from the LATER of
+// this and lastUsedModelTime, so an engine that has never served a request is
+// not treated as idle since the epoch. See api/idle-shutdown.js.
+let llamaStartedAt = 0;
 let activeLocalModel = null; // model currently being processed/loaded on local backend
 // Background-refreshed snapshot of the models the local router currently has resident,
 // as [{ id, sizeBytes }]. Read synchronously on the routing hot path by the
@@ -5865,6 +5870,7 @@ async function restartLlamaServer({ governed = true } = {}) {
       };
 
       console.log(`[restart] Starting preset: ${currentPreset}`);
+      llamaStartedAt = Date.now();
       llamaProcess = spawn('bash', [startScript], {
         cwd: PROJECT_ROOT,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -5889,6 +5895,7 @@ async function restartLlamaServer({ governed = true } = {}) {
       console.log('[restart] Starting router mode');
       currentMode = 'router';
       currentPreset = null;
+      llamaStartedAt = Date.now();
       llamaProcess = spawn('bash', [startScript], {
         cwd: PROJECT_ROOT,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -6498,7 +6505,8 @@ app.post('/api/server/start', async (req, res) => {
       HF_TOKEN: resolveHfToken(config, process.env)
     };
 
-    llamaProcess = spawn('bash', [startScript], {
+    llamaStartedAt = Date.now();
+      llamaProcess = spawn('bash', [startScript], {
       cwd: PROJECT_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
@@ -6605,7 +6613,8 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
     addLog('presets', `Activating preset: ${preset.name}`);
     addLog('presets', `EXTRA_SWITCHES: ${env.EXTRA_SWITCHES}`);
 
-    llamaProcess = spawn('bash', [startScript], {
+    llamaStartedAt = Date.now();
+      llamaProcess = spawn('bash', [startScript], {
       cwd: PROJECT_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
@@ -12399,8 +12408,15 @@ setInterval(async () => {
   if (activeRequests.size > 0) return; // requests in flight
   if (llamaQueue.active > 0 || llamaQueue.pending > 0) return;
 
-  const idleMs = Date.now() - (lastUsedModelTime || 0);
-  if (idleMs >= IDLE_SHUTDOWN_MINUTES * 60_000) {
+  const now = Date.now();
+  if (!shouldIdleShutdown({
+    now,
+    lastUsedAt: lastUsedModelTime,
+    startedAt: llamaStartedAt,
+    idleMinutes: IDLE_SHUTDOWN_MINUTES,
+  })) return;
+  {
+    const idleMs = now - Math.max(lastUsedModelTime || 0, llamaStartedAt || 0);
     const msg = `Idle shutdown: no requests for ${Math.round(idleMs / 60_000)} minutes. Stopping llama-server to save resources.`;
     console.log(`[idle] ${msg}`);
     addLog('system', msg);

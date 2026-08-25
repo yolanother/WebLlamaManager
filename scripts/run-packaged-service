@@ -22,6 +22,15 @@ declare -A SERVICE_ENV=(
   [NODE_ENV]=production
   [LLAMA_MANAGER_NODE_BIN]="$NODE_BIN"
   [HOME]=/var/lib/llama-manager
+  # distrobox-enter reads $USER directly and aborts with
+  # "distrobox-enter: 341: USER: parameter not set" without it. A system service
+  # has no login session to provide one, and this launcher rebuilds the
+  # environment from nothing, so the variable has to be declared here or the
+  # engine cannot start at all: every attempt died with podman exit 125, the
+  # kiosk reported no engine, and the underlying error never reached the
+  # manager's log because it is written by a process two levels down.
+  [USER]=llama-manager
+  [LOGNAME]=llama-manager
   [LLAMA_MANAGER_PACKAGED]=1
   [LLAMA_MANAGER_CONFIG_DIR]=/etc/llama-manager
   [LLAMA_MANAGER_DATA_DIR]=/var/lib/llama-manager
@@ -32,7 +41,15 @@ declare -A SERVICE_ENV=(
   [DS4_SERVER_BIN]="$DS4_BIN"
   [DISTROBOX_CONTAINER]="$ROCM_CONTAINER"
   [LLAMA_SERVER_BIN]="$LLAMA_BIN"
-  [SLOT_SAVE_PATH]=/var/cache/llama-manager/slots
+  # Inside the engine's distrobox container /var/cache is the CONTAINER's own,
+  # not the host's -- distrobox mounts $HOME and /run/host and nothing else. A
+  # host path here made llama-server die on
+  # "mkdir: cannot create directory '/var/cache/llama-manager': Permission
+  # denied" every time it started. The slot cache therefore lives under the
+  # service HOME, which distrobox does mount, so the same path resolves on both
+  # sides. Verified on hardware: this is what took the router from exit 1 to
+  # serving on 8080.
+  [SLOT_SAVE_PATH]=/var/lib/llama-manager/.cache/llama-slots
   [XDG_RUNTIME_DIR]=/run/llama-manager
   [PATH]=/usr/local/bin:/usr/bin:/bin
   [API_PORT]=3001
