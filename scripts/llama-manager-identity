@@ -36,6 +36,27 @@ HOSTNAMECTL="${LLAMA_MANAGER_HOSTNAMECTL:-hostnamectl}"
 CHOWN="${LLAMA_MANAGER_CHOWN:-chown}"
 STATE_OWNER="${LLAMA_MANAGER_STATE_OWNER:-llama-manager:llama-manager}"
 
+# Live USB persistence. The partition is addressed by LABEL and mounted at its
+# ROOT under /run for the moment it is needed, rather than reusing whatever mount
+# it already has. Measured on real media: casper bind-mounts this partition into
+# /var/log and /var/crash from a per-boot subdirectory named for the date
+# (install-logs-2026-08-25.0/log), so anything written through those paths is in
+# a directory the NEXT boot does not look at -- the name would be silently
+# forgotten on exactly the reboot it exists to survive.
+WRITABLE_DEVICE="${LLAMA_MANAGER_WRITABLE_DEVICE:-/dev/disk/by-label/writable}"
+WRITABLE_MOUNT="${LLAMA_MANAGER_WRITABLE_MOUNT:-/run/llama-manager/writable}"
+MIRROR_RELATIVE_PATH='llama-manager/node-name'
+MOUNT="${LLAMA_MANAGER_MOUNT:-mount}"
+UMOUNT="${LLAMA_MANAGER_UMOUNT:-umount}"
+
+# Path of the mirror for this run, and whether this run is the one that mounted
+# the partition and therefore owes it an unmount.
+MIRROR_PATH=""
+MIRROR_MOUNTED=0
+
+# Tool used to ask avahi to re-announce this node. Overridable for tests.
+SYSTEMCTL="${LLAMA_MANAGER_SYSTEMCTL:-systemctl}"
+
 # Loopback alias file kept in step with the hostname. Overridable for tests.
 HOSTS_FILE="${LLAMA_MANAGER_HOSTS_FILE:-/etc/hosts}"
 
@@ -47,32 +68,39 @@ BOOTSTRAP_NAME='setup'
 # characters and "-llama-manager" costs 14, so this is a readability cap.
 MAX_NAME_LENGTH=24
 
-# Locates the writable partition a live USB boot persists onto.
+# Makes the live USB's writable partition available and sets MIRROR_PATH.
 #
-# The live root is a RAM-backed overlay, so without this the chosen name would be
-# forgotten on every reboot. The partition is found by label rather than by path
-# because casper and the installer mount it wherever they like -- on current
-# media it lands on /var/crash, which is not a path anyone would guess. Prints
-# nothing when there is no such partition, which is the normal case for an
-# appliance installed on a disk.
-find_writable_mount() {
-  local target
-  target="$(findmnt --noheadings --output TARGET --first-only LABEL=writable 2>/dev/null)" || return 0
-  [[ -n "$target" && -d "$target" ]] && printf '%s\n' "$target"
+# An explicit override wins outright, which is how "this is an installed disk
+# with no mirror" is expressed (empty) and how the behaviour is tested without a
+# partition. Otherwise the labelled partition is mounted at its root; every
+# failure just leaves MIRROR_PATH empty, because losing persistence is worth a
+# shrug and never a failed boot.
+open_mirror() {
+  if [[ -n "${LLAMA_MANAGER_NODE_NAME_MIRROR+x}" ]]; then
+    MIRROR_PATH="$LLAMA_MANAGER_NODE_NAME_MIRROR"
+    return 0
+  fi
+  # Existence rather than a block-device test: the label is either there or it is
+  # not, and mount is the honest arbiter of whether it can be used. Anything that
+  # cannot be mounted falls through to "no mirror" like every other failure here.
+  [[ -e "$WRITABLE_DEVICE" ]] || return 0
+  mkdir -p "$WRITABLE_MOUNT" 2>/dev/null || return 0
+  if ! findmnt --noheadings --mountpoint "$WRITABLE_MOUNT" >/dev/null 2>&1; then
+    "$MOUNT" "$WRITABLE_DEVICE" "$WRITABLE_MOUNT" 2>/dev/null || return 0
+    MIRROR_MOUNTED=1
+  fi
+  MIRROR_PATH="$WRITABLE_MOUNT/$MIRROR_RELATIVE_PATH"
   return 0
 }
 
-# Resolves the mirror path on the writable partition, honouring an explicit
-# override so tests need no real partition. An empty override means "no mirror",
-# which is how an installed disk is expressed.
-resolve_mirror_path() {
-  if [[ -n "${LLAMA_MANAGER_NODE_NAME_MIRROR+x}" ]]; then
-    printf '%s\n' "$LLAMA_MANAGER_NODE_NAME_MIRROR"
-    return 0
+# Releases the writable partition if this run mounted it, so the appliance is not
+# left holding a mount nobody asked for.
+close_mirror() {
+  if [[ "$MIRROR_MOUNTED" == 1 ]]; then
+    "$UMOUNT" "$WRITABLE_MOUNT" 2>/dev/null || \
+      printf 'llama-manager-identity: could not release %s\n' "$WRITABLE_MOUNT" >&2
+    MIRROR_MOUNTED=0
   fi
-  local mount
-  mount="$(find_writable_mount)"
-  [[ -n "$mount" ]] && printf '%s/llama-manager/node-name\n' "$mount"
   return 0
 }
 
@@ -104,7 +132,7 @@ read_name_file() {
 resolve_name() {
   local name
   name="$(read_name_file "$NAME_FILE")"
-  [[ -n "$name" ]] || name="$(read_name_file "$(resolve_mirror_path)")"
+  [[ -n "$name" ]] || name="$(read_name_file "$MIRROR_PATH")"
   [[ -n "$name" ]] || name="$BOOTSTRAP_NAME"
   printf '%s\n' "$name"
 }
@@ -154,6 +182,7 @@ update_hosts_alias() {
 # to every store so the next boot -- live or installed -- finds it first.
 apply_identity() {
   local name hostname current
+  open_mirror
   name="$(resolve_name)"
   hostname="$name-llama-manager"
 
@@ -173,7 +202,7 @@ apply_identity() {
 
   # The mirror lives on the live USB's writable partition and is only ever
   # touched by root, so it is deliberately not handed over.
-  persist_name "$(resolve_mirror_path)" "$name"
+  persist_name "$MIRROR_PATH" "$name"
 
   update_hosts_alias "$hostname"
 
@@ -184,6 +213,21 @@ apply_identity() {
   fi
 
   if "$HOSTNAMECTL" set-hostname "$hostname" 2>/dev/null; then
+    # Measured on the appliance: avahi-daemon does NOT notice a hostname change.
+    # It keeps answering for the name it started with -- so a renamed box was
+    # reachable at its OLD .local address and never at its new one, which is the
+    # entire feature. avahi re-reads the system hostname at startup, so bouncing
+    # it is what actually publishes the new name. try-restart rather than restart
+    # so this is a no-op at boot, where this step runs before avahi has started
+    # and avahi will read the correct hostname on its own.
+    #
+    # --no-block is load-bearing. This unit is ordered Before= avahi-daemon, so a
+    # blocking restart asks systemd for a job that is ordered after the job that
+    # is waiting on it. That deadlocks the transaction, times out, and leaves
+    # avahi STOPPED -- the box then has no mDNS at all, which is far worse than
+    # the stale name this call exists to fix. Measured on a live appliance.
+    "$SYSTEMCTL" --no-block try-restart avahi-daemon.service 2>/dev/null || \
+      printf 'llama-manager-identity: could not ask avahi to re-announce\n' >&2
     printf 'llama-manager-identity: published as %s.local\n' "$hostname"
   else
     # A box that cannot set its hostname still has to boot and serve. It stays
@@ -195,8 +239,15 @@ apply_identity() {
 }
 
 case "${1:-apply}" in
-  apply) apply_identity ;;
-  show) resolve_name ;;
+  apply)
+    apply_identity
+    close_mirror
+    ;;
+  show)
+    open_mirror
+    resolve_name
+    close_mirror
+    ;;
   *)
     printf 'Usage: %s [apply|show]\n' "${0##*/}" >&2
     exit 2

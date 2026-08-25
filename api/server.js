@@ -7460,6 +7460,10 @@ function readStoredNodeName() {
  * live hostname is reported alongside it so a machine whose hostname was changed
  * from underneath the manager is visible as such rather than silently wrong.
  *
+ * "bootstrap" asks whether this node still answers to the unnamed default, not
+ * whether a file exists: the boot path writes the resolved name back to the store
+ * on every start, so the bootstrap name is itself stored from the first boot on.
+ *
  * @returns {{name:string, hostname:string, url:string, bootstrap:boolean,
  *   systemHostname:string, published:boolean}} Current node identity.
  */
@@ -7471,7 +7475,7 @@ function describeNodeIdentity() {
     name,
     hostname: hostnameFor(name),
     url: urlFor(name),
-    bootstrap: !stored,
+    bootstrap: name === BOOTSTRAP_NAME,
     systemHostname: live,
     published: nameFromHostname(live) === name,
   };

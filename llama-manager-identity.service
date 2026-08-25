@@ -30,3 +30,8 @@ ExecStart=/usr/lib/llama-manager/scripts/llama-manager-identity apply
 # The appliance must boot and serve even if it cannot name itself; the script
 # already swallows its own failures and this makes that contract explicit.
 SuccessExitStatus=0
+# Ordering this unit before avahi means every avahi start waits on it, so a
+# resolver that ever wedged would cost the appliance mDNS altogether. Bound it:
+# a name that could not be resolved in half a minute is not going to be, and a
+# box reachable by IP under its old name beats a box with no mDNS at all.
+TimeoutStartSec=30
