@@ -397,6 +397,8 @@ test_packaged_service_uses_declared_offline_node_runtime() {
   # The slot cache must resolve INSIDE the engine container, where /var/cache is
   # the container's own filesystem. Only $HOME is mounted through.
   assert_contains "slot cache lives under the mounted service home" "$launcher" "[SLOT_SAVE_PATH]=/var/lib/llama-manager/.cache/llama-slots"
+  # A restart must not SIGTERM the engine container that shares this cgroup.
+  assert_contains "service restart leaves the engine container alive" "$service" "KillMode=process"
   assert_contains "manifest declares minimum Node" "$contract" "LLAMA_MANAGER_NODE_VERSION_MIN=20.18.1"
   assert_contains "manifest declares bundled Node path" "$contract" "LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node"
   assert_contains "manifest declares sanitized launcher" "$contract" "LLAMA_MANAGER_SERVICE_LAUNCHER=/usr/lib/llama-manager/scripts/run-packaged-service"

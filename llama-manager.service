@@ -24,6 +24,19 @@ SupplementaryGroups=render video
 WorkingDirectory=/usr/lib/llama-manager/api
 ExecStartPre=/usr/bin/env -i HOME=/var/lib/llama-manager NODE_ENV=production LLAMA_MANAGER_PACKAGED=1 LLAMA_MANAGER_NODE_BIN=/usr/lib/llama-manager/node/bin/node PATH=/usr/bin:/bin /usr/lib/llama-manager/node/bin/node /usr/lib/llama-manager/scripts/check-node-runtime.mjs
 ExecStart=/usr/bin/env -i /usr/lib/llama-manager/scripts/run-packaged-service
+# Stop only the manager process, never its descendants.
+#
+# The engine runs in a rootless Podman container that distrobox starts on first
+# entry, which places it in THIS SERVICE'S cgroup. Under the default
+# KillMode=control-group, `systemctl restart llama-manager` therefore SIGTERMs
+# the container along with the manager -- observed on the appliance as the engine
+# container sitting at "Exited (143)" immediately after every restart, so the
+# manager then failed to enter it and reported podman exit 125. The service was
+# destroying the engine it was about to look for.
+#
+# The manager already stops llama-server explicitly by PID on shutdown, so
+# nothing is leaked by leaving the cgroup alone here.
+KillMode=process
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30
