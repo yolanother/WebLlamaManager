@@ -36,6 +36,9 @@ HOSTNAMECTL="${LLAMA_MANAGER_HOSTNAMECTL:-hostnamectl}"
 CHOWN="${LLAMA_MANAGER_CHOWN:-chown}"
 STATE_OWNER="${LLAMA_MANAGER_STATE_OWNER:-llama-manager:llama-manager}"
 
+# Loopback alias file kept in step with the hostname. Overridable for tests.
+HOSTS_FILE="${LLAMA_MANAGER_HOSTS_FILE:-/etc/hosts}"
+
 # Name carried before any theme has been chosen. A freshly flashed box is
 # addressable at setup-llama-manager.local from its very first boot.
 BOOTSTRAP_NAME='setup'
@@ -120,6 +123,33 @@ persist_name() {
   return 0
 }
 
+# Points the 127.0.1.1 loopback alias at the current hostname.
+#
+# hostnamectl does not touch /etc/hosts, and Debian's convention is that the
+# machine's own name resolves through that alias. Leaving it stale is what
+# produces "sudo: unable to resolve host" and a multi-second stall on every
+# privileged command -- a small thing that makes a renamed appliance feel broken.
+# The line is rewritten in place, or appended when the file has no alias at all,
+# and nothing else in the file is touched.
+update_hosts_alias() {
+  local hostname="$1" tmp
+  [[ -w "$HOSTS_FILE" ]] || return 0
+  tmp="$(mktemp "${HOSTS_FILE}.XXXXXX" 2>/dev/null)" || return 0
+  if grep -q '^127\.0\.1\.1[[:space:]]' "$HOSTS_FILE"; then
+    sed -e "s/^127\.0\.1\.1[[:space:]].*/127.0.1.1\t$hostname/" "$HOSTS_FILE" > "$tmp"
+  else
+    cat "$HOSTS_FILE" > "$tmp"
+    printf '127.0.1.1\t%s\n' "$hostname" >> "$tmp"
+  fi
+  # Written back through the existing inode rather than renamed over it, so the
+  # file keeps its ownership and mode and a /etc/hosts that is a symlink stays
+  # one. The staging file means sed never reads a file it is writing.
+  cat "$tmp" > "$HOSTS_FILE" 2>/dev/null || \
+    printf 'llama-manager-identity: cannot update %s\n' "$HOSTS_FILE" >&2
+  rm -f "$tmp"
+  return 0
+}
+
 # Resolves the identity, publishes it as the system hostname, and writes it back
 # to every store so the next boot -- live or installed -- finds it first.
 apply_identity() {
@@ -144,6 +174,8 @@ apply_identity() {
   # The mirror lives on the live USB's writable partition and is only ever
   # touched by root, so it is deliberately not handed over.
   persist_name "$(resolve_mirror_path)" "$name"
+
+  update_hosts_alias "$hostname"
 
   current="$("$HOSTNAMECTL" hostname 2>/dev/null)"
   if [[ "$current" == "$hostname" ]]; then

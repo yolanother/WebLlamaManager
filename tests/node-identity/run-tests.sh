@@ -72,7 +72,11 @@ printf '%s\n' "$*" >> "$SANDBOX/chown-calls"
 FAKE
   chmod +x "$SANDBOX/bin/chown"
 
+  printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n::1\tip6-localhost\n' "$1" \
+    > "$SANDBOX/hosts"
+
   export SANDBOX
+  export LLAMA_MANAGER_HOSTS_FILE="$SANDBOX/hosts"
   export LLAMA_MANAGER_CHOWN="$SANDBOX/bin/chown"
   export LLAMA_MANAGER_HOSTNAMECTL="$SANDBOX/bin/hostnamectl"
   export LLAMA_MANAGER_NODE_NAME_FILE="$SANDBOX/state/node-name"
@@ -87,7 +91,8 @@ FAKE
 drop_sandbox() {
   rm -rf "$SANDBOX"
   unset SANDBOX LLAMA_MANAGER_CHOWN LLAMA_MANAGER_HOSTNAMECTL \
-    LLAMA_MANAGER_NODE_NAME_FILE LLAMA_MANAGER_NODE_NAME_MIRROR
+    LLAMA_MANAGER_HOSTS_FILE LLAMA_MANAGER_NODE_NAME_FILE \
+    LLAMA_MANAGER_NODE_NAME_MIRROR
 }
 
 # Records the hostname the script settled on, so a test can assert what avahi
@@ -195,6 +200,34 @@ test_state_stays_writable_by_the_manager_account() {
   drop_sandbox
 }
 
+test_the_node_can_still_resolve_its_own_name() {
+  printf 'test_the_node_can_still_resolve_its_own_name\n'
+  new_sandbox llama
+  printf 'nebula\n' > "$LLAMA_MANAGER_NODE_NAME_FILE"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "the loopback alias follows the hostname" \
+    "$(awk '$1 == "127.0.1.1" { print $2 }' "$LLAMA_MANAGER_HOSTS_FILE")" \
+    "nebula-llama-manager"
+  assert_equals "the rest of the hosts file is left alone" \
+    "$(awk '$1 == "127.0.0.1" { print $2 }' "$LLAMA_MANAGER_HOSTS_FILE")" \
+    "localhost"
+  assert_equals "no duplicate loopback alias is left behind" \
+    "$(grep -c '^127.0.1.1' "$LLAMA_MANAGER_HOSTS_FILE")" "1"
+  drop_sandbox
+}
+
+test_a_missing_loopback_alias_is_added() {
+  printf 'test_a_missing_loopback_alias_is_added\n'
+  new_sandbox llama
+  printf '127.0.0.1\tlocalhost\n' > "$LLAMA_MANAGER_HOSTS_FILE"
+  printf 'nebula\n' > "$LLAMA_MANAGER_NODE_NAME_FILE"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "a hosts file with no alias gains one" \
+    "$(awk '$1 == "127.0.1.1" { print $2 }' "$LLAMA_MANAGER_HOSTS_FILE")" \
+    "nebula-llama-manager"
+  drop_sandbox
+}
+
 test_a_hostname_failure_never_blocks_the_manager() {
   printf 'test_a_hostname_failure_never_blocks_the_manager\n'
   new_sandbox llama
@@ -214,6 +247,8 @@ test_a_corrupt_store_never_yields_an_empty_hostname
 test_stored_text_is_re_normalized_before_it_is_published
 test_an_already_correct_hostname_is_left_alone
 test_state_stays_writable_by_the_manager_account
+test_the_node_can_still_resolve_its_own_name
+test_a_missing_loopback_alias_is_added
 test_a_hostname_failure_never_blocks_the_manager
 
 if ((failures > 0)); then
