@@ -14,6 +14,9 @@ When you hit a new one: add an entry below, drop a script under
 | llama.cpp on Strix Halo logs `failed to initialize ROCm: no ROCm-capable device is detected`; tok/s < 1 even on small models; `rocminfo` says `Unable to open /dev/kfd read-write: Invalid argument` | Blacklist the `amdxdna` NPU driver — it claims `/dev/kfd` before `amdgpu` can | [`scripts/fix-strix-halo-npu-conflict.sh`](../scripts/fix-strix-halo-npu-conflict.sh) |
 | `/dev/kfd` permissions look fine but container `rocminfo` returns EINVAL anyway | Full `amdgpu` reload (or host reboot) — the in-kernel KFD state is wedged | [`scripts/fix-gpu-passthrough.sh`](../scripts/fix-gpu-passthrough.sh) |
 | Model loaded but only a few hundred MB land in GTT; HIP backend logs `cudaMalloc failed` on Strix Halo for models larger than the BIOS-reserved VRAM partition | Export `GGML_HIP_UMA=1` and `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` before launching `llama-server` (already wired into `container-start.sh`) | n/a — config |
+| A renamed appliance is still reachable only at its OLD `<name>.local` address | `avahi-daemon` never notices a hostname change; ask it to re-announce with `systemctl --no-block try-restart avahi-daemon.service` | [`scripts/llama-manager-identity`](../scripts/llama-manager-identity) |
+| Restarting `avahi-daemon` from a unit ordered `Before=` it wedges systemd and leaves avahi **stopped** | The restart job is ordered after the job waiting on it. Use `--no-block`, and bound the unit with `TimeoutStartSec=` | [`llama-manager-identity.service`](../llama-manager-identity.service) |
+| A live USB forgets state written under the `writable` partition's mount point | casper bind-mounts that partition from a per-boot dated subdirectory. Mount it at its own root instead | [`scripts/llama-manager-identity`](../scripts/llama-manager-identity) |
 | `node --test api/` hangs forever with no output (or dies with `ERR_MODULE_NOT_FOUND: express`), and stray `node api` processes pile up | The bare directory arg spawns `node api` → `api/server.js` → a **real server**. Run [`node --test api/*.test.js`](#node---test-api-boots-a-real-server-and-hangs-forever) instead | n/a — invocation |
 
 ---
@@ -370,3 +373,76 @@ When you hit something painful:
 
 If the gotcha is about a hardware/kernel combo that isn't yours, label
 it clearly under **Affects** so other users know whether it applies.
+
+---
+
+## Node identity: three things that only fail on real media
+
+**Affects:** any appliance that publishes itself over mDNS — see
+[Zero-configuration node identity](Designs/NodeIdentity.md).
+
+All three passed a green test suite and failed on a booted appliance.
+
+### avahi-daemon does not notice a hostname change
+
+`hostnamectl set-hostname` changes the hostname, `/etc/hostname`, and the kernel
+node name, and `avahi-daemon` keeps answering for the name it started with. A
+renamed box was reachable at its **old** `.local` address and never at its new
+one — which is the entire feature, silently absent, with every local check
+passing.
+
+avahi re-reads the system hostname at startup, so the fix is to ask it to
+re-announce:
+
+```bash
+systemctl --no-block try-restart avahi-daemon.service
+```
+
+`try-restart` rather than `restart` so it is a no-op at boot, where identity is
+applied before avahi has started and avahi reads the correct hostname by itself.
+
+### A blocking restart of avahi from a unit ordered before it deadlocks systemd
+
+`llama-manager-identity.service` is `Before=avahi-daemon.service`. Calling
+`systemctl try-restart avahi-daemon.service` from inside it asks systemd for a
+job that is ordered *after* the job currently waiting on that call. The
+transaction deadlocks, the unit times out, and **avahi is left stopped** — the
+box then has no mDNS at all, which is far worse than the stale name the call
+exists to fix.
+
+Symptom, once it has happened:
+
+```
+$ systemctl list-jobs
+26607 llama-manager-identity.service start running
+26692 avahi-daemon.service           start waiting
+```
+
+Recover by killing the wedged `systemctl` and script processes; the jobs then
+drain. Avoid it with `--no-block`, and give the unit a `TimeoutStartSec=` so a
+resolver that ever wedges cannot hold avahi hostage indefinitely.
+
+### The `writable` partition is not mounted where you would write to it
+
+`findmnt LABEL=writable` reports a mount point — `/var/log` on current media —
+but casper bind-mounts the partition there from a subdirectory named for the boot
+date:
+
+```
+$ findmnt -o SOURCE,TARGET | grep writable
+/dev/disk/by-label/writable[/install-logs-2026-08-25.0/log]   /var/log
+/dev/disk/by-label/writable[/install-logs-2026-08-25.0/crash] /var/crash
+```
+
+Anything written through those paths lands in a directory the **next** boot does
+not look at, so live-USB state is forgotten on exactly the reboot it exists to
+survive — and it looks perfectly persistent until you actually reboot.
+
+Mount the labelled partition at its own root for the moment you need it:
+
+```bash
+mkdir -p /run/llama-manager/writable
+mount /dev/disk/by-label/writable /run/llama-manager/writable
+# ... read/write /run/llama-manager/writable/<your state> ...
+umount /run/llama-manager/writable
+```
