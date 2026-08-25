@@ -167,7 +167,25 @@ test_canonical_service_assets_are_package_safe() {
   assert_contains "service opts into packaged path defaults" "$service" "LLAMA_MANAGER_PACKAGED=1"
   assert_contains "service launches through immutable package code" "$service" "/usr/lib/llama-manager/scripts/run-packaged-service"
   assert_contains "polkit checks manager group" "$polkit" 'subject.isInGroup("llama-manager")'
-  assert_contains "polkit restricts authority to one unit" "$polkit" 'unit == "llama-manager.service"'
+  # Authority is scoped to an explicit list of package-owned units. The identity
+  # unit is in it because renaming has to take effect live, and granting the
+  # manager THAT UNIT is narrower than granting it the hostname1 polkit action,
+  # which would let it set any hostname over D-Bus. The list is asserted
+  # element-by-element, and the absence of a permissive fallthrough is asserted
+  # too: widening this rule is a privilege change and should fail the suite until
+  # someone states the new intent here.
+  assert_contains "polkit authorises the manager unit" "$polkit" '"llama-manager.service"'
+  assert_contains "polkit authorises the identity unit" "$polkit" '"llama-manager-identity.service"'
+  assert_contains "polkit authorises by explicit unit list" "$polkit" 'units.indexOf(unit) !== -1'
+  assert_contains "polkit still gates on the manager group" "$polkit" 'subject.isInGroup("llama-manager")'
+  if printf '%s' "$polkit" | grep -qE 'polkit\.Result\.YES' ; then
+    :
+  else
+    fail "polkit rule no longer grants anything"
+  fi
+  if printf '%s' "$polkit" | grep -qE 'return polkit\.Result\.YES;[[:space:]]*\}[[:space:]]*$' ; then
+    fail "polkit grants unconditionally at the end of the rule"
+  fi
   assert_contains "tmpfiles provisions rootless Podman runtime before service start" "$tmpfiles" \
     "d /run/llama-manager 0700 llama-manager llama-manager -"
   assert_contains "service reuses the tmpfiles runtime directory" "$service" "RuntimeDirectory=llama-manager"
