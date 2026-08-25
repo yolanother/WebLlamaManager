@@ -13,6 +13,12 @@ Description=Llama Manager API and Multi-Model Server
 Documentation=https://github.com/yolanother/llama-manager
 Wants=network-online.target
 After=network-online.target
+# Name this node before the manager answers on it. Wants= rather than an enabled
+# unit keeps identity on exactly one enablement path -- the manager's own -- so a
+# live USB boot and an installed disk both get it with no image-build or postinst
+# step of their own.
+Wants=llama-manager-identity.service
+After=llama-manager-identity.service
 StartLimitIntervalSec=120
 StartLimitBurst=5
 

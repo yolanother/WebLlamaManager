@@ -16,7 +16,7 @@ import { join } from 'path';
  * @param {{projectRoot:string, home?:string}} context Immutable application root and user home.
  * @returns {{packaged:boolean, configDir:string, configPath:string, dataDir:string,
  *   cacheDir:string, modelsDir:string, ds4ModelsDir:string, ds4StateDir:string,
- *   slotCacheDir:string}} Resolved absolute or caller-supplied paths.
+ *   nodeNamePath:string, slotCacheDir:string}} Resolved absolute or caller-supplied paths.
  */
 export function resolveRuntimePaths(env = {}, { projectRoot, home = env.HOME || '/root' } = {}) {
   if (!projectRoot) throw new TypeError('projectRoot is required');
@@ -34,6 +34,7 @@ export function resolveRuntimePaths(env = {}, { projectRoot, home = env.HOME || 
     modelsDir,
     ds4ModelsDir: env.DS4_GGUF_DIR || (packaged ? join(modelsDir, 'ds4') : join(home, 'models-ds4', 'deepseek-v4-gguf')),
     ds4StateDir: env.DS4_STATE_DIR || (packaged ? join(dataDir, 'ds4') : join(home, '.local', 'share', 'ds4')),
+    nodeNamePath: env.NODE_NAME_PATH || join(dataDir, 'node-name'),
     slotCacheDir: env.SLOT_SAVE_PATH || (packaged ? join(cacheDir, 'slots') : join(home, '.cache', 'llama-slots')),
   };
 }

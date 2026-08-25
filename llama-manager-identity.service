@@ -1,0 +1,32 @@
+# Llama Manager — node identity publication for zero-configuration access.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Resolves this appliance's node name and publishes it as the system hostname so
+# avahi-daemon answers for <name>-llama-manager.local. Runs as root because
+# changing the hostname requires it, and is deliberately not enabled with its own
+# WantedBy symlink: llama-manager.service pulls it in with Wants=, so the single
+# already-established enablement of the manager brings identity along on a live
+# USB boot and on an installed disk alike, with no second enablement path to keep
+# in sync in the image build and the package.
+#
+# It is also the seam the manager restarts, through the package's polkit rule,
+# when an operator chooses a new name -- so exactly one component ever writes the
+# hostname, at boot and at rename both.
+
+[Unit]
+Description=Llama Manager Node Identity
+Documentation=https://github.com/yolanother/llama-manager
+# Ordered before avahi where avahi is present so the very first publication is
+# already the right name. avahi re-publishes on later hostname changes by itself,
+# which is what makes the rename path work without touching it.
+Before=avahi-daemon.service
+After=systemd-hostnamed.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/usr/lib/llama-manager/scripts/llama-manager-identity apply
+# The appliance must boot and serve even if it cannot name itself; the script
+# already swallows its own failures and this makes that contract explicit.
+SuccessExitStatus=0

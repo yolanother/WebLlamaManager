@@ -1,0 +1,173 @@
+#!/bin/bash
+# Llama Manager — boot-time node identity resolution and hostname application.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Decides what this appliance calls itself and makes that name the system
+# hostname, which is the whole of the zero-configuration story: avahi-daemon
+# already publishes <hostname>.local, so setting the hostname is sufficient to
+# make the box reachable at <name>-llama-manager.local from any machine on the
+# link with no configuration anywhere. Runs as root from
+# llama-manager-identity.service, both at boot and again whenever the manager
+# persists a newly chosen name.
+#
+# Resolution order is persistent state, then the live USB's writable partition,
+# then the bootstrap name "setup". That order is what makes both directions
+# correct with one rule: at a live boot the persistent path is an empty RAM
+# overlay so the writable partition's copy wins and the box keeps the identity it
+# was given, while immediately after the manager writes a new name the persistent
+# path exists and the new name wins over the now-stale mirror.
+#
+# Nothing here is allowed to fail the unit. An appliance that cannot set its
+# hostname is still an appliance that must start and serve, and the manager is
+# ordered after this step.
+set -uo pipefail
+
+# Persistent store, written by this script and by the manager (which owns
+# /var/lib/llama-manager through the unit's StateDirectory).
+NAME_FILE="${LLAMA_MANAGER_NODE_NAME_FILE:-/var/lib/llama-manager/node-name}"
+
+# Tool used to change the hostname. Overridable so the behaviour can be tested
+# without touching the machine running the tests.
+HOSTNAMECTL="${LLAMA_MANAGER_HOSTNAMECTL:-hostnamectl}"
+
+# Tool used to hand the persistent store back to the service account, and the
+# account it is handed to. Overridable so the handover is observable in tests.
+CHOWN="${LLAMA_MANAGER_CHOWN:-chown}"
+STATE_OWNER="${LLAMA_MANAGER_STATE_OWNER:-llama-manager:llama-manager}"
+
+# Name carried before any theme has been chosen. A freshly flashed box is
+# addressable at setup-llama-manager.local from its very first boot.
+BOOTSTRAP_NAME='setup'
+
+# Longest name accepted, mirroring api/node-identity.js. A DNS label may be 63
+# characters and "-llama-manager" costs 14, so this is a readability cap.
+MAX_NAME_LENGTH=24
+
+# Locates the writable partition a live USB boot persists onto.
+#
+# The live root is a RAM-backed overlay, so without this the chosen name would be
+# forgotten on every reboot. The partition is found by label rather than by path
+# because casper and the installer mount it wherever they like -- on current
+# media it lands on /var/crash, which is not a path anyone would guess. Prints
+# nothing when there is no such partition, which is the normal case for an
+# appliance installed on a disk.
+find_writable_mount() {
+  local target
+  target="$(findmnt --noheadings --output TARGET --first-only LABEL=writable 2>/dev/null)" || return 0
+  [[ -n "$target" && -d "$target" ]] && printf '%s\n' "$target"
+  return 0
+}
+
+# Resolves the mirror path on the writable partition, honouring an explicit
+# override so tests need no real partition. An empty override means "no mirror",
+# which is how an installed disk is expressed.
+resolve_mirror_path() {
+  if [[ -n "${LLAMA_MANAGER_NODE_NAME_MIRROR+x}" ]]; then
+    printf '%s\n' "$LLAMA_MANAGER_NODE_NAME_MIRROR"
+    return 0
+  fi
+  local mount
+  mount="$(find_writable_mount)"
+  [[ -n "$mount" ]] && printf '%s/llama-manager/node-name\n' "$mount"
+  return 0
+}
+
+# Folds arbitrary stored text into a legal single mDNS label.
+#
+# This deliberately repeats the rules in api/node-identity.js rather than calling
+# into Node. It is a defensive re-check of a file, not the primary validator --
+# the manager normalises before it ever writes -- and it has to work at boot with
+# nothing but coreutils. Prints nothing when no usable name remains.
+normalize_name() {
+  printf '%s' "$1" \
+    | tr 'A-Z' 'a-z' \
+    | tr -c 'a-z0-9' '-' \
+    | tr -s '-' \
+    | sed -e 's/^-//' -e 's/-$//' \
+    | cut -c "1-$MAX_NAME_LENGTH" \
+    | sed -e 's/-$//'
+}
+
+# Reads one store file and prints the normalized name it holds, or nothing.
+read_name_file() {
+  local path="$1"
+  [[ -n "$path" && -r "$path" ]] || return 0
+  normalize_name "$(cat "$path" 2>/dev/null)"
+}
+
+# Prints the name this node should answer to, applying the resolution order
+# documented at the top of this file. Never prints an empty string.
+resolve_name() {
+  local name
+  name="$(read_name_file "$NAME_FILE")"
+  [[ -n "$name" ]] || name="$(read_name_file "$(resolve_mirror_path)")"
+  [[ -n "$name" ]] || name="$BOOTSTRAP_NAME"
+  printf '%s\n' "$name"
+}
+
+# Writes a name to a store path, creating its directory. Failures are reported
+# and swallowed: losing persistence is worth a warning, never a failed boot.
+persist_name() {
+  local path="$1" name="$2"
+  [[ -n "$path" ]] || return 0
+  mkdir -p "$(dirname "$path")" 2>/dev/null || {
+    printf 'llama-manager-identity: cannot create %s\n' "$(dirname "$path")" >&2
+    return 0
+  }
+  printf '%s\n' "$name" > "$path" 2>/dev/null || \
+    printf 'llama-manager-identity: cannot write %s\n' "$path" >&2
+  return 0
+}
+
+# Resolves the identity, publishes it as the system hostname, and writes it back
+# to every store so the next boot -- live or installed -- finds it first.
+apply_identity() {
+  local name hostname current
+  name="$(resolve_name)"
+  hostname="$name-llama-manager"
+
+  # Write both stores unconditionally. On a live boot this copies the writable
+  # partition's name into the RAM overlay; after the manager chooses a name it
+  # copies the new name out onto the writable partition. One unconditional write
+  # covers both because resolve_name has already picked the winner.
+  persist_name "$NAME_FILE" "$name"
+
+  # This script runs as root but the manager, which runs as llama-manager, has to
+  # be able to write the same file when an operator picks a new name. A file
+  # created here on a first boot would otherwise be root-owned and the manager
+  # would silently lose the ability to rename the node. The package's tmpfiles
+  # policy seeds the file with the right ownership too; this covers source
+  # installs and any path where tmpfiles has not run.
+  "$CHOWN" "$STATE_OWNER" "$NAME_FILE" 2>/dev/null || true
+
+  # The mirror lives on the live USB's writable partition and is only ever
+  # touched by root, so it is deliberately not handed over.
+  persist_name "$(resolve_mirror_path)" "$name"
+
+  current="$("$HOSTNAMECTL" hostname 2>/dev/null)"
+  if [[ "$current" == "$hostname" ]]; then
+    printf 'llama-manager-identity: already published as %s.local\n' "$hostname"
+    return 0
+  fi
+
+  if "$HOSTNAMECTL" set-hostname "$hostname" 2>/dev/null; then
+    printf 'llama-manager-identity: published as %s.local\n' "$hostname"
+  else
+    # A box that cannot set its hostname still has to boot and serve. It stays
+    # reachable by IP, and the manager is ordered after this step precisely so a
+    # failure here cannot keep the appliance down.
+    printf 'llama-manager-identity: could not set hostname to %s\n' "$hostname" >&2
+  fi
+  return 0
+}
+
+case "${1:-apply}" in
+  apply) apply_identity ;;
+  show) resolve_name ;;
+  *)
+    printf 'Usage: %s [apply|show]\n' "${0##*/}" >&2
+    exit 2
+    ;;
+esac
+exit 0

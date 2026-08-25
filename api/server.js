@@ -23,9 +23,10 @@ import { fileURLToPath } from 'url';
 import { dirname, join, basename, isAbsolute, relative, resolve } from 'path';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { cpus, totalmem, freemem, loadavg } from 'os';
+import { cpus, totalmem, freemem, loadavg, hostname as systemHostname, networkInterfaces } from 'os';
 import { EventEmitter } from 'events';
 import { createHash } from 'crypto';
+import { lookup as dnsLookup } from 'dns/promises';
 import pty from 'node-pty';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -58,6 +59,14 @@ import {
 } from './model-aliases.js';
 import { migrateModelMappings, synthesizeModelMapping, foldModelMapping } from './alias-migration.js';
 import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
+import {
+  BOOTSTRAP_NAME,
+  normalizeNodeName,
+  hostnameFor,
+  urlFor,
+  nameFromHostname,
+  suggestNames,
+} from './node-identity.js';
 import { addModelCapabilityMetadata, createModelCapabilityResolver } from './model-capabilities.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
@@ -7409,6 +7418,169 @@ app.post('/api/config', (req, res) => {
   config = { ...config, ...updates };
   saveConfig(config);
   res.json({ success: true, config: redactConfig(config) });
+});
+
+
+// ── Node identity ────────────────────────────────────────────────────────────
+//
+// An appliance has to be reachable with no configuration at all, which means it
+// has to name itself. The name is published as the system hostname and avahi
+// turns that into <name>-llama-manager.local; these routes are how the kiosk
+// reads that identity, asks the local model for themed names, and changes it.
+//
+// Nothing here changes the hostname directly. The manager runs unprivileged, so
+// it persists the name and restarts llama-manager-identity.service, which the
+// package's polkit rule permits and which is the one component allowed to touch
+// the hostname. Keeping the write in a single root script means the boot path and
+// the rename path cannot drift apart.
+
+const NODE_NAME_PATH = RUNTIME_PATHS.nodeNamePath;
+
+/** How long name generation waits on the local model before giving up. */
+const NAME_GENERATION_TIMEOUT_MS = 90_000;
+
+/**
+ * Read the persisted node name.
+ *
+ * @returns {string|null} Normalized stored name, or null when nothing valid is
+ *   stored — a missing, unreadable, or corrupt file all read as "not named yet".
+ */
+function readStoredNodeName() {
+  try {
+    return normalizeNodeName(readFileSync(NODE_NAME_PATH, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Describe the identity this node currently answers to.
+ *
+ * The stored name is authoritative because it is what the boot path applies; the
+ * live hostname is reported alongside it so a machine whose hostname was changed
+ * from underneath the manager is visible as such rather than silently wrong.
+ *
+ * @returns {{name:string, hostname:string, url:string, bootstrap:boolean,
+ *   systemHostname:string, published:boolean}} Current node identity.
+ */
+function describeNodeIdentity() {
+  const stored = readStoredNodeName();
+  const name = stored || BOOTSTRAP_NAME;
+  const live = systemHostname();
+  return {
+    name,
+    hostname: hostnameFor(name),
+    url: urlFor(name),
+    bootstrap: !stored,
+    systemHostname: live,
+    published: nameFromHostname(live) === name,
+  };
+}
+
+/**
+ * Report whether some other machine on this link already answers to a name.
+ *
+ * The probe is a plain hostname lookup, which reaches mDNS through nss-mdns on
+ * the appliance image. It is bounded because an unanswered mDNS query simply
+ * waits, and an address that turns out to be one of ours is this very node
+ * answering about itself, not a collision.
+ *
+ * @param {string} name Candidate node name.
+ * @returns {Promise<boolean>} True only when a different host clearly holds it.
+ */
+async function nodeNameIsTaken(name) {
+  const target = `${hostnameFor(name)}.local`;
+  const lookup = dnsLookup(target).then(({ address }) => address).catch(() => null);
+  const address = await Promise.race([
+    lookup,
+    new Promise((done) => setTimeout(() => done(null), 1200)),
+  ]);
+  if (!address) return false;
+  const ours = Object.values(networkInterfaces())
+    .flat()
+    .filter(Boolean)
+    .map((entry) => entry.address);
+  return !ours.includes(address);
+}
+
+/**
+ * Run one non-streaming completion against whatever model is loaded locally.
+ *
+ * Deliberately loops back through this server's own OpenAI-compatible route
+ * rather than hitting the engine directly, so name generation inherits the same
+ * queueing, model routing, and engine-activation behaviour as any other request
+ * and works whether the box is running llama.cpp or ds4.
+ *
+ * Bounded because the chat route will patiently wait out a cold model load for up
+ * to three minutes, which is right for a real inference request and wrong for a
+ * kiosk asking for name ideas: with no engine installed yet the operator would
+ * watch a spinner instead of being told to type a name. The cap is generous
+ * enough that a model which is merely still loading does finish in time.
+ *
+ * @param {Array<Object>} messages OpenAI-shaped chat messages.
+ * @returns {Promise<string>} The assistant's message content.
+ * @throws {Error} When the local model is unavailable or answers with an error.
+ */
+async function completeLocally(messages) {
+  const response = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: AbortSignal.timeout(NAME_GENERATION_TIMEOUT_MS),
+    body: JSON.stringify({ model: 'auto', messages, temperature: 0.9, max_tokens: 200 }),
+  });
+  if (!response.ok) throw new Error(`local model returned ${response.status}`);
+  const payload = await response.json();
+  return payload?.choices?.[0]?.message?.content || '';
+}
+
+app.get('/api/node/identity', (req, res) => {
+  res.json(describeNodeIdentity());
+});
+
+app.post('/api/node/name-suggestions', async (req, res) => {
+  const result = await suggestNames({
+    theme: req.body?.theme,
+    complete: completeLocally,
+    isTaken: nodeNameIsTaken,
+  });
+  // Always 200 with the current identity attached. Generation is a suggestion
+  // service, not a state change: a failure has to leave the kiosk showing the
+  // name and URL the node already answers to, never an error page with no way
+  // back to a reachable address.
+  res.json({ ...result, identity: describeNodeIdentity() });
+});
+
+app.post('/api/node/identity', async (req, res) => {
+  const name = normalizeNodeName(req.body?.name);
+  if (!name) {
+    return res.status(400).json({
+      error: 'A node name must contain at least one letter or digit.',
+      identity: describeNodeIdentity(),
+    });
+  }
+
+  try {
+    mkdirSync(dirname(NODE_NAME_PATH), { recursive: true });
+    writeFileSync(NODE_NAME_PATH, `${name}\n`);
+  } catch (error) {
+    console.error(`[node-identity] could not persist name: ${error.message}`);
+    return res.status(500).json({
+      error: 'The node name could not be saved.',
+      identity: describeNodeIdentity(),
+    });
+  }
+
+  // Restarting the identity unit is what actually publishes the name. A failure
+  // here is not fatal and is reported as such: the name is already persisted, so
+  // the node adopts it at the next boot even if it cannot adopt it right now.
+  const applied = await new Promise((done) => {
+    exec('systemctl restart llama-manager-identity.service', (error) => {
+      if (error) console.error(`[node-identity] could not apply hostname: ${error.message}`);
+      done(!error);
+    });
+  });
+
+  res.json({ applied, identity: describeNodeIdentity() });
 });
 
 app.get('/api/config', (req, res) => {

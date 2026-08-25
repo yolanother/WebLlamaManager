@@ -23,6 +23,7 @@ test('packaged installations use FHS locations for every mutable resource', () =
     dataDir: '/var/lib/llama-manager',
     cacheDir: '/var/cache/llama-manager',
     modelsDir: '/var/lib/llama-manager/models',
+    nodeNamePath: '/var/lib/llama-manager/node-name',
     ds4ModelsDir: '/var/lib/llama-manager/models/ds4',
     ds4StateDir: '/var/lib/llama-manager/ds4',
     slotCacheDir: '/var/cache/llama-manager/slots',
@@ -42,6 +43,7 @@ test('source installations retain checkout and user-home defaults', () => {
     dataDir: '/home/alice/src/llama-manager/data',
     cacheDir: '/home/alice/.cache/llama-manager',
     modelsDir: '/home/alice/models',
+    nodeNamePath: '/home/alice/src/llama-manager/data/node-name',
     ds4ModelsDir: '/home/alice/models-ds4/deepseek-v4-gguf',
     ds4StateDir: '/home/alice/.local/share/ds4',
     slotCacheDir: '/home/alice/.cache/llama-slots',
@@ -68,4 +70,18 @@ test('environment overrides relocate each mutable resource independently', () =>
   assert.equal(paths.ds4ModelsDir, '/models/ds4');
   assert.equal(paths.ds4StateDir, '/mnt/ds4-state');
   assert.equal(paths.slotCacheDir, '/mnt/slot-cache');
+});
+
+test('the node name store lives beside the rest of the mutable state', () => {
+  const packaged = resolveRuntimePaths({ LLAMA_MANAGER_PACKAGED: '1' }, { projectRoot: '/usr/lib/llama-manager' });
+  assert.equal(packaged.nodeNamePath, '/var/lib/llama-manager/node-name');
+
+  const source = resolveRuntimePaths({}, { projectRoot: '/src/llama', home: '/home/dev' });
+  assert.equal(source.nodeNamePath, '/src/llama/data/node-name');
+
+  const overridden = resolveRuntimePaths(
+    { NODE_NAME_PATH: '/run/somewhere/name' },
+    { projectRoot: '/src/llama' },
+  );
+  assert.equal(overridden.nodeNamePath, '/run/somewhere/name');
 });

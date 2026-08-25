@@ -3,8 +3,13 @@
 // LICENSE file in the repository root.
 //
 // Allows members of the llama-manager group to start, stop, and restart only
-// llama-manager.service. It intentionally grants no authority over other units,
-// systemd manager operations, package installation, or general root commands.
+// llama-manager.service and llama-manager-identity.service. The identity unit is
+// included because renaming the node has to take effect live, and it is the one
+// component permitted to change the hostname -- granting the manager the systemd
+// unit instead of the hostname1 action keeps the privilege scoped to a single
+// script whose behaviour is fixed by the package. It intentionally grants no
+// authority over other units, systemd manager operations, package installation,
+// or general root commands.
 
 polkit.addRule(function(action, subject) {
     if (action.id !== "org.freedesktop.systemd1.manage-units" ||
@@ -14,7 +19,8 @@ polkit.addRule(function(action, subject) {
 
     var unit = action.lookup("unit");
     var verb = action.lookup("verb");
-    if (unit == "llama-manager.service" &&
+    var units = ["llama-manager.service", "llama-manager-identity.service"];
+    if (units.indexOf(unit) !== -1 &&
         ["start", "stop", "restart"].indexOf(verb) !== -1) {
         return polkit.Result.YES;
     }

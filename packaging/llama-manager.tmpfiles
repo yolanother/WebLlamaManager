@@ -11,6 +11,7 @@ d /etc/llama-manager 2770 llama-manager llama-manager -
 f /etc/llama-manager/llama-manager.env 0660 llama-manager llama-manager -
 f /etc/llama-manager/config.json 0660 llama-manager llama-manager - {}
 d /var/lib/llama-manager 2770 llama-manager llama-manager -
+f /var/lib/llama-manager/node-name 0660 llama-manager llama-manager -
 d /var/lib/llama-manager/models 2770 llama-manager llama-manager -
 d /var/lib/llama-manager/models/ds4 2770 llama-manager llama-manager -
 d /var/lib/llama-manager/ds4 2770 llama-manager llama-manager -
