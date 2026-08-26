@@ -161,6 +161,7 @@ import { applyConfigDefaults } from './config-defaults.js';
 import { scheduleAutoStart } from './auto-start.js';
 import { resolveAltPort, listenBestEffort } from './alt-port.js';
 import { shouldIdleShutdown } from './idle-shutdown.js';
+import { resolveIdleMinutes } from './idle-policy.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -12576,7 +12577,15 @@ async function shedResidentModelsForMemory(cfg) {
 }
 
 // Idle shutdown — stop llama-server after 15 min with no requests
-const IDLE_SHUTDOWN_MINUTES = 15;
+// Minutes of inactivity before the router is stopped; 0 means never.
+//
+// A PACKAGED APPLIANCE DEFAULTS TO NEVER. It exists to answer: it boots, starts
+// its engine, and waits for somebody to walk up. Stopping the engine after
+// fifteen unattended minutes meant the kiosk greeted the first visitor with
+// "the engine is here but not answering yet", and their opening question paid a
+// ~29 second model load from USB. On a box with 124 GB of RAM, holding a 5 GB
+// model resident is the cheaper trade by a wide margin. See api/idle-policy.js.
+const IDLE_SHUTDOWN_MINUTES = resolveIdleMinutes({ env: process.env });
 const IDLE_CHECK_INTERVAL = 60_000; // check every minute
 
 setInterval(async () => {
@@ -12584,6 +12593,7 @@ setInterval(async () => {
   if (activeRequests.size > 0) return; // requests in flight
   if (llamaQueue.active > 0 || llamaQueue.pending > 0) return;
 
+  if (IDLE_SHUTDOWN_MINUTES <= 0) return; // never idle out (appliance default)
   const now = Date.now();
   if (!shouldIdleShutdown({
     now,
