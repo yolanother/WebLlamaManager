@@ -76,6 +76,12 @@ import {
   excludeSelf,
 } from './fleet-advertisement.js';
 import { browse as browseFleet } from './mdns-discovery.js';
+import {
+  ROLE_MAIN,
+  electMain,
+  roleFor,
+  designationTxt,
+} from './fleet-designation.js';
 import { addModelCapabilityMetadata, createModelCapabilityResolver } from './model-capabilities.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
@@ -7458,6 +7464,7 @@ app.post('/api/config', (req, res) => {
 // the rename path cannot drift apart.
 
 const NODE_NAME_PATH = RUNTIME_PATHS.nodeNamePath;
+const FLEET_PIN_PATH = RUNTIME_PATHS.fleetPinPath;
 
 /** How long name generation waits on the local model before giving up. */
 const NAME_GENERATION_TIMEOUT_MS = 90_000;
@@ -7590,6 +7597,19 @@ let lastAdvertisement = null;
 let lastAdvertisementError = null;
 
 /**
+ * Most recent view of the fleet, and how often it is refreshed.
+ *
+ * Designation needs this node to NOTICE peers arriving and leaving, which a
+ * purely on-demand browse cannot do -- nothing would converge until somebody
+ * happened to open the fleet screen. The cadence is deliberately slow: a desk
+ * fleet changes when a box is switched on, not many times a minute, and each
+ * browse costs a multicast round trip. The re-advertisement it triggers is
+ * idempotent, so a steady fleet writes nothing and avahi stays quiet.
+ */
+const FLEET_REFRESH_MS = 30_000;
+let lastKnownPeers = [];
+
+/**
  * Read every GPU's PCI vendor id, its dedicated VRAM, and its GTT in one pass.
  *
  * Deliberately synchronous sysfs reads rather than the cached `getGpuStats()`:
@@ -7688,6 +7708,52 @@ function describeEngineForFleet() {
  * @returns {boolean} Whether the advertisement is published and current.
  */
 /**
+ * Read the operator's sticky main-node override.
+ *
+ * @returns {boolean} True when this node was pinned as the fleet's main node.
+ */
+function readFleetPin() {
+  try {
+    return readFileSync(FLEET_PIN_PATH, 'utf-8').trim() === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Persist the operator's main-node override.
+ *
+ * Written rather than held in memory because the whole point of the override is
+ * that it outlives a restart -- an operator who pinned the good box does not
+ * expect the fleet to re-elect around them after a reboot.
+ *
+ * @param {boolean} pinned Whether this node is pinned as main.
+ * @returns {boolean} Whether the choice was persisted.
+ */
+function writeFleetPin(pinned) {
+  try {
+    mkdirSync(dirname(FLEET_PIN_PATH), { recursive: true });
+    writeFileSync(FLEET_PIN_PATH, pinned ? '1\n' : '0\n');
+    return true;
+  } catch (error) {
+    console.error(`[fleet] could not persist the main-node choice: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Describe this node's place in the fleet from the latest known view.
+ *
+ * @returns {{role: string, pinned: boolean, mainId: string|null}} Designation.
+ */
+function describeDesignation() {
+  const selfId = selfNodeId();
+  const pinned = readFleetPin();
+  const view = { selfId, peers: lastKnownPeers, pinned };
+  return { role: roleFor(view), pinned, mainId: electMain(view) };
+}
+
+/**
  * This node's stable fleet identity, derived from the machine id.
  *
  * @returns {string|null} The node id, or null when the machine id is unreadable.
@@ -7711,10 +7777,7 @@ function advertiseToFleet() {
       txt: advertisementTxt({
         id: selfNodeId(),
         name: identity.name,
-        // Phase 2 decides main-node designation; until then every node is
-        // simply itself, and says so rather than claiming an authority it has
-        // no way to hold.
-        role: 'standalone',
+        ...designationTxt(describeDesignation()),
         engine,
         model,
         capability: capabilityFrom({ ...hardware, engines: installedEngines() }),
@@ -7743,6 +7806,42 @@ app.get('/api/node/identity', (req, res) => {
   res.json(describeNodeIdentity());
 });
 
+/**
+ * Refresh this node's view of the fleet and re-publish what it implies.
+ *
+ * Kept deliberately quiet: the advertisement write is idempotent, so a fleet
+ * that has not changed produces no disk write and no avahi reload. Failures are
+ * swallowed because a browse that did not work is indistinguishable from an
+ * empty link, and both mean "carry on as a fleet of one".
+ *
+ * @returns {Promise<void>} Resolves once the view has been refreshed.
+ */
+async function refreshFleetView() {
+  try {
+    lastKnownPeers = excludeSelf(await browseFleet(), selfNodeId());
+    advertiseToFleet();
+  } catch {
+    // A fleet that cannot be seen is a fleet of one, which already works.
+  }
+}
+
+setInterval(refreshFleetView, FLEET_REFRESH_MS);
+
+app.post('/api/fleet/main', async (req, res) => {
+  // Pinning is the operator overruling the election on purpose, so it is stored
+  // before it is advertised -- a pin that vanished on restart would be worse
+  // than no pin at all.
+  const pinned = req.body?.pinned !== false;
+  if (!writeFleetPin(pinned)) {
+    return res.status(500).json({
+      error: 'The main-node choice could not be saved.',
+      designation: describeDesignation(),
+    });
+  }
+  advertiseToFleet();
+  res.json({ designation: describeDesignation() });
+});
+
 app.get('/api/fleet/peers', async (req, res) => {
   // A node that sees nobody is a fleet of one, which is a fully working
   // appliance. That is an empty list and a 200, never an error — the caller has
@@ -7750,9 +7849,11 @@ app.get('/api/fleet/peers', async (req, res) => {
   const selfId = selfNodeId();
   // This node answers its own query, so it is always in the raw browse.
   const peers = excludeSelf(await browseFleet(), selfId);
+  lastKnownPeers = peers;
+  const designation = describeDesignation();
   const self = describeNodeIdentity();
   res.json({
-    self: { ...self, id: selfId, role: 'standalone' },
+    self: { ...self, id: selfId, ...designation },
     peers: peers.map((peer) => ({
       id: peer.txt.id || null,
       name: peer.txt.name || peer.instance,
@@ -7761,6 +7862,8 @@ app.get('/api/fleet/peers', async (req, res) => {
       port: peer.port,
       url: peer.address ? `http://${peer.address}:${peer.port}` : null,
       role: peer.txt.role || null,
+      pinned: peer.txt.pin === '1',
+      main: !!designation.mainId && peer.txt.id === designation.mainId,
       engine: peer.txt.engine || null,
       model: peer.txt.model || null,
       capability: {
@@ -12183,8 +12286,11 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
 
   // Publish this node to the fleet as soon as it is answering. Done here rather
   // than only from the stats path so a headless appliance nobody is watching is
-  // still discoverable from the moment it boots.
+  // still discoverable from the moment it boots. The first browse follows
+  // immediately so the advertised role reflects a real view of the fleet rather
+  // than the fleet-of-one every node assumes before it has looked.
   advertiseToFleet();
+  refreshFleetView();
 
   // Auto-start llama only for an explicit boolean true. This keeps isolated
   // secondary managers passive even when a legacy config contains "false".

@@ -138,6 +138,7 @@ test('the advertisement carries identity, role, state and capability', () => {
     'id=a1b2c3d4e5f60718',
     'name=drakemore',
     'role=standalone',
+    'pin=',
     'engine=running',
     'model=qwen3-coder-next',
     'gpu=amd',
@@ -171,6 +172,27 @@ test('every TXT string stays inside the one-byte length the wire format allows',
   for (const entry of txt) {
     assert.ok(Buffer.byteLength(entry) <= 255, `too long: ${entry.slice(0, 40)}…`);
   }
+});
+
+test('the advertisement carries the operator pin so the fleet can see it', () => {
+  // The pin is how a choice made on ONE node's screen reaches every other node.
+  // There is no other channel: a pin that is stored but not advertised leaves
+  // the rest of the fleet electing around the operator's decision.
+  const txt = advertisementTxt({
+    id: 'a1', name: 'n', role: 'main', pin: '1', engine: 'idle', model: null,
+    capability: { gpu: 'amd', vram: 1, engines: 'llama' },
+  });
+  assert.ok(txt.includes('pin=1'));
+  assert.ok(txt.includes('role=main'));
+});
+
+test('an unpinned node advertises an empty pin rather than omitting it', () => {
+  const txt = advertisementTxt({
+    id: 'a1', name: 'n', role: 'secondary', engine: 'idle', model: null,
+    capability: { gpu: 'amd', vram: 1, engines: 'llama' },
+  });
+  assert.ok(txt.includes('pin='));
+  assert.ok(!txt.includes('pin=1'));
 });
 
 // ── Service file ────────────────────────────────────────────────────────────

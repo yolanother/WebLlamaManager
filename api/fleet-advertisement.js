@@ -160,18 +160,22 @@ function clipTxt(entry) {
  * @param {string} state.id Stable node id.
  * @param {string} state.name Node name.
  * @param {string} state.role Fleet role.
+ * @param {string} [state.pin] "1" when the operator pinned this node as main.
  * @param {string} state.engine Engine state.
  * @param {string|null} state.model Currently loaded model, if any.
  * @param {{gpu:string, vram:number, engines:string}} state.capability Capability.
  * @returns {string[]} TXT strings, ready to publish.
  */
-export function advertisementTxt({ id, name, role, engine, model, capability } = {}) {
+export function advertisementTxt({ id, name, role, pin, engine, model, capability } = {}) {
   const cap = capability || {};
   return [
     `v=${ADVERTISEMENT_VERSION}`,
     `id=${id ?? ''}`,
     `name=${name ?? ''}`,
     `role=${role ?? ''}`,
+    // Advertised, not merely stored: this is the only channel by which a choice
+    // made on one node's screen reaches the rest of the fleet.
+    `pin=${pin ?? ''}`,
     `engine=${engine ?? ''}`,
     `model=${model ?? ''}`,
     `gpu=${cap.gpu ?? ''}`,
