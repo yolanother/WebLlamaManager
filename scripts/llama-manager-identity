@@ -67,6 +67,19 @@ HOSTS_FILE="${LLAMA_MANAGER_HOSTS_FILE:-/etc/hosts}"
 # addressable at setup-llama-manager.local from its very first boot.
 BOOTSTRAP_NAME='setup'
 
+# Tool used to ask whether a name is already answered on this link, and the
+# seconds one probe may take. The lookup reaches mDNS through nss-mdns on the
+# appliance image. Both are overridable so the probe is testable without a
+# network. The bound is not optional: an mDNS query for a name nobody holds does
+# not fail, it waits, and this script runs before avahi -- an unbounded probe
+# would stall the boot and cost the appliance mDNS altogether.
+GETENT="${LLAMA_MANAGER_GETENT:-getent}"
+PROBE_TIMEOUT="${LLAMA_MANAGER_PROBE_TIMEOUT:-2}"
+
+# Highest bootstrap variant tried before giving up and keeping the base name.
+# Nine is far more unconfigured boxes than one desk will ever have at once.
+MAX_BOOTSTRAP_VARIANT=9
+
 # Longest name accepted, mirroring api/node-identity.js. A DNS label may be 63
 # characters and "-llama-manager" costs 14, so this is a readability cap.
 MAX_NAME_LENGTH=24
@@ -167,13 +180,52 @@ deny_loopback_publication() {
   printf 'llama-manager-identity: avahi will not publish on loopback\n'
 }
 
+# Reports whether some OTHER machine on this link already answers to a hostname.
+#
+# A node that already publishes the name finds itself, which is emphatically not
+# a collision: reading it as one would rename the box on every boot, walking it
+# up through the variants and changing its address each time. Every other
+# outcome -- not found, no resolver, a query that timed out -- reads as free,
+# because a possibly-duplicate name still leaves the box reachable.
+name_is_taken() {
+  local hostname="$1"
+  [[ "$hostname" == "$("$HOSTNAMECTL" hostname 2>/dev/null)" ]] && return 1
+  timeout "$PROBE_TIMEOUT" "$GETENT" hosts "$hostname.local" >/dev/null 2>&1
+}
+
+# Prints the bootstrap name this node can actually have.
+#
+# Every freshly flashed box wants the same memorable "setup", so a fleet of
+# unconfigured boxes collides on its first boot. The node steps aside itself
+# rather than leaving it to avahi: avahi resolves the collision by renaming the
+# published record silently, which leaves the manager reporting a name that now
+# reaches a DIFFERENT machine. Probing here means the name the node believes it
+# has is the name it actually holds -- and because the result is persisted by the
+# caller, this runs once in a node's life rather than at every boot.
+resolve_bootstrap_name() {
+  local candidate n
+  for ((n = 1; n <= MAX_BOOTSTRAP_VARIANT; n += 1)); do
+    if ((n == 1)); then candidate="$BOOTSTRAP_NAME"; else candidate="$BOOTSTRAP_NAME-$n"; fi
+    if ! name_is_taken "$candidate-llama-manager"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s\n' "$BOOTSTRAP_NAME"
+}
+
 # Prints the name this node should answer to, applying the resolution order
 # documented at the top of this file. Never prints an empty string.
+#
+# Only the bootstrap fall-through probes the link. A name an operator chose is
+# published as given even if something else holds it: that is not a tie to be
+# broken, and renaming a node the operator named would be a worse failure than a
+# duplicate.
 resolve_name() {
   local name
   name="$(read_name_file "$NAME_FILE")"
   [[ -n "$name" ]] || name="$(read_name_file "$MIRROR_PATH")"
-  [[ -n "$name" ]] || name="$BOOTSTRAP_NAME"
+  [[ -n "$name" ]] || name="$(resolve_bootstrap_name)"
   printf '%s\n' "$name"
 }
 

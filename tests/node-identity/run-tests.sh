@@ -377,7 +377,148 @@ test_the_unit_cannot_hold_mdns_hostage() {
   assert_equals "identity is published before avahi first announces it" "$before" "1"
 }
 
+# Installs a fake getent whose "taken" names are whatever is listed in
+# $SANDBOX/taken-names, and which records every name it was asked about. Stands
+# in for the mDNS lookup the bootstrap probe performs.
+arm_collision_probe() {
+  cat > "$SANDBOX/bin/getent" <<'FAKE'
+#!/bin/bash
+# Llama Manager — test double standing in for an mDNS hostname lookup.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+printf '%s\n' "$2" >> "$SANDBOX/getent-calls"
+[[ -f "$SANDBOX/getent-fails" ]] && exit 1
+if grep -qxF "$2" "$SANDBOX/taken-names" 2>/dev/null; then
+  printf '192.168.1.50 %s\n' "$2"
+  exit 0
+fi
+exit 2
+FAKE
+  chmod +x "$SANDBOX/bin/getent"
+  : > "$SANDBOX/taken-names"
+  export LLAMA_MANAGER_GETENT="$SANDBOX/bin/getent"
+}
+
+test_an_unclaimed_bootstrap_name_is_taken_as_is() {
+  printf 'test_an_unclaimed_bootstrap_name_is_taken_as_is\n'
+  new_sandbox llama
+  arm_collision_probe
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "the first box on the link keeps the memorable name" \
+    "$(applied_hostname)" "setup-llama-manager"
+  drop_sandbox
+}
+
+test_a_second_unconfigured_node_steps_aside() {
+  printf 'test_a_second_unconfigured_node_steps_aside\n'
+  # O1. Three boxes out of the same box of thumb drives all want
+  # setup-llama-manager. Left alone, avahi renames the loser behind our back and
+  # the node goes on believing it is called "setup" -- so it reports a URL that
+  # reaches a DIFFERENT machine. The node probes and steps aside itself instead.
+  new_sandbox llama
+  arm_collision_probe
+  printf 'setup-llama-manager.local\n' > "$SANDBOX/taken-names"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "a taken bootstrap name is stepped over" \
+    "$(applied_hostname)" "setup-2-llama-manager"
+  assert_equals "and the node knows which name it actually took" \
+    "$("$IDENTITY" show 2>/dev/null)" "setup-2"
+  drop_sandbox
+}
+
+test_the_bootstrap_probe_keeps_stepping_until_it_finds_a_gap() {
+  printf 'test_the_bootstrap_probe_keeps_stepping_until_it_finds_a_gap\n'
+  new_sandbox llama
+  arm_collision_probe
+  printf 'setup-llama-manager.local\nsetup-2-llama-manager.local\n' \
+    > "$SANDBOX/taken-names"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "the third box lands on the third name" \
+    "$(applied_hostname)" "setup-3-llama-manager"
+  drop_sandbox
+}
+
+test_the_name_the_probe_settled_on_survives_the_next_boot() {
+  printf 'test_the_name_the_probe_settled_on_survives_the_next_boot\n'
+  new_sandbox llama writable
+  arm_collision_probe
+  printf 'setup-llama-manager.local\n' > "$SANDBOX/taken-names"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "the chosen name is persisted, not re-derived" \
+    "$(cat "$LLAMA_MANAGER_NODE_NAME_FILE")" "setup-2"
+  assert_equals "and is carried onto the writable partition" \
+    "$(cat "$LLAMA_MANAGER_NODE_NAME_MIRROR")" "setup-2"
+  drop_sandbox
+}
+
+test_a_named_node_is_never_probed() {
+  printf 'test_a_named_node_is_never_probed\n'
+  # The probe exists to break a tie between unconfigured boxes. An operator's
+  # chosen name is not a tie, and renaming a node the operator named would be a
+  # far worse failure than a duplicate.
+  new_sandbox llama
+  arm_collision_probe
+  printf 'nebula-llama-manager.local\n' > "$SANDBOX/taken-names"
+  printf 'nebula\n' > "$LLAMA_MANAGER_NODE_NAME_FILE"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "a chosen name is published even when something else holds it" \
+    "$(applied_hostname)" "nebula-llama-manager"
+  assert_absent "and no probe is made at all" "$SANDBOX/getent-calls"
+  drop_sandbox
+}
+
+test_a_node_does_not_step_aside_from_itself() {
+  printf 'test_a_node_does_not_step_aside_from_itself\n'
+  # A box that already answers to setup-llama-manager finds itself when it
+  # probes. Reading that as a collision would rename the node on every single
+  # boot, walking it up to setup-9 and changing its address each time.
+  new_sandbox setup-llama-manager
+  arm_collision_probe
+  printf 'setup-llama-manager.local\n' > "$SANDBOX/taken-names"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "a node keeps the bootstrap name it already publishes" \
+    "$(applied_hostname)" "setup-llama-manager"
+  drop_sandbox
+}
+
+test_a_probe_that_fails_still_leaves_the_node_named() {
+  printf 'test_a_probe_that_fails_still_leaves_the_node_named\n'
+  # No resolver, no network, or a wedged lookup must not cost the box its name.
+  # A possibly-duplicate name beats no name, exactly as everywhere else here.
+  new_sandbox llama
+  arm_collision_probe
+  : > "$SANDBOX/getent-fails"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "a failed probe falls back to the bootstrap name" \
+    "$(applied_hostname)" "setup-llama-manager"
+  drop_sandbox
+}
+
+test_the_bootstrap_probe_is_bounded() {
+  printf 'test_the_bootstrap_probe_is_bounded\n'
+  # An mDNS query for a name nobody holds does not fail -- it waits. This unit is
+  # ordered before avahi, so an unbounded probe would stall the boot and cost the
+  # appliance mDNS entirely, which is the failure the unit's TimeoutStartSec
+  # exists to bound. Pin that the probe bounds itself too.
+  local bounded
+  bounded="$(grep -c 'timeout .*GETENT\|timeout .*\$GETENT\|PROBE_TIMEOUT' "$IDENTITY")"
+  if ((bounded > 0)); then
+    printf '  ok   the bootstrap probe cannot wait forever\n'
+  else
+    printf '  FAIL the bootstrap probe cannot wait forever (no timeout around it)\n'
+    failures=$((failures + 1))
+  fi
+}
+
 test_the_unit_cannot_hold_mdns_hostage
+test_an_unclaimed_bootstrap_name_is_taken_as_is
+test_a_second_unconfigured_node_steps_aside
+test_the_bootstrap_probe_keeps_stepping_until_it_finds_a_gap
+test_the_name_the_probe_settled_on_survives_the_next_boot
+test_a_named_node_is_never_probed
+test_a_node_does_not_step_aside_from_itself
+test_a_probe_that_fails_still_leaves_the_node_named
+test_the_bootstrap_probe_is_bounded
 test_unnamed_node_is_addressable_immediately
 test_persistent_state_names_the_node
 test_live_boot_recovers_its_name_from_the_writable_partition
