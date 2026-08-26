@@ -12,6 +12,14 @@ f /etc/llama-manager/llama-manager.env 0660 llama-manager llama-manager -
 f /etc/llama-manager/config.json 0660 llama-manager llama-manager - {}
 d /var/lib/llama-manager 2770 llama-manager llama-manager -
 f /var/lib/llama-manager/node-name 0660 llama-manager llama-manager -
+# The node's fleet advertisement. Handed to the manager account so publishing to
+# the fleet needs no privileged seam at all: avahi-daemon watches its services
+# directory and reloads on change by itself, so writing this file IS the
+# publication. World-readable rather than 0660 because avahi-daemon drops to the
+# "avahi" user before it reads -- a group-only mode leaves the node silently
+# unadvertised. The manager owns exactly this one path, and can therefore publish
+# mDNS records but change nothing else about the daemon.
+f /etc/avahi/services/llama-manager.service 0644 llama-manager llama-manager -
 d /var/lib/llama-manager/models 2770 llama-manager llama-manager -
 d /var/lib/llama-manager/models/ds4 2770 llama-manager llama-manager -
 d /var/lib/llama-manager/ds4 2770 llama-manager llama-manager -

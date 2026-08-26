@@ -18,6 +18,7 @@ import {
   capabilityFrom,
   advertisementTxt,
   buildServiceFile,
+  excludeSelf,
 } from './fleet-advertisement.js';
 
 // ── Node id ─────────────────────────────────────────────────────────────────
@@ -222,4 +223,38 @@ test('a port that is not a usable number is refused rather than published', () =
   assert.equal(buildServiceFile({ port: 'http', txt: [] }), null);
   assert.equal(buildServiceFile({ port: 99999, txt: [] }), null);
   assert.equal(buildServiceFile({ txt: [] }), null);
+});
+
+// ── Seeing yourself ─────────────────────────────────────────────────────────
+
+test('a node does not report itself as a peer', () => {
+  // A node answers its own multicast query, so the raw browse always contains
+  // it. Left in, a single appliance looks like a fleet of two -- which is the
+  // one thing Phase 1 must not do, since a lone node has to behave exactly as it
+  // does today and Phase 2's designation counts what discovery reports.
+  const peers = [
+    { instance: 'drakemore-llama-manager', txt: { id: 'b839de3c576f07b6' } },
+    { instance: 'ashfall-llama-manager', txt: { id: '0123456789abcdef' } },
+  ];
+  assert.deepEqual(
+    excludeSelf(peers, 'b839de3c576f07b6').map((p) => p.instance),
+    ['ashfall-llama-manager'],
+  );
+});
+
+test('an alone node sees an empty fleet', () => {
+  const peers = [{ instance: 'drakemore-llama-manager', txt: { id: 'abc' } }];
+  assert.deepEqual(excludeSelf(peers, 'abc'), []);
+});
+
+test('peers are kept when this node has no id of its own to compare', () => {
+  // No machine id means no node id. Dropping every peer would be worse than
+  // showing one too many, so an unknown self excludes nothing.
+  const peers = [{ instance: 'ashfall-llama-manager', txt: { id: 'abc' } }];
+  assert.equal(excludeSelf(peers, null).length, 1);
+});
+
+test('a peer that advertises no id is still reported', () => {
+  const peers = [{ instance: 'ashfall-llama-manager', txt: {} }];
+  assert.equal(excludeSelf(peers, 'abc').length, 1);
 });

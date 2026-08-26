@@ -67,6 +67,15 @@ import { readCompletionText,
   nameFromHostname,
   suggestNames,
 } from './node-identity.js';
+import {
+  SERVICE_FILE_PATH,
+  nodeIdFrom,
+  capabilityFrom,
+  advertisementTxt,
+  buildServiceFile,
+  excludeSelf,
+} from './fleet-advertisement.js';
+import { browse as browseFleet } from './mdns-discovery.js';
 import { addModelCapabilityMetadata, createModelCapabilityResolver } from './model-capabilities.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
@@ -3167,6 +3176,17 @@ async function getSystemStats() {
   // Dedicated embedding server health (null/disabled if not configured).
   let embedStats = null;
   try { embedStats = await getEmbedHealth(); } catch { /* embed down */ }
+
+  // Keep this node's fleet advertisement in step with its engine. Hung off the
+  // one place all state is already assembled rather than wired into each of the
+  // several sites engine state changes, and idempotent, so it reaches the disk
+  // only on a real transition.
+  //
+  // ponytail: this refreshes when something reads stats — the dashboard socket
+  // or /api/stats. A headless node with nobody watching republishes its engine
+  // field on the next read rather than the instant it changes; peers wanting
+  // live state fetch it over HTTP, which is what the TXT record defers to.
+  advertiseToFleet();
 
   let ds4Stats = null;
   if (currentEngine === ENGINE_TYPES.DS4) {
@@ -7562,8 +7582,194 @@ async function completeLocally(messages) {
   return readCompletionText(payload?.choices?.[0]?.message);
 }
 
+/**
+ * Last advertisement written, and the last failure reported, so that a repeated
+ * call neither churns avahi nor floods the log.
+ */
+let lastAdvertisement = null;
+let lastAdvertisementError = null;
+
+/**
+ * Read every GPU's PCI vendor id, its dedicated VRAM, and its GTT in one pass.
+ *
+ * Deliberately synchronous sysfs reads rather than the cached `getGpuStats()`:
+ * this feeds an advertisement refresh that can happen on any engine transition,
+ * and `getGpuStats()` spawns rocm-smi inside the distrobox container, which is
+ * far too heavy to hang off a state change. Every failure degrades to "nothing
+ * known", which the capability record reports honestly as zero.
+ *
+ * @returns {{vendors: string[], vramTotalBytes: number, gttTotalBytes: number}}
+ *   What could be read about this node's graphics hardware.
+ */
+function readGpuHardware() {
+  const vendors = [];
+  let vramTotalBytes = 0;
+  let gttTotalBytes = 0;
+  try {
+    for (const card of readdirSync('/sys/class/drm')) {
+      if (!/^card\d+$/.test(card)) continue;
+      const dir = `/sys/class/drm/${card}/device`;
+      const read = (leaf) => {
+        try {
+          return readFileSync(`${dir}/${leaf}`, 'utf-8').trim();
+        } catch {
+          return '';
+        }
+      };
+      const vendor = read('vendor');
+      if (vendor) vendors.push(vendor);
+      vramTotalBytes = Math.max(vramTotalBytes, parseInt(read('mem_info_vram_total'), 10) || 0);
+      gttTotalBytes = Math.max(gttTotalBytes, parseInt(read('mem_info_gtt_total'), 10) || 0);
+    }
+  } catch {
+    // No sysfs, or no permission to walk it. Reported as an unknown GPU.
+  }
+  return { vendors, vramTotalBytes, gttTotalBytes };
+}
+
+/**
+ * Report which engine backends this node can actually run.
+ *
+ * llama.cpp is the base engine and is always present; ds4 is an optional
+ * package, so its binary is probed for. This is what tells a peer in a mixed
+ * fleet whether work can be placed here at all — an empty list is a node that
+ * can receive nothing, which is a meaningfully different answer from "this node
+ * did not say".
+ *
+ * @returns {string[]} Engine type identifiers this node can serve with.
+ */
+function installedEngines() {
+  const engines = [ENGINE_TYPES.LLAMA];
+  try {
+    const ds4 = resolveDs4Config(config, process.env);
+    if (ds4?.binPath && existsSync(ds4.binPath)) engines.push(ENGINE_TYPES.DS4);
+  } catch {
+    // ds4 not configured; the base engine still stands.
+  }
+  return engines;
+}
+
+/**
+ * Describe this node's engine to the fleet.
+ *
+ * Coarse on purpose. mDNS carries only enough to find and triage a peer; a peer
+ * that wants live detail fetches it over HTTP once discovery has produced a host
+ * and a port, which is also what keeps this record from needing to be rewritten
+ * on every small change.
+ *
+ * @returns {{engine: string, model: string|null}} Engine state and loaded model.
+ */
+function describeEngineForFleet() {
+  const running = currentEngine === ENGINE_TYPES.DS4
+    ? !!getDs4Supervisor()?.isRunning()
+    : llamaProcess !== null && !llamaProcess.killed;
+  return { engine: running ? 'running' : 'idle', model: activeLocalModel || null };
+}
+
+/**
+ * Publish this node to the fleet by writing the avahi service file.
+ *
+ * avahi watches its services directory and reloads on change by itself, so
+ * writing the file IS the publication — there is no daemon to bounce and no
+ * avahi-utils on the image to call. The path is fixed and always overwritten in
+ * place: avahi refuses a service group whose instance name and type are already
+ * claimed locally, so a second file under a different name would take this node
+ * off the fleet rather than update it. Measured on the appliance.
+ *
+ * Best-effort throughout. A node that cannot advertise is a node its peers do
+ * not see, which is exactly the working single-appliance behaviour we already
+ * ship — never a reason to fail a request or a start-up.
+ *
+ * The write is idempotent: an unchanged advertisement is not rewritten. That is
+ * what lets this be called from the routine stats tick instead of being wired
+ * into each of the several places engine state changes — every avahi reload
+ * costs a re-announcement, so only real transitions should reach the disk.
+ *
+ * @returns {boolean} Whether the advertisement is published and current.
+ */
+/**
+ * This node's stable fleet identity, derived from the machine id.
+ *
+ * @returns {string|null} The node id, or null when the machine id is unreadable.
+ */
+function selfNodeId() {
+  try {
+    return nodeIdFrom(readFileSync('/etc/machine-id', 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function advertiseToFleet() {
+  try {
+    const identity = describeNodeIdentity();
+    const hardware = readGpuHardware();
+    const { engine, model } = describeEngineForFleet();
+
+    const contents = buildServiceFile({
+      port: API_PORT,
+      txt: advertisementTxt({
+        id: selfNodeId(),
+        name: identity.name,
+        // Phase 2 decides main-node designation; until then every node is
+        // simply itself, and says so rather than claiming an authority it has
+        // no way to hold.
+        role: 'standalone',
+        engine,
+        model,
+        capability: capabilityFrom({ ...hardware, engines: installedEngines() }),
+      }),
+    });
+    if (!contents) return false;
+    if (contents === lastAdvertisement) return true;
+
+    writeFileSync(SERVICE_FILE_PATH, contents);
+    lastAdvertisement = contents;
+    console.log('[fleet] advertising this node as _llama-manager._tcp');
+    return true;
+  } catch (error) {
+    // Logged once per distinct failure rather than on every stats tick: the
+    // usual cause is a source checkout with no writable /etc/avahi/services,
+    // where this is expected and must not fill the log.
+    if (lastAdvertisementError !== error.message) {
+      lastAdvertisementError = error.message;
+      console.error(`[fleet] could not advertise this node: ${error.message}`);
+    }
+    return false;
+  }
+}
+
 app.get('/api/node/identity', (req, res) => {
   res.json(describeNodeIdentity());
+});
+
+app.get('/api/fleet/peers', async (req, res) => {
+  // A node that sees nobody is a fleet of one, which is a fully working
+  // appliance. That is an empty list and a 200, never an error — the caller has
+  // nothing different to do about it.
+  const selfId = selfNodeId();
+  // This node answers its own query, so it is always in the raw browse.
+  const peers = excludeSelf(await browseFleet(), selfId);
+  const self = describeNodeIdentity();
+  res.json({
+    self: { ...self, id: selfId, role: 'standalone' },
+    peers: peers.map((peer) => ({
+      id: peer.txt.id || null,
+      name: peer.txt.name || peer.instance,
+      host: peer.host,
+      address: peer.address,
+      port: peer.port,
+      url: peer.address ? `http://${peer.address}:${peer.port}` : null,
+      role: peer.txt.role || null,
+      engine: peer.txt.engine || null,
+      model: peer.txt.model || null,
+      capability: {
+        gpu: peer.txt.gpu || null,
+        vram: Number(peer.txt.vram) || 0,
+        engines: peer.txt.engines ? peer.txt.engines.split(',') : [],
+      },
+    })),
+  });
 });
 
 app.post('/api/node/name-suggestions', async (req, res) => {
@@ -7608,6 +7814,11 @@ app.post('/api/node/identity', async (req, res) => {
       done(!error);
     });
   });
+
+  // Re-advertise under the new name. The service file itself carries avahi's %h
+  // wildcard so the instance name follows the hostname on its own, but the name
+  // also appears in the TXT records a peer reads, and those are ours to update.
+  advertiseToFleet();
 
   res.json({ applied, identity: describeNodeIdentity() });
 });
@@ -11969,6 +12180,11 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   console.log(`Models directory: ${MODELS_DIR}`);
   console.log(`Llama server will run on port ${LLAMA_PORT}`);
   console.log(`Stats interval: ${STATS_INTERVAL}ms`);
+
+  // Publish this node to the fleet as soon as it is answering. Done here rather
+  // than only from the stats path so a headless appliance nobody is watching is
+  // still discoverable from the moment it boots.
+  advertiseToFleet();
 
   // Auto-start llama only for an explicit boolean true. This keeps isolated
   // secondary managers passive even when a legacy config contains "false".

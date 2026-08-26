@@ -181,6 +181,28 @@ export function advertisementTxt({ id, name, role, engine, model, capability } =
 }
 
 /**
+ * Drop this node from a list of discovered peers.
+ *
+ * A node answers its own multicast query, so a raw browse always contains it.
+ * Left in, a single appliance reports a fleet of two — which breaks the promise
+ * that a node seeing no peers behaves exactly as it does today, and would give
+ * Phase 2's designation a phantom to elect against.
+ *
+ * A node with no id of its own excludes nothing: dropping every peer because
+ * this node could not read its machine id would be a worse failure than showing
+ * one too many.
+ *
+ * @param {Array<{txt?: Object<string,string>}>} peers Discovered peers.
+ * @param {string|null} selfId This node's id.
+ * @returns {Array<Object>} Peers other than this node.
+ */
+export function excludeSelf(peers, selfId) {
+  if (!Array.isArray(peers)) return [];
+  if (!selfId) return peers;
+  return peers.filter((peer) => peer?.txt?.id !== selfId);
+}
+
+/**
  * Escape text for inclusion in the service file.
  *
  * Node names come from an operator or from a language model, and model ids come

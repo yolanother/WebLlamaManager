@@ -188,6 +188,19 @@ test_canonical_service_assets_are_package_safe() {
   fi
   assert_contains "tmpfiles provisions rootless Podman runtime before service start" "$tmpfiles" \
     "d /run/llama-manager 0700 llama-manager llama-manager -"
+  # Publishing to the fleet is a file write and nothing else, so the manager
+  # account owns exactly this path. The mode is the load-bearing part: avahi
+  # drops to its own user before reading the services directory, so a 0660 file
+  # leaves the node silently unadvertised with no error anywhere.
+  assert_contains "tmpfiles hands the fleet advertisement to the manager account" \
+    "$tmpfiles" "f /etc/avahi/services/llama-manager.service 0644 llama-manager llama-manager -"
+  # Owning the advertisement file is necessary but not sufficient:
+  # ProtectSystem=full makes the whole of /etc read-only, so without this
+  # carve-out the manager gets EROFS and the node never reaches the fleet -- with
+  # a correctly owned file sitting there the whole time. The leading "-" keeps a
+  # box with no avahi installed from failing to start at all.
+  assert_contains "service may write the fleet advertisement despite ProtectSystem" \
+    "$service" "ReadWritePaths=-/etc/avahi/services"
   assert_contains "service reuses the tmpfiles runtime directory" "$service" "RuntimeDirectory=llama-manager"
   assert_contains "service preserves the private runtime mode" "$service" "RuntimeDirectoryMode=0700"
   assert_contains "service permits rootless subordinate-id mapping helpers" "$service" "NoNewPrivileges=no"

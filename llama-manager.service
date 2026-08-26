@@ -78,6 +78,16 @@ ReadWritePaths=/etc/llama-manager
 # This is a deliberate, narrow concession: the service can write cgroups, which
 # it needs to run a container at all. Every other protection below stays on.
 ProtectControlGroups=no
+
+# The node's fleet advertisement. ProtectSystem=full makes all of /etc read-only,
+# so owning the file is not enough on its own -- without this the manager gets
+# EROFS and the appliance never appears to its peers, silently and with the file
+# sitting there correctly owned. Measured on a live appliance, not theorised.
+#
+# Leading "-" because the path only exists where avahi-daemon is installed: a
+# source checkout or a dev box has no /etc/avahi, and a missing ReadWritePaths
+# entry without it refuses to start the unit at all.
+ReadWritePaths=-/etc/avahi/services
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
