@@ -37,7 +37,7 @@ setup step on each node has failed the brief.
    an install-to-disk is not done. Identity, discovery, and role must survive a
    live boot.
 
-## Phase 0 — node identity *(in progress, task pmc737LOFfNkGFXQMKZ7D)*
+## Phase 0 — node identity *(done)*
 
 Each node is reachable at `http://{name}-llama-manager.local`.
 
@@ -59,21 +59,49 @@ action is to open one of them, and a fleet of three unconfigured boxes competing
 for the same name is a problem we would rather surface immediately than paper
 over. **Open question O1** below.
 
-## Phase 1 — discovery
+## Phase 1 — discovery *(built)*
 
 Nodes advertise a DNS-SD service (`_llama-manager._tcp`) carrying, in TXT
-records: node name, role, engine state, model inventory hash, and API port.
-Avahi is already running and already publishes; this is one service file plus
-the code to keep the TXT records current.
+records: schema version, node id, name, role, engine state, loaded model, and
+the capability triple (`gpu`, `vram`, `engines`) that settles O5.
 
 Browsing that service gives every node a live picture of the fleet without a
 registry, a broker, or a bootstrap address. A node that sees no peers is simply
-a fleet of one.
+a fleet of one — and reports an empty list, having filtered itself out of its
+own browse by node id.
 
 **Why DNS-SD rather than a gossip protocol or a broadcast of our own:** it is
-already running on the box, every OS ships a browser for it, and it makes the
-fleet inspectable with `avahi-browse` when something is wrong — which matters
-more than protocol elegance the first time a node does not appear.
+already running on the box and every OS ships a browser for it.
+
+**Measured on hardware (2026-08-25), and each of these changed the design:**
+
+- **There is no `avahi-browse` on the appliance.** Only `avahi-daemon` and the
+  libraries are installed; `avahi-utils` is absent entirely. Discovery therefore
+  speaks the mDNS wire format directly over an ephemeral UDP port rather than
+  shelling out, which also lets it coexist with the avahi already holding 5353.
+  Queries set the unicast-response bit, which avahi honours.
+- **Publishing is free.** Writing `/etc/avahi/services/llama-manager.service` is
+  picked up with no restart — the journal shows "Files changed, reloading" then
+  "successfully established". No polkit seam, no unit bounce, no dependency.
+- **One query returns a whole peer.** Verified from a second machine, a single
+  PTR query comes back with PTR, TXT, SRV, A and AAAA stuffed into one response.
+  Discovery is one round trip, not three.
+- **`ProtectSystem=full` makes all of `/etc` read-only.** Owning the service file
+  is not sufficient; without a `ReadWritePaths` carve-out the manager gets EROFS
+  and the node never appears, with a correctly owned file sitting there.
+- **avahi refuses a service group whose instance name and type are already
+  claimed locally.** The advertisement is therefore one fixed path, always
+  overwritten in place; a second file under another name takes the node OFF the
+  fleet rather than updating it.
+- **`deny-interfaces=lo` is what stops avahi renaming the node.** Without it
+  avahi publishes on loopback before the real interface exists, finds its own
+  record on re-probe, and renames itself to `<name>-2`. Already handled by
+  `scripts/llama-manager-identity`, which edits avahi's config at boot — that
+  placement is the right one, since it covers an installed disk and not only the
+  live ISO layer. Discovery depends on it and does not re-implement it.
+
+Live state beyond triage is fetched over HTTP once discovery yields a host and
+port; the TXT records carry only what is needed to find a peer and place work.
 
 ## Phase 2 — main-node designation
 
@@ -122,10 +150,26 @@ refuse work from nodes outside it. **Open question O4.**
 
 ## Open questions
 
-- **O1 — name collision on first boot.** Three unconfigured nodes all claim
-  `setup-llama-manager.local`. mDNS will resolve this by renaming (`-2`, `-3`),
-  which is survivable but confusing. Alternative: seed the bootstrap name from
-  the machine ID so it is unique but unmemorable. Decide before Phase 1.
+- **O1 — name collision on first boot. DECIDED (2026-08-25): the node steps
+  aside itself.** At boot, a node falling through to the bootstrap name probes
+  the link and adopts the first free variant (`setup`, `setup-2`, `setup-3`),
+  then persists what it picked. The visible result matches what avahi would have
+  done anyway; the difference is that the NODE knows. Left to avahi, the record
+  is renamed silently while the manager goes on reporting the name it thinks it
+  has — handing the operator a URL that opens a different machine.
+
+  Rejected: seeding from the machine ID, which is unique but unguessable and
+  breaks the "open one of them" first action the setup flow is built around.
+
+  Only the bootstrap fall-through probes. A name an operator chose is published
+  as given, and a node that finds itself is not a collision — otherwise a box
+  would rename on every boot. The probe is bounded, which is load-bearing: an
+  mDNS query for a name nobody holds does not fail, it waits, and the identity
+  unit is ordered before avahi.
+
+  The residual race — three boxes booting simultaneously, all probing empty air
+  — is accepted. avahi still resolves it, and discovery keys peers on the stable
+  node id rather than the name.
 - **O2 — election vs operator designation.** See Phase 2.
 - **O3 — is offload worth it?** Measure before building: time a request served
   locally against the same request shipped to a peer, on the real hardware, with
@@ -133,10 +177,20 @@ refuse work from nodes outside it. **Open question O4.**
   feature than it looks.
 - **O4 — fleet trust.** What establishes it, and what happens when an untrusted
   node advertises itself.
-- **O5 — mixed hardware.** An AMD box and an NVIDIA box in one fleet: does the
-  main node need to know which models each peer can actually run? Almost
-  certainly yes, which means the inventory in the TXT records is a capability
-  record, not just a model list.
+- **O5 — mixed hardware. DECIDED (2026-08-25): a capability triple, not an
+  inventory.** Each node advertises `gpu` (vendor), `vram` (usable model memory
+  in MiB), and `engines` (the backends it can actually run). "Can this peer run
+  model X" is answered by engine format support plus memory fit; which models
+  are on disk is a separate per-node question that belongs to Phase 4.
+
+  Usable memory is the larger of VRAM and GTT, and that is the point of it: the
+  Strix Halo appliance reports a nominal 1 GB of dedicated VRAM against ~120 GB
+  of real model memory in GTT, while a discrete NVIDIA card is the reverse. A
+  peer that believed the APU's VRAM figure would never be offered a model it runs
+  comfortably. Verified on hardware — the appliance advertises `vram=122800`.
+
+  A machine reporting several GPUs resolves to the most capable, since a
+  workstation with a discrete card also reports the integrated adapter beside it.
 
 ## Sequencing
 
