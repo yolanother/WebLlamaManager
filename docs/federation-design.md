@@ -103,35 +103,72 @@ already running on the box and every OS ships a browser for it.
 Live state beyond triage is fetched over HTTP once discovery yields a host and
 port; the TXT records carry only what is needed to find a peer and place work.
 
-## Phase 2 — main-node designation
+## Phase 2 — main-node designation *(built)*
 
 One node coordinates. The rest serve inference on request.
 
-**Leaning, not yet decided (O2):** deterministic election over the discovered
-set, lowest node-id wins, with an explicit operator override that is sticky and
-persisted. Automatic election keeps the zero-config promise; the override exists
-because the operator will have opinions about which box is the good one, and a
-system that re-elects around them is infuriating.
+**Decided (O2):** deterministic election over the discovered set, lowest node id
+wins, with an explicit operator override that is sticky and persisted.
+
+The election is *convergent rather than negotiated*. Every node ranks the same
+set of ids the same way, so all of them reach the same answer without exchanging
+a message, and transiently different views settle by themselves as discovery
+converges. No terms, no votes, no quorum.
+
+The operator's pin is both persisted **and advertised**. Advertising it is
+load-bearing, not informational: the TXT record is the only channel by which a
+choice made on one node's screen reaches the rest of the fleet, and a pin that
+were merely stored would leave every other node quietly electing around the
+operator's decision. A node does not prefer its own pin over a peer's, or two
+pinned nodes would each believe they were main and the fleet would never
+converge.
+
+A node that cannot state its own id defers rather than claiming main — a main
+node the fleet cannot address is worse than none. A node alone is main of a
+fleet of one, with nothing to wait for.
 
 The main node's authority must be soft: a secondary that loses contact keeps
 serving its own users. There is no fencing and no quorum here — this is a desk,
 not a datacentre, and the failure we actually expect is a thumb drive being
 pulled out.
 
-## Phase 3 — inference offload
+## Phase 3 — inference offload *(gated — harness built, not yet run)*
 
 The main node routes work to peers when that is faster than serving it locally.
 
 This is the phase with the most unknowns and the least justification for
-guessing. What we know: the manager already has a router mode and a queue, so
-the shape of "hold a request, pick a target, stream back" exists. What we do not
-know: whether offload beats local execution often enough to be worth it on this
-hardware, given a 5 GB model load and a gigabit link. **That is measurable and
-should be measured before it is built** — see O3.
+guessing, so it stays gated. `scripts/measure-offload.mjs` is the gate and is
+ready to run against two live appliances.
 
-## Phase 4 — managed model downloads
+The framing that harness encodes, because it decides the size of this phase: a
+single request on an idle box is **always** faster served locally — the hop buys
+nothing and costs a round trip. Offload can only pay when the local node is
+saturated or cannot serve the request at all. So the harness measures the *hop
+tax* (one request local vs shipped, both idle) and the *crossover* (N concurrent
+requests local-only vs spread across the fleet), and treats a cold peer that
+must load the model first as a separate and much more expensive proposition.
+
+Load is spread round-robin rather than by a clever policy, deliberately: that is
+the floor any real routing must beat, and a policy that cannot beat round-robin
+is not worth building. The verdict reads p50, never mean — one cold model load
+drags a mean somewhere no request actually went — refuses to answer at all on a
+partial run, and reports a gain below 1.25x as marginal rather than as a green
+light.
+
+## Phase 4 — managed model downloads *(built)*
 
 From the main node's screen, pull a model onto any node, or all of them.
+
+The distinction the fleet screen lives on is between "that node does not have
+the model" and "that node did not answer". They look identical in a naive merge
+and are not remotely the same to an operator: showing an unreachable node as
+missing invites a redundant multi-gigabyte download onto a box that already
+holds the file. An in-flight download is reported as in flight, not as present —
+a half-downloaded model is not a model.
+
+Targeting never defaults. An unspecified target resolves to nothing rather than
+to "all", because defaulting a mis-typed request to the whole fleet turns a typo
+into simultaneous downloads on every box.
 
 The download UI becomes fleet-aware: a model has a per-node presence, and the
 operator acts on the fleet rather than on a box. The main node does not proxy
@@ -142,11 +179,14 @@ proxying makes the main node's uplink the bottleneck for every node at once.
 
 Stated plainly because it is easy to skip and expensive to retrofit.
 
-Today the appliance answers on `0.0.0.0` with no authentication, which is a
-reasonable default for one box on a home LAN and an unreasonable one for a fleet
-that accepts work from peers. Before Phase 3 ships, node-to-node calls need at
-minimum a shared secret established at designation time, and the fleet needs to
-refuse work from nodes outside it. **Open question O4.**
+Today the appliance answers on `0.0.0.0` with no authentication.
+
+**Decided (O4): LAN-trust, no shared secret.** Work is accepted from any node
+advertising `_llama-manager._tcp` on the local link. Stated plainly once,
+because the alternative was offered and declined deliberately: anything on the
+LAN can queue inference on this hardware. That is an accepted posture for a
+desk-scale fleet behind a router, and it is the first decision to revisit if the
+fleet ever leaves that setting.
 
 ## Open questions
 
@@ -170,13 +210,17 @@ refuse work from nodes outside it. **Open question O4.**
   The residual race — three boxes booting simultaneously, all probing empty air
   — is accepted. avahi still resolves it, and discovery keys peers on the stable
   node id rather than the name.
-- **O2 — election vs operator designation.** See Phase 2.
-- **O3 — is offload worth it?** Measure before building: time a request served
-  locally against the same request shipped to a peer, on the real hardware, with
-  a warm and a cold model. If the crossover is rare, Phase 3 is a much smaller
-  feature than it looks.
-- **O4 — fleet trust.** What establishes it, and what happens when an untrusted
-  node advertises itself.
+- **O2 — election vs operator designation. DECIDED (2026-08-26):** lowest node
+  id wins, with a sticky, advertised operator override. See Phase 2. Rejected:
+  capability-weighted ranking, which moves main whenever a bigger box joins and
+  needs damping because capability changes at runtime; and operator-only
+  designation, which leaves a fresh fleet with no main until somebody chooses.
+- **O3 — is offload worth it?** OPEN, and deliberately still open. The harness
+  exists (`scripts/measure-offload.mjs`) and the verdict logic is tested; the
+  run needs two live appliances and the second one is down. Phase 3 does not
+  start until this produces a number.
+- **O4 — fleet trust. DECIDED (2026-08-26):** LAN-trust, no secret. See the
+  security posture above.
 - **O5 — mixed hardware. DECIDED (2026-08-25): a capability triple, not an
   inventory.** Each node advertises `gpu` (vendor), `vram` (usable model memory
   in MiB), and `engines` (the backends it can actually run). "Can this peer run
