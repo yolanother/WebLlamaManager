@@ -59,7 +59,7 @@ import {
 } from './model-aliases.js';
 import { migrateModelMappings, synthesizeModelMapping, foldModelMapping } from './alias-migration.js';
 import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
-import {
+import { readCompletionText,
   BOOTSTRAP_NAME,
   normalizeNodeName,
   hostnameFor,
@@ -162,6 +162,8 @@ import { scheduleAutoStart } from './auto-start.js';
 import { resolveAltPort, listenBestEffort } from './alt-port.js';
 import { shouldIdleShutdown } from './idle-shutdown.js';
 import { resolveIdleMinutes } from './idle-policy.js';
+import { resolveNamingModel } from './naming-model.js';
+import { seedDefaultAliases } from './seed-aliases.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -7527,15 +7529,37 @@ async function nodeNameIsTaken(name) {
  * @throws {Error} When the local model is unavailable or answers with an error.
  */
 async function completeLocally(messages) {
+  // Ask for a model that is actually loaded rather than the `auto` alias.
+  // MEASURED on the appliance: `auto` resolved to an alias named
+  // `default-small`, which the appliance does not define, so every naming
+  // request failed upstream with "model 'default-small' not found" and the
+  // kiosk reported "The model returned no usable names" -- blaming the model
+  // for a request that never reached one. See api/naming-model.js.
+  let models = [];
+  try {
+    const listed = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/models`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (listed.ok) {
+      const payload = await listed.json();
+      models = (payload?.data || []).map((item) => item?.id).filter(Boolean);
+    }
+  } catch {
+    models = [];
+  }
+  const model = resolveNamingModel({ models });
+
   const response = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal: AbortSignal.timeout(NAME_GENERATION_TIMEOUT_MS),
-    body: JSON.stringify({ model: 'auto', messages, temperature: 0.9, max_tokens: 200 }),
+    // A reasoning model needs room to think AND answer. At 200 tokens Qwen3
+    // spent the entire budget reasoning and returned no content at all.
+    body: JSON.stringify({ model, messages, temperature: 0.9, max_tokens: 700 }),
   });
   if (!response.ok) throw new Error(`local model returned ${response.status}`);
   const payload = await response.json();
-  return payload?.choices?.[0]?.message?.content || '';
+  return readCompletionText(payload?.choices?.[0]?.message);
 }
 
 app.get('/api/node/identity', (req, res) => {
@@ -11948,6 +11972,27 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
 
   // Auto-start llama only for an explicit boolean true. This keeps isolated
   // secondary managers passive even when a legacy config contains "false".
+  // GIVE A FRESH APPLIANCE THE ALIAS ITS OWN ROUTING DEPENDS ON.
+  //
+  // `auto` resolves to `default-small`, and an appliance ships one model with an
+  // EMPTY config, so that alias pointed at nothing: every request routed through
+  // it failed upstream with {"code":400,"message":"model 'default-small' not
+  // found"}. Node naming was the visible casualty -- the kiosk reported that the
+  // model had returned no usable names, for a request that never reached a
+  // model. Seeding here, once the local models are known, makes the appliance
+  // answer its own routing out of the box.
+  //
+  // An alias the operator has already set is never touched; see seed-aliases.js.
+  try {
+    const localModels = scanLocalModels().map((entry) => entry?.name).filter(Boolean);
+    if (seedDefaultAliases(config, localModels)) {
+      saveConfig(config);
+      console.log(`[aliases] default-small now points at ${config.aliases['default-small'].targets[0].model}`);
+    }
+  } catch (error) {
+    console.warn(`[aliases] could not seed default-small: ${error.message}`);
+  }
+
   const autoStartScheduled = scheduleAutoStart({
     autoStart: config.autoStart,
     schedule: setTimeout,

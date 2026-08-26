@@ -136,6 +136,32 @@ function acceptCandidate(raw) {
  * @param {unknown} text Raw assistant message content.
  * @returns {string[]} Unique accepted names, at most {@link MAX_CANDIDATES}.
  */
+/**
+ * Reads the usable text out of an assistant message.
+ *
+ * A REASONING MODEL MAY NEVER EMIT `content` AT ALL. Measured on the appliance:
+ * Qwen3 reasons before it answers, and with a 200-token budget it spent the
+ * whole budget thinking and returned `finish_reason: "length"` with an empty
+ * content string and its work-in-progress in `reasoning_content`. The parser
+ * saw "" and the kiosk reported that the model had returned no usable names --
+ * blaming the model for a reply that was cut off mid-thought.
+ *
+ * Real content always wins. The reasoning is a fallback, not a preference: it
+ * is a draft, and every candidate pulled from it still has to pass the same
+ * acceptance rules as one the model committed to.
+ *
+ * @param {unknown} message An assistant message object.
+ * @returns {string} The best available text, or an empty string.
+ */
+export function readCompletionText(message) {
+  if (!message || typeof message !== 'object') return '';
+  const content = typeof message.content === 'string' ? message.content.trim() : '';
+  if (content) return content;
+  const reasoning =
+    typeof message.reasoning_content === 'string' ? message.reasoning_content.trim() : '';
+  return reasoning;
+}
+
 export function parseNameCandidates(text) {
   if (typeof text !== 'string') return [];
 

@@ -23,6 +23,7 @@ import {
   disambiguate,
   buildSuggestionMessages,
   suggestNames,
+  readCompletionText,
 } from './node-identity.js';
 
 // ── Name normalization ──────────────────────────────────────────────────────
@@ -198,4 +199,31 @@ test('suggested names are checked for collisions before they are offered', async
     isTaken: async (n) => taken.has(n),
   });
   assert.deepEqual(result.candidates, ['thunder-2', 'cirrus']);
+});
+
+
+test('a thinking model that never emits content still yields its answer', () => {
+  // MEASURED on the appliance. Qwen3 reasons before answering, and with a
+  // 200-token budget it spent all of it on reasoning_content and emitted an
+  // EMPTY content string:
+  //   finish_reason: "length", content: "", reasoning_content: "Okay, the user
+  //   wants me to come up with 6 short computer names..."
+  // The parser saw "" and the kiosk reported "the model returned no usable
+  // names", blaming the model for a reply that was cut off mid-thought.
+  assert.deepEqual(
+    readCompletionText({ content: '', reasoning_content: '["ember","wyrm"]' }),
+    '["ember","wyrm"]',
+  );
+});
+
+test('real content always wins over reasoning', () => {
+  assert.deepEqual(
+    readCompletionText({ content: '["ash"]', reasoning_content: '["wrong"]' }),
+    '["ash"]',
+  );
+});
+
+test('a message with neither yields an empty string, not a crash', () => {
+  assert.equal(readCompletionText({}), '');
+  assert.equal(readCompletionText(null), '');
 });
