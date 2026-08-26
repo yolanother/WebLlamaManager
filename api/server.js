@@ -82,6 +82,7 @@ import {
   roleFor,
   designationTxt,
 } from './fleet-designation.js';
+import { mergeFleetModels, resolveTargets } from './fleet-models.js';
 import { addModelCapabilityMetadata, createModelCapabilityResolver } from './model-capabilities.js';
 import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
@@ -7826,6 +7827,108 @@ async function refreshFleetView() {
 }
 
 setInterval(refreshFleetView, FLEET_REFRESH_MS);
+
+/**
+ * Ask one node in the fleet what models it holds and what it is fetching.
+ *
+ * A node that does not answer is reported unreachable rather than empty: those
+ * are very different facts to an operator deciding where to send a
+ * multi-gigabyte download.
+ *
+ * @param {{id:string, name:string, url:string}} node The node to ask.
+ * @returns {Promise<Object>} Its model inventory, or an unreachable marker.
+ */
+async function fetchNodeModels(node) {
+  try {
+    const [models, downloads] = await Promise.all([
+      fetch(`${node.url}/api/models`, { signal: AbortSignal.timeout(8000) }).then((r) => r.json()),
+      fetch(`${node.url}/api/downloads`, { signal: AbortSignal.timeout(8000) })
+        .then((r) => r.json())
+        .catch(() => ({})),
+    ]);
+    return {
+      id: node.id,
+      name: node.name,
+      url: node.url,
+      models: models?.localModels || [],
+      downloads: downloads?.downloads || downloads || {},
+      reachable: true,
+    };
+  } catch {
+    return { id: node.id, name: node.name, url: node.url, reachable: false };
+  }
+}
+
+/**
+ * List this node and every peer, with the address each can be reached at.
+ *
+ * @returns {Array<{id:string, name:string, url:string}>} The whole fleet.
+ */
+function fleetEndpoints() {
+  const identity = describeNodeIdentity();
+  const self = {
+    id: selfNodeId(),
+    name: identity.name,
+    url: `http://127.0.0.1:${API_PORT}`,
+  };
+  const peers = lastKnownPeers
+    .filter((peer) => peer.address && peer.txt?.id)
+    .map((peer) => ({
+      id: peer.txt.id,
+      name: peer.txt.name || peer.instance,
+      url: `http://${peer.address}:${peer.port}`,
+    }));
+  return [self, ...peers];
+}
+
+app.get('/api/fleet/models', async (req, res) => {
+  lastKnownPeers = excludeSelf(await browseFleet(), selfNodeId());
+  const fleet = fleetEndpoints();
+  const nodes = await Promise.all(fleet.map(fetchNodeModels));
+  res.json({
+    nodes: nodes.map(({ id, name, url, reachable }) => ({ id, name, url, reachable })),
+    models: mergeFleetModels(nodes),
+  });
+});
+
+app.post('/api/fleet/pull', async (req, res) => {
+  const { repo, quantization, filename, pattern, targets } = req.body || {};
+  if (!repo) return res.status(400).json({ error: 'Missing repo parameter' });
+
+  const fleet = fleetEndpoints();
+  const chosen = resolveTargets(targets, fleet);
+  if (!chosen.length) {
+    // Never defaulted to the whole fleet: a mis-typed target would otherwise
+    // become simultaneous multi-gigabyte downloads on every box.
+    return res.status(400).json({
+      error: 'No reachable target nodes were named. Pass targets: "all" or a list of node ids.',
+      fleet: fleet.map((node) => node.id),
+    });
+  }
+
+  // The main node tells each node to fetch and does NOT proxy the bytes --
+  // proxying would make this node's uplink the bottleneck for the whole fleet
+  // at once, which is the entire reason downloads are delegated.
+  const started = await Promise.all(chosen.map(async (id) => {
+    const node = fleet.find((entry) => entry.id === id);
+    try {
+      const response = await fetch(`${node.url}/api/pull`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repo, quantization, filename, pattern }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const body = await response.json().catch(() => ({}));
+      return { node: id, ok: response.ok, ...body };
+    } catch (error) {
+      // One unreachable node must not fail the others; the operator gets a row
+      // per node saying exactly which started and which did not.
+      return { node: id, ok: false, error: error.message };
+    }
+  }));
+
+  res.json({ repo, started });
+});
 
 app.post('/api/fleet/main', async (req, res) => {
   // Pinning is the operator overruling the election on purpose, so it is stored
