@@ -63,7 +63,21 @@ NoNewPrivileges=no
 PrivateTmp=yes
 ProtectSystem=full
 ReadWritePaths=/etc/llama-manager
-ProtectControlGroups=yes
+# Rootless Podman must be able to create the engine container's cgroup, and
+# ProtectControlGroups=yes mounts /sys/fs/cgroup READ-ONLY for this service.
+#
+# MEASURED ON THE APPLIANCE. With it enabled every engine start failed with
+# podman exit 125 and the kiosk reported "no inference engine on this machine
+# yet" -- while the very same launcher, with this service's exact environment,
+# working directory and stdin, served on 8080 when run outside the unit. That
+# asymmetry is what took several hypotheses to narrow: PrivateTmp and the
+# missing TTY both reproduce SUCCESSFULLY outside the service, so neither was
+# the cause. Relaxing this one directive alone takes the router from exit 125 to
+# "Llama server restarted successfully" and 33 tok/s.
+#
+# This is a deliberate, narrow concession: the service can write cgroups, which
+# it needs to run a container at all. Every other protection below stays on.
+ProtectControlGroups=no
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
