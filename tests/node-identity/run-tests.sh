@@ -354,6 +354,86 @@ test_an_operator_deny_list_is_extended_not_replaced() {
   drop_sandbox
 }
 
+# AN INSTALLED DISK KEEPS THE NAME IT WAS INSTALLED WITH.
+#
+# subiquity writes /etc/hostname from the installer's identity page, but nothing
+# in the install writes /var/lib/llama-manager/node-name, and the live USB's
+# "writable" partition does not exist on an installed disk -- so both stores are
+# empty on the very first boot after installation. Without a third source the
+# bootstrap probe wins and the box renames ITSELF back to setup-llama-manager,
+# discarding the name the operator chose and the address they were given.
+#
+# The running hostname is that third source. It is authoritative precisely
+# because something already set it: the installer, an operator, a cloud image.
+test_an_installed_disk_keeps_the_name_it_was_installed_with() {
+  printf 'test_an_installed_disk_keeps_the_name_it_was_installed_with\n'
+  new_sandbox dracmoreth-llama-manager
+  # No node-name file and no mirror: exactly a freshly installed disk.
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "the installed name is recovered from the hostname" \
+    "$("$IDENTITY" show 2>/dev/null)" "dracmoreth"
+  assert_equals "the box still answers where it was installed" \
+    "$(applied_hostname)" "dracmoreth-llama-manager"
+  # And it is persisted, so this recovery happens once rather than every boot.
+  assert_equals "the recovered name is written to the store" \
+    "$(cat "$LLAMA_MANAGER_NODE_NAME_FILE" 2>/dev/null)" "dracmoreth"
+  drop_sandbox
+}
+
+# The recovery must not defeat the bootstrap collision probe. A box whose
+# hostname is the bootstrap name has NOT been named by anyone -- treating it as
+# a chosen name would pin every unconfigured box to "setup" and stop them
+# stepping aside from each other.
+test_a_bootstrap_hostname_is_not_a_chosen_name() {
+  printf 'test_a_bootstrap_hostname_is_not_a_chosen_name\n'
+  # A box already wearing a bootstrap VARIANT is the discriminating case: if the
+  # hostname were mistaken for a chosen name the node would be pinned to
+  # "setup-2" forever, never re-probing, even once the box it stepped aside from
+  # is gone. Rejecting it sends the node back through the probe, which finds the
+  # base name free and takes it.
+  new_sandbox setup-2-llama-manager
+  arm_collision_probe
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "a bootstrap variant is re-probed, not pinned" \
+    "$("$IDENTITY" show 2>/dev/null)" "setup"
+  drop_sandbox
+}
+
+# Same for the variants the probe itself hands out.
+test_a_bootstrap_variant_hostname_is_not_a_chosen_name() {
+  printf 'test_a_bootstrap_variant_hostname_is_not_a_chosen_name\n'
+  new_sandbox setup-3-llama-manager
+  arm_collision_probe
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "a setup-N box is still unnamed" \
+    "$("$IDENTITY" show 2>/dev/null)" "setup"
+  drop_sandbox
+}
+
+# A hostname that is not one of ours says nothing about what this node is
+# called. Ubuntu's own <user>-<product> default lands here, and inventing a node
+# name out of it would be worse than the bootstrap name.
+test_a_foreign_hostname_is_not_mistaken_for_a_node_name() {
+  printf 'test_a_foreign_hostname_is_not_mistaken_for_a_node_name\n'
+  new_sandbox yolan-ubuntu
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "an unrelated hostname leaves the node unnamed" \
+    "$("$IDENTITY" show 2>/dev/null)" "setup"
+  drop_sandbox
+}
+
+# The stores still outrank the hostname: the manager and the live mirror are
+# where a DELIBERATE name lives, and a stale hostname must not override one.
+test_the_store_still_outranks_the_running_hostname() {
+  printf 'test_the_store_still_outranks_the_running_hostname\n'
+  new_sandbox stale-llama-manager
+  printf 'nebula\n' > "$LLAMA_MANAGER_NODE_NAME_FILE"
+  "$IDENTITY" apply >/dev/null 2>&1
+  assert_equals "the stored name wins over the running hostname" \
+    "$("$IDENTITY" show 2>/dev/null)" "nebula"
+  drop_sandbox
+}
+
 test_a_hostname_failure_never_blocks_the_manager() {
   printf 'test_a_hostname_failure_never_blocks_the_manager\n'
   new_sandbox llama
@@ -535,6 +615,11 @@ test_avahi_is_left_alone_when_the_name_did_not_change
 test_the_mirror_is_written_at_the_partition_root
 test_avahi_does_not_publish_on_loopback
 test_an_operator_deny_list_is_extended_not_replaced
+test_an_installed_disk_keeps_the_name_it_was_installed_with
+test_a_bootstrap_hostname_is_not_a_chosen_name
+test_a_bootstrap_variant_hostname_is_not_a_chosen_name
+test_a_foreign_hostname_is_not_mistaken_for_a_node_name
+test_the_store_still_outranks_the_running_hostname
 test_a_hostname_failure_never_blocks_the_manager
 
 if ((failures > 0)); then
