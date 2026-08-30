@@ -220,6 +220,22 @@ test_install_flow() {
       "$sb/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh"
     assert_file "control helper installed with launcher" \
       "$sb/usr/local/lib/llama-manager/kiosk/llama-kiosk-control.py"
+    local installed_exec
+    installed_exec="$(sed -n 's/^Exec=//p' "$sb/usr/share/wayland-sessions/llama-kiosk.desktop")"
+    assert_eq "registered session Exec resolves to an installed executable" yes \
+      "$([ -x "$sb$installed_exec" ] && echo yes || echo no)"
+    assert_eq "installed session runtime is readable and executable by kiosk user" yes \
+      "$([ -r "$sb/usr/share/wayland-sessions/llama-kiosk.desktop" ] && \
+          [ -x "$sb/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh" ] && \
+          [ -x "$sb/usr/local/lib/llama-manager/kiosk/llama-kiosk-control.py" ] && \
+          [ -r "$sb/usr/local/lib/llama-manager/kiosk/lib/kiosk-common.sh" ] && \
+          [ -x "$sb/usr/local" ] && [ -x "$sb/usr/local/lib" ] && \
+          [ -x "$sb/usr/local/lib/llama-manager" ] && \
+          [ -x "$sb/usr/local/lib/llama-manager/kiosk" ] && echo yes || echo no)"
+    assert_eq "installed session has no installation-media dependency" no \
+      "$(grep -Rqs '/cdrom' \
+          "$sb/usr/share/wayland-sessions/llama-kiosk.desktop" \
+          "$sb/usr/local/lib/llama-manager/kiosk" && echo yes || echo no)"
 
     # gdm autologin enabled for the user.
     assert_eq "autologin enabled" "yes" \
@@ -443,6 +459,67 @@ test_production_account_safety_guards() {
     )
 }
 
+# Production account creation must yield an ordinary login-capable account.
+# Ubuntu's Firefox snap cannot use a system account, while omitting a password
+# at creation keeps the dedicated autologin identity password-locked.
+test_production_account_class() {
+    printf 'test_production_account_class\n'
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      id() { return 1; }
+      chown() { :; }
+      useradd() {
+          local account_class=normal password_state=locked expect_password=false argument
+          for argument in "$@"; do
+              if $expect_password; then
+                  case "$argument" in !*|'*'*) password_state=locked ;; *) password_state=unlocked ;; esac
+                  expect_password=false
+                  continue
+              fi
+              case "$argument" in
+                  --system|-r) account_class=system ;;
+                  --password|-p) expect_password=true ;;
+              esac
+          done
+          mkdir -p "$sb/home/llama-kiosk"
+          printf 'class=%s\npassword=%s\n' "$account_class" "$password_state" \
+              > "$sb/account-state"
+      }
+
+      kiosk_ensure_account llama-kiosk >/dev/null 2>&1; rc=$?
+      assert_eq "production kiosk account creation succeeds" 0 "$rc"
+      assert_eq "dedicated graphical account is normal, not system" \
+          normal "$(sed -n 's/^class=//p' "$sb/account-state" 2>/dev/null)"
+      assert_eq "dedicated graphical account remains password-locked" \
+          locked "$(sed -n 's/^password=//p' "$sb/account-state" 2>/dev/null)"
+      rm -rf "$sb"
+    )
+}
+
+# An installed/offline appliance must already contain Cage. The kiosk
+# configurator may reject an incomplete image, but must never consult APT or a
+# network source to repair it at runtime.
+test_offline_dependency_guard() {
+    printf 'test_offline_dependency_guard\n'
+    ( source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+      local sb rc; sb="$(new_sandbox)"; export KIOSK_ROOT=/
+      kiosk_path() { printf '%s/%s\n' "$sb" "${1#/}"; }
+      command() {
+          if [ "${1:-}" = -v ] && [ "${2:-}" = cage ]; then return 1; fi
+          builtin command "$@"
+      }
+      apt-get() { printf '%s\n' "$*" >> "$sb/network-command"; return 0; }
+
+      kiosk_ensure_cage >/dev/null 2>&1; rc=$?
+      assert_eq "missing offline Cage dependency is reported as an error" no \
+          "$([ "$rc" -eq 0 ] && echo yes || echo no)"
+      assert_no_file "kiosk configuration never invokes APT/network" \
+          "$sb/network-command"
+      rm -rf "$sb"
+    )
+}
+
 test_preexisting_session_entry_is_restored() {
     printf 'test_preexisting_session_entry_is_restored\n'
     local sb session; sb="$(new_sandbox)"
@@ -655,6 +732,50 @@ EOF
     rm -rf "$sb"
 }
 
+# The session waits for manager readiness before starting the compositor and
+# leaves a diagnostic when Cage or the browser dies, so GDM logs explain a
+# blank or returned session without requiring a graphical test environment.
+test_launcher_readiness_and_exit_report() {
+    printf 'test_launcher_readiness_and_exit_report\n'
+    local sb out rc events; sb="$(new_sandbox)"
+    mkdir -p "$sb/bin"
+    cat > "$sb/bin/curl" <<EOF
+#!/bin/bash
+count=0
+[ ! -f "$sb/curl-count" ] || read -r count < "$sb/curl-count"
+count=\$((count + 1))
+printf '%s\n' "\$count" > "$sb/curl-count"
+printf 'curl\n' >> "$sb/events"
+[ "\$count" -ge 2 ]
+EOF
+    cat > "$sb/bin/sleep" <<EOF
+#!/bin/bash
+printf 'sleep\n' >> "$sb/events"
+EOF
+    cat > "$sb/bin/cage" <<EOF
+#!/bin/bash
+printf 'cage\n' >> "$sb/events"
+exit 23
+EOF
+    cat > "$sb/bin/firefox" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    ln -s /usr/bin/dirname "$sb/bin/dirname"
+    chmod +x "$sb/bin/curl" "$sb/bin/sleep" "$sb/bin/cage" "$sb/bin/firefox"
+
+    out="$(PATH="$sb/bin" KIOSK_LAUNCH_ONCE=1 \
+        KIOSK_URL="http://localhost:3001/kiosk" KIOSK_WAIT_BUDGET=4 \
+        /bin/bash "$REPO_ROOT/scripts/llama-kiosk-launch.sh" 2>&1)"; rc=$?
+    events="$(paste -sd, "$sb/events" 2>/dev/null)"
+    assert_eq "manager readiness is established before Cage/browser launch" \
+        "curl,sleep,curl,cage" "$events"
+    assert_eq "launcher preserves compositor/browser failure status" 23 "$rc"
+    assert_eq "launcher reports compositor/browser exit status" yes \
+      "$(printf '%s\n' "$out" | grep -Eiq '(cage|compositor|browser).*(exit|status).*23' && echo yes || echo no)"
+    rm -rf "$sb"
+}
+
 test_url_resolution
 test_manifest
 test_backup
@@ -665,12 +786,15 @@ test_dry_run_no_mutation
 test_uninstall_flow
 test_preexisting_account_is_preserved
 test_production_account_safety_guards
+test_production_account_class
+test_offline_dependency_guard
 test_preexisting_session_entry_is_restored
 test_uninstall_without_install_preserves_session_entry
 test_partial_install_without_completion_marker_is_cleaned
 test_session_symlink_target_is_never_overwritten
 test_dangling_session_symlink_is_restored_exactly
 test_launcher
+test_launcher_readiness_and_exit_report
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
