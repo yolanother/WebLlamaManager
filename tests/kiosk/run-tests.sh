@@ -316,7 +316,7 @@ test_uninstall_flow() {
       "$(grep '^installed_kiosk_account=' "$sb/var/backups/llama-kiosk/manifest" | cut -d= -f2-)"
     assert_eq "active kiosk session stopped before account removal" "yes" \
       "$(awk '/stop-session/{stopped=NR} /remove-account/{removed=NR} END{print (stopped && removed && stopped < removed) ? "yes" : "no"}' "$sb/actions.log")"
-    assert_eq "reinstall preserves installer-added cage guidance" "yes" \
+    assert_eq "offline appliance never claims package-owned Cage" "no" \
       "$(printf '%s\n' "$uninstall_out" | grep -q "cage.*installed by this script" && echo yes || echo no)"
 
     # Once the successful uninstall clears installation ownership, a later

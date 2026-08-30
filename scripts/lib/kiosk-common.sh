@@ -162,24 +162,17 @@ kiosk_require_browser() {
     return 1
 }
 
-# Ensure the `cage` compositor is installed (apt). Records in the manifest
-# whether WE installed it, so uninstall can offer to remove it.
+# Require the `cage` compositor from the appliance's offline package set.
+# Runtime package-manager access would make target installation depend on a
+# network mirror and can leave GDM selecting a session that cannot start.
 kiosk_ensure_cage() {
     if [ "${KIOSK_TEST_CAGE_MISSING:-0}" != 1 ] && command -v cage >/dev/null 2>&1; then
         [ "$(kiosk_manifest_get installed_cage)" = true ] || \
             kiosk_manifest_set installed_cage false
         return 0
     fi
-    # In a sandbox we cannot apt-install; just record intent.
-    if [ "$KIOSK_ROOT" != "/" ]; then
-        kiosk_log "(sandbox) would apt-get install cage"
-        kiosk_manifest_set installed_cage true
-        return 0
-    fi
-    kiosk_log "Installing cage (Wayland kiosk compositor)..."
-    kiosk_run apt-get update
-    kiosk_run apt-get install -y cage
-    kiosk_manifest_set installed_cage true
+    kiosk_warn "Cage compositor is missing; reinstall the offline appliance package set."
+    return 1
 }
 
 # Resolve the snap-compatible home for a dedicated kiosk account.
