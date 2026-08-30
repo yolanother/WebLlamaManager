@@ -1,7 +1,7 @@
 # Kiosk Dashboard Service — Design
 
 **Date:** 2026-05-31
-**Status:** Implemented; revised 2026-07-14 for appliance packaging
+**Status:** Implemented; revised 2026-08-30 for offline appliance packaging
 **Author:** Llama Manager
 **Spec location:** `docs/superpowers/specs/2026-05-31-kiosk-dashboard-service-design.md`
 
@@ -47,8 +47,9 @@ Derived from the target host:
   **Wayland**.
 - Ubuntu Desktop's **Firefox snap** is available in the offline base image.
   Chrome and Chromium are optional alternatives, never requirements.
-- **cage** is a mandatory appliance-package/image dependency. The standalone
-  source installer uses `apt` as a fallback when it is missing.
+- **cage** is a mandatory package/image dependency. Installation fails with an
+  actionable diagnostic when it is absent; kiosk setup never invokes a package
+  manager or network source at runtime.
 - The dashboard is served by the package system service at
   `http://localhost:${API_PORT}` (default port `3001`). Runtime values come from
   `/etc/llama-manager/llama-manager.env`.
@@ -62,12 +63,13 @@ Power on
       → llama-kiosk-launch.sh
         → start 127.0.0.1-only System Login helper
         → wait until KIOSK_URL is reachable (curl retry loop)
-        → exec cage -- firefox --kiosk … KIOSK_URL
+        → run cage -- firefox --kiosk … KIOSK_URL
 ```
 
 GNOME stays installed; the kiosk is simply a *different session* that gdm
-auto-logs into. If the browser or cage exits, the session ends and gdm restarts
-the autologin session — the kiosk self-heals.
+auto-logs into. If the browser or Cage exits, the launcher records its status in
+the session journal before the session ends, so a black-screen failure is
+diagnosable and gdm can restart the autologin session.
 
 ## 4. Components / artifacts
 
@@ -82,15 +84,15 @@ the autologin session — the kiosk self-heals.
 ### 4.1 System changes made by `install` (all backed up first)
 
 1. **Require `cage`**. Appliance packages declare it as a dependency so offline
-   installations already contain it; the standalone installer falls back to
-   `apt-get install -y cage`. Record whether *we* installed it so uninstall can
-   offer removal. Require any supported browser, preferring Chrome/Chromium when
-   present and otherwise using the Firefox command bundled with Ubuntu Desktop.
-2. Create the dedicated locked `llama-kiosk` system account with private home
-   `/home/llama-kiosk`, and copy runtime files outside administrator homes.
-   This standard home location works with Ubuntu's strictly confined Firefox
-   snap without configuring a broad system-level `homedirs` override for
-   `/var/lib`.
+   installations already contain it. Missing Cage aborts configuration; runtime
+   APT or network access is forbidden. Require any supported browser, preferring
+   Chrome/Chromium when present and otherwise using the Firefox command bundled
+   with Ubuntu Desktop.
+2. Create the dedicated password-locked, normal graphical `llama-kiosk` account
+   (UID at or above `UID_MIN`) with private home `/home/llama-kiosk`, and copy
+   runtime files outside administrator homes. The normal account class and
+   standard home let GDM and Ubuntu's strictly confined Firefox snap run it;
+   AccountsService explicitly records `SystemAccount=false`.
 3. **`/etc/gdm3/custom.conf`** — back up, then enable:
    ```ini
    [daemon]
