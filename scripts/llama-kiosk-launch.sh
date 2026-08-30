@@ -5,11 +5,11 @@
 #
 # Invoked by the "Llama Kiosk" Wayland session (see install-kiosk.sh). Resolves
 # the dashboard URL from the canonical packaged manager EnvironmentFile, waits
-# until it is reachable, then replaces itself with `cage` running full-screen
-# Firefox, Chrome, or Chromium in kiosk mode. Firefox is the offline-safe Ubuntu
-# Desktop default; the launcher preserves its snap-compatible managed HOME when
-# GDM supplies an incomplete environment. Chrome-family browsers remain
-# supported when installed.
+# until it is reachable, then runs `cage` with full-screen Firefox, Chrome, or
+# Chromium in kiosk mode and reports the compositor/browser exit status.
+# Firefox is the offline-safe Ubuntu Desktop default; the launcher preserves
+# its snap-compatible managed HOME when GDM supplies an incomplete environment.
+# Chrome-family browsers remain supported when installed.
 #
 # Starts the separate loopback-only control helper so the local kiosk can switch
 # to GDM without adding a remotely reachable API route.
@@ -29,6 +29,15 @@ WAIT_BUDGET="${KIOSK_WAIT_BUDGET:-60}"
 export HOME="${HOME:-/home/llama-kiosk}"
 PROFILE_DIR="$HOME/.config/llama-kiosk/chrome"
 CONTROL_HELPER="$SCRIPT_DIR/llama-kiosk-control.py"
+CONTROL_HELPER_PID=""
+
+# Stop the session-scoped control helper after Cage and its browser exit.
+cleanup_control_helper() {
+    [ -n "$CONTROL_HELPER_PID" ] || return 0
+    kill "$CONTROL_HELPER_PID" 2>/dev/null || true
+    wait "$CONTROL_HELPER_PID" 2>/dev/null || true
+}
+trap cleanup_control_helper EXIT
 
 # Start the desktop-session helper only for the real kiosk session. It is bound
 # to 127.0.0.1 by its own implementation and validates the dashboard Origin.
@@ -36,6 +45,7 @@ start_control_helper() {
     [ "${KIOSK_LAUNCH_ONCE:-0}" = "1" ] && return 0
     if [ -x "$CONTROL_HELPER" ]; then
         python3 "$CONTROL_HELPER" --dashboard-url "$URL" &
+        CONTROL_HELPER_PID=$!
     else
         kiosk_warn "local System Login helper is missing or not executable"
     fi
@@ -62,11 +72,12 @@ wait_for_url() {
 # flags and an explicit Wayland environment; Chrome-family browsers retain the
 # appliance profile and app-mode flags. Tests may request one launch only.
 launch() {
-    local browser
+    local browser status
     local -a cmd
     browser="$(kiosk_require_browser)" || return 1
     if [ "$browser" = firefox ]; then
-        cmd=(cage -- env MOZ_ENABLE_WAYLAND=1 "$browser" --kiosk --private-window "$URL")
+        cmd=(cage -- env MOZ_ENABLE_WAYLAND=1
+            "$browser" --kiosk --private-window "$URL")
     else
         cmd=(cage -- "$browser"
             --kiosk
@@ -80,11 +91,13 @@ launch() {
             "--user-data-dir=$PROFILE_DIR"
             "--app=$URL")
     fi
-    if [ "${KIOSK_LAUNCH_ONCE:-0}" = "1" ]; then
-        "${cmd[@]}"
+    if "${cmd[@]}"; then
+        status=0
     else
-        exec "${cmd[@]}"
+        status=$?
     fi
+    kiosk_warn "Cage/browser exited with status $status"
+    return "$status"
 }
 
 start_control_helper

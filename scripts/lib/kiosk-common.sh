@@ -6,9 +6,9 @@
 # Shared helpers for scripts/install-kiosk.sh and scripts/llama-kiosk-launch.sh.
 # Provides sandbox-aware path resolution (KIOSK_ROOT), canonical manager-env
 # KIOSK_URL resolution, Firefox/Chrome browser discovery, dedicated-account and
-# session lifecycle, persistent resource-ownership markers, idempotent backups,
-# terminal uninstall guards, and a dry-run-aware command wrapper. This file is
-# sourced, not executed.
+# session lifecycle, normal locked-account validation, persistent
+# resource-ownership markers, idempotent backups, terminal uninstall guards,
+# and a dry-run-aware command wrapper. This file is sourced, not executed.
 
 # Guard against double-sourcing.
 [ -n "${_KIOSK_COMMON_SOURCED:-}" ] && return 0
@@ -190,14 +190,15 @@ kiosk_account_home() {
 }
 
 # Ensure the dedicated kiosk account exists. Production installs create a
-# locked system account with a writable private home under /home and a normal
+# locked normal account with a writable private home under /home and a normal
 # shell so GDM and strict Firefox snap confinement can start the Wayland
-# session. Sandboxed installs model the same lifecycle without touching the
-# host user database. The manifest records ownership so uninstall never removes
-# an account or home that predated Llama Manager.
+# session. Existing accounts must already be normal and locked; the installer
+# never changes their credentials. Sandboxed installs model the same lifecycle
+# without touching the host user database. The manifest records ownership so
+# uninstall never removes an account or home that predated Llama Manager.
 # Args: $1 = account name.
 kiosk_ensure_account() {
-    local user="$1" logical_home home existing_home managed
+    local user="$1" logical_home home existing_home managed uid uid_min password_state
     logical_home="$(kiosk_account_home "$user")"
     home="$(kiosk_path "$logical_home")"
     managed="$(kiosk_manifest_get installed_kiosk_account)"
@@ -218,8 +219,20 @@ kiosk_ensure_account() {
     fi
     if id "$user" >/dev/null 2>&1; then
         existing_home="$(getent passwd "$user" | cut -d: -f6)"
+        uid="$(getent passwd "$user" | cut -d: -f3)"
+        uid_min="$(awk '$1 == "UID_MIN" { print $2; exit }' /etc/login.defs 2>/dev/null || true)"
+        uid_min="${uid_min:-1000}"
         if [ "$existing_home" != "$logical_home" ]; then
             kiosk_warn "existing account '$user' uses '$existing_home', not required home '$logical_home'; refusing to modify it"
+            return 1
+        fi
+        if ! [[ "$uid" =~ ^[0-9]+$ && "$uid_min" =~ ^[0-9]+$ ]] || [ "$uid" -lt "$uid_min" ]; then
+            kiosk_warn "existing account '$user' is a system account; refusing to use it for confined Firefox"
+            return 1
+        fi
+        password_state="$(passwd --status "$user" 2>/dev/null | awk '{ print $2 }')"
+        if [ "$password_state" != L ]; then
+            kiosk_warn "existing account '$user' is not password-locked; refusing to modify its credentials"
             return 1
         fi
         if [ -L "$home" ] || [ ! -d "$home" ]; then
@@ -233,8 +246,8 @@ kiosk_ensure_account() {
         kiosk_warn "$logical_home already exists while account '$user' is absent; refusing to claim it"
         return 1
     fi
-    kiosk_run useradd --system --create-home --home-dir "$logical_home" \
-        --shell /bin/bash --user-group "$user"
+    kiosk_run useradd --create-home --home-dir "$logical_home" \
+        --shell /bin/bash --user-group --password '!' "$user"
     kiosk_run chown -R "$user:$user" "$home"
     kiosk_manifest_set installed_kiosk_account true
 }
@@ -306,7 +319,7 @@ kiosk_stop_session() {
 kiosk_install_runtime() {
     local source_root="$1" logical_dir="/usr/local/lib/llama-manager/kiosk" dest
     dest="$(kiosk_path "$logical_dir")"
-    if [ -e "$dest" ] && [ -z "$(kiosk_manifest_get installed_runtime)" ]; then
+    if [ -e "$dest" ] && [ "$(kiosk_manifest_get installed_runtime)" != true ]; then
         kiosk_warn "$logical_dir already exists but is not managed by this installer"
         return 1
     fi
@@ -314,7 +327,7 @@ kiosk_install_runtime() {
         kiosk_log "DRY-RUN would install kiosk runtime to $logical_dir"
         return 0
     fi
-    mkdir -p "$dest/lib"
+    install -d -m 0755 "$dest" "$dest/lib"
     install -m 0755 "$source_root/scripts/llama-kiosk-launch.sh" "$dest/llama-kiosk-launch.sh"
     install -m 0755 "$source_root/scripts/llama-kiosk-control.py" "$dest/llama-kiosk-control.py"
     install -m 0644 "$source_root/scripts/lib/kiosk-common.sh" "$dest/lib/kiosk-common.sh"
@@ -327,6 +340,7 @@ kiosk_remove_runtime() {
     [ "$(kiosk_manifest_get installed_runtime)" = "true" ] || return 0
     dest="$(kiosk_path /usr/local/lib/llama-manager/kiosk)"
     kiosk_run rm -rf "$dest"
+    kiosk_manifest_set installed_runtime false
 }
 
 # Set or replace a "key=value" line under an [section]-less or simple INI file,
@@ -424,6 +438,14 @@ kiosk_install() {
             awk '{print} /^\[User\]/ && !d {print "Session=llama-kiosk"; d=1}' "$acct" > "$tmp"
         fi
         mv "$tmp" "$acct"
+        tmp="$(mktemp)"
+        if grep -qE '^SystemAccount=' "$acct"; then
+            sed 's|^SystemAccount=.*|SystemAccount=false|' "$acct" > "$tmp"
+        else
+            awk '{print} /^\[User\]/ && !d {print "SystemAccount=false"; d=1}' "$acct" > "$tmp"
+        fi
+        mv "$tmp" "$acct"
+        chmod 0644 "$acct"
     fi
 
     # Generate the session entry.
