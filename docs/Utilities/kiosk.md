@@ -52,7 +52,8 @@ sudo bash scripts/install-kiosk.sh install --no-start
 ```
 
 The installer:
-- requires `cage` and installs it through apt if missing,
+- requires `cage` from the appliance's offline package set and fails without
+  invoking APT if it is missing,
 - uses Ubuntu Desktop's bundled Firefox offline, while retaining optional
   Chrome/Chromium support,
 - creates the dedicated `llama-kiosk` account with `/home/llama-kiosk` as its
@@ -77,10 +78,10 @@ target with `KIOSK_URL=` (or `API_PORT=`) in the canonical package environment
 `http://localhost:3001/kiosk`.
 
 The appliance DEB and Ubuntu image **must include `cage` as a package
-dependency** so the kiosk is available without network access. The standalone
-script's apt installation is a fallback for source-based installations, not a
-replacement for declaring the appliance package dependency. Proprietary Chrome
-is never required.
+dependency** so the kiosk is available without network access. There is no
+runtime APT fallback: a missing compositor stops configuration with `Cage
+compositor is missing; reinstall the offline appliance package set.` before GDM
+is changed. Proprietary Chrome is never required.
 
 The installer intentionally does not run `snap set system homedirs=...`.
 Keeping this dedicated home under `/home` avoids granting snaps access to a
@@ -143,8 +144,12 @@ sudo journalctl -b _UID="$(id -u llama-kiosk)" --no-pager
 
 Look for a missing `Exec` target, an unreadable file under the installed runtime,
 Firefox snap confinement or profile errors, Cage/Wayland startup failures, and a
-dashboard readiness timeout. Once the paths and account are correct, recover the
-graphical session with:
+dashboard readiness timeout. The launcher logs `Cage/browser exited with status
+N` and returns the same non-zero status when Cage or the browser fails, so the
+user journal preserves the session's failure code. If no supported browser can
+be resolved, it instead logs `No supported browser found. Install Firefox,
+Chrome, or Chromium before continuing.` Once the paths and account are correct,
+recover the graphical session with:
 
 ```bash
 sudo bash scripts/install-kiosk.sh restart
@@ -174,13 +179,13 @@ no-op and never touches an unmanaged entry. If the installer created
 `llama-kiosk`, it removes that account and its private home. It first terminates
 the kiosk login session and refuses account removal if processes remain. A
 pre-existing account with that name is preserved. `cage` is left installed
-(remove with `sudo apt remove cage` if you want). Re-running the installer
-preserves its ownership markers, so uninstall still removes installer-created
-resources and reports when the installer originally added `cage`. After a
-successful uninstall records `installed=false`, later uninstall commands are
-complete no-ops: they never replay stale backups or remove resources created
-after kiosk removal. A partial installation whose manifest has no `installed`
-completion marker remains recoverable through the same uninstall command.
+because it belongs to the offline appliance package set, not this script.
+Re-running the installer preserves its ownership markers, so uninstall still
+removes installer-created resources. After a successful uninstall records
+`installed=false`, later uninstall commands are complete no-ops: they never
+replay stale backups or remove resources created after kiosk removal. A partial
+installation whose manifest has no `installed` completion marker remains
+recoverable through the same uninstall command.
 
 ## Tests
 
