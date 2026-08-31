@@ -100,6 +100,27 @@ test_ctl_only_targets_llama_manager_service() {
   rm -rf "$sandbox"
 }
 
+test_packaged_env_agrees_with_the_installer_about_models() {
+  printf 'test_packaged_env_agrees_with_the_installer_about_models\n'
+  local env_file models_dir
+  env_file="$REPO_ROOT/packaging/llama-manager.env"
+
+  # THE TWO HALVES MUST NAME THE SAME DIRECTORY.
+  #
+  # The offline installer stages the bundled GGUF, and this file tells the
+  # manager where to look. They were changed independently: the installer moved
+  # to /volumes/models (and now deletes the old location as obsolete) while this
+  # file set no MODELS_DIR at all, so the manager fell back to $HOME/models.
+  # Each half was self-consistent; together they lost the model. Measured on
+  # hardware -- the 5 GB Qwen3-8B sat in /volumes/models and the dashboard
+  # reported an appliance with no models, not even the one on its own media.
+  models_dir="$(sed -n 's/^MODELS_DIR=//p' "$env_file" | head -1)"
+  assert_eq "packaged env names a models directory" "yes" \
+    "$([ -n "$models_dir" ] && echo yes || echo no)"
+  assert_eq "packaged env points at the appliance's canonical model location" \
+    "/volumes/models" "$models_dir"
+}
+
 test_ctl_selects_persistent_model_storage() {
   printf 'test_ctl_selects_persistent_model_storage\n'
   local sandbox model_dir output
@@ -542,6 +563,7 @@ test_packaged_install_exits_with_apt_guidance
 test_ctl_reports_overridden_runtime_paths
 test_ctl_manages_json_config_without_root
 test_ctl_only_targets_llama_manager_service
+test_packaged_env_agrees_with_the_installer_about_models
 test_ctl_selects_persistent_model_storage
 test_ctl_reads_path_overrides_from_package_configuration_file
 test_ctl_rejects_model_storage_unusable_by_service_identity

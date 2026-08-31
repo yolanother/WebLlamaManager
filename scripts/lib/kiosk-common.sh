@@ -165,6 +165,9 @@ kiosk_restore_file() {
 #
 # `cog` is deliberately absent despite the docs calling it preferred: it is not
 # packaged for noble at all, so recommending it was recommending nothing.
+# The appliance's own kiosk shell, installed beside the launcher.
+KIOSK_SHELL_BIN="${KIOSK_SHELL_BIN:-/usr/local/lib/llama-manager/kiosk/llama-kiosk-shell.py}"
+
 KIOSK_DEFAULT_BROWSERS='epiphany-browser google-chrome google-chrome-stable chromium chromium-browser firefox'
 
 # Find a supported Wayland kiosk browser. Echoes the binary name, or fails with
@@ -178,6 +181,12 @@ KIOSK_DEFAULT_BROWSERS='epiphany-browser google-chrome google-chrome-stable chro
 # Honors KIOSK_FAKE_CHROME=1 to preserve the sandboxed installer test seam.
 kiosk_require_browser() {
     if [ "${KIOSK_FAKE_CHROME:-0}" = "1" ]; then printf 'google-chrome\n'; return 0; fi
+    # The appliance's OWN shell comes first. It is not a browser and has no
+    # browser furniture to suppress -- no chrome, tabs, menus, downloads,
+    # navigation, onboarding, or "set as default browser?" prompt. Everything
+    # below it is a general-purpose browser kept only as a fallback for an
+    # image where the shell is missing.
+    if [ -x "$KIOSK_SHELL_BIN" ]; then printf '%s\n' "$KIOSK_SHELL_BIN"; return 0; fi
     local b
     for b in ${LLAMA_KIOSK_BROWSERS:-$KIOSK_DEFAULT_BROWSERS}; do
         if command -v "$b" >/dev/null 2>&1; then printf '%s\n' "$b"; return 0; fi
@@ -348,6 +357,10 @@ kiosk_install_runtime() {
     install -d -m 0755 "$dest" "$dest/lib"
     install -m 0755 "$source_root/scripts/llama-kiosk-launch.sh" "$dest/llama-kiosk-launch.sh"
     install -m 0755 "$source_root/scripts/llama-kiosk-control.py" "$dest/llama-kiosk-control.py"
+    # The appliance's own shell. Installed unconditionally: kiosk_require_browser
+    # prefers it over any browser, and an image that shipped the launcher without
+    # it would silently fall back to a general-purpose browser.
+    install -m 0755 "$source_root/scripts/llama-kiosk-shell.py" "$dest/llama-kiosk-shell.py"
     install -m 0644 "$source_root/scripts/lib/kiosk-common.sh" "$dest/lib/kiosk-common.sh"
     kiosk_manifest_set installed_runtime true
 }

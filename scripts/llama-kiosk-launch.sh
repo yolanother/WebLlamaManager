@@ -75,7 +75,12 @@ launch() {
     local browser status
     local -a cmd
     browser="$(kiosk_require_browser)" || return 1
-    if [ "$browser" = epiphany-browser ]; then
+    if [ "$browser" = "$KIOSK_SHELL_BIN" ]; then
+        # The shell takes the URL and needs nothing else: it is fullscreen and
+        # undecorated by construction, and it shows the appliance's own branded
+        # waiting state until the manager is serving.
+        cmd=(cage -- "$browser" "$URL")
+    elif [ "$browser" = epiphany-browser ]; then
         # --private-instance, NOT --application-mode. Measured on the
         # appliance: --application-mode wants an epiphany WEB APP profile whose
         # directory name encodes a GApplication ID, so a plain directory makes
