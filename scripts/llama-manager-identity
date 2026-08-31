@@ -214,6 +214,42 @@ resolve_bootstrap_name() {
   printf '%s\n' "$BOOTSTRAP_NAME"
 }
 
+# Prints the node name the CURRENT system hostname already carries, or nothing.
+#
+# THE THIRD STORE, AND THE ONE AN INSTALLED DISK HAS.
+#
+# Neither persistent store exists on the first boot after an install to disk:
+# nothing in the offline installer writes /var/lib/llama-manager/node-name, and
+# the live USB's "writable" partition is not present on the installed disk at
+# all. Without this the bootstrap probe wins and the box renames ITSELF back to
+# setup-llama-manager, throwing away the name the operator typed on the
+# installer's identity page and the address they were handed.
+#
+# The running hostname is authoritative exactly because something already set
+# it deliberately -- subiquity from the identity page, an operator, a cloud
+# image. Recovering from it fixes the CLASS rather than the installer alone: any
+# route that sets the hostname correctly now persists on first boot.
+#
+# It ranks BELOW both stores. Those hold a name someone chose through the
+# manager; a hostname may merely be left over.
+#
+# A hostname that is not one of ours, or that is the bootstrap name or one of
+# the setup-N variants the probe hands out, means nobody has named this box --
+# the probe must run exactly as before. Pinning a node to a variant it was
+# assigned would stop it ever reclaiming the base name.
+read_name_from_hostname() {
+  local hostname name
+  hostname="$("$HOSTNAMECTL" hostname 2>/dev/null)" || return 0
+  hostname="$(printf '%s' "${hostname%%.*}" | tr 'A-Z' 'a-z')"
+  [[ "$hostname" == *-llama-manager ]] || return 0
+  name="${hostname%-llama-manager}"
+  [[ -n "$name" ]] || return 0
+  case "$name" in
+    "$BOOTSTRAP_NAME"|"$BOOTSTRAP_NAME"-[0-9]) return 0 ;;
+  esac
+  normalize_name "$name"
+}
+
 # Prints the name this node should answer to, applying the resolution order
 # documented at the top of this file. Never prints an empty string.
 #
@@ -225,6 +261,7 @@ resolve_name() {
   local name
   name="$(read_name_file "$NAME_FILE")"
   [[ -n "$name" ]] || name="$(read_name_file "$MIRROR_PATH")"
+  [[ -n "$name" ]] || name="$(read_name_from_hostname)"
   [[ -n "$name" ]] || name="$(resolve_bootstrap_name)"
   printf '%s\n' "$name"
 }
