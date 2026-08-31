@@ -28,3 +28,11 @@ Thumbs.db
 # Editor/tool config
 opencode.json
 opencode.json~
+
+# Local agent harness configuration. Per-developer and per-machine: hookify
+# rules and Claude Code settings describe how one operator's agents behave, not
+# how the product builds. These were committed by accident (2807f60, 8b1856a)
+# and are untracked again here.
+.claude/settings.json
+.claude/settings.local.json
+.claude/hookify.*.local.md
