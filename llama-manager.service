@@ -92,13 +92,38 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectClock=yes
-RestrictSUIDSGID=yes
+# NOT enabled, though it is otherwise good hygiene here. This restriction is a
+# seccomp filter, and seccomp is inherited by every descendant -- including the
+# processes inside the engine container. distrobox initializes that container by
+# upgrading util-linux and pam, whose payloads are setuid binaries (/usr/bin/mount,
+# chfn, pam_timestamp_check); with this on, rpm cannot set their setuid bits and
+# the transaction dies with "cpio: chmod failed", so container setup never
+# completes and the engine never starts. Verified both ways on the appliance:
+# with it, a chmod 4755 inside the container fails; without it, it succeeds.
+# The container is a pinned, offline, first-party image, so its own setuid
+# binaries are not the threat this option defends against.
+RestrictSUIDSGID=no
 LockPersonality=yes
-# Mapping helpers may acquire only the two capabilities required to write the
-# service account's subordinate uid/gid maps. Node additionally receives
-# CAP_NET_BIND_SERVICE as an ambient capability so the non-root service account
-# can bind the appliance's port 80 dashboard listener (see ALT_PORT).
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE
+# Mapping helpers need more than CAP_SETUID/CAP_SETGID, which is what this list
+# used to assume. Rootless Podman builds the engine container's user namespace by
+# exec'ing the distro's setuid-root /usr/bin/newuidmap, which writes
+# /proc/<pid>/uid_map. The bounding set caps what even a setuid-root binary may
+# hold, so without CAP_DAC_OVERRIDE and CAP_SYS_ADMIN that write fails with
+#   newuidmap: open of uid_map failed: Permission denied
+# and Podman exits 125 before any of our code runs -- which the manager then
+# reported as "llama-server crashed".
+#
+# This is invisible in normal operation because it only bites when the container
+# must be STARTED. `podman exec` into an already-running container joins the
+# existing namespace and never calls newuidmap, so a freshly installed appliance
+# looks healthy right up until the first restart, and then never recovers.
+#
+# The service itself holds none of these. It runs as llama-manager with
+# CapEff = CAP_NET_BIND_SERVICE alone (verified on the appliance); the bounding
+# set only permits the distro-shipped setuid helper to do its one job. Node
+# receives CAP_NET_BIND_SERVICE as an ambient capability so the non-root service
+# account can bind the appliance's port 80 dashboard listener (see ALT_PORT).
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_SYS_ADMIN
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]

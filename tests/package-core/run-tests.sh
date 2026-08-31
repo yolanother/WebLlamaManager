@@ -234,9 +234,28 @@ test_canonical_service_assets_are_package_safe() {
   assert_contains "service retains private temporary storage" "$service" "PrivateTmp=yes"
   assert_contains "service retains read-only package and OS trees" "$service" "ProtectSystem=full"
   assert_contains "service retains kernel module protection" "$service" "ProtectKernelModules=yes"
-  assert_contains "service retains setuid/setgid creation restrictions" "$service" "RestrictSUIDSGID=yes"
+  # RestrictSUIDSGID is deliberately NOT enabled, and this assertion is inverted
+  # from what it used to check. It is a seccomp filter, and seccomp is inherited
+  # by every descendant -- including processes inside the engine container.
+  # distrobox initializes that container by upgrading util-linux and pam, whose
+  # payloads are setuid binaries; with the restriction on, rpm cannot set their
+  # setuid bits, the transaction dies with "cpio: chmod failed", and the engine
+  # never starts. The container is a pinned, offline, first-party image.
+  assert_contains "container setup can set setuid bits" "$service" "RestrictSUIDSGID=no"
+  # The bounding set must cover what rootless Podman needs to build the engine
+  # container user namespace, which it does by exec'ing the distro setuid-root
+  # /usr/bin/newuidmap to write /proc/<pid>/uid_map. CAP_SETUID/CAP_SETGID alone
+  # are NOT enough: without CAP_DAC_OVERRIDE and CAP_SYS_ADMIN that write fails
+  # with "open of uid_map failed: Permission denied" and Podman exits 125, which
+  # the manager reports as "llama-server crashed". This only bites when the
+  # container has to be STARTED -- podman exec joins an existing namespace -- so
+  # a fresh appliance looks healthy until its first restart and then never
+  # recovers. The service itself holds none of these (CapEff is
+  # CAP_NET_BIND_SERVICE alone); the bounding set only permits the setuid helper.
   assert_contains "service bounds mapping helper capabilities to uid and gid setup" "$service" \
     "CapabilityBoundingSet=CAP_SETUID CAP_SETGID"
+  assert_contains "bounding set lets newuidmap open uid_map" "$service" "CAP_DAC_OVERRIDE"
+  assert_contains "bounding set lets newuidmap build the namespace" "$service" "CAP_SYS_ADMIN"
   assert_contains "service grants Node only the port 80 bind capability" "$service" \
     "AmbientCapabilities=CAP_NET_BIND_SERVICE"
   if [[ "$service" == *"/home/yolan"* ]]; then
