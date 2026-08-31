@@ -214,6 +214,24 @@ test_install_flow() {
 
     # Session desktop file generated and points at the launcher.
     assert_file "session file created" "$sb/usr/share/wayland-sessions/llama-kiosk.desktop"
+
+    # A PORTAL BACKEND MUST BE DECLARED FOR THIS DESKTOP.
+    #
+    # The session sets DesktopNames=llama-kiosk, so XDG_CURRENT_DESKTOP is a
+    # name no shipped portal backend claims, and xdg-desktop-portal then serves
+    # nothing. MEASURED on the appliance: org.freedesktop.portal.Settings did
+    # not exist, Firefox logged "No such interface" on every launch, and
+    # epiphany-browser aborted outright with
+    # "Failed to create XdpPortal instance: Could not connect: Permission
+    # denied". A kiosk whose browser aborts on startup shows a black screen.
+    assert_file "portal backend declared for the kiosk desktop" \
+      "$sb/usr/share/xdg-desktop-portal/llama-kiosk-portals.conf"
+    assert_eq "portal config names a backend that ships on the image" "yes" \
+      "$(grep -qE '^default=gtk' "$sb/usr/share/xdg-desktop-portal/llama-kiosk-portals.conf" && echo yes || echo no)"
+    # Named for the desktop it serves, so it applies to this session only and a
+    # normal desktop session is untouched.
+    assert_eq "portal config is scoped to the kiosk desktop, not global" "yes" \
+      "$([ ! -e "$sb/usr/share/xdg-desktop-portal/portals.conf" ] && echo yes || echo no)"
     assert_eq "session Exec uses readable installed runtime" "yes" \
       "$(grep -q '^Exec=/usr/local/lib/llama-manager/kiosk/llama-kiosk-launch.sh' "$sb/usr/share/wayland-sessions/llama-kiosk.desktop" && echo yes || echo no)"
     assert_file "launcher installed outside administrator home" \

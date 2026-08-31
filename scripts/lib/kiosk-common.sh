@@ -363,6 +363,50 @@ kiosk_set_ini_key() {
     fi
 }
 
+# Declare which xdg-desktop-portal backend serves this session.
+#
+# The session entry sets DesktopNames=llama-kiosk, so XDG_CURRENT_DESKTOP is
+# `llama-kiosk` — a desktop name no portal backend claims. xdg-desktop-portal
+# then starts, serves nothing, and every request fails.
+#
+# MEASURED on the appliance: the portal was running and
+# `org.freedesktop.portal.Settings` did not exist on it. Firefox logged
+# "Failed to read portal settings: ... No such interface" on every launch, and
+# epiphany-browser did not survive it at all —
+# "libportal-CRITICAL: Failed to create XdpPortal instance: Could not connect:
+# Permission denied", then SIGABRT. A kiosk whose browser aborts on startup is
+# a black screen with a cursor, which is exactly what the appliance showed.
+#
+# Ubuntu ships gnome.portal and gtk.portal but maps them only through
+# gnome-portals.conf, which applies to GNOME. gtk is the right backend here: it
+# is the generic one, it is present on the image, and the kiosk needs Settings
+# and OpenURI rather than anything GNOME-specific.
+#
+# Named for the desktop it serves, per xdg-desktop-portal's
+# <desktop>-portals.conf convention, so it applies to this session only and
+# leaves a normal desktop session untouched.
+# Arg: none.
+kiosk_write_portal_config() {
+    local dest dest_dir temp content
+    dest="$(kiosk_path /usr/share/xdg-desktop-portal/llama-kiosk-portals.conf)"
+    content="[preferred]
+default=gtk"
+    if [ "$KIOSK_DRY_RUN" = "true" ]; then
+        kiosk_log "DRY-RUN would write portal config to $dest"
+        return 0
+    fi
+    dest_dir="$(dirname "$dest")"
+    mkdir -p "$dest_dir"
+    temp="$(mktemp "$dest_dir/.llama-kiosk-portals.XXXXXX")"
+    if ! printf '%s\n' "$content" > "$temp" ||
+        ! chmod 0644 "$temp" ||
+        ! mv -Tf "$temp" "$dest"; then
+        rm -f "$temp"
+        return 1
+    fi
+    kiosk_log "wrote portal config: $dest"
+}
+
 # Atomically publish the kiosk Wayland session desktop entry through a
 # same-directory regular temp file, never following an existing destination
 # symlink. The final entry is mode 0644.
@@ -410,6 +454,7 @@ kiosk_install() {
     kiosk_backup_file gdm_custom_conf /etc/gdm3/custom.conf
     kiosk_backup_file "accountsservice_$user" "/var/lib/AccountsService/users/$user"
     kiosk_backup_file wayland_session /usr/share/wayland-sessions/llama-kiosk.desktop
+    kiosk_backup_file portal_config /usr/share/xdg-desktop-portal/llama-kiosk-portals.conf
     kiosk_manifest_set target_user "$user"
 
     # Enable gdm autologin for the user.
@@ -444,9 +489,19 @@ kiosk_install() {
     # Generate the session entry.
     kiosk_write_session "$launcher"
 
+    # And tell xdg-desktop-portal which backend serves it. Without this the
+    # session's browser aborts or degrades on a portal that answers nothing.
+    kiosk_write_portal_config
+
     kiosk_manifest_set installed true
     kiosk_log "Kiosk installed."
-    kiosk_log "Escape hatches: SSH, or Ctrl+Alt+F3 for a text console."
+    # Do NOT promise escape hatches this image does not have. MEASURED on the
+    # appliance: Ctrl+Alt+F2 and Ctrl+Alt+F3 reach no TTY, and sshd is not
+    # installed on a release target at all -- so the previous message sent an
+    # operator whose kiosk had failed to two doors that are not there. Naming a
+    # recovery route that does not exist costs more than naming none.
+    kiosk_log "If the kiosk fails, recover from GRUB's recovery mode, or enable"
+    kiosk_log "diagnostic SSH at install time to reach this machine remotely."
 
     # Bring the kiosk up now (no reboot needed) unless --no-start was given.
     if [ "${KIOSK_NO_START:-false}" = "true" ]; then
