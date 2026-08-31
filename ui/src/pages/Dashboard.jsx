@@ -13,6 +13,7 @@ import {
 } from 'recharts';
 import { API_BASE, formatBytes, formatUptime, formatModelName } from '../api.js';
 import { isLocalKioskHost, requestSystemLogin } from '../kiosk-control.js';
+import { resolveGpuPanel } from '../gpu-panel.js';
 import { useVisiblePolling } from '../hooks/useVisiblePolling.js';
 import {
   StatCard,
@@ -1319,6 +1320,39 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               </div>
             </div>
           )}
+
+          {/* Cards other than the one inference runs on. Renders nothing at
+              all on a single-GPU box, which is almost every appliance: the
+              headline cards above already describe that machine completely. */}
+          {resolveGpuPanel(stats).additional.map((gpu) => (
+            <div
+              className="resource-card glass-panel"
+              key={gpu.card || gpu.title}
+              style={gpu.available ? undefined : { opacity: 0.55 }}
+            >
+              <div className="resource-info">
+                <span className="resource-label">
+                  {gpu.title}
+                  <span style={{ fontSize: '0.7em', opacity: 0.7, marginLeft: '0.4em' }}>
+                    {gpu.kind}
+                  </span>
+                </span>
+                {/* Never a bare 0: an unmeasurable card says why. */}
+                <span className="resource-detail">{gpu.detail}</span>
+                {gpu.available && gpu.temperature > 0 && (
+                  <span
+                    className="resource-detail"
+                    style={{ color: severityColor(sensorSeverity(gpu.temperature, stats?.guard)) }}
+                  >
+                    {gpu.temperature}°C{gpu.power > 0 ? ` \u00b7 ${gpu.power.toFixed(0)} W` : ''}
+                  </span>
+                )}
+                <span className="resource-detail" style={{ fontSize: '0.7em', opacity: 0.7 }}>
+                  Not used for inference
+                </span>
+              </div>
+            </div>
+          ))}
 
           <div className="resource-card glass-panel">
             <ProgressRing

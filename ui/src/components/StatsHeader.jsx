@@ -115,14 +115,24 @@ function StatsHeader({ stats }) {
               <span className="stats-header-label">{stats.gpu.isAPU ? 'GTT' : 'VRAM'}</span>
             </div>
 
-            <div className="stats-header-item" title="GPU Usage">
+            <div
+              className="stats-header-item"
+              title={(stats.gpus?.length || 1) > 1
+                ? `GPU usage \u2014 inference card of ${stats.gpus.length}`
+                : 'GPU Usage'}
+            >
               <ProgressRing
                 value={stats.gpu.usage || 0}
                 size={36}
                 strokeWidth={4}
                 color="var(--accent)"
               />
-              <span className="stats-header-label">GPU</span>
+              {/* The rail is a one-line summary of the card the model runs on;
+                  it is not multiplied per card. The count only tells the
+                  operator another card exists so a missing one is noticeable. */}
+              <span className="stats-header-label">
+                GPU{(stats.gpus?.length || 1) > 1 ? ` 1/${stats.gpus.length}` : ''}
+              </span>
             </div>
 
             {(stats.guard || stats.gpu.temperature > 0) && (() => {

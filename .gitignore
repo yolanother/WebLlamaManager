@@ -36,3 +36,8 @@ opencode.json~
 .claude/settings.json
 .claude/settings.local.json
 .claude/hookify.*.local.md
+
+# Worktree convenience symlinks to the primary checkout. Never tracked.
+api/node_modules
+ui/node_modules
+node_modules/
