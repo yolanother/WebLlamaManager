@@ -154,12 +154,42 @@ read-only, with a narrow exception for `/etc/llama-manager`.
 `NoNewPrivileges` is explicitly disabled because rootless Podman/Distrobox must
 execute the distribution's setuid `newuidmap` and `newgidmap` helpers to install
 the service account's subordinate-ID mappings; enabling it makes the packaged
-gfx1151 container fail before inference starts. The bounding set contains only
-`CAP_SETUID` and `CAP_SETGID`, which those helpers require; the empty ambient set
-means Node starts with neither capability. The service still runs as the
-unprivileged `llama-manager` identity and retains `PrivateTmp`, `ProtectSystem`,
-kernel protection, and `RestrictSUIDSGID` (which prevents creating new
-setuid/setgid files but does not block the installed mapping helpers). GPU
+gfx1151 container fail before inference starts.
+
+The bounding set is `CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE
+CAP_DAC_OVERRIDE CAP_SYS_ADMIN`. It used to carry only the first three, on the
+assumption that the mapping helpers needed nothing more; that assumption was
+wrong and it cost the appliance its engine. `newuidmap` writes
+`/proc/<pid>/uid_map`, the bounding set caps what even a setuid-root binary may
+hold, and without `CAP_DAC_OVERRIDE` and `CAP_SYS_ADMIN` that write fails with
+`newuidmap: open of uid_map failed: Permission denied`. Podman then exits 125
+before any manager code runs, and the manager reported that as
+`llama-server crashed`. Both capabilities were confirmed necessary by probing
+each subset with
+`systemd-run --property=CapabilityBoundingSet=... podman unshare id -u`.
+The empty ambient set still means Node itself starts with none of these: the
+running service holds `CAP_NET_BIND_SERVICE` alone, for the port 80 listener,
+and the bounding set exists only so the distribution's setuid helper can do its
+one job.
+
+`RestrictSUIDSGID` is deliberately NOT enabled, which is a change from the
+original posture. It is a seccomp filter, and seccomp is inherited by every
+descendant — including the processes inside the engine container. Distrobox
+initialises that container by upgrading `util-linux` and `pam`, whose payloads
+are setuid binaries, so with the restriction on `rpm` cannot set their setuid
+bits and container setup dies with `cpio: chmod failed`. The earlier claim that
+it "does not block the installed mapping helpers" was true of the helpers and
+missed this second-order effect entirely. The container it now permits setuid
+bits inside is a pinned, offline, first-party image.
+
+Both failures only appear when the container has to be STARTED: `podman exec`
+into an already-running container joins the existing namespace and re-runs
+neither the mapping helper nor the package setup. A freshly provisioned
+appliance therefore looks healthy — the first-boot setup unit sets no capability
+restriction at all — and stops working at its first restart.
+
+The service still runs as the unprivileged `llama-manager` identity and retains
+`PrivateTmp`, `ProtectSystem`, and kernel protection. GPU
 device isolation,
 home-directory protection, and a globally read-only filesystem are intentionally
 not enabled because ROCm and operator-selected local/NAS model storage may live
