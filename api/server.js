@@ -335,6 +335,22 @@ const resolveModelCapabilities = createModelCapabilityResolver(MODELS_DIR);
 const CONTAINER_NAME = process.env.DISTROBOX_CONTAINER || 'llama-rocm-7rc-rocwmma';
 const API_PORT = process.env.API_PORT || 3001;
 const LLAMA_PORT = process.env.LLAMA_PORT || 8080;
+
+// How long to wait for the engine after we have just launched it ourselves.
+//
+// On the packaged appliance the engine does not start in-process: it starts a
+// container, and distrobox re-runs its own initialization every time that
+// container goes from stopped to running. On a cold container that takes
+// minutes -- it upgrades util-linux and pam, and the first attempt at that
+// transaction fails and only succeeds on distrobox's retry. At the old 60s the
+// manager gave up in the middle of a start that was progressing normally,
+// killed it, and reported a bare "exit code 125" with no cause, which reads as
+// a crash rather than a timeout.
+//
+// The wait polls /health and returns the moment the engine answers, so a
+// generous ceiling costs a healthy machine nothing; it only changes how long a
+// genuinely slow first start is allowed to take before being called a failure.
+const ENGINE_START_WAIT_MS = 300000;
 const EMBED_PORT = process.env.EMBED_PORT || 5252;
 const LLAMA_UI_URL = process.env.LLAMA_UI_URL || null; // Optional override for llama.cpp UI URL
 const handleAudioTranscription = createAudioTranscriptionHandler({
@@ -2826,7 +2842,7 @@ async function restoreDesiredResidentModels() {
       addLog('models', `Desired residency restore deferred: memory governor is ${guardMemState} (${guardMemLast.reason})`);
       return;
     }
-    const ready = await waitForServerReady({ maxWait: 60_000, label: 'residency-restore' });
+    const ready = await waitForServerReady({ maxWait: ENGINE_START_WAIT_MS, label: 'residency-restore' });
     if (!ready) {
       addLog('models', 'Desired residency restore deferred: llama router is not ready');
       return;
@@ -5995,7 +6011,7 @@ async function restartLlamaServer({ governed = true } = {}) {
     intentionalStop = false;
 
     // Wait for server to become healthy
-    const ready = await waitForServerReady({ maxWait: 60000, label: 'restart' });
+    const ready = await waitForServerReady({ maxWait: ENGINE_START_WAIT_MS, label: 'restart' });
     if (ready) {
       consecutiveFailedRestarts = 0; // recovery cleared the wedge signal
       console.log('[restart] Llama server restarted successfully');
