@@ -180,6 +180,7 @@ import { shouldIdleShutdown } from './idle-shutdown.js';
 import { resolveIdleMinutes } from './idle-policy.js';
 import { resolveNamingModel } from './naming-model.js';
 import { seedDefaultAliases } from './seed-aliases.js';
+import { buildInventory } from './gpu-inventory.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -3063,29 +3064,71 @@ function getCpuTemperature() {
 // clock, and busy %. Without them the dashboard shows 0 °C / 0 W / 0 MHz / 0 % and the
 // governor never throttles a hot APU. Each field is 0 if its sensor is unavailable.
 // Returns { temperature(°C), power(W), coreClock(MHz), busyPercent(%) }.
-function getGpuSysfsStats() {
-  const out = { temperature: 0, power: 0, coreClock: 0, busyPercent: 0 };
+function readCardSysfs(card) {
+  const dev = `/sys/class/drm/${card}/device`;
+  let hwmon = null;
+  try {
+    for (const hw of readdirSync(`${dev}/hwmon`)) {
+      if (readFileSync(`${dev}/hwmon/${hw}/name`, 'utf-8').trim() === 'amdgpu') { hwmon = `${dev}/hwmon/${hw}`; break; }
+    }
+  } catch { /* no hwmon on this card */ }
+  if (!hwmon) return null; // not the GPU card (e.g. a display-only node)
+  const readInt = (p) => { try { return parseInt(readFileSync(p, 'utf-8').trim()) || 0; } catch { return 0; } };
+  const readOpt = (p) => { try { const v = parseInt(readFileSync(p, 'utf-8').trim()); return Number.isFinite(v) ? v : null; } catch { return null; } };
+  let name = '';
+  try { name = readFileSync(`${dev}/product_name`, 'utf-8').trim(); } catch { /* not published */ }
+  return {
+    card,
+    name,
+    driver: 'amdgpu',
+    available: true,
+    temperature: Math.round(readInt(`${hwmon}/temp1_input`) / 100) / 10, // m°C -> °C
+    power: Math.round(readInt(`${hwmon}/power1_average`) / 1000000),     // µW -> W
+    coreClock: Math.round(readInt(`${hwmon}/freq1_input`) / 1000000),    // Hz -> MHz
+    busyPercent: readInt(`${dev}/gpu_busy_percent`),
+    vramBytes: readOpt(`${dev}/mem_info_vram_total`),
+    gttBytes: readOpt(`${dev}/mem_info_gtt_total`),
+    gttUsedBytes: readOpt(`${dev}/mem_info_gtt_used`),
+  };
+}
+
+// Read EVERY amdgpu card from sysfs, in DRM enumeration order.
+//
+// This used to return on the first card it found. DRM cards enumerate in kernel
+// order, so an OCuLink-attached discrete card can sort AHEAD of the APU -- and
+// the dashboard then showed the discrete card's temperature, power and memory
+// under the iGPU's label while the thermal governor throttled on the same
+// numbers. Wrong values, not missing ones.
+// Returns [] when the machine has no amdgpu card.
+function getAllGpuSysfsStats() {
+  const cards = [];
   try {
     for (const card of readdirSync('/sys/class/drm')) {
       if (!/^card\d+$/.test(card)) continue;
-      const dev = `/sys/class/drm/${card}/device`;
-      let hwmon = null;
-      try {
-        for (const hw of readdirSync(`${dev}/hwmon`)) {
-          if (readFileSync(`${dev}/hwmon/${hw}/name`, 'utf-8').trim() === 'amdgpu') { hwmon = `${dev}/hwmon/${hw}`; break; }
-        }
-      } catch { /* no hwmon on this card */ }
-      if (!hwmon) continue; // not the GPU card (e.g. a display-only node)
-      const readInt = (p) => { try { return parseInt(readFileSync(p, 'utf-8').trim()) || 0; } catch { return 0; } };
-      out.temperature = Math.round(readInt(`${hwmon}/temp1_input`) / 100) / 10; // m°C -> °C
-      out.power = Math.round(readInt(`${hwmon}/power1_average`) / 1000000);      // µW -> W
-      out.coreClock = Math.round(readInt(`${hwmon}/freq1_input`) / 1000000);     // Hz -> MHz
-      out.busyPercent = readInt(`${dev}/gpu_busy_percent`);
-      return out;
+      const stats = readCardSysfs(card);
+      if (stats) cards.push(stats);
     }
   } catch {
     // sysfs not available
   }
+  return cards;
+}
+
+// The INFERENCE card's stats, in the shape every existing caller expects. The
+// thermal governor and the dashboard's headline figures both read this, so it
+// must describe the card the model actually runs on rather than card0.
+// Returns zeroes when no GPU is present, as it always has.
+function getGpuSysfsStats() {
+  const out = { temperature: 0, power: 0, coreClock: 0, busyPercent: 0 };
+  const cards = getAllGpuSysfsStats();
+  if (cards.length === 0) return out;
+  const systemBytes = memTotalBytes();
+  const inference = buildInventory(cards, systemBytes)[0];
+  const chosen = cards.find((c) => c.card === inference.card) || cards[0];
+  out.temperature = chosen.temperature;
+  out.power = chosen.power;
+  out.coreClock = chosen.coreClock;
+  out.busyPercent = chosen.busyPercent;
   return out;
 }
 
@@ -3246,6 +3289,10 @@ async function getSystemStats() {
       appUsage: appUsage.memUsage
     },
     gpu: gpuStats,
+    // Every card in the machine, inference card first. `gpu` above is that same
+    // card in its original shape -- unchanged, because the whole dashboard reads
+    // it. A single-GPU box gets a one-entry array and looks exactly as it did.
+    gpus: buildInventory(getAllGpuSysfsStats(), memTotalBytes()),
     llama: llamaStats,
     embed: embedStats,
     ds4: ds4Stats,
@@ -3452,22 +3499,17 @@ async function getContextStats() {
 // Read GTT (Graphics Translation Table) memory stats from sysfs
 // This is the relevant metric for APUs with unified memory
 async function getGttStats() {
-  try {
-    for (const card of readdirSync('/sys/class/drm')) {
-      const dir = `/sys/class/drm/${card}/device`;
-      const totalPath = `${dir}/mem_info_gtt_total`;
-      const usedPath = `${dir}/mem_info_gtt_used`;
-      if (!existsSync(totalPath) || !existsSync(usedPath)) continue;
-      const total = parseInt(readFileSync(totalPath, 'utf-8').trim(), 10) || 0;
-      const used = parseInt(readFileSync(usedPath, 'utf-8').trim(), 10) || 0;
-      if (total > 0) {
-        return { total, used, usage: Math.round((used / total) * 1000) / 10 };
-      }
-    }
-  } catch {
-    // sysfs not available or not readable
-  }
-  return { total: 0, used: 0, usage: 0 };
+  // Was: the first card exposing mem_info_gtt_total. On a two-GPU box that can
+  // be the discrete card, whose small GTT aperture then stood in for the APU's
+  // unified memory and made the dashboard's headline memory figure wrong.
+  const cards = getAllGpuSysfsStats();
+  if (cards.length === 0) return { total: 0, used: 0, usage: 0 };
+  const inference = buildInventory(cards, memTotalBytes())[0];
+  const chosen = cards.find((c) => c.card === inference.card) || cards[0];
+  const total = chosen.gttBytes || 0;
+  const used = chosen.gttUsedBytes || 0;
+  if (total <= 0) return { total: 0, used: 0, usage: 0 };
+  return { total, used, usage: Math.round((used / total) * 1000) / 10 };
 }
 
 let gpuStatsCache = { at: 0, value: null };
