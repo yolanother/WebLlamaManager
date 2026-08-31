@@ -75,7 +75,17 @@ launch() {
     local browser status
     local -a cmd
     browser="$(kiosk_require_browser)" || return 1
-    if [ "$browser" = firefox ]; then
+    if [ "$browser" = epiphany-browser ]; then
+        # --private-instance, NOT --application-mode. Measured on the
+        # appliance: --application-mode wants an epiphany WEB APP profile whose
+        # directory name encodes a GApplication ID, so a plain directory makes
+        # it abort -- "Failed to get GApplication ID from profile directory",
+        # SIGTRAP in libglib, and the session died with status 133.
+        # --private-instance takes an arbitrary --profile directory, which is
+        # what we have. Cage gives the window the whole output either way.
+        install -d "$PROFILE_DIR" 2>/dev/null || true
+        cmd=(cage -- "$browser" --private-instance "--profile=$PROFILE_DIR" "$URL")
+    elif [ "$browser" = firefox ]; then
         cmd=(cage -- env MOZ_ENABLE_WAYLAND=1
             "$browser" --kiosk --private-window "$URL")
     else

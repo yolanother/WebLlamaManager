@@ -147,20 +147,45 @@ kiosk_restore_file() {
     fi
 }
 
-# Find a supported Wayland kiosk browser. Prefer Chrome/Chromium when installed,
-# then fall back to Ubuntu Desktop's offline Firefox snap command. Echoes the
-# binary name, or fails with installation guidance when none is available.
+# The browsers this kiosk will drive, most preferred first.
+#
+# ORDER IS DELIBERATE AND FIREFOX IS LAST. Measured on the appliance: Ubuntu's
+# Firefox is a SNAP, and on a fresh profile it runs its first-run onboarding
+# instead of the URL it was handed. It never requested the dashboard once --
+# the manager's request log stayed empty across every restart -- while opening
+# HTTPS connections to Mozilla infrastructure from an appliance that is
+# supposed to work unplugged. Pre-seeding prefs did not help: Firefox 147 moved
+# to a new "Profile Groups" layout, so a user.js in the profiles.ini profile is
+# not read. That is what a black screen with a cursor looks like from the
+# outside: a compositor with nothing mapped on it.
+#
+# epiphany-browser is a real .deb rather than a snap, so it carries no
+# confinement, no vendor onboarding, and no self-updating revision. It is the
+# WebKitGTK fallback docs/KIOSK.md already named.
+#
+# `cog` is deliberately absent despite the docs calling it preferred: it is not
+# packaged for noble at all, so recommending it was recommending nothing.
+KIOSK_DEFAULT_BROWSERS='epiphany-browser google-chrome google-chrome-stable chromium chromium-browser firefox'
+
+# Find a supported Wayland kiosk browser. Echoes the binary name, or fails with
+# installation guidance when none is available.
+#
+# LLAMA_KIOSK_BROWSERS overrides the list, space separated, most preferred
+# first. docs/KIOSK.md has always documented this override; it was never
+# implemented, so an operator who tried to work around a bad browser choice got
+# no effect and no error.
+#
 # Honors KIOSK_FAKE_CHROME=1 to preserve the sandboxed installer test seam.
 kiosk_require_browser() {
     if [ "${KIOSK_FAKE_CHROME:-0}" = "1" ]; then printf 'google-chrome\n'; return 0; fi
     local b
-    for b in google-chrome google-chrome-stable chromium chromium-browser; do
+    for b in ${LLAMA_KIOSK_BROWSERS:-$KIOSK_DEFAULT_BROWSERS}; do
         if command -v "$b" >/dev/null 2>&1; then printf '%s\n' "$b"; return 0; fi
     done
-    if command -v firefox >/dev/null 2>&1; then printf 'firefox\n'; return 0; fi
-    kiosk_warn "No supported browser found. Install Firefox, Chrome, or Chromium before continuing."
+    kiosk_warn "No supported browser found. Tried: ${LLAMA_KIOSK_BROWSERS:-$KIOSK_DEFAULT_BROWSERS}"
     return 1
 }
+
 
 # Require the `cage` compositor from the appliance's offline package set.
 # Runtime package-manager access would make target installation depend on a
