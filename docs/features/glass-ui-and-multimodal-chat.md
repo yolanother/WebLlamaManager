@@ -8,12 +8,14 @@
 - Dark is the default scheme; light mode overrides live under `[data-theme="light"]` (including light values for the legacy `--bg-*`/`--text-*` vars). Fallbacks: `@supports not (backdrop-filter)` → opaque surfaces; `prefers-reduced-motion` and `prefers-reduced-transparency` honored.
 - Color scheme control: `ui/src/theme/colorScheme.js` (pure, tested) + `getColorScheme()`/`setColorScheme('dark'|'light'|'system')` in `ui/src/theme/siteTheme.js`; persisted in `localStorage['colorScheme']`; `system` follows the OS via `matchMedia`. User control: **Settings → Appearance** (segmented Dark/Light/System + site-theme picker).
 - Site themes (from the private `site/` submodule) still override `:root` vars at runtime and retint the ambient background, panels, and chart colors.
+- A second Look, **Professional** (flat, desaturated, default since 2026-09-01), sits alongside this skeuomorphic-glass "Classic" look as a `data-look` preference — see [UiLookAndLayout.md](../Designs/UiLookAndLayout.md) for its token overrides and the seven bounded structural rules it adds on top of the tokens above.
 
 ## Layout / navigation
 
 - `ui/src/App.jsx` was mechanically split (PR #17) into `ui/src/pages/*.jsx` and `ui/src/components/*.jsx`; App.jsx is now an 87-line layout+routes shell. `API_BASE` and shared fetch helpers live in `ui/src/api.js`.
 - Dashboard remains the default `/` route, restyled as a glass bento grid with floating `StatsHeader` and `QueryPanel` (PR #19). Charts consume CSS vars (`--accent`, `--success`, `--warning`, `--error`, `--info`, `--chart-grid`).
 - Sidebar (PR #21): SVG icon set in `ui/src/components/icons.jsx` (no emoji); **Settings moved to the sidebar footer slot** (gear); **llama.cpp UI is now a regular nav item** (external link, `stats.llamaUiUrl` or `:llamaPort` fallback) in Settings' old position.
+- A second Layout, **chat-first** (chat as the home route, one conversation sidebar, every admin page under a collapsible Manage group), is available as a `data-layout` preference alongside this sidebar-first "dashboard" layout — see [UiLookAndLayout.md](../Designs/UiLookAndLayout.md) for the shell structure, routes, and the shared conversation store.
 
 ## Chat (first-class, multimodal)
 

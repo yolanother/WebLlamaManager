@@ -39,7 +39,27 @@ Each theme is a flat directory `site/themes/<id>/` containing:
   ```
 
   Because `:root[data-site-theme="<id>"]` is more specific than the base
-  `:root`, its values win while the theme is active.
+  `:root`, its values win while the theme is active. The token families
+  available to override are: core surfaces/text/status (`--bg-*`,
+  `--text-*`, `--accent(-hover)`, `--success/warning/error/info`,
+  `--border`), the soft/border tint variants of each status color, the
+  neutral overlay/shade scales, surface variants (`--surface-well`,
+  `--surface-code(-elevated)`, `--surface-input`), the categorical
+  chart/series palette (`--series-1..7` and siblings), chart axis/grid
+  chrome, and the resource-gauge ring colors (`--gauge-*`) — see
+  [UiLookAndLayout.md](./UiLookAndLayout.md) for the full list.
+
+  **Interaction with the Professional look.** When a user has selected the
+  Professional Look (`ui/src/theme/professional.css`,
+  `data-look="professional"`), Professional overrides the same base surface
+  tokens (`--bg-primary` and friends) and the `.sidebar.sidebar-glass` rule
+  with higher specificity than a site theme's own `:root[data-site-theme=
+  "x"]` block, so a theme's surfaces and its own frosted sidebar styling are
+  suppressed under Professional. The one token Professional never touches
+  while a site theme is active is `--accent` — a theme's brand color (and
+  the logo it drives) always carries through regardless of Look. See
+  [UiLookAndLayout.md](./UiLookAndLayout.md#site-themes-vs-professional) for
+  the specificity mechanics and the exact paired-selector pattern.
 
 - **`theme.json`** (required) — metadata:
 
