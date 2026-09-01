@@ -41,6 +41,43 @@ test('redactConfig: handles missing hfToken', () => {
   assert.deepEqual(redactConfig({ a: 1 }), { a: 1 });
 });
 
+test('actionableDownloadError: a plain failure with NO token configured names the token', () => {
+  // The common fresh-appliance case: nothing is gated, the CLI just exits 1,
+  // and the operator is left with "check the output". If no token is configured
+  // at all, say so and point at Settings -- that is the most likely fix and the
+  // cheapest one to try.
+  const m = actionableDownloadError({ output: 'some unrelated failure', exitCode: 1, hasToken: false });
+  assert.match(m, /Settings/);
+  assert.match(m, /token/i);
+});
+
+test('actionableDownloadError: a plain failure WITH a token does not blame the token', () => {
+  // Claiming a token problem when one is configured sends the operator to fix
+  // something that is not broken.
+  const m = actionableDownloadError({ output: 'some unrelated failure', exitCode: 1, hasToken: true });
+  assert.doesNotMatch(m, /Settings/);
+  assert.match(m, /exit code 1/);
+});
+
+test('actionableDownloadError: a missing downloader is named, not blamed on the network', () => {
+  // The appliance ships no Python venv at all, so HF_CLI_PATH does not exist.
+  // node-pty reports that as exit 1, NOT 127, so the existing "exit code 127 ->
+  // run ./install.sh" branch never fires and the operator was told to check
+  // their network for a binary that was never installed.
+  const m = actionableDownloadError({ exitCode: 1, hasToken: true, cliMissing: true });
+  assert.match(m, /not installed|downloader/i);
+  assert.doesNotMatch(m, /network or model-path/);
+});
+
+test('actionableDownloadError: a packaged appliance is not told to run ./install.sh', () => {
+  // There is no ./install.sh on an appliance — it is a packaged image. Telling
+  // the operator to run one sends them looking for a file that does not exist,
+  // which is the same class of dead end this message set out to remove.
+  const m = actionableDownloadError({ exitCode: 1, hasToken: true, cliMissing: true, packaged: true });
+  assert.doesNotMatch(m, /install\.sh/);
+  assert.match(m, /not installed|downloader/i);
+});
+
 test('actionableDownloadError: forkpty', () => {
   const m = actionableDownloadError({ forkpty: true });
   assert.match(m, /PTY allocation failed/i);

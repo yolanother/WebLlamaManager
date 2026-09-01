@@ -223,15 +223,23 @@ function gib(bytes) {
 }
 
 /**
- * Decide whether ds4 can be OFFERED as an enable-able server given current free
- * unified memory. ds4 is never auto-started; this only powers the "enable if
- * there is enough memory" affordance in the tracking UI. Streaming presets need
- * only the resident streaming-weight estimate (+ safety); non-streaming presets
- * need the full on-disk weight (+ safety).
- * @param {{freeMemBytes?:number, ds4Config?:object}} params
- * @returns {{eligible:boolean, requiredBytes:number, freeBytes:number, streaming:boolean, reason:string}}
+ * Decide whether ds4 can be OFFERED as an enable-able server. ds4 is never
+ * auto-started; this only powers the "enable it" affordance in the tracking UI.
+ * Streaming presets need only the resident streaming-weight estimate
+ * (+ safety); non-streaming presets need the full on-disk weight (+ safety).
+ *
+ * Memory is NOT sufficient on its own. The appliance ships the ds4-server
+ * binary but not the ~80GB of weights, and it has far more RAM than the gate
+ * asks for, so a memory-only test advertised DS4 as available on a machine that
+ * could never serve it -- the dashboard offered DS4 while the chat panel
+ * correctly listed nothing. Callers that know whether the weights are on disk
+ * pass `weightsPresent`; it defaults to true so a caller that cannot tell keeps
+ * the previous memory-only behaviour rather than hiding a working engine.
+ *
+ * @param {{freeMemBytes?:number, ds4Config?:object, weightsPresent?:boolean}} params
+ * @returns {{eligible:boolean, requiredBytes:number, freeBytes:number, streaming:boolean, weightsPresent:boolean, reason:string}}
  */
-export function ds4EnableGate({ freeMemBytes = 0, ds4Config } = {}) {
+export function ds4EnableGate({ freeMemBytes = 0, ds4Config, weightsPresent = true } = {}) {
   const cfg = ds4Config || resolveDs4Config({}, {});
   const streaming = String(cfg.ssdStreaming ?? 'auto').toLowerCase() !== 'off';
   const weight = streaming
@@ -239,11 +247,20 @@ export function ds4EnableGate({ freeMemBytes = 0, ds4Config } = {}) {
     : num(cfg.weightBytes, 80 * 1024 ** 3);
   const requiredBytes = weight + num(cfg.safetyBytes, 5 * 1024 ** 3);
   const freeBytes = num(freeMemBytes, 0);
-  const eligible = freeBytes >= requiredBytes;
-  const reason = eligible
-    ? `Enough memory to enable DS4 (needs ~${gib(requiredBytes)}, ${gib(freeBytes)} free).`
-    : `Not enough memory to enable DS4: needs ~${gib(requiredBytes)}${streaming ? ' (SSD-streaming)' : ' (full weight)'}, only ${gib(freeBytes)} free.`;
-  return { eligible, requiredBytes, freeBytes, streaming, reason };
+  const hasWeights = weightsPresent !== false;
+  const enoughMemory = freeBytes >= requiredBytes;
+  const eligible = hasWeights && enoughMemory;
+  let reason;
+  if (!hasWeights) {
+    // Named explicitly: the operator's next step is to put weights THERE, and
+    // a bare "unavailable" sends them looking at memory instead.
+    reason = `DS4 model weights are not installed in ${cfg.ggufDir}.`;
+  } else if (enoughMemory) {
+    reason = `Enough memory to enable DS4 (needs ~${gib(requiredBytes)}, ${gib(freeBytes)} free).`;
+  } else {
+    reason = `Not enough memory to enable DS4: needs ~${gib(requiredBytes)}${streaming ? ' (SSD-streaming)' : ' (full weight)'}, only ${gib(freeBytes)} free.`;
+  }
+  return { eligible, requiredBytes, freeBytes, streaming, weightsPresent: hasWeights, reason };
 }
 
 /**
@@ -302,9 +319,18 @@ export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {} } = 
     { ...ds4, idleReady: false },
     { router: false, slots: false, vision: false, speculative: false });
   if (!ds4Entry.running) {
-    const gate = ds4EnableGate({ freeMemBytes: ds4.freeMemBytes, ds4Config: ds4cfg });
+    const gate = ds4EnableGate({
+      freeMemBytes: ds4.freeMemBytes,
+      ds4Config: ds4cfg,
+      weightsPresent: ds4.weightsPresent,
+    });
     ds4Entry.enable = gate;
-    ds4Entry.state = gate.eligible ? 'available' : 'insufficient-memory';
+    // Three distinct states, because they need three different actions: install
+    // the weights, free memory, or click enable. Collapsing the first into
+    // 'insufficient-memory' would point the operator at the wrong problem.
+    ds4Entry.state = gate.eligible
+      ? 'available'
+      : (gate.weightsPresent ? 'insufficient-memory' : 'model-missing');
   }
 
   return [llamaEntry, embedEntry, ds4Entry].sort((a, b) => a.id.localeCompare(b.id));

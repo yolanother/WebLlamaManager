@@ -395,6 +395,26 @@ test('ds4EnableGate: eligible when free memory covers the streaming requirement'
   assert.equal(g.freeBytes, 60 * 1024 ** 3);
 });
 
+test('ds4EnableGate: ineligible when the DS4 weights are not installed', () => {
+  // The appliance ships the ds4-server binary but not the ~80GB weights, and it
+  // has plenty of RAM. Gating on memory alone advertised DS4 as available on a
+  // machine that could never serve it -- the dashboard offered it while the chat
+  // panel correctly showed nothing.
+  const cfg = resolveDs4Config({}, {});
+  const g = ds4EnableGate({ freeMemBytes: 120 * 1024 ** 3, ds4Config: cfg, weightsPresent: false });
+  assert.equal(g.eligible, false);
+  assert.equal(g.weightsPresent, false);
+  assert.match(g.reason, /not installed|no model|weights/i);
+  assert.match(g.reason, new RegExp(cfg.ggufDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+});
+
+test('ds4EnableGate: present weights plus enough memory is still eligible', () => {
+  const cfg = resolveDs4Config({}, {});
+  const g = ds4EnableGate({ freeMemBytes: 60 * 1024 ** 3, ds4Config: cfg, weightsPresent: true });
+  assert.equal(g.eligible, true);
+  assert.equal(g.weightsPresent, true);
+});
+
 test('ds4EnableGate: ineligible with a reason when memory is short', () => {
   const cfg = resolveDs4Config({}, {});
   const g = ds4EnableGate({ freeMemBytes: 20 * 1024 ** 3, ds4Config: cfg });

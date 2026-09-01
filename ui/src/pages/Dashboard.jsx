@@ -7,6 +7,7 @@
 // per-model decode, prompt, first-token, and speculative-decoding histories.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart,
   BarChart, Bar
@@ -1129,7 +1130,8 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               {stats.servers.map((srv) => {
                 const stateLabel = {
                   running: 'Running', degraded: 'Degraded', idle: 'Idle',
-                  available: 'Available', 'insufficient-memory': 'Needs memory', down: 'Down',
+                  available: 'Available', 'insufficient-memory': 'Needs memory',
+                  'model-missing': 'Model missing', down: 'Down',
                 }[srv.state] || srv.state;
                 const status = srv.state === 'running' ? 'success'
                   : (srv.state === 'down' || srv.state === 'degraded' || srv.state === 'insufficient-memory') ? 'error'
@@ -1141,9 +1143,22 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   : 'no models';
                 // ds4 that is not running surfaces its enable-gate reason so the
                 // operator sees exactly why it can or cannot be turned on.
-                const sub = (srv.id === 'ds4' && srv.enable && !srv.running)
-                  ? srv.enable.reason
-                  : `${modelSummary}${srv.port ? ` :${srv.port}` : ''}`;
+                // A missing model is the one state the operator can fix in one
+                // click, so say what is wrong AND offer the way out rather than
+                // leaving them to work out that "Model missing" means "go to
+                // Downloads". Every other state keeps its plain text.
+                const sub = srv.state === 'model-missing'
+                  ? (
+                    <>
+                      {srv.enable?.reason}{' '}
+                      <Link className="download-gated-link" to="/download#ds4">
+                        Find it in Downloads →
+                      </Link>
+                    </>
+                  )
+                  : (srv.id === 'ds4' && srv.enable && !srv.running)
+                    ? srv.enable.reason
+                    : `${modelSummary}${srv.port ? ` :${srv.port}` : ''}`;
                 return (
                   <StatCard key={srv.id} label={srv.displayName} value={stateLabel}
                     subValue={sub} icon={icon} status={status} />
@@ -1394,6 +1409,11 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                      info.status === 'failed' ? `Failed: ${info.error}` :
                      info.status === 'starting' ? 'Starting...' : 'Downloading...'}
                   </span>
+                  {info.status === 'failed' && info.needsHfToken && (
+                    <Link className="download-gated-link" to="/settings">
+                      Add a HuggingFace token in Settings →
+                    </Link>
+                  )}
                   {info.status === 'failed' && info.gatedUrl && (
                     <a className="download-gated-link" href={info.gatedUrl} target="_blank" rel="noopener noreferrer">
                       Request access on HuggingFace ↗

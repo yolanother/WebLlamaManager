@@ -3264,6 +3264,7 @@ async function getSystemStats() {
   // in one shape, differing only by their models and state. Remote backends are
   // intentionally out of scope here; ds4 is offered as an enable-gated option
   // (never auto-started) when unified-memory headroom allows.
+  const ds4DescriptorConfig = resolveDs4Config(config, process.env);
   const servers = buildLocalServerRegistry({
     llama: {
       running: llamaProcess !== null && !llamaProcess.killed,
@@ -3279,10 +3280,16 @@ async function getSystemStats() {
       models: embedStats?.model ? [embedStats.model] : [],
     },
     ds4: {
-      ds4Config: resolveDs4Config(config, process.env),
+      ds4Config: ds4DescriptorConfig,
       running: currentEngine === ENGINE_TYPES.DS4 && !!ds4Stats,
       healthy: !!ds4Stats,
       freeMemBytes: memAvailableBytes(),
+      // Whether the weights are actually on disk. Without this the enable-gate
+      // sees only free memory, and the appliance -- which ships the ds4-server
+      // binary but not the ~80GB of weights, on a box with plenty of RAM --
+      // advertised DS4 as available while the chat panel correctly had nothing
+      // to offer.
+      weightsPresent: ds4WeightsPresent(ds4DescriptorConfig.ggufDir),
       models: ds4Stats?.model ? [ds4Stats.model] : [],
     },
   });
@@ -3358,7 +3365,7 @@ async function getSystemStats() {
     downloads: Object.fromEntries(
       Array.from(downloadProcesses.entries()).map(([id, info]) => [
         id,
-        { progress: info.progress, status: info.status, error: info.error, output: info.output, startedAt: info.startedAt, gatedUrl: info.gatedUrl || null }
+        { progress: info.progress, status: info.status, error: info.error, output: info.output, startedAt: info.startedAt, gatedUrl: info.gatedUrl || null, needsHfToken: !!info.needsHfToken }
       ])
     ),
     backends: config.backends?.enabled ? Object.fromEntries(
@@ -4625,7 +4632,7 @@ app.get('/api/status', async (req, res) => {
       downloads: Object.fromEntries(
         Array.from(downloadProcesses.entries()).map(([id, info]) => [
           id,
-          { progress: info.progress, status: info.status, error: info.error, gatedUrl: info.gatedUrl || null }
+          { progress: info.progress, status: info.status, error: info.error, gatedUrl: info.gatedUrl || null, needsHfToken: !!info.needsHfToken }
         ])
       ),
       queue: {
@@ -6756,6 +6763,27 @@ app.post('/api/server/stop', async (req, res) => {
   res.json({ success: true });
 });
 
+/**
+ * Report whether any DS4 GGUF weight file is present in the configured directory.
+ *
+ * The DS4 enable-gate is otherwise a pure memory test, which is not enough on
+ * its own: an appliance ships the ds4-server binary without the weights, so a
+ * memory-only check offers an engine that cannot start.
+ *
+ * @param {string} ggufDir Directory DS4 weights are expected in.
+ * @returns {boolean} True when at least one .gguf file is readable there.
+ */
+function ds4WeightsPresent(ggufDir) {
+  if (!ggufDir) return false;
+  try {
+    return readdirSync(ggufDir).some((f) => f.toLowerCase().endsWith('.gguf'));
+  } catch {
+    // Missing or unreadable directory means no usable weights, which is exactly
+    // what the gate needs to know.
+    return false;
+  }
+}
+
 // Update llama.cpp - pull latest and rebuild
 let llamaUpdateProcess = null;
 let llamaUpdateStatus = { status: 'idle', output: '', startedAt: null, completedAt: null };
@@ -6955,6 +6983,16 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
       '--local-dir', targetDir
     ];
 
+    // Refuse before spawning: node-pty reports a missing binary as exit 1, not
+    // 127, so without this the operator gets "check the output for a network or
+    // model-path issue" for a downloader that was never installed. The appliance
+    // image ships no Python venv, which is exactly this case.
+    if (!existsSync(HF_CLI_PATH)) {
+      const message = actionableDownloadError({ cliMissing: true, packaged: DISTRIBUTION_POLICY.packaged });
+      addLog('download', message);
+      return res.status(503).json({ error: message, cliMissing: true });
+    }
+
     console.log(`[download] Starting: ${HF_CLI_PATH} ${hfArgs.join(' ')}`);
     addLog('download', `Starting download: ${repo} (${includePatterns.join(', ')})`);
 
@@ -7099,11 +7137,20 @@ function handleHfDownload(res, { downloadId, repo, includePatterns, targetDir })
         } else {
           // Inspect output for gated/auth indicators and whether a token is set,
           // and point the operator at Settings when a token is needed.
+          const hasHfToken = !!resolveHfToken(config, process.env);
+          const cliMissing = !existsSync(HF_CLI_PATH);
           errorMsg = actionableDownloadError({
             output: downloadInfo.output || '',
             exitCode,
-            hasToken: !!resolveHfToken(config, process.env)
+            hasToken: hasHfToken,
+            cliMissing,
+            packaged: DISTRIBUTION_POLICY.packaged
           });
+          // No token configured at all: flag it so the UI can offer a direct
+          // route to Settings, the same way gatedUrl offers a route to the
+          // model's HF page. A failure the operator cannot act on is the thing
+          // being fixed here, not the download itself.
+          if (!hasHfToken) downloadInfo.needsHfToken = true;
           // Gated/approval-required model: surface a direct link to its HF page
           // so the operator can request access instead of just seeing a failure.
           if (isGatedOutput(downloadInfo.output || '')) {

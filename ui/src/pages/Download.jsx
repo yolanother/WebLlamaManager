@@ -6,6 +6,7 @@
 // model downloads, including the DS4 catalog, in responsive glass panels.
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { API_BASE, formatBytes } from '../api.js';
 import '../styles/pages.css';
 
@@ -177,6 +178,7 @@ function DownloadPage({ stats }) {
       </div>
 
       {/* ── DS4 / DeepSeek V4 section ──────────────────────────────────────── */}
+      <div id="ds4" />
       <section className="page-section glass-panel ds4-download-section">
         <div className="ds4-section-header">
           <h3>DS4 / DeepSeek V4</h3>
@@ -278,6 +280,11 @@ function DownloadPage({ stats }) {
                      info.status === 'failed' ? `Failed: ${info.error}` :
                      info.status === 'starting' ? 'Starting...' : 'Downloading...'}
                   </span>
+                  {info.status === 'failed' && info.needsHfToken && (
+                    <Link className="download-gated-link" to="/settings">
+                      Add a HuggingFace token in Settings →
+                    </Link>
+                  )}
                   {info.status === 'failed' && info.gatedUrl && (
                     <a className="download-gated-link" href={info.gatedUrl} target="_blank" rel="noopener noreferrer">
                       Request access on HuggingFace ↗

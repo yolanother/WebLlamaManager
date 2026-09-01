@@ -64,17 +64,40 @@ export function hfModelUrl(repo) {
 
 /**
  * Build an actionable, user-facing message for a failed model download.
- * @param {{output?:string, exitCode?:number, forkpty?:boolean, hasToken?:boolean}} a
+ * @param {{output?:string, exitCode?:number, forkpty?:boolean, hasToken?:boolean, cliMissing?:boolean, packaged?:boolean}} a
  * @returns {string}
  */
-export function actionableDownloadError({ output = '', exitCode = 1, forkpty = false, hasToken = false }) {
+export function actionableDownloadError({ output = '', exitCode = 1, forkpty = false, hasToken = false, cliMissing = false, packaged = false }) {
   if (forkpty) {
     return 'PTY allocation failed (forkpty). Restart the Llama Manager service and retry.';
+  }
+  if (cliMissing) {
+    // Checked FIRST: with no downloader installed every other explanation is
+    // wrong. node-pty surfaces a missing binary as exit 1, not 127, so the
+    // caller's "exit code 127" branch never catches this and the operator was
+    // being told to check the network for a program that was never installed.
+    // The remedy differs by install kind, and giving the wrong one is its own
+    // dead end: an appliance is a packaged image with no ./install.sh to run,
+    // so pointing there sends the operator hunting for a file that is not
+    // present. On an appliance a missing downloader is a defect in the image,
+    // and saying so plainly is more useful than a command that cannot work.
+    return packaged
+      ? 'Download failed: the model downloader (HuggingFace CLI) is not installed on this appliance, so no model can be downloaded. This is missing from the installed image rather than something you have misconfigured.'
+      : 'Download failed: the model downloader (HuggingFace CLI) is not installed on this system, so no model can be downloaded. Run ./install.sh to set up the Python environment.';
   }
   if (isGatedOutput(output)) {
     return hasToken
       ? 'Download failed: access denied (gated model). Your HuggingFace token may lack access — accept the model license on huggingface.co, then retry.'
       : 'Download failed: this model is gated. Add a HuggingFace token in Settings (and accept the model license on huggingface.co), then retry.';
+  }
+  if (!hasToken) {
+    // Nothing in the output says "gated", but no token is configured either.
+    // On a fresh appliance that is the most common cause and the cheapest thing
+    // to rule out, so name it -- while still stating what actually happened, so
+    // an operator whose failure is really network or model-path is not sent
+    // chasing a token. Deliberately phrased as "no token is configured", a fact,
+    // rather than "the token is the problem", a guess.
+    return `Download failed (exit code ${exitCode}). No HuggingFace token is configured — many models need one. Add a token in Settings and retry; if one is not needed, check the output for a network or model-path issue.`;
   }
   return `Download failed (exit code ${exitCode}). Check the output for details (network or model-path issue).`;
 }
