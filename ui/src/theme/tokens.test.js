@@ -19,6 +19,7 @@ import path from 'node:path';
 const STYLESHEETS = [
   '../index.css',
   './glass.css',
+  './professional.css',
   '../App.css',
   '../styles/pages.css',
   '../styles/chat.css',

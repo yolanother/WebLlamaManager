@@ -1,0 +1,351 @@
+/*
+ * Copyright (c) Llama Manager contributors.
+ * Use of this source code is governed by the LICENSE file in the repository root.
+ *
+ * "Professional" look: a flat, desaturated design-token override for the
+ * dashboard, activated by `data-look="professional"` on <html> (see
+ * theme/uiPrefs.js). Replaces the skeuomorphic-glass "Classic" look with
+ * opaque neutral surfaces, hairline borders, no ambient wallpaper/glow/blur,
+ * and desaturated status/series/gauge colors, plus the seven bounded
+ * structural overrides (gauges, status/model cards, outline buttons, page
+ * header/tab strip, sidebar, stats header, floating quick-query button) that
+ * token values alone cannot express. See docs/superpowers/specs/2026-09-01-
+ * ui-look-and-chat-first-layout-design.md, "Professional look", for the full
+ * contract. Every rule is scoped under `:root[data-look="professional"]`;
+ * every token block is additionally paired with the matching
+ * `[data-site-theme]` selector (specificity 0,3,0) so it outranks an active
+ * site theme's own `:root[data-site-theme="x"]` stylesheet (0,2,0 / 0,1,1),
+ * except `--accent`, which Professional never sets while a site theme is
+ * active so that theme's brand color (and its logo, driven elsewhere) carries
+ * through. Imported in main.jsx after glass.css.
+ */
+
+/* ── Base tokens (dark) — flat neutral surfaces, hairline borders, no glow ── */
+:root[data-look="professional"],
+:root[data-look="professional"][data-site-theme] {
+  --bg-primary: #121316;
+  --bg-secondary: #191a1e;
+  --bg-tertiary: #202227;
+  --text-primary: #ececec;
+  --text-secondary: #9a9ca3;
+  --text-tertiary: #6f727a;
+  --border: rgba(255, 255, 255, 0.08);
+
+  /* Glass collapses to flat: opaque fills, no blur/saturate/sheen/highlight. */
+  --glass-bg: var(--glass-bg-opaque);
+  --glass-bg-elevated: var(--glass-bg-elevated-opaque);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-blur: 0px;
+  --glass-saturate: 100%;
+  --glass-sheen: none;
+  --glass-highlight: transparent;
+
+  /* Shadows reduce to a 1px hairline plus a 2px 20% shade. */
+  --shadow-raised: 0 1px 0 var(--border), 0 2px 4px var(--shade-1);
+  --shadow-floating: 0 1px 0 var(--border), 0 2px 4px var(--shade-1);
+  --shadow-pressed: 0 1px 0 var(--border), 0 2px 4px var(--shade-1);
+
+  /* No ambient wallpaper or radial glows behind the app shell. */
+  --ambient-image: none;
+  --ambient-accent: transparent;
+  --ambient-success: transparent;
+  --ambient-info: transparent;
+
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  /* Desaturated status set, soft tints at 10% and borders at 25% of each. */
+  --success: #3fb950;
+  --warning: #d29922;
+  --error: #f0616d;
+  --info: #58a6ff;
+  --success-soft: color-mix(in srgb, var(--success) 10%, transparent);
+  --success-soft-2: var(--success-soft);
+  --success-soft-3: var(--success-soft);
+  --success-soft-4: var(--success-soft);
+  --success-border: color-mix(in srgb, var(--success) 25%, transparent);
+  --warning-soft: color-mix(in srgb, var(--warning) 10%, transparent);
+  --warning-soft-2: var(--warning-soft);
+  --warning-soft-3: var(--warning-soft);
+  --warning-soft-4: var(--warning-soft);
+  --warning-border: color-mix(in srgb, var(--warning) 25%, transparent);
+  --warning-border-2: var(--warning-border);
+  --error-soft: color-mix(in srgb, var(--error) 10%, transparent);
+  --error-soft-2: var(--error-soft);
+  --error-soft-3: var(--error-soft);
+  --error-soft-4: var(--error-soft);
+  --error-border: color-mix(in srgb, var(--error) 25%, transparent);
+  --info-soft: color-mix(in srgb, var(--info) 10%, transparent);
+  --info-soft-2: var(--info-soft);
+  --info-soft-3: var(--info-soft);
+  --info-soft-4: var(--info-soft);
+  --info-soft-5: var(--info-soft);
+  --info-border: color-mix(in srgb, var(--info) 25%, transparent);
+  --info-border-2: var(--info-border);
+
+  /* Series/chart palette: a muted set of the same hues. The many -deep/-light/
+     -alt/-alt2 siblings collapse onto the muted base rather than each getting
+     a bespoke tint — ponytail: flat mapping, split per-token if a chart is
+     found to need distinct shades under Professional. */
+  --series-1: #4c9aa8;
+  --series-1-soft: color-mix(in srgb, var(--series-1) 50%, transparent);
+  --series-1-soft-2: color-mix(in srgb, var(--series-1) 30%, transparent);
+  --series-2: #8b83c9;
+  --series-2-deep: var(--series-2);
+  --series-2-deep-2: var(--series-2);
+  --series-2-light: var(--series-2);
+  --series-2-light-2: var(--series-2);
+  --series-2-alt: var(--series-2);
+  --series-2-alt-soft: color-mix(in srgb, var(--series-2) 12%, transparent);
+  --series-2-alt2: var(--series-2);
+  --series-2-alt2-soft: color-mix(in srgb, var(--series-2) 33%, transparent);
+  --series-2-alt2-soft-2: color-mix(in srgb, var(--series-2) 5%, transparent);
+  --series-3: #c98a5d;
+  --series-3-soft: color-mix(in srgb, var(--series-3) 20%, transparent);
+  --series-3-soft-2: color-mix(in srgb, var(--series-3) 6%, transparent);
+  --series-3-soft-3: color-mix(in srgb, var(--series-3) 15%, transparent);
+  --series-3-light: var(--series-3);
+  --series-4: #b5577e;
+  --series-4-alt: var(--series-4);
+  --series-5: #4f9d7c;
+  --series-5-alt: var(--series-5);
+  --series-5-alt-soft: color-mix(in srgb, var(--series-5) 10%, transparent);
+  --series-5-alt-soft-2: color-mix(in srgb, var(--series-5) 15%, transparent);
+  --series-6: #93a35a;
+  --series-7: #c9a355;
+  --series-7-soft: color-mix(in srgb, var(--series-7) 10%, transparent);
+  --series-7-soft-2: color-mix(in srgb, var(--series-7) 15%, transparent);
+
+  /* Gauges: neutral track, --accent fill (thermal readouts keep their own
+     threshold color — see the .progress-ring-fill rule below). */
+  --gauge-track: var(--overlay-4);
+  --gauge-cpu: var(--accent);
+  --gauge-memory: var(--accent);
+  --gauge-gtt: var(--accent);
+  --gauge-gpu: var(--accent);
+  --gauge-context: var(--accent);
+}
+
+/* ── Accent: never set while a site theme is active, so its brand color (and
+   logo, applied elsewhere) carries through. Only the no-site-theme default
+   gets Professional's calmer indigo. ── */
+:root[data-look="professional"]:not([data-site-theme]) {
+  --accent: #6b70e0;
+  --accent-hover: #8085ea;
+}
+
+/* ── Light scheme ── */
+:root[data-look="professional"][data-theme="light"],
+:root[data-look="professional"][data-site-theme][data-theme="light"] {
+  --bg-primary: #f7f7f8;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #f0f0f2;
+  --text-primary: #1f1f22;
+  --border: rgba(0, 0, 0, 0.1);
+  --glass-border: rgba(0, 0, 0, 0.1);
+  --success: #1a7f37;
+  --warning: #9a6700;
+  --error: #cf222e;
+  --info: #0969da;
+}
+
+/* ── Structural rule 1: gauges ──────────────────────────────────────────────
+   Track uses --gauge-track; fill uses --accent, switching to --warning/
+   --error only when ProgressRing's own value-derived severity (see util.jsx)
+   says so. The stroke color is normally set inline per-ring by the caller, so
+   this needs !important to win. Multi-segment rings (.progress-ring-segment,
+   e.g. the CPU app-vs-system split) are excluded — their per-segment colors
+   are a semantic split, not a severity signal. Thermal readouts
+   (.stats-header-temp) are plain text colored inline and are untouched,
+   keeping their threshold color as the spec requires. */
+:root[data-look="professional"] .progress-ring-bg {
+  stroke: var(--gauge-track);
+}
+
+:root[data-look="professional"] .progress-ring-fill:not(.progress-ring-segment) {
+  stroke: var(--accent) !important;
+}
+
+:root[data-look="professional"] .progress-ring-fill[data-severity="warning"]:not(.progress-ring-segment) {
+  stroke: var(--warning) !important;
+}
+
+:root[data-look="professional"] .progress-ring-fill[data-severity="critical"]:not(.progress-ring-segment) {
+  stroke: var(--error) !important;
+}
+
+/* ── Structural rule 2: status and model cards ──────────────────────────────
+   Tinted background and colored full border removed in favor of a neutral
+   border plus a small colored dot (::before) and colored badge text. */
+:root[data-look="professional"] .stat-card.success,
+:root[data-look="professional"] .stat-card.warning,
+:root[data-look="professional"] .stat-card.error,
+:root[data-look="professional"] .model-card.active {
+  position: relative;
+  background: var(--bg-secondary);
+  border-color: var(--border);
+}
+
+:root[data-look="professional"] .stat-card.success::before,
+:root[data-look="professional"] .stat-card.warning::before,
+:root[data-look="professional"] .stat-card.error::before,
+:root[data-look="professional"] .model-card.active::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+:root[data-look="professional"] .stat-card.success::before,
+:root[data-look="professional"] .model-card.active::before {
+  background: var(--success);
+}
+
+:root[data-look="professional"] .stat-card.warning::before {
+  background: var(--warning);
+}
+
+:root[data-look="professional"] .stat-card.error::before {
+  background: var(--error);
+}
+
+:root[data-look="professional"] .badge.success {
+  background: var(--bg-tertiary);
+  color: var(--success);
+}
+
+:root[data-look="professional"] .badge.warning {
+  background: var(--bg-tertiary);
+  color: var(--warning);
+}
+
+:root[data-look="professional"] .badge.error {
+  background: var(--bg-tertiary);
+  color: var(--error);
+}
+
+:root[data-look="professional"] .badge.info {
+  background: var(--bg-tertiary);
+  color: var(--info);
+}
+
+/* ── Structural rule 3: buttons ──────────────────────────────────────────────
+   Only .btn-primary stays solid accent (token-driven already). The other
+   semantic buttons become outline: colored text, a 25% colored border,
+   filling only on hover. */
+:root[data-look="professional"] .btn-secondary,
+:root[data-look="professional"] .btn-secondary.glass-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+:root[data-look="professional"] .btn-secondary:hover:not(:disabled),
+:root[data-look="professional"] .btn-secondary.glass-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--control-contrast);
+  border-color: var(--accent);
+}
+
+:root[data-look="professional"] .btn-warning,
+:root[data-look="professional"] .btn-warning.glass-btn {
+  background: transparent;
+  color: var(--warning);
+  border: 1px solid color-mix(in srgb, var(--warning) 25%, transparent);
+}
+
+:root[data-look="professional"] .btn-warning:hover:not(:disabled),
+:root[data-look="professional"] .btn-warning.glass-btn:hover:not(:disabled) {
+  background: var(--warning);
+  color: var(--control-contrast);
+  border-color: var(--warning);
+}
+
+:root[data-look="professional"] .btn-danger,
+:root[data-look="professional"] .btn-danger.glass-btn {
+  background: transparent;
+  color: var(--error);
+  border: 1px solid color-mix(in srgb, var(--error) 25%, transparent);
+}
+
+:root[data-look="professional"] .btn-danger:hover:not(:disabled),
+:root[data-look="professional"] .btn-danger.glass-btn:hover:not(:disabled) {
+  background: var(--error);
+  color: var(--control-contrast);
+  border-color: var(--error);
+}
+
+/* ── Structural rule 4: page header and tab strip ───────────────────────────
+   Panel background, border, and shadow removed; a single hairline
+   border-bottom remains. Covers the page-header (including Dashboard's
+   glass-panel hero) and every glass-panel-style tab strip that only holds a
+   title or tabs. */
+:root[data-look="professional"] .page-header,
+:root[data-look="professional"] .page-header.glass-panel,
+:root[data-look="professional"] .page-header.glass-panel--floating,
+:root[data-look="professional"] .settings-tabs,
+:root[data-look="professional"] .logs-tabs,
+:root[data-look="professional"] .api-tabs {
+  background: none;
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+}
+
+/* ── Structural rule 5: sidebar ──────────────────────────────────────────────
+   Flat --bg-secondary, no sheen or drop shadow; active item is --overlay-2
+   background with --accent text/icon, no glow. Paired with [data-site-theme]
+   so it beats the AMD theme's frosted `.sidebar` rule. */
+:root[data-look="professional"] .sidebar.sidebar-glass,
+:root[data-look="professional"][data-site-theme] .sidebar.sidebar-glass {
+  background: var(--bg-secondary);
+  background-image: none;
+  border-right: 1px solid var(--border);
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+:root[data-look="professional"] .sidebar-glass .nav-item.active {
+  background: var(--overlay-2);
+  background-image: none;
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--accent);
+}
+
+/* ── Structural rule 6: stats header ─────────────────────────────────────────
+   Panel background and shadow removed; a borderless strip with a hairline
+   border-bottom. */
+:root[data-look="professional"] .stats-header {
+  background: none;
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Structural rule 7: floating quick-query button ─────────────────────────
+   Neutral --bg-tertiary with --border instead of solid accent. */
+:root[data-look="professional"] .query-fab,
+:root[data-look="professional"] .query-fab.glass-btn {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  box-shadow: none;
+}
+
+:root[data-look="professional"] .query-fab:hover:not(:disabled),
+:root[data-look="professional"] .query-fab.glass-btn:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  border-color: var(--accent);
+}

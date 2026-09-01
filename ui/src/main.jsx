@@ -10,6 +10,7 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import './index.css';
 import './theme/glass.css';
+import './theme/professional.css';
 import { initSiteTheme } from './theme/siteTheme.js';
 import { initUiPrefs } from './theme/uiPrefs.js';
 

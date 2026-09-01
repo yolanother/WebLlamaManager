@@ -27,6 +27,22 @@ function StatCard({ label, value, subValue, status, icon }) {
 }
 
 // Progress Ring Component
+
+/**
+ * Generic value-based severity for a gauge ring, used only to pick a
+ * `data-severity` attribute the Professional look's CSS keys the fill color
+ * off of (see theme/professional.css, structural rule 1); Classic ignores
+ * the attribute and renders exactly as before via the `color`/segment
+ * `color` props.
+ * @param {number} value - Ring percentage (0-100).
+ * @returns {'normal'|'warning'|'critical'} Severity level for `value`.
+ */
+function ringSeverity(value) {
+  if (value >= 95) return 'critical';
+  if (value >= 80) return 'warning';
+  return 'normal';
+}
+
 function ProgressRing({ value, size = 80, strokeWidth = 8, color = 'var(--accent)', segments = null, centerValue = null }) {
   const radius = (size - strokeWidth) / 2;
   const circumference = radius * 2 * Math.PI;
@@ -93,6 +109,7 @@ function ProgressRing({ value, size = 80, strokeWidth = 8, color = 'var(--accent
       />
       <circle
         className="progress-ring-fill"
+        data-severity={ringSeverity(value)}
         strokeWidth={strokeWidth}
         fill="transparent"
         r={radius}
