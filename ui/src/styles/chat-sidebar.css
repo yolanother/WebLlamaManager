@@ -15,6 +15,17 @@
   min-height: 100vh;
 }
 
+.chat-first-shell svg {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
 .chat-first-sidebar {
   display: none;
   flex: 0 0 280px;
