@@ -2,8 +2,10 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Composes persisted conversations, multimodal media ingest, rich messages,
-// automatic model routing, and cancellable streaming completions.
+// Composes multimodal media ingest, rich messages, automatic model routing,
+// and cancellable streaming completions around the conversation list owned
+// by `conversationStore.js` (list/active-id state and its localStorage
+// persistence live there now, shared with the chat-first shell's sidebar).
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
@@ -11,6 +13,16 @@ import { API_BASE } from '../api.js';
 import { ArtifactWorkbench } from '../components/chat/ArtifactWorkbench.jsx';
 import { Composer } from '../components/chat/Composer.jsx';
 import { ConversationSidebar } from '../components/chat/ConversationSidebar.jsx';
+import {
+  createConversation as createStoredConversation,
+  deleteConversation,
+  importConversations as importConversationsIntoStore,
+  renameConversation,
+  selectConversation,
+  subscribeErrors,
+  updateConversation,
+  useConversations,
+} from '../components/chat/conversationStore.js';
 import { MessageList } from '../components/chat/MessageList.jsx';
 import { contentToText } from '../components/chat/Message.jsx';
 import {
@@ -30,42 +42,10 @@ import {
 import { useChatStream } from '../components/chat/useChatStream.js';
 import '../styles/chat.css';
 
-const CONVERSATIONS_KEY = 'chat_conversations';
-const ACTIVE_CONVERSATION_KEY = 'chat_active_conversation';
-
+/** Generate a client-side unique id for messages, attachments, and artifacts. */
 function makeId() {
   return globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function makeConversation() {
-  const now = new Date().toISOString();
-  return {
-    id: makeId(),
-    title: 'New conversation',
-    model: 'auto',
-    messages: [],
-    artifacts: [],
-    createdAt: now,
-    updatedAt: now,
-  };
-}
-
-function loadConversations() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(CONVERSATIONS_KEY) || '[]');
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map((conversation) => ({
-      ...conversation,
-      id: conversation.id || makeId(),
-      title: conversation.title || 'New conversation',
-      model: conversation.model || 'auto',
-      messages: Array.isArray(conversation.messages) ? conversation.messages : [],
-      artifacts: Array.isArray(conversation.artifacts) ? conversation.artifacts : [],
-    }));
-  } catch {
-    return [];
-  }
 }
 
 function fileToDataUrl(file) {
@@ -100,10 +80,7 @@ async function readMediaError(response) {
  * First-class chat composition root.
  */
 function ChatPage({ stats }) {
-  const [conversations, setConversations] = useState(loadConversations);
-  const [activeConversationId, setActiveConversationId] = useState(() => (
-    localStorage.getItem(ACTIVE_CONVERSATION_KEY)
-  ));
+  const { conversations, activeId: activeConversationId, active: activeConversation } = useConversations();
   const [models, setModels] = useState([]);
   const [railOpen, setRailOpen] = useState(() => window.innerWidth >= 1200);
   const [prompt, setPrompt] = useState('');
@@ -122,10 +99,6 @@ function ChatPage({ stats }) {
     streamingMessage,
   } = useChatStream();
 
-  const activeConversation = useMemo(
-    () => conversations.find((conversation) => conversation.id === activeConversationId),
-    [activeConversationId, conversations],
-  );
   const activeArtifact = useMemo(
     () => activeConversation?.artifacts?.find((artifact) => artifact.id === activeArtifactId),
     [activeArtifactId, activeConversation],
@@ -134,31 +107,7 @@ function ChatPage({ stats }) {
     || stats.llama?.status === 'ok'
     || stats.ds4?.status === 'ok';
 
-  useEffect(() => {
-    if (conversations.length === 0) {
-      const conversation = makeConversation();
-      setConversations([conversation]);
-      setActiveConversationId(conversation.id);
-      return;
-    }
-    if (!conversations.some((conversation) => conversation.id === activeConversationId)) {
-      setActiveConversationId(conversations[0].id);
-    }
-  }, [activeConversationId, conversations]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(conversations));
-    } catch (error) {
-      setPageError(`Could not save conversations locally: ${error.message}`);
-    }
-  }, [conversations]);
-
-  useEffect(() => {
-    if (activeConversationId) {
-      localStorage.setItem(ACTIVE_CONVERSATION_KEY, activeConversationId);
-    }
-  }, [activeConversationId]);
+  useEffect(() => subscribeErrors(setPageError), []);
 
   useEffect(() => {
     if (activeArtifactId && activeConversation && !activeArtifact) {
@@ -189,18 +138,6 @@ function ChatPage({ stats }) {
     const interval = setInterval(fetchModels, 10000);
     return () => clearInterval(interval);
   }, [fetchModels]);
-
-  const updateConversation = useCallback((id, updates) => {
-    setConversations((current) => current.map((conversation) => (
-      conversation.id === id
-        ? {
-          ...conversation,
-          ...(typeof updates === 'function' ? updates(conversation) : updates),
-          updatedAt: new Date().toISOString(),
-        }
-        : conversation
-    )));
-  }, []);
 
   const replaceAttachment = useCallback((id, replacement) => {
     setAttachments((current) => current.map((attachment) => (
@@ -537,9 +474,7 @@ function ChatPage({ stats }) {
 
   const createConversation = useCallback(() => {
     if (isStreaming) stop();
-    const conversation = makeConversation();
-    setConversations((current) => [conversation, ...current]);
-    setActiveConversationId(conversation.id);
+    createStoredConversation();
     setPrompt('');
     setAttachments([]);
     setEditing(null);
@@ -548,32 +483,11 @@ function ChatPage({ stats }) {
     if (window.innerWidth < 1200) setRailOpen(false);
   }, [isStreaming, stop]);
 
-  const deleteConversation = useCallback((id) => {
-    setConversations((current) => {
-      const remaining = current.filter((conversation) => conversation.id !== id);
-      if (id === activeConversationId) setActiveConversationId(remaining[0]?.id || null);
-      return remaining;
-    });
-  }, [activeConversationId]);
-
   const importConversations = useCallback(async (file) => {
     try {
       const parsed = JSON.parse(await file.text());
-      const imported = Array.isArray(parsed) ? parsed : parsed.conversations;
-      if (!Array.isArray(imported)) throw new Error('Expected a JSON conversation array.');
-      const normalized = imported.map((conversation) => ({
-        ...conversation,
-        id: conversation.id || makeId(),
-        title: conversation.title || 'Imported conversation',
-        model: conversation.model || 'auto',
-        messages: Array.isArray(conversation.messages) ? conversation.messages : [],
-        artifacts: Array.isArray(conversation.artifacts) ? conversation.artifacts : [],
-        createdAt: conversation.createdAt || new Date().toISOString(),
-        updatedAt: conversation.updatedAt || new Date().toISOString(),
-      }));
-      setConversations((current) => [...normalized, ...current]);
+      const normalized = importConversationsIntoStore(parsed);
       if (normalized[0]) {
-        setActiveConversationId(normalized[0].id);
         setActiveArtifactId(null);
         setArtifactContextEnabled(false);
       }
@@ -612,9 +526,9 @@ function ChatPage({ stats }) {
         onCreate={createConversation}
         onDelete={deleteConversation}
         onImport={importConversations}
-        onRename={(id, title) => updateConversation(id, { title })}
+        onRename={renameConversation}
         onSelect={(id) => {
-          setActiveConversationId(id);
+          selectConversation(id);
           setPrompt('');
           setAttachments([]);
           setEditing(null);
