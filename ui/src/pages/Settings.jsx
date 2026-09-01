@@ -19,7 +19,7 @@ import {
   useEffectsMode,
   useSiteTheme,
 } from '../theme/siteTheme.js';
-import { getLook, setLook, useLook, getLayout, setLayout, useLayout } from '../theme/uiPrefs.js';
+import { setLook, useLook, setLayout, useLayout } from '../theme/uiPrefs.js';
 import '../styles/pages.css';
 
 /**
