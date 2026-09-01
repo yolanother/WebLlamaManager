@@ -18,6 +18,7 @@ When you hit a new one: add an entry below, drop a script under
 | Restarting `avahi-daemon` from a unit ordered `Before=` it wedges systemd and leaves avahi **stopped** | The restart job is ordered after the job waiting on it. Use `--no-block`, and bound the unit with `TimeoutStartSec=` | [`llama-manager-identity.service`](../llama-manager-identity.service) |
 | A live USB forgets state written under the `writable` partition's mount point | casper bind-mounts that partition from a per-boot dated subdirectory. Mount it at its own root instead | [`scripts/llama-manager-identity`](../scripts/llama-manager-identity) |
 | `node --test api/` hangs forever with no output (or dies with `ERR_MODULE_NOT_FOUND: express`), and stray `node api` processes pile up | The bare directory arg spawns `node api` → `api/server.js` → a **real server**. Run [`node --test api/*.test.js`](#node---test-api-boots-a-real-server-and-hangs-forever) instead | n/a — invocation |
+| Every model download on an appliance fails with `Download failed (exit code 1). Check the output for details (network or model-path issue)` — including with a valid HuggingFace token set | The image ships **no downloader**: no `.venv`, no pip, `python3-venv` not installed. Nothing is wrong with the network or the token | [see below](#an-appliance-ships-no-model-downloader-and-blames-your-network) |
 
 ---
 
@@ -359,6 +360,59 @@ kill <pid>
 `node --test api/*.test.js` completes in well under a second and prints
 a pass/fail summary. `ps -eo pid,args | grep "node api"` returns
 nothing afterwards.
+
+## An appliance ships no model downloader, and blames your network
+
+**Symptom.** Every download fails, immediately, with:
+
+```
+Failed: Download failed (exit code 1). Check the output for details (network or model-path issue).
+```
+
+Setting a HuggingFace token changes nothing. The message is wrong twice over:
+the network is fine and the model path is fine.
+
+**Cause.** `api/server.js` resolves the downloader as
+`<PROJECT_ROOT>/.venv/bin/hf` (falling back to `huggingface-cli`). On an
+installed appliance none of that exists:
+
+```
+/usr/lib/llama-manager/.venv    -> No such file or directory
+command -v hf huggingface-cli   -> (none)
+dpkg -l python3-venv            -> un   (not installed)
+python3 -m pip --version        -> No module named pip
+```
+
+So *no* model can be downloaded, on *any* appliance — this is not specific to
+DS4 or to any one repo.
+
+**Why the error was so misleading.** `node-pty` reports a missing binary as
+**exit 1, not 127**, so the existing `exit code 127 -> run ./install.sh` branch
+never fired and the generic network/model-path fallback took over. The download
+endpoint now checks `existsSync(HF_CLI_PATH)` BEFORE spawning and says the
+downloader is missing; on a packaged image it does not tell you to run
+`./install.sh`, because there isn't one.
+
+**Diagnosing it in one command:**
+
+```bash
+ls -l /usr/lib/llama-manager/.venv/bin/hf
+```
+
+**Working around it on a test box** (needs network — which is why it is not the
+real fix):
+
+```bash
+apt-get install -y --no-install-recommends python3-venv python3-pip
+python3 -m venv /usr/lib/llama-manager/.venv
+/usr/lib/llama-manager/.venv/bin/pip install 'huggingface_hub[cli]'
+chown -R llama-manager:llama-manager /usr/lib/llama-manager/.venv
+systemctl restart llama-manager.service
+```
+
+The real fix is for the image to ship the downloader, installed **offline** from
+the media: an appliance should not need internet in order to become able to
+fetch models later.
 
 ## Reporting a new gotcha
 

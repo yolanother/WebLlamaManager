@@ -161,6 +161,32 @@ known-good build and refusing to serve a broken one. See
 
 ---
 
+## When the dashboard offers DS4 (`ds4EnableGate`)
+
+DS4 is never auto-started. The dashboard shows it as an enable-able server, and
+`ds4EnableGate()` in `api/engines.js` decides which of three states it is in.
+The states are kept distinct because they need different actions:
+
+| State | Meaning | What fixes it |
+|---|---|---|
+| `available` | weights present, memory sufficient | click enable |
+| `insufficient-memory` | weights present, not enough free unified memory | free memory |
+| `model-missing` | no `.gguf` in the configured `ggufDir` | install the weights |
+
+**Memory alone is not sufficient, and assuming it was shipped a real bug.** The
+appliance carries the `ds4-server` binary but not the ~80 GB of weights, and it
+has far more RAM than the gate asks for, so a memory-only test advertised DS4 as
+available on a machine that could never serve it — the dashboard offered DS4
+while the chat panel correctly listed nothing. Both were right; the gate was
+wrong.
+
+`api/server.js` supplies `weightsPresent` by looking for any `.gguf` under the
+resolved `ggufDir`; the gate keeps the check injectable and defaults it to
+`true`, so a caller that cannot tell falls back to the old memory-only behaviour
+rather than hiding a working engine. In the `model-missing` state the dashboard
+card links to the DS4 section of the Downloads page, and the reason names the
+exact directory the weights are expected in.
+
 ## Guards are DS4-aware
 
 The stability guards ([`features-overview.md`](features-overview.md) §Guards) all
