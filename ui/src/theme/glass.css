@@ -56,6 +56,7 @@
   --warning: #b45309;
   --error: #b91c1c;
   --border: #cbd5e1;
+  --text-tertiary: #6b7280;
 
   --glass-bg: rgba(255, 255, 255, 0.82);
   --glass-bg-elevated: rgba(255, 255, 255, 0.94);
@@ -158,7 +159,7 @@ html[data-theme="light"][data-effects="simple"] {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm);
   box-shadow:
-    inset 0 1px 3px rgba(0, 0, 0, 0.2),
+    inset 0 1px 3px var(--surface-input),
     inset 0 1px 0 var(--glass-highlight);
   -webkit-backdrop-filter:
     blur(var(--glass-blur))

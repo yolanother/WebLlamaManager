@@ -367,8 +367,8 @@
 .chat-assistant-mark {
   display: grid;
   place-items: center;
-  color: #fff;
-  background: linear-gradient(145deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #a855f7));
+  color: var(--text-primary);
+  background: linear-gradient(145deg, var(--accent), color-mix(in srgb, var(--accent) 55%, var(--series-2-alt)));
   box-shadow: var(--shadow-raised);
 }
 
@@ -1237,16 +1237,16 @@
   align-items: center;
   justify-content: center;
   padding: 0;
-  color: #fff;
-  background: color-mix(in srgb, var(--accent) 78%, #000);
-  border: 1px solid color-mix(in srgb, var(--accent) 65%, #fff);
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--accent) 78%, var(--text-inverse));
+  border: 1px solid color-mix(in srgb, var(--accent) 65%, var(--text-primary));
   border-radius: 999px;
   box-shadow: var(--shadow-raised);
   font-weight: 750;
 }
 
 .chat-submit-button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-hover) 82%, #000);
+  background: color-mix(in srgb, var(--accent-hover) 82%, var(--text-inverse));
 }
 
 .chat-submit-button:disabled {
@@ -1531,7 +1531,7 @@
   display: grid;
   place-items: center;
   padding: 20px;
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--shade-50);
 }
 
 .chat-link-dialog {
@@ -1624,7 +1624,7 @@
     width: 100%;
     height: 100%;
     padding: 0;
-    background: rgba(0, 0, 0, 0.42);
+    background: var(--shade-42);
     border: 0;
     border-radius: 0;
   }

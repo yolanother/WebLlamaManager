@@ -115,7 +115,7 @@
 .logs-tabs .active,
 .api-tabs .active,
 .docs-nav-item.active {
-  color: #fff;
+  color: var(--text-primary);
   background: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 75%, var(--glass-border));
   box-shadow: var(--shadow-pressed);
@@ -191,7 +191,7 @@
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm);
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.18);
+  box-shadow: inset 0 1px 3px var(--shade-18);
 }
 
 .settings-page .backend-card {

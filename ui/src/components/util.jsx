@@ -113,22 +113,22 @@ function ProgressRing({ value, size = 80, strokeWidth = 8, color = 'var(--accent
 
 // Color definitions for charts
 const CHART_COLORS = {
-  temperature: '#ef4444',
-  temperatureCpu: '#f59e0b',
-  power: '#f59e0b',
-  memory: '#22c55e',
-  memorySecondary: '#8b5cf6',
-  appUsage: '#38bdf8',
-  tokens: '#3b82f6',
-  requestOk: '#22c55e',
-  requestErr: '#ef4444',
-  requestRetry: '#f59e0b',
-  requestRestart: '#f97316',
-  contextUsed: '#a78bfa',
-  contextTotal: '#4c1d95',
-  queueActive: '#06b6d4',
-  queuePending: '#f59e0b',
-  offloaded: '#8b5cf6'
+  temperature: 'var(--error)',
+  temperatureCpu: 'var(--warning)',
+  power: 'var(--warning)',
+  memory: 'var(--success)',
+  memorySecondary: 'var(--info)',
+  appUsage: 'var(--chart-app-usage)',
+  tokens: 'var(--accent)',
+  requestOk: 'var(--success)',
+  requestErr: 'var(--error)',
+  requestRetry: 'var(--warning)',
+  requestRestart: 'var(--series-3)',
+  contextUsed: 'var(--series-2)',
+  contextTotal: 'var(--series-2-deep)',
+  queueActive: 'var(--series-1)',
+  queuePending: 'var(--warning)',
+  offloaded: 'var(--info)'
 };
 
 // --- Thermal status helpers -------------------------------------------------
@@ -245,9 +245,9 @@ function TemperatureChart({ data, height = 140 }) {
               <stop offset="95%" stopColor={CHART_COLORS.temperatureCpu} stopOpacity={0} />
             </linearGradient>
           </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-axis-line)" />
           <XAxis dataKey="timestamp" hide />
-          <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <YAxis domain={[0, 100]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit="°C" />} />
           <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpu)" strokeWidth={2} dot={false} />
           <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpu)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
@@ -260,8 +260,8 @@ function TemperatureChart({ data, height = 140 }) {
 // Color scheme for backend distinction. Local = greens; each remote backend
 // gets a stable color derived from its name hash so the same backend looks
 // the same every render.
-const LOCAL_BAR_COLOR = '#10b981';
-const REMOTE_BAR_PALETTE = ['#3b82f6', '#a855f7', '#f59e0b', '#06b6d4', '#ec4899', '#ef4444', '#84cc16', '#f97316'];
+const LOCAL_BAR_COLOR = 'var(--series-5)';
+const REMOTE_BAR_PALETTE = ['var(--accent)', 'var(--series-2-alt)', 'var(--warning)', 'var(--series-1)', 'var(--series-4-alt)', 'var(--error)', 'var(--series-6)', 'var(--series-3)'];
 function backendColor(backend) {
   if (!backend) return LOCAL_BAR_COLOR;
   let h = 0;
@@ -313,8 +313,8 @@ function ModelTpsRankChart({ modelBreakdown, window = 'all', height = 200 }) {
           layout="vertical"
           margin={{ top: 5, right: 48, left: 5, bottom: 5 }}
         >
-          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" horizontal={false} />
-          <XAxis type="number" tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-axis-line)" horizontal={false} />
+          <XAxis type="number" tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <YAxis
             type="category"
             dataKey="label"
@@ -323,7 +323,7 @@ function ModelTpsRankChart({ modelBreakdown, window = 'all', height = 200 }) {
               if (!d) return null;
               return (
                 <g transform={`translate(${x},${y})`}>
-                  <text x={-6} y={0} dy={4} textAnchor="end" fill={d.isRemote ? '#9ca3af' : '#10b981'} fontSize={11}>
+                  <text x={-6} y={0} dy={4} textAnchor="end" fill={d.isRemote ? 'var(--text-tertiary)' : 'var(--series-5)'} fontSize={11}>
                     {labelFor(d)}
                   </text>
                 </g>
@@ -334,7 +334,7 @@ function ModelTpsRankChart({ modelBreakdown, window = 'all', height = 200 }) {
             width={260}
           />
           <Tooltip content={<ChartTooltip unit=" tok/s" />} />
-          <Bar dataKey="tps" name="tok/s" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: '#ccc', fontSize: 11, formatter: (v) => v.toFixed(1) }}>
+          <Bar dataKey="tps" name="tok/s" radius={[0, 4, 4, 0]} label={{ position: 'right', fill: 'var(--chart-value-text)', fontSize: 11, formatter: (v) => v.toFixed(1) }}>
             {data.map((entry) => (
               <Cell key={entry.key} fill={backendColor(entry.backend)} />
             ))}
@@ -371,7 +371,7 @@ function ModelPerformanceBreakdown({ modelBreakdown }) {
   const renderRow = (m) => (
     <tr key={m.name}>
       <td>
-        <span className="model-backend-pill" style={{ background: backendColor(m.backend), color: '#0a0a0a' }}>
+        <span className="model-backend-pill" style={{ background: backendColor(m.backend), color: 'var(--pill-text)' }}>
           {m.isRemote ? m.backend : 'local'}
         </span>
       </td>
@@ -531,7 +531,7 @@ function ModelRequestStatsTable({ requestStats, window, onWindowChange }) {
                     {m.isRemote && (
                       <span
                         className="model-backend-pill"
-                        style={{ background: backendColor(m.backend), color: '#0a0a0a' }}
+                        style={{ background: backendColor(m.backend), color: 'var(--pill-text)' }}
                       >
                         {m.backend}
                       </span>
@@ -836,9 +836,9 @@ function UsageChart({ data, height = 140 }) {
               <stop offset="95%" stopColor={CHART_COLORS.appUsage} stopOpacity={0} />
             </linearGradient>
           </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-axis-line)" />
           <XAxis dataKey="timestamp" hide />
-          <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <YAxis domain={[0, 100]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit="%" />} />
           <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpuUse)" strokeWidth={2} dot={false} />
           <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpuUse)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
@@ -871,9 +871,9 @@ function PowerChart({ data, height = 140 }) {
               <stop offset="95%" stopColor={CHART_COLORS.power} stopOpacity={0} />
             </linearGradient>
           </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-axis-line)" />
           <XAxis dataKey="timestamp" hide />
-          <YAxis domain={[0, Math.ceil(maxPower / 10) * 10]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <YAxis domain={[0, Math.ceil(maxPower / 10) * 10]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit="W" />} />
           <Area type="monotone" dataKey="watts" name="Power" stroke={CHART_COLORS.power} fill="url(#gradPower)" strokeWidth={2} dot={false} />
         </AreaChart>
@@ -910,9 +910,9 @@ function MemoryChart({ data, primaryKey = 'vram', height = 140 }) {
               <stop offset="95%" stopColor={CHART_COLORS.appUsage} stopOpacity={0} />
             </linearGradient>
           </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-axis-line)" />
           <XAxis dataKey="timestamp" hide />
-          <YAxis domain={[0, 100]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <YAxis domain={[0, 100]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit="%" />} />
           <Area type="monotone" dataKey={primaryKey} name={primaryKey.toUpperCase()} stroke={CHART_COLORS.memory} fill="url(#gradMem)" strokeWidth={2} dot={false} />
           <Area type="monotone" dataKey="system" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
@@ -924,7 +924,7 @@ function MemoryChart({ data, primaryKey = 'vram', height = 140 }) {
 }
 
 // Model line colors for per-model charts
-const MODEL_SPEED_COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a78bfa', '#06b6d4', '#f97316', '#ec4899'];
+const MODEL_SPEED_COLORS = ['var(--accent)', 'var(--success)', 'var(--warning)', 'var(--error)', 'var(--series-2)', 'var(--series-1)', 'var(--series-3)', 'var(--series-4-alt)'];
 
 // Tokens/sec Chart Component — shows separate lines per model
 function TokensChart({ data, height = 140 }) {
@@ -956,9 +956,9 @@ function TokensChart({ data, height = 140 }) {
                 <stop offset="95%" stopColor={CHART_COLORS.tokens} stopOpacity={0} />
               </linearGradient>
             </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-axis-line)" />
             <XAxis dataKey="timestamp" hide />
-            <YAxis domain={[0, Math.ceil(maxTokens / 5) * 5]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+            <YAxis domain={[0, Math.ceil(maxTokens / 5) * 5]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
             <Tooltip content={<ChartTooltip unit=" tok/s" />} />
             <Area type="monotone" dataKey="tokensPerSecond" name="Speed" stroke={CHART_COLORS.tokens} fill="url(#gradTokens)" strokeWidth={2} dot={false} />
           </AreaChart>
@@ -989,9 +989,9 @@ function TokensChart({ data, height = 140 }) {
     <div className="chart-container" style={{ height }}>
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={transformed} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-axis-line)" />
           <XAxis dataKey="timestamp" hide />
-          <YAxis domain={[0, Math.ceil(maxTokens / 5) * 5]} tick={{ fill: '#888', fontSize: 10 }} tickLine={false} axisLine={false} />
+          <YAxis domain={[0, Math.ceil(maxTokens / 5) * 5]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit=" tok/s" />} />
           {models.map((m, i) => {
             const color = MODEL_SPEED_COLORS[i % MODEL_SPEED_COLORS.length];
@@ -1039,7 +1039,7 @@ function ActiveRequestPanel({ request, isFullscreen }) {
         <div className="active-request-info">
           <span className="active-request-model">{request.model}</span>
           {request.backend && request.backend !== 'local' && (
-            <span style={{ display: 'inline-block', padding: '1px 6px', borderRadius: '3px', fontSize: '0.75em', background: '#2d1b69', color: '#a78bfa', marginRight: '6px' }}>
+            <span style={{ display: 'inline-block', padding: '1px 6px', borderRadius: '3px', fontSize: '0.75em', background: 'var(--series-2-deep-2)', color: 'var(--series-2)', marginRight: '6px' }}>
               {request.backend}
             </span>
           )}

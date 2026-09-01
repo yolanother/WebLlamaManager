@@ -14,7 +14,7 @@
   background-image: var(--glass-sheen);
   border-right: 1px solid var(--glass-border);
   box-shadow:
-    10px 0 30px rgba(0, 0, 0, 0.16),
+    10px 0 30px var(--shade-16),
     inset 0 1px 0 var(--glass-highlight);
   -webkit-backdrop-filter:
     blur(var(--glass-blur))
@@ -41,7 +41,7 @@
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm);
   box-shadow:
-    0 4px 12px rgba(0, 0, 0, 0.2),
+    0 4px 12px var(--shade-1),
     inset 0 1px 0 var(--glass-highlight);
 }
 
@@ -103,7 +103,7 @@
   background-image: var(--glass-sheen);
   border-color: color-mix(in srgb, var(--accent) 42%, var(--glass-border));
   box-shadow:
-    0 5px 16px rgba(0, 0, 0, 0.2),
+    0 5px 16px var(--shade-1),
     inset 0 1px 0 var(--glass-highlight);
 }
 
@@ -174,7 +174,7 @@
     border-right: 0;
     border-bottom: 1px solid var(--glass-border);
     box-shadow:
-      0 10px 30px rgba(0, 0, 0, 0.16),
+      0 10px 30px var(--shade-16),
       inset 0 1px 0 var(--glass-highlight);
   }
 
