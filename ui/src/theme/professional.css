@@ -137,6 +137,8 @@
 /* ── Light scheme ── */
 :root[data-look="professional"][data-theme="light"],
 :root[data-look="professional"][data-site-theme][data-theme="light"] {
+  /* White overlays vanish on a white page; give rings a visible neutral track. */
+  --gauge-track: rgba(15, 23, 42, 0.12);
   --bg-primary: #f7f7f8;
   --bg-secondary: #ffffff;
   --bg-tertiary: #f0f0f2;
