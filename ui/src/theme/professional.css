@@ -176,7 +176,12 @@
 
 /* ── Structural rule 2: status and model cards ──────────────────────────────
    Tinted background and colored full border removed in favor of a neutral
-   border plus a small colored dot (::before) and colored badge text. */
+   border plus a small colored dot and colored badge text. Covers .stat-card
+   (the "Status Grid" tiles, gets a synthesized ::before dot), .model-card's
+   "Loaded" active state (::before dot too), and .server-status-strip (the
+   Dashboard's per-server status row, which already renders a real
+   .status-strip-dot element — only its border and the dot's glow need
+   removing, not a second dot). */
 :root[data-look="professional"] .stat-card.success,
 :root[data-look="professional"] .stat-card.warning,
 :root[data-look="professional"] .stat-card.error,
@@ -212,23 +217,48 @@
   background: var(--error);
 }
 
-:root[data-look="professional"] .badge.success {
-  background: var(--bg-tertiary);
+:root[data-look="professional"] .server-status-strip.success,
+:root[data-look="professional"] .server-status-strip.warning,
+:root[data-look="professional"] .server-status-strip.error {
+  background: var(--bg-secondary);
+  border-color: var(--border);
+  border-left-color: var(--border);
+}
+
+:root[data-look="professional"] .status-strip-dot.success,
+:root[data-look="professional"] .status-strip-dot.warning {
+  box-shadow: none;
+}
+
+/* Badge/mode-badge/engine-badge/etc. normally get a `border: 1px solid
+   currentColor` and a 16%-tinted background (App.css, "Global skeuomorphic-
+   glass chrome"); Professional keeps only the colored text. */
+:root[data-look="professional"] .badge.success,
+:root[data-look="professional"] .badge.warning,
+:root[data-look="professional"] .badge.error,
+:root[data-look="professional"] .badge.info,
+:root[data-look="professional"] .mode-badge.success,
+:root[data-look="professional"] .mode-badge.single {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+:root[data-look="professional"] .badge.success,
+:root[data-look="professional"] .mode-badge.success {
   color: var(--success);
 }
 
-:root[data-look="professional"] .badge.warning {
-  background: var(--bg-tertiary);
+:root[data-look="professional"] .badge.warning,
+:root[data-look="professional"] .mode-badge.single {
   color: var(--warning);
 }
 
 :root[data-look="professional"] .badge.error {
-  background: var(--bg-tertiary);
   color: var(--error);
 }
 
 :root[data-look="professional"] .badge.info {
-  background: var(--bg-tertiary);
   color: var(--info);
 }
 
