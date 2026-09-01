@@ -19,6 +19,7 @@ import {
   useEffectsMode,
   useSiteTheme,
 } from '../theme/siteTheme.js';
+import { getLook, setLook, useLook, getLayout, setLayout, useLayout } from '../theme/uiPrefs.js';
 import '../styles/pages.css';
 
 /**
@@ -64,6 +65,9 @@ function SiteThemeSection() {
 function AppearanceSection() {
   const [scheme, setScheme] = useState(() => getColorScheme());
   const effects = useEffectsMode();
+  const look = useLook();
+  const layout = useLayout();
+  const isProfessional = look === 'professional';
   const schemeOptions = [
     { value: 'dark', label: 'Dark' },
     { value: 'light', label: 'Light' },
@@ -73,6 +77,14 @@ function AppearanceSection() {
     { value: 'auto', label: 'Auto' },
     { value: 'glass', label: 'Glass' },
     { value: 'simple', label: 'Simple' },
+  ];
+  const lookOptions = [
+    { value: 'classic', label: 'Classic' },
+    { value: 'professional', label: 'Professional' },
+  ];
+  const layoutOptions = [
+    { value: 'dashboard', label: 'Dashboard' },
+    { value: 'chat-first', label: 'Chat-first' },
   ];
 
   const selectScheme = (value) => {
@@ -97,6 +109,30 @@ function AppearanceSection() {
       <div className="appearance-section__header">
         <h3>Appearance</h3>
         <p>Choose the interface color scheme, effects, and optional host-provided site theme.</p>
+      </div>
+      <div className="scheme-setting">
+        <span id="look-label">Look</span>
+        <div
+          className="scheme-segmented"
+          role="group"
+          aria-labelledby="look-label"
+        >
+          {lookOptions.map(({ value, label }) => (
+            <button
+              key={value}
+              type="button"
+              className={`glass-btn scheme-option ${look === value ? 'active' : ''}`}
+              aria-pressed={look === value}
+              onClick={() => setLook(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <p className="setting-hint">
+          Professional flattens surfaces and reserves color for actions and status. Site themes
+          still supply the accent.
+        </p>
       </div>
       <div className="scheme-setting">
         <span id="color-scheme-label">Color scheme</span>
@@ -134,28 +170,57 @@ function AppearanceSection() {
               type="button"
               className={`glass-btn scheme-option ${effects.preference === value ? 'active' : ''}`}
               aria-pressed={effects.preference === value}
+              disabled={isProfessional}
               onClick={() => setEffectsMode(value)}
             >
               {label}
             </button>
           ))}
         </div>
-        <p className="setting-hint" aria-live="polite">{effectsHint}</p>
+        <p className="setting-hint" aria-live="polite">
+          {isProfessional ? 'Not used by the Professional look.' : effectsHint}
+        </p>
         <div>
           <button
             type="button"
             className="btn-secondary btn-small glass-btn"
-            disabled={effects.preference !== 'auto'}
+            disabled={isProfessional || effects.preference !== 'auto'}
             title={
-              effects.preference === 'auto'
-                ? 'Clear the cached result and measure visible frame performance again'
-                : 'Select Auto to run the performance check'
+              isProfessional
+                ? 'Not used by the Professional look'
+                : effects.preference === 'auto'
+                  ? 'Clear the cached result and measure visible frame performance again'
+                  : 'Select Auto to run the performance check'
             }
             onClick={rerunEffectsProbe}
           >
             Re-run performance check
           </button>
         </div>
+      </div>
+      <div className="scheme-setting">
+        <span id="layout-label">Layout</span>
+        <div
+          className="scheme-segmented"
+          role="group"
+          aria-labelledby="layout-label"
+        >
+          {layoutOptions.map(({ value, label }) => (
+            <button
+              key={value}
+              type="button"
+              className={`glass-btn scheme-option ${layout === value ? 'active' : ''}`}
+              aria-pressed={layout === value}
+              onClick={() => setLayout(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <p className="setting-hint">
+          Chat-first makes chat the home page with a single conversation sidebar. Admin pages
+          live under Manage.
+        </p>
       </div>
       <SiteThemeSection />
     </section>
