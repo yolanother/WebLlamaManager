@@ -8,12 +8,14 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useLocation } from 'react-router-dom';
 import { API_BASE, copyTextToClipboard, formatModelName } from '../api.js';
+import { useLayout } from '../theme/uiPrefs.js';
 import { parseMessageWithCodeBlocks } from './CodeBlock.jsx';
 import { SearchableSelect } from './SearchableSelect.jsx';
 
 // Query Panel Component
 function QueryPanel({ stats }) {
   const location = useLocation();
+  const layout = useLayout();
   const [isOpen, setIsOpen] = useState(false);
   const [models, setModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState(() => {
@@ -113,6 +115,13 @@ function QueryPanel({ stats }) {
 
   // Hide on chat page - use the full-featured chat there
   if (location.pathname === '/chat') {
+    return null;
+  }
+
+  // Hide on the chat-first shell's home route - the embedded ChatPage is
+  // the full-featured chat there too; QueryPanel still floats over admin
+  // pages reached via the shell's Manage group.
+  if (location.pathname === '/' && layout === 'chat-first') {
     return null;
   }
 

@@ -353,6 +353,13 @@
   padding: 34px 24px 28px;
 }
 
+/* Embedded in the chat-first shell: no rail/hamburger/stage header (the
+   shell provides them), so the message column matches the composer's
+   width and stays centred like the ChatGPT/Claude reference. */
+.chat-page-shell--embedded .chat-message-column {
+  width: min(100%, 48rem);
+}
+
 .chat-welcome {
   display: flex;
   min-height: 100%;

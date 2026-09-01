@@ -9,9 +9,11 @@ import React from 'react';
 import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import './App.css';
 import { useWebSocket } from './api.js';
+import { ChatFirstShell } from './components/ChatFirstShell.jsx';
 import { Sidebar } from './components/Sidebar.jsx';
 import { StatsHeader } from './components/StatsHeader.jsx';
 import { QueryPanel } from './components/QueryPanel.jsx';
+import { useLayout } from './theme/uiPrefs.js';
 import Dashboard from './pages/Dashboard.jsx';
 import ChatPage from './pages/Chat.jsx';
 import PresetsPage from './pages/Presets.jsx';
@@ -30,6 +32,7 @@ import ApiDocsPage from './pages/ApiDocs.jsx';
 function AppLayout() {
   const { stats, logs, connected, clearLogs, requestLogs, clearRequestLogs, llmLogs, clearLlmLogs, activeRequest, activeRequestsMap } = useWebSocket();
   const location = useLocation();
+  const layout = useLayout();
 
   // Kiosk view: glanceable, auto-paging Dashboard only.
   if (location.pathname === '/kiosk') {
@@ -45,6 +48,25 @@ function AppLayout() {
     );
   }
 
+  // Chat-first: one conversation sidebar, chat as the home route, every
+  // admin page reachable through its Manage group.
+  if (layout === 'chat-first') {
+    return (
+      <ChatFirstShell
+        stats={stats}
+        connected={connected}
+        logs={logs}
+        clearLogs={clearLogs}
+        requestLogs={requestLogs}
+        clearRequestLogs={clearRequestLogs}
+        llmLogs={llmLogs}
+        clearLlmLogs={clearLlmLogs}
+        activeRequest={activeRequest}
+        activeRequestsMap={activeRequestsMap}
+      />
+    );
+  }
+
   return (
     <div className="app-layout">
       <Sidebar stats={stats} />
@@ -57,6 +79,7 @@ function AppLayout() {
         <StatsHeader stats={stats} />
         <Routes>
           <Route path="/" element={<Dashboard stats={stats} activeRequest={activeRequest} />} />
+          <Route path="/dashboard" element={<Dashboard stats={stats} activeRequest={activeRequest} />} />
           <Route path="/chat" element={<ChatPage stats={stats} />} />
           <Route path="/presets" element={<PresetsPage stats={stats} />} />
           <Route path="/models" element={<ModelsPage stats={stats} />} />

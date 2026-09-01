@@ -6,6 +6,8 @@
 // and cancellable streaming completions around the conversation list owned
 // by `conversationStore.js` (list/active-id state and its localStorage
 // persistence live there now, shared with the chat-first shell's sidebar).
+// The `embedded` prop drops the page's own conversation rail, hamburger, and
+// new-conversation button when the chat-first shell already provides them.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
@@ -78,8 +80,14 @@ async function readMediaError(response) {
 
 /**
  * First-class chat composition root.
+ *
+ * @param {object} props
+ * @param {object} [props.stats] - The websocket `stats` payload.
+ * @param {boolean} [props.embedded] - When true, renders inside the
+ *   chat-first shell: no conversation rail, hamburger, or new-conversation
+ *   icon button (the shell provides all three), and a centred message column.
  */
-function ChatPage({ stats }) {
+function ChatPage({ stats, embedded = false }) {
   const { conversations, activeId: activeConversationId, active: activeConversation } = useConversations();
   const [models, setModels] = useState([]);
   const [railOpen, setRailOpen] = useState(() => window.innerWidth >= 1200);
@@ -517,53 +525,57 @@ function ChatPage({ stats }) {
   }
 
   return (
-    <div className="chat-page-shell">
-      <ConversationSidebar
-        activeId={activeConversation.id}
-        conversations={conversations}
-        open={railOpen}
-        onClose={() => setRailOpen(false)}
-        onCreate={createConversation}
-        onDelete={deleteConversation}
-        onImport={importConversations}
-        onRename={renameConversation}
-        onSelect={(id) => {
-          selectConversation(id);
-          setPrompt('');
-          setAttachments([]);
-          setEditing(null);
-          setActiveArtifactId(null);
-          setArtifactContextEnabled(false);
-        }}
-      />
+    <div className={`chat-page-shell ${embedded ? 'chat-page-shell--embedded' : ''}`}>
+      {!embedded && (
+        <ConversationSidebar
+          activeId={activeConversation.id}
+          conversations={conversations}
+          open={railOpen}
+          onClose={() => setRailOpen(false)}
+          onCreate={createConversation}
+          onDelete={deleteConversation}
+          onImport={importConversations}
+          onRename={renameConversation}
+          onSelect={(id) => {
+            selectConversation(id);
+            setPrompt('');
+            setAttachments([]);
+            setEditing(null);
+            setActiveArtifactId(null);
+            setArtifactContextEnabled(false);
+          }}
+        />
+      )}
       <main className={`chat-main ${activeArtifact ? 'has-workbench' : ''}`}>
         <section className="chat-stage" aria-label="Chat">
-          <header className="chat-stage-header">
-            <button
-              type="button"
-              className="chat-icon-btn"
-              aria-label="Open conversations"
-              onClick={() => setRailOpen(true)}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 6h16M4 12h16M4 18h10" />
-              </svg>
-            </button>
-            <div className="chat-stage-title">
-              <strong>{activeConversation.title}</strong>
-              <span>{activeConversation.messages.length} messages</span>
-            </div>
-            <button
-              type="button"
-              className="chat-icon-btn"
-              aria-label="New conversation"
-              onClick={createConversation}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 5v14M5 12h14" />
-              </svg>
-            </button>
-          </header>
+          {!embedded && (
+            <header className="chat-stage-header">
+              <button
+                type="button"
+                className="chat-icon-btn"
+                aria-label="Open conversations"
+                onClick={() => setRailOpen(true)}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 6h16M4 12h16M4 18h10" />
+                </svg>
+              </button>
+              <div className="chat-stage-title">
+                <strong>{activeConversation.title}</strong>
+                <span>{activeConversation.messages.length} messages</span>
+              </div>
+              <button
+                type="button"
+                className="chat-icon-btn"
+                aria-label="New conversation"
+                onClick={createConversation}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+              </button>
+            </header>
+          )}
           {pageError && (
             <div className="chat-page-error" role="alert">
               <span>{pageError}</span>
