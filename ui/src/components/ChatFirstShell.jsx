@@ -62,7 +62,7 @@ function ChatFirstShell({
   const onChatRoute = location.pathname === '/';
 
   return (
-    <div className="chat-first-shell">
+    <div className={`chat-first-shell ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
       <ChatSidebar stats={stats} open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
       <div className="chat-first-main">
         <header className="chat-first-topbar">
@@ -93,7 +93,7 @@ function ChatFirstShell({
           <Routes>
             <Route path="/" element={<ChatPage stats={stats} embedded />} />
             <Route path="/dashboard" element={<Dashboard stats={stats} activeRequest={activeRequest} />} />
-            <Route path="/chat" element={<ChatPage stats={stats} />} />
+            <Route path="/chat" element={<ChatPage stats={stats} embedded />} />
             <Route path="/presets" element={<PresetsPage stats={stats} />} />
             <Route path="/models" element={<ModelsPage stats={stats} />} />
             <Route path="/download" element={<DownloadPage stats={stats} />} />

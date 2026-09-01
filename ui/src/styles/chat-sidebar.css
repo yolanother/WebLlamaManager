@@ -15,7 +15,8 @@
   min-height: 100vh;
 }
 
-.chat-first-shell svg {
+.chat-first-sidebar svg,
+.chat-first-topbar svg {
   width: 20px;
   height: 20px;
   flex: 0 0 auto;
@@ -179,6 +180,11 @@
 
 .chat-first-hamburger {
   display: none;
+}
+
+/* Desktop: the sidebar can be collapsed; the hamburger is the way back. */
+.chat-first-shell.sidebar-collapsed .chat-first-hamburger {
+  display: inline-grid;
 }
 
 .chat-first-topbar-title {
