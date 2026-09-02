@@ -205,11 +205,11 @@ function DownloadPage({ stats }) {
         </section>
       )}
 
-      {/* ── Recommended models chip row ────────────────────────────────── */}
+      {/* ── Recommended models chip row (same card styling the embedding strip used) ── */}
       <div id="ds4" />
-      <section className="page-section glass-panel">
-        <h3>Recommended models</h3>
-        <div className="ds4-options-list">
+      <div className="search-section">
+        <div className="card glass-panel">
+          <h3>Recommended models</h3>
           {RECOMMENDED_REPOS.map((r) => (
             <button
               key={r.id}
@@ -221,9 +221,6 @@ function DownloadPage({ stats }) {
             </button>
           ))}
         </div>
-      </section>
-
-      <div className="search-section">
         <div className="search-bar">
           <input
             type="text"
