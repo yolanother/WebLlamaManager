@@ -159,3 +159,51 @@ test('DS4 fixture: fits = totalSize <= capacity*0.70, ggufDir echoed, pattern is
   assert.equal(q4kExperts.kind, 'file', 'unrecognized token name is not dropped, kind file');
   assert.equal(q4kExperts.rank, 4, 'fallback rank picks up the Q4 token');
 });
+
+// ── DS4 with the REAL antirez/deepseek-v4-gguf names ───────────────────────
+// These names carry misleading tokens (`-F32`, `-F16HC`, `Q4KExperts`) that
+// the generic grouper would turn into bogus "F32"/"F16" quant groups.
+
+function realDs4Files() {
+  return [
+    { path: 'DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf', size: 3807602400 },
+    { path: 'DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf', size: 86720111488 },
+    { path: 'DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf', size: 86720111488 },
+    { path: 'DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf', size: 86720111776 },
+    { path: 'DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf', size: 97591747456 },
+    { path: 'DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf', size: 164633502304 },
+    { path: 'DeepSeek-V4-Flash-Vision-Encoder.gguf', size: 932857760 },
+    { path: 'DeepSeek-V4-Pro-Q4K-Layers00-30.gguf', size: 457521327328 },
+  ];
+}
+
+const DS4_IMATRIX = 'DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix';
+
+test('DS4 real names: every entry is kind file (no F32/F16 groups), sorted fits-first by size, recommended = the configured preset model', () => {
+  const result = buildRepoRecommendations({
+    files: realDs4Files(),
+    engine: 'ds4',
+    ggufDir: '/d',
+    presentNames: [`${DS4_IMATRIX}.gguf`],
+    preferredNames: [`${DS4_IMATRIX}.gguf`],
+    capacityBytes: 133622603776,
+  });
+  assert.ok(result.quantizations.every((q) => q.kind === 'file'), 'ds4 never groups by quant token');
+  assert.ok(!result.quantizations.some((q) => q.quantization === 'F32' || q.quantization === 'F16'));
+  assert.equal(result.recommended, DS4_IMATRIX);
+  const order = result.quantizations.map((q) => q.quantization);
+  assert.equal(order[0], 'DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8', 'largest fitting first');
+  assert.ok(order.indexOf(DS4_IMATRIX) < order.indexOf('DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32'), 'MTP (small) after the weights');
+  const firstUnfit = result.quantizations.findIndex((q) => !q.fit.fits);
+  assert.ok(result.quantizations.slice(firstUnfit).every((q) => !q.fit.fits), 'unfit entries are contiguous at the end');
+  assert.equal(result.quantizations[firstUnfit].quantization, 'DeepSeek-V4-Pro-Q4K-Layers00-30', 'unfit sorted by size desc');
+});
+
+test('DS4 real names without a configured preset: recommended falls back to the largest fitting imatrix file', () => {
+  const result = buildRepoRecommendations({
+    files: realDs4Files().filter((f) => !f.path.includes('-0731')),
+    engine: 'ds4',
+    capacityBytes: 133622603776,
+  });
+  assert.equal(result.recommended, DS4_IMATRIX);
+});

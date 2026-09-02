@@ -7405,12 +7405,17 @@ app.get('/api/repo/:author/:model/files', async (req, res) => {
     const presentNames = engine === 'ds4'
       ? listDs4GgufFiles(ds4Config.ggufDir, { existsSync, readdirSync, statSync }).map((f) => f.name)
       : undefined;
+    // The file a ds4 preset is configured to run is the strongest "recommended" signal.
+    const preferredNames = engine === 'ds4'
+      ? Object.values(config.presets || {}).filter((p) => isDs4Preset(p) && p.modelPath).map((p) => basename(p.modelPath))
+      : undefined;
 
     res.json(buildRepoRecommendations({
       files,
       engine,
       ggufDir: engine === 'ds4' ? ds4Config.ggufDir : undefined,
       presentNames,
+      preferredNames,
       capacityBytes,
     }));
   } catch (error) {

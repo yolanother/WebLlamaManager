@@ -116,6 +116,33 @@ function compareEntries(a, b) {
   return b.totalSize - a.totalSize;
 }
 
+/** ds4 ordering: the repo's names carry no comparable quant tokens, so the
+ * weights (largest) lead and the small MTP/vision/support files follow. */
+function compareDs4Entries(a, b) {
+  if (a.kind === 'mmproj' || b.kind === 'mmproj') {
+    if (a.kind !== b.kind) return a.kind === 'mmproj' ? 1 : -1;
+  }
+  if (a.fit.fits !== b.fit.fits) return a.fit.fits ? -1 : 1;
+  return b.totalSize - a.totalSize;
+}
+
+/**
+ * Pick the ds4 recommendation: the file a ds4 preset is configured to run when
+ * it fits, else the largest fitting file whose name says `imatrix` (the
+ * known-good DeepSeek V4 Flash quant on this class of box), else the largest
+ * fitting file. ponytail: name heuristic instead of a curated catalog; add a
+ * catalog if antirez publishes a second family under the same repo.
+ * @param {Array<object>} entries Sorted ds4 entries.
+ * @param {Set<string>} preferred Basenames of preset-configured ds4 models.
+ * @returns {object|undefined}
+ */
+function pickDs4Recommended(entries, preferred) {
+  const fitting = entries.filter((e) => e.kind !== 'mmproj' && e.fit.fits);
+  return fitting.find((e) => preferred.has(basename(e.files[0])))
+    || fitting.find((e) => /imatrix/i.test(e.quantization))
+    || fitting[0];
+}
+
 /**
  * Group a repo's GGUF files by quantization and annotate each group with a
  * rank, a memory-fit verdict, and (for ds4) whether it is already present on
@@ -125,6 +152,7 @@ function compareEntries(a, b) {
  * @param {'llama'|'ds4'} [a.engine] Which fit rule + response shape to use.
  * @param {string} [a.ggufDir] Echoed back for ds4 (the dir `files` was listed from).
  * @param {Iterable<string>} [a.presentNames] Filenames already present on disk (ds4 only).
+ * @param {Iterable<string>} [a.preferredNames] Filenames ds4 presets are configured to run (ds4 only); the recommendation prefers these.
  * @param {number} a.capacityBytes Injected memory/VRAM budget (bytes).
  * @param {number} [a.minContext] Context size used for the llama fit estimate.
  * @returns {{engine:string, ggufDir?:string, recommended:(string|null),
@@ -135,10 +163,15 @@ export function buildRepoRecommendations({
   engine = 'llama',
   ggufDir,
   presentNames,
+  preferredNames,
   capacityBytes,
   minContext = DEFAULTS.minContext,
 } = {}) {
   const presentSet = presentNames ? new Set(Array.from(presentNames, (n) => basename(n))) : null;
+  const preferredSet = new Set(Array.from(preferredNames || [], (n) => basename(n)));
+  // ds4 repo names (e.g. `...-IQ2XXS-w2Q2K-AProjQ8-...-F32.gguf`) carry tokens that
+  // only look like quants, so ds4 never groups by token: one entry per file.
+  const groupByToken = engine !== 'ds4';
   const groups = new Map();
   const singles = [];
 
@@ -146,7 +179,7 @@ export function buildRepoRecommendations({
     const base = basename(file.path);
     const isMmproj = /mmproj/i.test(base);
     const quant = isMmproj ? null : extractQuantization(base);
-    const kind = isMmproj ? 'mmproj' : (quant ? 'quant' : 'file');
+    const kind = isMmproj ? 'mmproj' : (groupByToken && quant ? 'quant' : 'file');
 
     if (kind === 'quant') {
       const splitMatch = base.match(/[-_](\d{5})-of-(\d{5})\.gguf$/i);
@@ -179,9 +212,11 @@ export function buildRepoRecommendations({
     entry.fit = computeFit({ totalSize: entry.totalSize, engine, capacityBytes, minContext });
     entry.present = presentSet ? entry.files.every((f) => presentSet.has(basename(f))) : false;
   }
-  entries.sort(compareEntries);
+  entries.sort(engine === 'ds4' ? compareDs4Entries : compareEntries);
 
-  const recommendedEntry = entries.find((e) => e.kind === 'quant' && e.fit.fits);
+  const recommendedEntry = engine === 'ds4'
+    ? pickDs4Recommended(entries, preferredSet)
+    : entries.find((e) => e.kind === 'quant' && e.fit.fits);
 
   const result = {
     engine,
