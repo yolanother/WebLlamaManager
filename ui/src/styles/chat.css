@@ -1229,6 +1229,57 @@
   color: var(--accent);
 }
 
+/* Family rows: the family name and its fold-out toggle share one row, so the
+   toggle must not be nested inside the selecting button (a button inside a
+   button is invalid and swallows the click). */
+.chat-model-family-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.chat-model-family-row .chat-model-option {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-model-family-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 44px;
+  padding: 0 8px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+}
+
+.chat-model-family-toggle:hover {
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  border-color: var(--glass-border);
+}
+
+.chat-model-family-toggle[aria-expanded="true"] .chat-model-chevron {
+  transform: rotate(180deg);
+}
+
+.chat-model-option--member {
+  padding-left: 26px;
+  font-size: 12px;
+}
+
+/* The specific build, shown on the family row only when it is not the default. */
+.chat-model-variant {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .chat-model-empty {
   padding: 14px;
   color: var(--text-secondary);
