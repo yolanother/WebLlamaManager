@@ -30,23 +30,34 @@ test('extractQuantization on unrecognized names returns null', () => {
 });
 
 // ── Muse Glimmer fixture (llama engine, HF repo listing) ──────────────────
+// Real unsloth/Muse-Glimmer-30B-GGUF file list (from the HF tree API).
 
 function museGlimmerFiles() {
   return [
-    { path: 'Muse-Glimmer-30B-BF16-00001-of-00003.gguf', size: 18.49 * GB },
-    { path: 'Muse-Glimmer-30B-BF16-00002-of-00003.gguf', size: 18.49 * GB },
-    { path: 'Muse-Glimmer-30B-BF16-00003-of-00003.gguf', size: 18.5 * GB },
-    { path: 'Muse-Glimmer-30B-UD-Q8_K_XL.gguf', size: 32.3 * GB },
+    { path: 'BF16/Muse-Glimmer-30B-BF16-00001-of-00002.gguf', size: 27.75 * GB },
+    { path: 'BF16/Muse-Glimmer-30B-BF16-00002-of-00002.gguf', size: 27.75 * GB },
     { path: 'Muse-Glimmer-30B-Q8_0.gguf', size: 29.6 * GB },
+    { path: 'Muse-Glimmer-30B-UD-Q8_K_XL.gguf', size: 32.3 * GB },
     { path: 'Muse-Glimmer-30B-UD-Q6_K_XL.gguf', size: 26.3 * GB },
-    { path: 'Muse-Glimmer-30B-UD-Q4_K_XL.gguf', size: 15.9 * GB },
-    { path: 'Muse-Glimmer-30B-IQ2_M.gguf', size: 11.4 * GB },
-    { path: 'mmproj-BF16.gguf', size: 0.9 * GB },
-    { path: 'mmproj-F16.gguf', size: 1.7 * GB },
+    { path: 'Muse-Glimmer-30B-UD-Q5_K_XL.gguf', size: 22.5 * GB },
+    { path: 'Muse-Glimmer-30B-UD-Q5_K_M.gguf', size: 21.0 * GB },
+    { path: 'Muse-Glimmer-30B-UD-Q5_K_L.gguf', size: 23.0 * GB },
+    { path: 'Muse-Glimmer-30B-UD-Q4_K_XL.gguf', size: 15.88 * GB },
+    { path: 'Muse-Glimmer-30B-UD-Q3_K_XL.gguf', size: 13.0 * GB },
+    { path: 'Muse-Glimmer-30B-UD-Q2_K_XL.gguf', size: 10.5 * GB },
+    { path: 'Muse-Glimmer-30B-UD-IQ3_M.gguf', size: 12.5 * GB },
+    { path: 'Muse-Glimmer-30B-UD-IQ3_XXS.gguf', size: 11.0 * GB },
+    { path: 'Muse-Glimmer-30B-UD-IQ2_M.gguf', size: 9.5 * GB },
+    { path: 'Muse-Glimmer-30B-UD-IQ2_XS.gguf', size: 8.8 * GB },
+    { path: 'Muse-Glimmer-30B-UD-IQ2_XXS.gguf', size: 8.0 * GB },
+    { path: 'mmproj-Muse-Glimmer-30B-BF16.gguf', size: 3.85 * GB },
+    { path: 'mmproj-Muse-Glimmer-30B-Q8_0.gguf', size: 1.9 * GB },
+    { path: 'mmproj-kquant.gguf', size: 1.4 * GB },
+    { path: 'dflash-kquant.gguf', size: 1.4 * GB },
   ];
 }
 
-test('Muse Glimmer at 133.6GB capacity recommends UD-Q8_K_XL; BF16 fits but ranks below Q6; mmproj last', () => {
+test('Muse Glimmer at 133.6GB capacity: UD-Q8_K_XL recommended over the equal-rank Q8_0 by size tiebreak, mmproj not folded into BF16, mmproj/file kinds last', () => {
   const result = buildRepoRecommendations({
     files: museGlimmerFiles(),
     engine: 'llama',
@@ -54,26 +65,43 @@ test('Muse Glimmer at 133.6GB capacity recommends UD-Q8_K_XL; BF16 fits but rank
   });
 
   assert.equal(result.engine, 'llama');
+  // (2) Q8_0 and UD-Q8_K_XL both rank 8; UD-Q8_K_XL (32.3GB) > Q8_0 (29.6GB) wins the tiebreak.
   assert.equal(result.recommended, 'UD-Q8_K_XL');
 
   const byQuant = new Map(result.quantizations.map((q) => [q.quantization, q]));
+  assert.equal(byQuant.get('Q8_0').rank, byQuant.get('UD-Q8_K_XL').rank);
+
   const bf16 = byQuant.get('BF16');
-  const q6 = byQuant.get('UD-Q6_K_XL');
-  const iq2 = byQuant.get('IQ2_M');
   assert.equal(bf16.isSplit, true);
-  assert.equal(bf16.totalParts, 3);
-  assert.equal(bf16.fit.fits, true);
-  assert.ok(bf16.rank < q6.rank, 'BF16 must rank below Q6');
-  assert.ok(iq2.rank < 2, 'IQ2_M must rank below a Q2 entry (bits - 0.5)');
+  assert.equal(bf16.totalParts, 2);
+  // (1) the mmproj BF16 file must not be folded into the BF16 quant group.
+  assert.equal(bf16.files.length, 2);
+  assert.ok(bf16.files.every((f) => !/mmproj/i.test(f)));
+
+  const mmprojBf16 = byQuant.get('mmproj-Muse-Glimmer-30B-BF16');
+  assert.equal(mmprojBf16.kind, 'mmproj');
+  assert.equal(mmprojBf16.pattern, 'mmproj-Muse-Glimmer-30B-BF16.gguf');
+
+  // (4) UD-IQ3_M (3 - 0.5 = 2.5) ranks above UD-Q2_K_XL (2).
+  assert.equal(byQuant.get('UD-IQ3_M').rank, 2.5);
+  assert.equal(byQuant.get('UD-Q2_K_XL').rank, 2);
+  assert.ok(byQuant.get('UD-IQ3_M').rank > byQuant.get('UD-Q2_K_XL').rank);
+
+  // (3) a non-mmproj, non-quant file (no recognized/fallback token) is kind:'file',
+  // rank 0, pattern is its exact filename; a same-named mmproj file is kind:'mmproj'.
+  const dflash = byQuant.get('dflash-kquant');
+  assert.equal(dflash.kind, 'file');
+  assert.equal(dflash.rank, 0);
+  assert.equal(dflash.pattern, 'dflash-kquant.gguf');
+  const mmprojKquant = byQuant.get('mmproj-kquant');
+  assert.equal(mmprojKquant.kind, 'mmproj');
+  assert.equal(mmprojKquant.rank, 0);
 
   // mmproj entries sort after every non-mmproj entry regardless of rank/fit.
   const kinds = result.quantizations.map((q) => q.kind);
-  assert.equal(kinds.filter((k) => k === 'mmproj').length, 2);
-  assert.deepEqual(kinds.slice(-2).sort(), ['mmproj', 'mmproj']);
-
-  const mmprojEntry = byQuant.get('mmproj-BF16');
-  assert.equal(mmprojEntry.kind, 'mmproj');
-  assert.equal(mmprojEntry.pattern, 'mmproj-BF16.gguf');
+  const mmprojCount = kinds.filter((k) => k === 'mmproj').length;
+  assert.equal(mmprojCount, 3);
+  assert.deepEqual(kinds.slice(-mmprojCount), ['mmproj', 'mmproj', 'mmproj']);
 });
 
 test('Muse Glimmer at 24GB capacity recommends UD-Q4_K_XL (Q6 no longer fits)', () => {
