@@ -13,6 +13,7 @@ import {
   resolveDs4Config,
   engineDescriptor,
   ds4EnableGate,
+  ds4ModelRef,
   buildLocalServerRegistry,
   renderModelsPresetIni,
   gemmaMtpPresetSection,
@@ -394,6 +395,40 @@ test('ds4EnableGate: eligible when free memory covers the streaming requirement'
   assert.equal(g.eligible, true);
   assert.equal(g.requiredBytes, cfg.streamingWeightBytes + cfg.safetyBytes);
   assert.equal(g.freeBytes, 60 * 1024 ** 3);
+});
+
+// ---------------------------------------------------------------------------
+// ds4ModelRef — a downloaded DS4 GGUF is usable WITHOUT a stored preset
+// ---------------------------------------------------------------------------
+
+test('ds4ModelRef: resolves a downloaded GGUF by its listed name', () => {
+  // DS4 is meant to behave like any other model: if the weights are there it
+  // appears in the model list, and asking for it loads it (evicting others,
+  // which is what "exclusive" means). Requiring the operator to hand-build a
+  // preset first is what made a downloaded DS4 show as Available and still be
+  // unusable.
+  const files = [{ name: 'DeepSeek-V4-Flash-IQ2XXS.gguf', path: '/m/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf', sizeBytes: 1 }];
+  const ref = ds4ModelRef('DeepSeek-V4-Flash-IQ2XXS.gguf', files);
+  assert.ok(ref, 'expected a ref for a listed GGUF');
+  assert.equal(ref.preset.modelPath, 'DeepSeek-V4-Flash-IQ2XXS.gguf');
+  assert.equal(ref.preset.engine, 'ds4');
+});
+
+test('ds4ModelRef: matches the name with or without the .gguf suffix', () => {
+  const files = [{ name: 'DeepSeek-V4-Flash-IQ2XXS.gguf', path: '/m/ds4/x.gguf', sizeBytes: 1 }];
+  assert.ok(ds4ModelRef('DeepSeek-V4-Flash-IQ2XXS', files));
+});
+
+test('ds4ModelRef: refuses anything that is not a listed DS4 GGUF', () => {
+  // This gates an 87GB load that evicts every resident model, so it must match
+  // an actual file in the ds4 directory and nothing else. A loose match here
+  // would swap the whole box on a typo.
+  const files = [{ name: 'DeepSeek-V4-Flash-IQ2XXS.gguf', path: '/m/ds4/x.gguf', sizeBytes: 1 }];
+  assert.equal(ds4ModelRef('Qwen3-8B-Q4_K_M', files), null);
+  assert.equal(ds4ModelRef('DeepSeek', files), null);
+  assert.equal(ds4ModelRef('', files), null);
+  assert.equal(ds4ModelRef(null, files), null);
+  assert.equal(ds4ModelRef('DeepSeek-V4-Flash-IQ2XXS.gguf', []), null);
 });
 
 test('ds4EnableGate: ineligible when the DS4 weights are not installed', () => {

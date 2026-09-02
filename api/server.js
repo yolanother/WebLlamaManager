@@ -151,7 +151,7 @@ import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
-  listDs4GgufFiles, validateDs4DownloadRequest, isDs4RepoAllowed,
+  listDs4GgufFiles, ds4ModelRef, validateDs4DownloadRequest, isDs4RepoAllowed,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -909,7 +909,18 @@ function ds4PresetForModel(cfg, modelName) {
   if (!cfg || typeof modelName !== 'string') return null;
   const preset = cfg.presets?.[modelName];
   if (preset && isDs4Preset(preset)) return { presetId: modelName, preset };
-  return null;
+  // No stored preset: fall back to the GGUFs actually present in the ds4
+  // directory. A downloaded DS4 is meant to be usable straight away — it shows
+  // in the model list and loading it is what "request the model" means, with
+  // exclusivity evicting the resident models. Requiring a hand-built preset is
+  // what left a downloaded DS4 showing Available and still unusable.
+  try {
+    const ds4cfg = resolveDs4Config(cfg, RUNTIME_ENV);
+    const files = listDs4GgufFiles(ds4cfg.ggufDir, { existsSync, readdirSync, statSync });
+    return ds4ModelRef(modelName, files);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -8839,6 +8850,36 @@ async function handleModels(req, res) {
         }),
       });
     }
+
+    // 3) DS4 weights that are downloaded but not loaded. DS4 runs exclusively
+    // and is never auto-started, so it is absent from both the router's list and
+    // the MODELS_DIR scan (its GGUFs live in a dedicated dir because that quant
+    // only loads in ds4-server). Listing them is what makes a downloaded DS4
+    // selectable: requesting one activates DS4 and evicts the resident models.
+    try {
+      const ds4cfg = resolveDs4Config(config, RUNTIME_ENV);
+      for (const f of listDs4GgufFiles(ds4cfg.ggufDir, { existsSync, readdirSync, statSync })) {
+        if (byId.has(f.name) || seenNorm.has(norm(f.name))) continue;
+        byId.set(f.name, {
+          id: f.name,
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: 'ds4',
+          meta: null,
+          n_ctx: null,
+          displayName: f.name,
+          status: currentEngine === ENGINE_TYPES.DS4 ? 'loaded' : 'available',
+          alias: aliases[f.name] || null,
+          size: f.sizeBytes || 0,
+          engine: ENGINE_TYPES.DS4,
+          context_management: contextCapabilities(ENGINE_TYPES.DS4, {
+            slotCacheEnabled: slotCacheCfg().enabled,
+            slotOperationsSupported: false,
+          }),
+        });
+        seenNorm.add(norm(f.name));
+      }
+    } catch { /* ds4 not configured on this host — leave the list as-is */ }
 
     const data = { object: 'list', data: [...byId.values()] };
     // Advertise the configured default-big/default-small aliases so clients can

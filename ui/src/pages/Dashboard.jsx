@@ -1148,13 +1148,13 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 // leaving them to work out that "Model missing" means "go to
                 // Downloads". Every other state keeps its plain text.
                 //
-                // 'available' is the state most likely to be misread. It means
-                // "eligible to be enabled", NOT "ready to use" -- DS4 only runs
-                // once a ds4 preset selects one of its GGUFs, so until then it
-                // is absent from the chat model list even though the card says
-                // Available. That reads as a contradiction, so the card carries
-                // the next step rather than leaving the operator to discover
-                // that Presets is where DS4 gets turned on.
+                // 'available' means the weights are there and DS4 can be loaded
+                // on demand: its GGUFs appear in the model list, and picking one
+                // activates DS4, evicting the resident models. Say that, because
+                // "Available" next to an engine that is not running otherwise
+                // reads as a contradiction -- and an earlier version of this card
+                // sent people to Presets to hand-build one, which is no longer
+                // how DS4 gets started.
                 const sub = srv.state === 'model-missing'
                   ? (
                     <>
@@ -1165,14 +1165,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     </>
                   )
                   : (srv.id === 'ds4' && srv.state === 'available' && !srv.running)
-                    ? (
-                      <>
-                        {srv.enable?.reason} Not running yet — DS4 starts from a preset.{' '}
-                        <Link className="download-gated-link" to="/presets">
-                          Set it up in Presets →
-                        </Link>
-                      </>
-                    )
+                    ? `${srv.enable?.reason || ''} Pick a DS4 model in the chat model list to load it — it runs exclusively and unloads the others.`.trim()
                     : (srv.id === 'ds4' && srv.enable && !srv.running)
                       ? srv.enable.reason
                       : `${modelSummary}${srv.port ? ` :${srv.port}` : ''}`;

@@ -169,7 +169,7 @@ The states are kept distinct because they need different actions:
 
 | State | Meaning | What fixes it |
 |---|---|---|
-| `available` | weights present, memory sufficient | click enable |
+| `available` | weights present, memory sufficient | nothing — pick a DS4 model in any model list and it loads (see below) |
 | `insufficient-memory` | weights present, not enough free unified memory | free memory |
 | `model-missing` | no `.gguf` in the configured `ggufDir` | install the weights |
 
@@ -188,6 +188,37 @@ card links to the Download page (`/download#ds4`, where the DeepSeek V4 Flash
 chip opens the repo's file list with per-file fit verdicts — see
 [download-page.md](download-page.md)), and the reason names the exact directory
 the weights are expected in.
+
+## Selecting DS4 loads it (`ds4ModelRef`)
+
+Once the weights are present DS4 behaves like any other model: **its GGUFs appear
+in `/api/v1/models`, and requesting one loads it.** "Exclusive" describes what
+that load does to everything else — it evicts the resident models — not a
+requirement that an operator configure something first.
+
+Two pieces make that work, and both had to be connected:
+
+- `handleModels()` lists the files `listDs4GgufFiles()` finds in the ds4
+  `ggufDir`, marked `status: 'available'` (or `loaded` when DS4 is the active
+  engine). They are not in the router's list, because DS4 is never auto-started,
+  and not in the `MODELS_DIR` scan, because DS4 GGUFs live in a dedicated
+  directory — that quantization only loads in `ds4-server`.
+- `ds4PresetForModel()` falls back to `ds4ModelRef()`, which resolves a requested
+  name against those same files. `activateDs4Exclusive()` only ever needed a
+  `modelPath`, so a listed file is enough; no stored preset is required.
+
+The activation path itself already existed: a request reaches
+`ensureDs4ForModel()`, which calls `activateDs4Exclusive()`. What was missing was
+purely discovery — `ds4ModelsList()` returned `null` unless DS4 was *already* the
+active engine (so DS4 could only be listed once running, which is circular), and
+`ds4PresetForModel()` matched only a stored preset, so a freshly downloaded GGUF
+resolved to nothing. The result was a DS4 that reported itself Available and was
+simultaneously absent from every model list.
+
+`ds4ModelRef()` matches EXACTLY — the full filename, with or without the `.gguf`
+suffix — and nothing else. This gates a load of roughly 87 GB that unloads every
+resident model, so a prefix or fuzzy match would swap the whole box on a
+near-miss name.
 
 ## Guards are DS4-aware
 

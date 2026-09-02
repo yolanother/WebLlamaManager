@@ -592,6 +592,37 @@ export function isDs4RepoAllowed(repo, allowedRepos) {
  * @param {{existsSync:Function, readdirSync:Function, statSync:Function}} fsImpl
  * @returns {{name:string, path:string, sizeBytes:(number|null)}[]}
  */
+/**
+ * Resolve a requested model name to a DS4 model reference, using only the GGUFs
+ * actually present in the ds4 directory.
+ *
+ * DS4 is meant to behave like every other model: if its weights are downloaded
+ * it appears in the model list, and requesting it loads it — "exclusive" means
+ * it evicts the resident models, not that an operator must hand-build a preset
+ * first. Activation only needs a `modelPath`, so a listed file is enough; this
+ * returns the same `{presetId, preset}` shape a stored preset would.
+ *
+ * Matching is deliberately EXACT (with or without the `.gguf` suffix) against
+ * the listed files. This gates an ~87GB load that evicts everything resident,
+ * so a fuzzy match would swap the whole box on a near-miss name.
+ *
+ * @param {string} modelName The model id from the request.
+ * @param {Array<{name:string}>} ggufFiles Files from listDs4GgufFiles().
+ * @returns {{presetId:string, preset:{engine:string, modelPath:string}}|null}
+ */
+export function ds4ModelRef(modelName, ggufFiles) {
+  if (typeof modelName !== 'string' || !modelName) return null;
+  const want = modelName.toLowerCase().replace(/\.gguf$/i, '');
+  for (const f of ggufFiles || []) {
+    const have = String(f?.name || '');
+    if (!have) continue;
+    if (have.toLowerCase().replace(/\.gguf$/i, '') === want) {
+      return { presetId: have, preset: { engine: ENGINE_TYPES.DS4, modelPath: have } };
+    }
+  }
+  return null;
+}
+
 export function listDs4GgufFiles(ggufDir, fsImpl = {}) {
   const { existsSync, readdirSync, statSync } = fsImpl;
   if (!ggufDir || typeof existsSync !== 'function' || !existsSync(ggufDir)) return [];
