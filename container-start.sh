@@ -104,6 +104,19 @@ CMD=(
 # router's auto-generated preset (--model/--mmproj/--ctx-size preserved).
 [ -n "${MODELS_PRESET:-}" ] && [ -f "$MODELS_PRESET" ] && CMD+=(--models-preset "$MODELS_PRESET")
 
+# A custom-built llama-server links against shared libs (libllama, libmtmd,
+# libggml-*) that live BESIDE it, and its RUNPATH records the build directory of
+# the machine that compiled it — a path that need not exist on the machine that
+# RUNS it. DT_RUNPATH is searched after LD_LIBRARY_PATH, so pointing that at the
+# binary's own directory makes a relocated build self-contained without patching
+# the ELF. Guarded on libllama.so so the toolbox's self-contained
+# /usr/local/bin/llama-server is left exactly as it was.
+LLAMA_BIN_DIR=$(dirname "$LLAMA_SERVER_BIN")
+if [ -e "$LLAMA_BIN_DIR/libllama.so" ]; then
+    export LD_LIBRARY_PATH="$LLAMA_BIN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "Using bundled engine libs from $LLAMA_BIN_DIR"
+fi
+
 printf 'Command:'
 printf ' %q' "${CMD[@]}"
 printf '\n'

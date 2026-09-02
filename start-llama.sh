@@ -26,7 +26,15 @@ case "${LLAMA_MANAGER_PACKAGED:-}" in
   1|true)
     CONTAINER_NAME=llama-rocm-7.2.4
     CONTAINER_START=/run/host/usr/lib/llama-manager/container-start.sh
-    LLAMA_SERVER_BIN=/usr/local/bin/llama-server
+    # Honour an engine supplied by the service environment, falling back to the
+    # toolbox's own binary. This was an unconditional assignment, which meant a
+    # packaged appliance could never run a llama.cpp newer than the one baked
+    # into the container image — so a model whose architecture landed upstream
+    # after the image was built could not be loaded at all, whatever the service
+    # was configured with. Muse Glimmer 30B is the case that exposed it: it
+    # needs b10353+, the image ships b9820, and every request failed with
+    # "unknown model architecture: 'muse-glimmer'".
+    LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/usr/local/bin/llama-server}"
     ;;
   *)
     CONTAINER_NAME="${DISTROBOX_CONTAINER:-llama-rocm-7rc-rocwmma}"

@@ -16,7 +16,25 @@ readonly NODE_BIN=/usr/lib/llama-manager/node/bin/node
 readonly SERVER_ENTRY=/usr/lib/llama-manager/api/server.js
 readonly DS4_BIN=/usr/lib/llama-manager-ds4/bin/ds4-server
 readonly ROCM_CONTAINER=llama-rocm-7.2.4
-readonly LLAMA_BIN=/usr/local/bin/llama-server
+# Engine selection. The toolbox image ships a llama-server, but upstream adds
+# model architectures faster than the image is refreshed, so an appliance must
+# be able to run a newer engine without rebuilding the container. A build
+# installed under the service data directory therefore wins when present.
+#
+# /var/lib/llama-manager is bind-mounted into the engine container (distrobox
+# mounts $HOME), so the same path resolves on both sides; a path outside it
+# would not exist for the process that actually execs the binary. `current` is
+# a symlink to the active build, so upgrading is a symlink swap and rollback is
+# the reverse.
+#
+# The bundled build is NOT self-contained: its shared libraries sit beside it
+# and container-start.sh puts that directory on LD_LIBRARY_PATH.
+readonly BUNDLED_LLAMA_BIN=/var/lib/llama-manager/engine/current/llama-server
+if [[ -x "$BUNDLED_LLAMA_BIN" ]]; then
+  readonly LLAMA_BIN="$BUNDLED_LLAMA_BIN"
+else
+  readonly LLAMA_BIN=/usr/local/bin/llama-server
+fi
 
 declare -A SERVICE_ENV=(
   [NODE_ENV]=production
