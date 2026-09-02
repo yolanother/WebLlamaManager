@@ -15,6 +15,7 @@ import {
   ds4EnableGate,
   ds4ModelRef,
   ds4ArgIsShellSafe,
+  llamaFitsBesideDs4,
   buildLocalServerRegistry,
   renderModelsPresetIni,
   gemmaMtpPresetSection,
@@ -405,6 +406,60 @@ test('ds4EnableGate: eligible when free memory covers the streaming requirement'
 // ---------------------------------------------------------------------------
 // ds4 launch arguments must not be able to run commands
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// llamaFitsBesideDs4 — evict DS4 only when the llama model genuinely cannot fit
+// ---------------------------------------------------------------------------
+
+test('llamaFitsBesideDs4: a small model fits in real headroom, so DS4 stays', () => {
+  // Measured on the dedicated appliance: DS4 resident leaves ~16 GiB free, and
+  // default-small (Qwen3-8B-Q4_K_M) is ~4.7 GiB. Tearing down an 80 GiB engine
+  // to serve that is pure waste — the whole point of the gate.
+  const fit = llamaFitsBesideDs4({
+    freeMemBytes: 16 * 1024 ** 3,
+    modelBytes: 5 * 1024 ** 3,
+    contextTokens: 8192,
+    kvBytesPerToken: 128 * 1024,
+    safetyBytes: 2 * 1024 ** 3,
+  });
+  assert.equal(fit.fits, true);
+});
+
+test('llamaFitsBesideDs4: refuses when the headroom is not really there', () => {
+  // A contended host (Frostburn runs containers alongside) can have far less
+  // free than a dedicated one. Same code, different answer — the decision is
+  // made from measured free memory, never from a per-box assumption.
+  const fit = llamaFitsBesideDs4({
+    freeMemBytes: 6 * 1024 ** 3,
+    modelBytes: 5 * 1024 ** 3,
+    contextTokens: 8192,
+    kvBytesPerToken: 128 * 1024,
+    safetyBytes: 2 * 1024 ** 3,
+  });
+  assert.equal(fit.fits, false);
+  assert.match(fit.reason, /not enough/i);
+});
+
+test('llamaFitsBesideDs4: counts the KV cache, not just the weights', () => {
+  // 8192 tokens * 128KiB = 1 GiB of KV. A check that ignored it would admit a
+  // model that then OOMs partway through its first long request.
+  const base = { freeMemBytes: 8 * 1024 ** 3, modelBytes: 5 * 1024 ** 3,
+                 kvBytesPerToken: 128 * 1024, safetyBytes: 2 * 1024 ** 3 };
+  assert.equal(llamaFitsBesideDs4({ ...base, contextTokens: 1024 }).fits, true);
+  assert.equal(llamaFitsBesideDs4({ ...base, contextTokens: 65536 }).fits, false);
+});
+
+test('llamaFitsBesideDs4: an unknown model size is never assumed to fit', () => {
+  // resolveModelSizeBytes returns 0 when it cannot size a model. Treating that
+  // as "fits" would evict nothing and then OOM; treating it as "does not fit"
+  // falls back to the old evict-first behaviour, which is safe.
+  const fit = llamaFitsBesideDs4({
+    freeMemBytes: 64 * 1024 ** 3, modelBytes: 0, contextTokens: 8192,
+    kvBytesPerToken: 128 * 1024, safetyBytes: 2 * 1024 ** 3,
+  });
+  assert.equal(fit.fits, false);
+  assert.match(fit.reason, /unknown/i);
+});
 
 test('ds4ArgIsShellSafe: rejects command substitution and shell operators', () => {
   // ds4 launch arguments are passed through `distrobox enter`, which builds a

@@ -56,8 +56,17 @@ export function ds4ModelMatches(requestedModel, ds4ModelIds = []) {
  * @param {boolean} [params.hasViableRemote=false] Whether some remote backend can serve requestedModel.
  * @returns {{target:'local-ds4'|'remote'|'reject', reason:string}}
  */
-export function ds4RequestTarget({ requestedModel, ds4ModelIds = [], hasViableRemote = false } = {}) {
+export function ds4RequestTarget({
+  requestedModel, ds4ModelIds = [], hasViableRemote = false, llamaRunning = false,
+} = {}) {
   if (ds4ModelMatches(requestedModel, ds4ModelIds)) return { target: 'local-ds4', reason: 'ds4-model' };
+  // DS4 is exclusive by DEFAULT, not by necessity. When a llama model was
+  // admitted beside it (see llamaFitsBesideDs4 — measured free memory, not an
+  // assumption about the host), that model is running locally and should serve
+  // its own requests. Without this branch, keeping DS4 resident would send the
+  // small-model request to a remote backend or reject it, which is worse than
+  // the eviction it was meant to avoid.
+  if (llamaRunning) return { target: 'local-llama', reason: 'co-resident-llama' };
   if (hasViableRemote) return { target: 'remote', reason: 'offload' };
   return { target: 'reject', reason: 'exclusive-ds4-no-backend' };
 }

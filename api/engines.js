@@ -623,6 +623,57 @@ export function isDs4RepoAllowed(repo, allowedRepos) {
  * @param {Array<{name:string}>} ggufFiles Files from listDs4GgufFiles().
  * @returns {{presetId:string, preset:{engine:string, modelPath:string}}|null}
  */
+/**
+ * Decide whether a llama model can be served ALONGSIDE a resident DS4, instead
+ * of evicting DS4 to make room.
+ *
+ * DS4 is exclusive by default: any llama request tore down an ~80 GB engine and
+ * paid a full reload to come back. On a machine dedicated to llama-manager that
+ * is usually unnecessary — DS4 resident still leaves ~16 GiB free, and
+ * default-small is under 5 GiB.
+ *
+ * The decision is made from MEASURED free memory at the moment of the request,
+ * never from a per-host assumption. The same code then does the right thing on a
+ * dedicated box (plenty of headroom, keep DS4) and on a contended one running
+ * containers beside the manager (little headroom, evict as before).
+ *
+ * Budget: model weights + KV cache for the requested context + a safety margin.
+ * The KV term matters — omitting it admits a model that fits at load and then
+ * runs the box out of memory partway through its first long request.
+ *
+ * An unknown model size (resolveModelSizeBytes yields 0) is never treated as
+ * fitting: the caller falls back to evicting DS4, which is the previous, safe
+ * behaviour.
+ *
+ * @param {{freeMemBytes:number, modelBytes:number, contextTokens:number,
+ *          kvBytesPerToken:number, safetyBytes:number}} p
+ * @returns {{fits:boolean, requiredBytes:number, freeBytes:number, reason:string}}
+ */
+export function llamaFitsBesideDs4({
+  freeMemBytes = 0, modelBytes = 0, contextTokens = 0,
+  kvBytesPerToken = 0, safetyBytes = 0,
+} = {}) {
+  const freeBytes = num(freeMemBytes, 0);
+  const weights = num(modelBytes, 0);
+  if (weights <= 0) {
+    return {
+      fits: false, requiredBytes: 0, freeBytes,
+      reason: 'Model size is unknown, so co-residency cannot be admitted safely; DS4 will be evicted.',
+    };
+  }
+  const kv = num(contextTokens, 0) * num(kvBytesPerToken, 0);
+  const requiredBytes = weights + kv + num(safetyBytes, 0);
+  const fits = freeBytes >= requiredBytes;
+  return {
+    fits,
+    requiredBytes,
+    freeBytes,
+    reason: fits
+      ? `Fits beside DS4 (needs ~${gib(requiredBytes)}, ${gib(freeBytes)} free) — keeping DS4 resident.`
+      : `Not enough free memory to run beside DS4: needs ~${gib(requiredBytes)}, only ${gib(freeBytes)} free.`,
+  };
+}
+
 // Characters that are dangerous in a ds4 launch argument.
 //
 // ds4 arguments do not reach ds4-server as a clean argv: `distrobox enter`

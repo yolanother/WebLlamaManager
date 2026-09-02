@@ -24,6 +24,33 @@ import {
 const GB = 1024 * 1024 * 1024;
 
 // ── ds4ModelMatches ──────────────────────────────────────────────────────────
+test('ds4RequestTarget: a co-resident llama serves non-ds4 models locally', () => {
+  // When DS4 stays resident because a small model fits beside it, that small
+  // model has to actually be served. Without this branch the request falls
+  // through to remote-or-503 — so keeping DS4 would have been WORSE than
+  // evicting it, which is why the fit gate and this target ship together.
+  const r = ds4RequestTarget({
+    requestedModel: 'Qwen3-8B-Q4_K_M', ds4ModelIds: ['DeepSeek-V4-Flash.gguf'],
+    hasViableRemote: false, llamaRunning: true,
+  });
+  assert.equal(r.target, 'local-llama');
+});
+
+test('ds4RequestTarget: the ds4 model still wins even when llama is co-resident', () => {
+  const r = ds4RequestTarget({
+    requestedModel: 'DeepSeek-V4-Flash.gguf', ds4ModelIds: ['DeepSeek-V4-Flash.gguf'],
+    llamaRunning: true,
+  });
+  assert.equal(r.target, 'local-ds4');
+});
+
+test('ds4RequestTarget: unchanged when nothing is co-resident', () => {
+  // The exclusive-mode behaviour must be exactly as before for hosts with no
+  // headroom: offload if a remote can serve, otherwise refuse rather than queue.
+  assert.equal(ds4RequestTarget({ requestedModel: 'other', ds4ModelIds: ['d.gguf'], hasViableRemote: true }).target, 'remote');
+  assert.equal(ds4RequestTarget({ requestedModel: 'other', ds4ModelIds: ['d.gguf'], hasViableRemote: false }).target, 'reject');
+});
+
 test('ds4ModelMatches: exact and normalized matches', () => {
   assert.equal(ds4ModelMatches('deepseek-v4-flash', ['deepseek-v4-flash']), true);
   assert.equal(ds4ModelMatches('DeepSeek V4 Flash', ['deepseek-v4-flash']), true); // punctuation/case

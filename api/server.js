@@ -151,7 +151,7 @@ import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
-  listDs4GgufFiles, ds4ModelRef, validateDs4DownloadRequest, isDs4RepoAllowed,
+  listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -5818,9 +5818,36 @@ async function ensureDs4ForModel(rawModel, resolvedModel) {
   // whose target has been re-pointed at llama — the alias follows the operator's
   // preferred-big choice. Arbitrary non-alias models keep offloading (task-3).
   if (currentEngine === ENGINE_TYPES.DS4 && (rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS)) {
-    console.log(`[ds4] default-model alias '${rawModel}' now points at llama target '${resolvedModel}' — deactivating exclusive ds4 mode`);
-    addLog('presets', `default-model alias '${rawModel}' re-pointed at llama target '${resolvedModel}' — reversing exclusive ds4 mode`);
-    await deactivateDs4Exclusive();
+    // Evict DS4 only if the llama target genuinely cannot run beside it. On a
+    // host dedicated to llama-manager, DS4 resident still leaves room for a
+    // small model, and tearing down an ~80GB engine to serve default-small
+    // costs a full reload for nothing. On a contended host the same check
+    // measures less headroom and evicts exactly as before — the decision comes
+    // from free memory now, not from an assumption about the machine.
+    const ds4cfg = resolveDs4Config(config, RUNTIME_ENV);
+    const fit = llamaFitsBesideDs4({
+      freeMemBytes: memAvailableBytes(),
+      modelBytes: resolveModelSizeBytes(resolvedModel),
+      contextTokens: config.contextSize || 0,
+      kvBytesPerToken: ds4cfg.kvBytesPerToken,
+      safetyBytes: ds4cfg.safetyBytes,
+    });
+    if (fit.fits) {
+      console.log(`[ds4] keeping DS4 resident for '${rawModel}' -> '${resolvedModel}': ${fit.reason}`);
+      addLog('presets', `Serving '${resolvedModel}' beside DS4 rather than evicting it. ${fit.reason}`);
+      // Keeping DS4 is only half the job: DS4's own activation evicted llama, so
+      // without starting it back up the request would be offloaded to a remote
+      // backend or rejected — worse than the eviction this avoids. Bring llama
+      // up beside DS4 now that the memory budget has admitted it.
+      if (!llamaProcess) {
+        console.log(`[ds4] starting llama beside DS4 to serve '${resolvedModel}'`);
+        await restartLlamaServer({ governed: false });
+      }
+    } else {
+      console.log(`[ds4] default-model alias '${rawModel}' now points at llama target '${resolvedModel}' — deactivating exclusive ds4 mode (${fit.reason})`);
+      addLog('presets', `default-model alias '${rawModel}' re-pointed at llama target '${resolvedModel}' — reversing exclusive ds4 mode. ${fit.reason}`);
+      await deactivateDs4Exclusive();
+    }
   }
   return null;
 }
@@ -5834,6 +5861,13 @@ async function ensureDs4ForModel(rawModel, resolvedModel) {
  * @throws {Error} When memory admission or a required mode switch fails.
  */
 async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
+  // A llama model that was ADMITTED to run beside DS4 (llamaFitsBesideDs4, from
+  // measured free memory) is allowed through the normal path — that is the whole
+  // point of not evicting DS4 for a model that fits. Everything else still
+  // early-returns below.
+  if (currentEngine === ENGINE_TYPES.DS4 && llamaProcess) {
+    return;
+  }
   // While the ds4 engine owns the box, do NOT run any llama mode-switch/restart:
   // starting llama-server alongside ds4 would OOM (ds4's 81GB model + a llama
   // model can't coexist in 124GB RAM). ds4 chat requests are served upstream in
@@ -10324,12 +10358,27 @@ async function handleChatCompletions(req, res) {
       requestedModel,
       ds4ModelIds: ds4ModelIdsForPreset(currentPreset),
       hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'chat/completions', aliasRouting),
+      // A llama server admitted beside DS4 serves its own models locally rather
+      // than being offloaded or refused.
+      llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
       req.body = proxyBody;
       return proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime, mediaMetadata });
     }
-    if (requestPolicy.localOnly) {
+    // A llama server was admitted beside DS4, so this model is served LOCALLY by
+    // it. Skip the whole exclusive-mode offload block below: that path assumes
+    // no local engine can take the request and hands a null backend to
+    // buildRemoteRouting, which then throws on `.url`.
+    if (decision.target === 'local-llama') {
+      // Served LOCALLY by the llama server admitted beside DS4 — resolved the
+      // same way as when DS4 is not running at all. This must skip every branch
+      // below: they assume no local engine can take the request, and the
+      // force-remote tail hands a null backend to buildRemoteRouting, which
+      // throws on `.url`.
+      console.log(`[chat/completions] serving '${requestedModel}' on the llama server co-resident with DS4`);
+      routing = resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
+    } else if (requestPolicy.localOnly) {
       contextRoutingStats.offloadSuppressedLocalOnly++;
       contextRoutingStats.localOnlyRejected++;
       addLog('backends', `offload-suppressed(local_only): ds4 exclusive cannot locally serve '${requestedModel}'`);
@@ -10341,17 +10390,17 @@ async function handleChatCompletions(req, res) {
         },
         _llama_manager: { routing: 'local_only', routing_outcome: 'rejected', offload_suppressed: true },
       });
-    }
-    if (decision.target === 'reject') {
+    } else if (decision.target === 'reject') {
       const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
       addLog('backends', `ds4 exclusive: no offload backend for '${requestedModel}' — returning 503`);
       return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
+    } else {
+      // Force remote (never local): build routing from the fastest viable backend.
+      const backend = findFastestAvailableBackend(requestedModel, 'chat/completions', aliasRouting);
+      const remoteModel = remoteTargetModel(backend, aliasRouting);
+      routing = buildRemoteRouting(backend, remoteModel, 'chat/completions');
+      console.log(`[chat/completions] ds4 exclusive: offloading non-ds4 model '${requestedModel}' to ${backend.name} (${remoteModel})`);
     }
-    // Force remote (never local): build routing from the fastest viable backend.
-    const backend = findFastestAvailableBackend(requestedModel, 'chat/completions', aliasRouting);
-    const remoteModel = remoteTargetModel(backend, aliasRouting);
-    routing = buildRemoteRouting(backend, remoteModel, 'chat/completions');
-    console.log(`[chat/completions] ds4 exclusive: offloading non-ds4 model '${requestedModel}' to ${backend.name} (${remoteModel})`);
   } else {
     // Resolve backend routing (local vs remote) the normal way.
     routing = resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
