@@ -4,8 +4,10 @@
 # gfx1151 ROCm build. Bump LLAMA_CPP_REF deliberately only after validating text,
 # vision, and speculative decoding through the managed production runtime.
 #
-# Rollback pin restored after the 2026-08-22 update produced question-mark-only
-# Qwen3-8B output on the Frostburn AMD GPU path. Keep this pin until a newer
-# runtime passes both Qwen3-8B and Qwen3.8 validation.
+# 2026-09-01: bumped to upstream tag b10752 for Muse Glimmer 30B support
+# (merged in b10353). The previous 2026-08-22 bump was rolled back after
+# question-mark-only Qwen3-8B output on the Frostburn GPU path, so every bump
+# must re-validate Qwen3-8B text, Gemma-4 vision+MTP, and Muse Glimmer+mmproj
+# before the service is switched to the custom binary.
 LLAMA_CPP_REPO=https://github.com/ggerganov/llama.cpp.git
-LLAMA_CPP_REF=8be759e6f70d629638a7eb70db3824cbdcea370b
+LLAMA_CPP_REF=b96806d96061049a5b574269b049bf6241d63d46
