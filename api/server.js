@@ -49,6 +49,7 @@ const PROJECT_ROOT = dirname(__dirname);
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
+import { normalizeModelKey } from './model-identity.js';
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
@@ -2758,7 +2759,7 @@ function memTotalBytes() {
 function resolveModelSizeBytes(modelId) {
   if (!modelId) return 0;
   try {
-    const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const norm = normalizeModelKey;
     const target = norm(modelId);
     let best = 0;
     for (const m of scanLocalModels()) {
@@ -8779,7 +8780,11 @@ async function handleModels(req, res) {
     // also listed so /v1/models reflects what is AVAILABLE even when the router
     // is idle/stopped (previously this returned nothing unless a model was loaded).
     const byId = new Map();
-    const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    // normalizeModelKey, not a local regex: the router names a model
+    // "Qwen3-8B-Q4_K_M" while the file on disk is "Qwen3-8B-Q4_K_M.gguf", and a
+    // key that keeps the extension makes those two look like different models —
+    // which listed the same model twice in the chat picker.
+    const norm = normalizeModelKey;
     const seenNorm = new Set();
 
     // 1) Models reported by the running router (if it is up).

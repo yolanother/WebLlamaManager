@@ -1147,6 +1147,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 // click, so say what is wrong AND offer the way out rather than
                 // leaving them to work out that "Model missing" means "go to
                 // Downloads". Every other state keeps its plain text.
+                //
+                // 'available' is the state most likely to be misread. It means
+                // "eligible to be enabled", NOT "ready to use" -- DS4 only runs
+                // once a ds4 preset selects one of its GGUFs, so until then it
+                // is absent from the chat model list even though the card says
+                // Available. That reads as a contradiction, so the card carries
+                // the next step rather than leaving the operator to discover
+                // that Presets is where DS4 gets turned on.
                 const sub = srv.state === 'model-missing'
                   ? (
                     <>
@@ -1156,9 +1164,18 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                       </Link>
                     </>
                   )
-                  : (srv.id === 'ds4' && srv.enable && !srv.running)
-                    ? srv.enable.reason
-                    : `${modelSummary}${srv.port ? ` :${srv.port}` : ''}`;
+                  : (srv.id === 'ds4' && srv.state === 'available' && !srv.running)
+                    ? (
+                      <>
+                        {srv.enable?.reason} Not running yet — DS4 starts from a preset.{' '}
+                        <Link className="download-gated-link" to="/presets">
+                          Set it up in Presets →
+                        </Link>
+                      </>
+                    )
+                    : (srv.id === 'ds4' && srv.enable && !srv.running)
+                      ? srv.enable.reason
+                      : `${modelSummary}${srv.port ? ` :${srv.port}` : ''}`;
                 return (
                   <StatCard key={srv.id} label={srv.displayName} value={stateLabel}
                     subValue={sub} icon={icon} status={status} />
