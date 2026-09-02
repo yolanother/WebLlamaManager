@@ -452,6 +452,10 @@ export function validatePresetEngineFields(body = {}) {
   if (!body.modelPath || typeof body.modelPath !== 'string') {
     return { ok: false, error: 'ds4 presets require a modelPath (GGUF file under the ds4 ggufDir).' };
   }
+  // modelPath lands in the ds4 argv too, and reaches the same distrobox eval.
+  if (!ds4ArgIsShellSafe(body.modelPath)) {
+    return { ok: false, error: 'ds4 modelPath must not contain shell metacharacters.' };
+  }
   const ds4 = { modelPath: body.modelPath };
 
   if (body.context !== undefined && body.context !== null && body.context !== '') {
@@ -469,6 +473,9 @@ export function validatePresetEngineFields(body = {}) {
   }
   if (body.kvDiskDir !== undefined && body.kvDiskDir !== null && body.kvDiskDir !== '') {
     if (typeof body.kvDiskDir !== 'string') return { ok: false, error: 'ds4 kvDiskDir must be a string path.' };
+    if (!ds4ArgIsShellSafe(body.kvDiskDir)) {
+      return { ok: false, error: 'ds4 kvDiskDir must not contain shell metacharacters.' };
+    }
     ds4.kvDiskDir = body.kvDiskDir;
   }
   if (body.kvDiskSpaceMb !== undefined && body.kvDiskSpaceMb !== null && body.kvDiskSpaceMb !== '') {
@@ -478,6 +485,12 @@ export function validatePresetEngineFields(body = {}) {
   }
   if (body.extraSwitches !== undefined && body.extraSwitches !== null && body.extraSwitches !== '') {
     if (typeof body.extraSwitches !== 'string') return { ok: false, error: 'ds4 extraSwitches must be a string.' };
+    // These reach ds4-server through `distrobox enter`, which eval's its command
+    // string — so an unchecked value here is remote command execution as the
+    // service account for anyone who can write a preset.
+    if (!ds4ArgIsShellSafe(body.extraSwitches)) {
+      return { ok: false, error: 'ds4 extraSwitches must not contain shell metacharacters.' };
+    }
     ds4.extraSwitches = body.extraSwitches;
   }
   // Adaptive activation fields (see ds4-adaptive.js).
@@ -610,6 +623,35 @@ export function isDs4RepoAllowed(repo, allowedRepos) {
  * @param {Array<{name:string}>} ggufFiles Files from listDs4GgufFiles().
  * @returns {{presetId:string, preset:{engine:string, modelPath:string}}|null}
  */
+// Characters that are dangerous in a ds4 launch argument.
+//
+// ds4 arguments do not reach ds4-server as a clean argv: `distrobox enter`
+// builds a command string and eval's it (verified on the appliance — an
+// extraSwitches value of `--flag$(touch /tmp/canary)` created the canary, i.e.
+// arbitrary execution as the llama-manager account). Both extraSwitches and
+// modelPath are settable through the preset API, so anyone who can reach the
+// dashboard could run commands on the box.
+//
+// Pre-quoting was measured and rejected: printf %q blocks the substitution but
+// the backslashes survive the eval, so a legitimate path with a space arrives
+// corrupted as `one\ two`. Refusing the metacharacters at the boundary is the
+// fix that neither breaks real values nor depends on distrobox's quoting.
+//
+// These fields hold flags, numbers and filenames. None of the rejected
+// characters has a legitimate use in them.
+const DS4_UNSAFE_ARG_CHARS = /[$`;|&<>(){}\n\r\\'"*?~!#]/;
+
+/**
+ * Whether a ds4 launch argument is safe to pass through the distrobox eval.
+ *
+ * @param {string} value An extraSwitches string or a model path.
+ * @returns {boolean} False when it contains a shell metacharacter.
+ */
+export function ds4ArgIsShellSafe(value) {
+  if (value === undefined || value === null || value === '') return true;
+  return !DS4_UNSAFE_ARG_CHARS.test(String(value));
+}
+
 // Launch knobs applied to a DS4 model selected straight from the model list
 // (no stored preset). Mirrors the defaults the Presets editor writes, so an
 // implicitly-selected model launches the same way a hand-built preset does —

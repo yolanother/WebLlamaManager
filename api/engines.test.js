@@ -14,6 +14,7 @@ import {
   engineDescriptor,
   ds4EnableGate,
   ds4ModelRef,
+  ds4ArgIsShellSafe,
   buildLocalServerRegistry,
   renderModelsPresetIni,
   gemmaMtpPresetSection,
@@ -400,6 +401,63 @@ test('ds4EnableGate: eligible when free memory covers the streaming requirement'
 // ---------------------------------------------------------------------------
 // ds4ModelRef — a downloaded DS4 GGUF is usable WITHOUT a stored preset
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ds4 launch arguments must not be able to run commands
+// ---------------------------------------------------------------------------
+
+test('ds4ArgIsShellSafe: rejects command substitution and shell operators', () => {
+  // ds4 launch arguments are passed through `distrobox enter`, which builds a
+  // command string and eval's it. VERIFIED on the appliance: an extraSwitches
+  // value of "--flag$(touch /tmp/canary)" created the canary — arbitrary
+  // execution as the llama-manager account, reachable by anyone who can PUT a
+  // preset. These fields are flags and filenames; none of this belongs in them.
+  for (const bad of [
+    '--flag$(touch /tmp/x)',
+    '--flag`id`',
+    '--a; rm -rf /',
+    '--a | nc host 1',
+    '--a && curl evil',
+    '--a > /etc/passwd',
+    '--a\nsecond-line',
+    '--a$HOME',
+  ]) {
+    assert.equal(ds4ArgIsShellSafe(bad), false, `expected rejection: ${bad}`);
+  }
+});
+
+test('validatePresetEngineFields: refuses a ds4 preset that smuggles a command', () => {
+  // End of the actual attack path: PUT a preset with a crafted extraSwitches and
+  // the launcher runs it. The API must refuse before it is ever stored.
+  const bad = validatePresetEngineFields({
+    engine: 'ds4', modelPath: 'model.gguf', extraSwitches: '--rocm $(touch /tmp/pwned)',
+  });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /shell metacharacters/);
+
+  const badPath = validatePresetEngineFields({
+    engine: 'ds4', modelPath: 'model.gguf; rm -rf /',
+  });
+  assert.equal(badPath.ok, false);
+
+  const good = validatePresetEngineFields({
+    engine: 'ds4', modelPath: 'DeepSeek-V4-Flash-IQ2XXS.gguf', extraSwitches: '--rocm --cors',
+  });
+  assert.equal(good.ok, true);
+});
+
+test('ds4ArgIsShellSafe: accepts the switches and paths actually used', () => {
+  for (const ok of [
+    '--rocm --cors',
+    '--ssd-streaming-cache-experts 32',
+    '--power 100',
+    '/var/lib/llama-manager/models/ds4/DeepSeek-V4-Flash-IQ2XXS.gguf',
+    'DeepSeek-V4-Flash-Layers37-42Q4KExperts-chat-v2-imatrix-fixed-0731.gguf',
+    '',
+  ]) {
+    assert.equal(ds4ArgIsShellSafe(ok), true, `expected acceptance: ${ok}`);
+  }
+});
 
 test('ds4ModelRef: resolves a downloaded GGUF by its listed name', () => {
   // DS4 is meant to behave like any other model: if the weights are there it
