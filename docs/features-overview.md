@@ -250,6 +250,14 @@ the token in all API output. A **DS4-scoped** download endpoint (`/api/ds4/downl
 is repo-allowlisted (`config.ds4.allowedRepos`) and hard-pinned to the ds4 model
 dir so ds4 GGUFs can never pollute `~/models`.
 
+Every repo's file listing (`/api/repo/:author/:model/files`) is **ranked and
+fit-checked** for this machine (`api/repo-recommendations.js`): one recommended
+quant (best bit depth that fits, Q8 preferred over BF16), the rest sorted by fit
+then quality, mmproj files kept separate and bundled into "Download recommended"
+for vision models. The Download page shows a "Recommended models" chip row
+(DeepSeek V4 Flash, Muse Glimmer 30B, the embedding models) that opens that view
+directly. See [download-page.md](download-page.md).
+
 ## 11. Monitoring, logs & analytics
 
 - **Live stats** (`/api/system/stats`, WebSocket `/ws`): CPU/RAM/GTT/GPU

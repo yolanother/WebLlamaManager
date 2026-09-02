@@ -184,8 +184,10 @@ wrong.
 resolved `ggufDir`; the gate keeps the check injectable and defaults it to
 `true`, so a caller that cannot tell falls back to the old memory-only behaviour
 rather than hiding a working engine. In the `model-missing` state the dashboard
-card links to the DS4 section of the Downloads page, and the reason names the
-exact directory the weights are expected in.
+card links to the Download page (`/download#ds4`, where the DeepSeek V4 Flash
+chip opens the repo's file list with per-file fit verdicts — see
+[download-page.md](download-page.md)), and the reason names the exact directory
+the weights are expected in.
 
 ## Guards are DS4-aware
 
