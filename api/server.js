@@ -150,7 +150,7 @@ import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
-  listDs4GgufFiles, validateDs4DownloadRequest,
+  listDs4GgufFiles, validateDs4DownloadRequest, isDs4RepoAllowed,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -158,6 +158,7 @@ import {
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
+import { buildRepoRecommendations, computeCapacityBytes } from './repo-recommendations.js';
 import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
   shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision
@@ -7398,8 +7399,20 @@ app.get('/api/repo/:author/:model/files', async (req, res) => {
       files = await fetchRepoFilesRecursive(repoId);
     }
 
-    const quantizations = groupFilesByQuantization(files);
-    res.json({ quantizations });
+    const ds4Config = resolveDs4Config(config, RUNTIME_ENV);
+    const engine = isDs4RepoAllowed(repoId, ds4Config.allowedRepos) ? 'ds4' : 'llama';
+    const capacityBytes = computeCapacityBytes(buildInventory(getAllGpuSysfsStats(), memTotalBytes()), memTotalBytes());
+    const presentNames = engine === 'ds4'
+      ? listDs4GgufFiles(ds4Config.ggufDir, { existsSync, readdirSync, statSync }).map((f) => f.name)
+      : undefined;
+
+    res.json(buildRepoRecommendations({
+      files,
+      engine,
+      ggufDir: engine === 'ds4' ? ds4Config.ggufDir : undefined,
+      presentNames,
+      capacityBytes,
+    }));
   } catch (error) {
     console.error('[repo/files] Error:', error);
     res.status(500).json({ error: error.message });
@@ -7509,61 +7522,6 @@ async function fetchRepoFilesRecursive(repoId, path = '') {
   }
 
   return allFiles;
-}
-
-// Group files by quantization
-function groupFilesByQuantization(files) {
-  const quantizations = new Map();
-
-  for (const file of files) {
-    const quant = extractQuantization(file.path);
-    if (!quant) continue;
-
-    // Check if this is a split file (e.g., model-00001-of-00003.gguf)
-    const splitMatch = file.path.match(/[-_](\d{5})-of-(\d{5})\.gguf$/i);
-
-    if (!quantizations.has(quant)) {
-      quantizations.set(quant, {
-        quantization: quant,
-        files: [],
-        totalSize: 0,
-        isSplit: false,
-        totalParts: 1
-      });
-    }
-
-    const entry = quantizations.get(quant);
-    entry.files.push(file.path);
-    entry.totalSize += file.size || 0;
-
-    if (splitMatch) {
-      entry.isSplit = true;
-      entry.totalParts = parseInt(splitMatch[2]);
-    }
-  }
-
-  // Convert to array and sort by quantization name
-  return Array.from(quantizations.values())
-    .sort((a, b) => a.quantization.localeCompare(b.quantization));
-}
-
-function extractQuantization(filename) {
-  // Remove split suffix first for matching
-  const cleanName = filename.replace(/[-_]\d{5}-of-\d{5}\.gguf$/i, '.gguf');
-
-  const patterns = [
-    /[-_](Q\d+_K(?:_[SML])?)/i,
-    /[-_](IQ\d+_[A-Z]+)/i,
-    /[-_](F16|F32|BF16)/i,
-    /[-_](Q\d+_0)/i,
-    /[-_](Q\d+)/i
-  ];
-
-  for (const pattern of patterns) {
-    const match = cleanName.match(pattern);
-    if (match) return match[1].toUpperCase();
-  }
-  return null;
 }
 
 // Update config
