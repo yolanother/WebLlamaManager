@@ -17,6 +17,7 @@ import {
   renderModelsPresetIni,
   gemmaMtpPresetSection,
   qwen38MtpPresetSection,
+  museGlimmerDflashPresetSection,
   validatePresetEngineFields,
   resolveDs4ModelPath,
   ds4ModelEntry,
@@ -607,4 +608,33 @@ test('qwen38MtpPresetSection: public helper is documented and trusts explicit fi
   assert.match(documentation[1], /pure|filesystem/i);
   assert.match(documentation[1], /@param/);
   assert.match(documentation[1], /@returns?/);
+});
+
+test('museGlimmerDflashPresetSection: present drafter → Muse Glimmer section with draft-dflash + published sampling', () => {
+  const s = museGlimmerDflashPresetSection({ modelsDir: '/home/u/models', draftExists: true });
+  assert.deepEqual(s, {
+    name: 'unsloth_Muse-Glimmer-30B-GGUF',
+    options: {
+      'model-draft': '/home/u/models/unsloth_Muse-Glimmer-30B-GGUF/dflash-kquant.gguf',
+      'spec-type': 'draft-dflash',
+      'gpu-layers-draft': '99',
+      'temp': '1.0',
+      'top-p': '0.95',
+      'top-k': '64',
+    },
+  });
+  assert.equal(
+    renderModelsPresetIni([s]),
+    '[unsloth_Muse-Glimmer-30B-GGUF]\n'
+      + 'model-draft = /home/u/models/unsloth_Muse-Glimmer-30B-GGUF/dflash-kquant.gguf\n'
+      + 'spec-type = draft-dflash\n'
+      + 'gpu-layers-draft = 99\n'
+      + 'temp = 1.0\n'
+      + 'top-p = 0.95\n'
+      + 'top-k = 64\n',
+  );
+});
+
+test('museGlimmerDflashPresetSection: no drafter → null (router serves Muse Glimmer without DFlash)', () => {
+  assert.equal(museGlimmerDflashPresetSection({ modelsDir: '/m', draftExists: false }), null);
 });

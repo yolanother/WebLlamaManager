@@ -404,6 +404,33 @@ export function qwen38MtpPresetSection({ modelsDir, draftExists } = {}) {
 }
 
 /**
+ * Build the models-preset section that enables DFlash speculative decoding and
+ * the published sampling defaults for Muse Glimmer 30B. The router auto-detects
+ * the primary GGUF and its mmproj (vision) but cannot infer the DFlash drafter
+ * that unsloth ships alongside (`dflash-kquant.gguf`), nor the model card's
+ * sampling (temp 1.0, top-p 0.95, top-k 64). Measured on Strix Halo with
+ * UD-Q4_K_XL: 11.7 tok/s with DFlash vs 8.2 without (acceptance ~0.46). Returns
+ * null when the drafter is absent so the router serves it un-accelerated. No
+ * filesystem access; callers own the existence check.
+ * @param {{modelsDir:string, draftExists:boolean}} params Model root and caller-verified drafter availability.
+ * @returns {{name:string, options:Object<string,string>}|null} Router section descriptor or null.
+ */
+export function museGlimmerDflashPresetSection({ modelsDir, draftExists } = {}) {
+  if (!draftExists) return null;
+  return {
+    name: 'unsloth_Muse-Glimmer-30B-GGUF',
+    options: {
+      'model-draft': `${modelsDir}/unsloth_Muse-Glimmer-30B-GGUF/dflash-kquant.gguf`,
+      'spec-type': 'draft-dflash',
+      'gpu-layers-draft': '99',
+      'temp': '1.0',
+      'top-p': '0.95',
+      'top-k': '64',
+    },
+  };
+}
+
+/**
  * Validate the engine-related fields of a preset create/update request body.
  * Returns the normalized engine and (for ds4) a validated ds4 field block, or a
  * human-readable error. Does NOT touch the filesystem — existence checks stay in

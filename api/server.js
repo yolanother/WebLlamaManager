@@ -152,7 +152,8 @@ import {
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, validateDs4DownloadRequest,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
-  qwen38MtpPresetSection
+  qwen38MtpPresetSection,
+  museGlimmerDflashPresetSection
 } from './engines.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { createDs4Updater } from './ds4-updater.js';
@@ -2560,6 +2561,22 @@ const DEFAULT_PRESETS = {
       temp: 0.7,
       topP: 1.0,
       topK: 20,
+      minP: 0,
+      extraSwitches: '--jinja'
+    }
+  },
+  'muse-glimmer-30b': {
+    id: 'muse-glimmer-30b',
+    name: 'Muse Glimmer 30B (vision)',
+    description: 'Meta dense 30B reasoning + vision model; needs llama.cpp >= b10353. -hf also fetches the mmproj.',
+    hfRepo: 'unsloth/Muse-Glimmer-30B-GGUF:UD-Q4_K_XL',
+    context: 131072,
+    config: {
+      chatTemplateKwargs: '',
+      reasoningFormat: 'deepseek',
+      temp: 1.0,
+      topP: 0.95,
+      topK: 64,
       minP: 0,
       extraSwitches: '--jinja'
     }
@@ -5866,9 +5883,9 @@ async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
  * Write the router's `--models-preset` INI (into the cache dir, shared into the
  * distrobox via $HOME) enabling model-specific speculative decode when a known
  * draft GGUF is present. The router auto-detects primary models and --mmproj but
- * cannot infer separate draft models, so this file adds Gemma MTP and Qwen3.8
- * MTP/n-gram profiles without changing unaccelerated serving when drafts are
- * absent. Returns the file path, or '' when there is nothing to configure
+ * cannot infer separate draft models, so this file adds Gemma MTP, Qwen3.8
+ * MTP/n-gram and Muse Glimmer DFlash (+ its published sampling) profiles without
+ * changing unaccelerated serving when drafts are absent. Returns the file path, or '' when there is nothing to configure
  * (caller then omits MODELS_PRESET so the router behaves exactly as before).
  * @returns {string}
  */
@@ -5877,12 +5894,14 @@ function writeModelsPresetFile() {
     const gemmaDraftPath = join(MODELS_DIR, 'google_gemma-4-E2B-it-assistant', 'gemma-4-E2B-it-assistant-BF16.gguf');
     const qwenDir = join(MODELS_DIR, 'unsloth_Qwen3.8-27B-GGUF');
     const qwenDraftPath = join(qwenDir, 'mtp-Qwen3.8-27B-Q4_0.gguf');
+    const museDraftPath = join(MODELS_DIR, 'unsloth_Muse-Glimmer-30B-GGUF', 'dflash-kquant.gguf');
     const sections = [
       gemmaMtpPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(gemmaDraftPath) }),
       qwen38MtpPresetSection({
         modelsDir: MODELS_DIR,
         draftExists: existsSync(qwenDir) && existsSync(qwenDraftPath),
       }),
+      museGlimmerDflashPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(museDraftPath) }),
     ].filter(Boolean);
     const ini = renderModelsPresetIni(sections);
     if (!ini) return '';
