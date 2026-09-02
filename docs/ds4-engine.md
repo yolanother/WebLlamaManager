@@ -112,9 +112,55 @@ While DS4 is active, request routing (`ds4RequestTarget`) is:
 
 - request for the DS4 model / `default-big` → **local ds4-server** (bypasses all
   llama slot/prefix/tokenize machinery via `proxyChatToDs4`);
-- request for any other model → **offload to a remote backend**;
+- request for another model that **fits in the memory left over** → **local
+  llama, co-resident with DS4** (`local-llama`; see below);
+- request for another model that does **not** fit → **offload to a remote
+  backend**;
 - no backend can serve it → **clean 503** (never a second local load, never an
   infinite queue).
+
+### 2a. Co-residency: evict DS4 only when the other model cannot fit
+
+Selecting a small model used to evict DS4 unconditionally. That is the wrong
+trade on a box dedicated to serving models: DS4 is ~87 GB of weights, so a
+one-line question to an 8B model threw away an engine that costs a full reload
+to get back.
+
+The decision is now made against **measured free memory**, per request.
+`llamaFitsBesideDs4()` (`api/engines.js`) budgets:
+
+    weights + (contextTokens x kvBytesPerToken) + safetyBytes
+
+and DS4 is evicted only when that budget does not fit in `MemAvailable`.
+
+Two properties it deliberately has:
+
+- **The KV term is not optional.** Admitting on weights alone lets a model load
+  and then run the box out of memory partway through its first long request.
+- **An unknown model size never fits.** When `resolveModelSizeBytes()` yields 0
+  the answer is "evict" — the previous, safe behaviour — rather than a guess.
+
+Keeping DS4 is only half the job. DS4's activation had already evicted llama, so
+a gate that merely *skipped* the eviction would leave llama down and the request
+offloaded or refused — worse than the eviction it avoided. The same branch
+therefore starts llama beside DS4, and the router's `local-llama` target serves
+the request locally instead of falling through to the force-remote path.
+
+**Expect this to go both ways, and that is correct.** DS4 resident leaves only
+~10-16 GiB on a 128 GB box while an 8B Q4 plus KV wants ~10.7 GiB, so the margin
+is thin by nature. Measured on the same host:
+
+    keeping DS4 resident for 'default-small' -> 'Qwen3-8B-Q4_K_M':
+      Fits beside DS4 (needs ~10.7 GiB, 16.7 GiB free)
+
+    deactivating exclusive ds4 mode
+      (Not enough free memory to run beside DS4: needs ~10.7 GiB,
+       only 10.2 GiB free)
+
+Co-residency is a measured opportunity, not a guarantee. A dedicated host
+(drakemore) will usually co-reside; a contended one running containers alongside
+(Frostburn) will usually evict. This is why the check reads free memory at
+request time rather than being configured once per box.
 
 ### 3. Adaptive context + SSD-streaming — `api/ds4-adaptive.js`
 
