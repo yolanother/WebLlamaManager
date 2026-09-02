@@ -36,7 +36,7 @@ source "$VERSION_FILE"
 
 # ---- Settings (override via env) ---------------------------------------------
 LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$HOME/llama.cpp}"
-DISTROBOX_CONTAINER="${DISTROBOX_CONTAINER:-llama-rocm-7rc-rocwmma}"
+DISTROBOX_CONTAINER="${DISTROBOX_CONTAINER:-llama-rocm-7.2.4}"
 INSTALL_BIN="${INSTALL_BIN:-$HOME/.local/bin/llama-server}"
 JOBS="${JOBS:-$(nproc)}"
 LLAMA_CPP_CLEAN="${LLAMA_CPP_CLEAN:-0}"

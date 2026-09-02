@@ -6,22 +6,26 @@ This is the missing-from-`install.sh` half of the stack: `install.sh` installs t
 **Node manager + UI**; this document covers the **llama.cpp engine** it drives.
 
 > **TL;DR (current setup):** the engine runs inside the **ROCm 7.2.4** distrobox
-> toolbox `llama-rocm-7.2.4`, which **ships a prebuilt `/usr/local/bin/llama-server`
-> (v9820)**. There is **no build step** for normal operation — the manager just
-> execs that binary inside the toolbox. The old ROCm-7.0-RC toolbox emitted
-> gfx1151-incompatible kernels that hard-froze the box under gpt-oss-120b; 7.2.4
-> fixed it. See [Why ROCm 7.2.4](#why-rocm-724-illegal-opcode-lockup-history).
+> toolbox `llama-rocm-7.2.4`. Since 2026-09-01 the manager runs a **custom build,
+> `~/.local/bin/llama-server` (b10752)**, compiled inside that toolbox by
+> `scripts/build-llama-cpp.sh` from the commit pinned in `.llama-cpp-version` — the
+> toolbox's own prebuilt `/usr/local/bin/llama-server` is v9820, too old for Muse
+> Glimmer 30B (support landed in b10353). `install.sh` prefers the custom binary
+> whenever `~/.local/bin/llama-server` exists and falls back to the prebuilt one.
+> The old ROCm-7.0-RC toolbox emitted gfx1151-incompatible kernels that hard-froze
+> the box under gpt-oss-120b; 7.2.4 fixed it. See
+> [Why ROCm 7.2.4](#why-rocm-724-illegal-opcode-lockup-history).
 
 ## The two halves of the stack
 
 | Layer | What | Provided by |
 |---|---|---|
 | **Manager + UI** | `api/server.js` (router/proxy, OpenAI API, web UI) | `./install.sh` (Node deps, `vite build`, systemd `--user` unit `llama-manager.service`) |
-| **Engine** | llama.cpp `llama-server` (the actual GGUF inference, on the iGPU) | the **ROCm 7.2.4 distrobox toolbox** ships it prebuilt (this doc); a custom rebuild via `scripts/build-llama-cpp.sh` is optional |
+| **Engine** | llama.cpp `llama-server` (the actual GGUF inference, on the iGPU) | built by `scripts/build-llama-cpp.sh` inside the **ROCm 7.2.4 distrobox toolbox** at the commit pinned in `.llama-cpp-version` (this doc); the toolbox's prebuilt v9820 binary is the fallback |
 
 The manager spawns the engine via `start-llama.sh` → enters the
 `llama-rocm-7.2.4` distrobox → runs `container-start.sh`, which execs
-`llama-server` (the toolbox's `/usr/local/bin/llama-server`) in **router mode**.
+`llama-server` (`$LLAMA_SERVER_BIN`, currently the custom `~/.local/bin/llama-server`) in **router mode**.
 
 ## Hardware / container context
 
@@ -29,11 +33,10 @@ The manager spawns the engine via `start-llama.sh` → enters the
 - **Runtime:** ROCm **7.2.4** inside distrobox `llama-rocm-7.2.4`
   (image `docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4`). The distrobox
   shares `$HOME`, so the host `~/.local/bin` and `~/llama.cpp` are visible inside it.
-- **Runtime-only toolbox:** the 7.2.4 image is ~7 GB and ships **no compiler** — it is
-  a runtime toolbox. It includes a working **prebuilt `/usr/local/bin/llama-server`
-  (v9820)**, which is what the manager runs. (The previous `rocm-7rc-rocwmma` image
-  carried a full toolchain because we built llama.cpp ourselves; with 7.2.4 we don't
-  need to.)
+- **Toolbox can build:** the 7.2.4 image ships a working **prebuilt
+  `/usr/local/bin/llama-server` (v9820)** AND a usable HIP toolchain (GNU 15.3 +
+  `/opt/rocm*/llvm/bin/clang++`) — `scripts/build-llama-cpp.sh` compiles b10752 inside
+  it in ~25 minutes. The prebuilt binary is the fallback when no custom build exists.
 - **Kernel note:** the toolbox README suggests kernel 6.18.4+, but the prebuilt binary
   detects and drives the GPU fine on **kernel 6.17** here
   (`llama-server --list-devices` → `ROCm0: AMD Radeon 8060S Graphics`).
@@ -164,23 +167,40 @@ systemctl --user restart llama-manager.service     # restart manager → respawn
 
 See the `deploy-llama-manager` skill for verification (PID changed, `/api/v1/models` → 200).
 
-## Custom builds (optional — not needed for normal operation)
+## Custom builds (the current engine)
 
-**You do not need to build anything** to run the engine — the 7.2.4 toolbox ships a
-working `llama-server`. `scripts/build-llama-cpp.sh` exists only for **custom builds**
-(e.g. testing a newer upstream commit for a brand-new model architecture before a
-prebuilt toolbox carries it).
+The manager currently runs a custom build because new model architectures land
+upstream faster than the toolbox image is refreshed: **Muse Glimmer 30B** needs
+llama.cpp ≥ b10353 (merged 2026-08-10) and the toolbox's prebuilt binary is v9820, so
+`.llama-cpp-version` pins upstream tag **b10752** and the manager runs the build.
 
-The build script was updated to **auto-detect the ROCm directory and HIP compiler**, so
-it works across toolbox versions (it no longer hard-codes `/opt/rocm-7.0/...`), and it
-keeps `-DGGML_HIP_ROCWMMA_FATTN=ON`. It still needs a toolbox **with a compiler** — the
-runtime-only 7.2.4 image cannot build; point `DISTROBOX_CONTAINER` at a toolchain image
-for a custom build.
+The build script **auto-detects the ROCm directory and HIP compiler**, so it works
+across toolbox versions (it no longer hard-codes `/opt/rocm-7.0/...`), and it keeps
+`-DGGML_HIP_ROCWMMA_FATTN=ON`. Build inside the runtime toolbox:
 
 ```bash
-scripts/build-llama-cpp.sh                      # build the pinned commit, install binary
-LLAMA_CPP_CLEAN=1 scripts/build-llama-cpp.sh    # wipe build dir first (clean build)
+DISTROBOX_CONTAINER=llama-rocm-7.2.4 LLAMA_CPP_CLEAN=1 scripts/build-llama-cpp.sh
 ```
+
+### Validation gate before switching the service to a new build
+
+The 2026-08-22 bump was rolled back because Qwen3-8B produced question-mark-only
+output on this GPU path. Every bump must pass, on a spare port, by hand, BEFORE
+`./install.sh` switches the service:
+
+1. **Qwen3-8B** (`Qwen_Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf`, `--jinja`) answers a
+   chat prompt with real text (`chat_template_kwargs: {enable_thinking: false}`).
+2. **Gemma-4 E2B** with `--mmproj` and the assistant MTP draft
+   (`--spec-type draft-mtp --spec-draft-n-max 1`) answers text, describes an image,
+   and logs `draft acceptance`.
+3. **Muse Glimmer 30B** UD-Q4_K_XL with `mmproj-Muse-Glimmer-30B-BF16.gguf` and
+   `--temp 1.0 --top-p 0.95 --top-k 64` answers text and describes an image
+   (expect ~2 minutes to load; the `special_eot_id is not in special_eog_ids` warning
+   is benign).
+
+b10752 passed all three on 2026-09-01. When running an engine by hand inside the
+toolbox, kill it by port (`pkill -f "[l]lama-server -m .* --port <port>"`) — killing
+the `distrobox enter` wrapper leaves the inner `llama-server` alive.
 
 What it does:
 1. **Checkout** — clones `~/llama.cpp` if absent, fetches, checks out `LLAMA_CPP_REF`
@@ -210,8 +230,8 @@ is self-contained.)
 ## Related
 
 - `container-start.sh` — execs `LLAMA_SERVER_BIN` inside `DISTROBOX_CONTAINER` in router mode.
-- `install.sh` — defaults `DISTROBOX_CONTAINER=llama-rocm-7.2.4`, `LLAMA_SERVER_BIN=/usr/local/bin/llama-server`.
-- `scripts/build-llama-cpp.sh` — optional custom build.
-- `.llama-cpp-version` — the pinned commit for custom builds.
+- `install.sh` — defaults `DISTROBOX_CONTAINER=llama-rocm-7.2.4`; `LLAMA_SERVER_BIN` prefers `~/.local/bin/llama-server` when it exists, else `/usr/local/bin/llama-server`.
+- `scripts/build-llama-cpp.sh` — builds the pinned commit (the current engine).
+- `.llama-cpp-version` — the pinned commit (b10752 as of 2026-09-01).
 - Skills: `build-llama-cpp` (custom build/update the engine), `deploy-llama-manager`
   (deploy/restart), `system-health-monitor` (don't compile while the box is redlining).

@@ -8,18 +8,21 @@ description: Build or update the ROCm llama.cpp `llama-server` engine that the l
 The manager's router runs llama.cpp `llama-server` on the iGPU. Full context:
 `docs/llama-cpp-rocm-build-and-deployment.md`.
 
-## First: you probably don't need to build
+## Current state (2026-09-01)
 
-The engine now runs inside the **ROCm 7.2.4** distrobox toolbox `llama-rocm-7.2.4`
-(image `docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4`), which **ships a working
-prebuilt `/usr/local/bin/llama-server` (v9820)**. That is what the manager runs
-(`LLAMA_SERVER_BIN=/usr/local/bin/llama-server`, `DISTROBOX_CONTAINER=llama-rocm-7.2.4`).
-For normal operation — including gpt-oss-120b with flash-attn — **no build step is
-needed**.
+The engine runs inside the **ROCm 7.2.4** distrobox toolbox `llama-rocm-7.2.4`
+(image `docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4`). The manager runs the
+**custom build `~/.local/bin/llama-server` (b10752)**, pinned in `.llama-cpp-version`
+and compiled by `scripts/build-llama-cpp.sh` INSIDE that toolbox (it has a working
+toolchain; the old "runtime-only, cannot build" note was wrong). The toolbox's own
+prebuilt `/usr/local/bin/llama-server` (v9820) is the fallback `install.sh` uses when
+no custom build exists — it is too old for Muse Glimmer 30B (needs ≥ b10353).
 
-Only build when you need a **custom binary**: testing a newer upstream commit for a
-brand-new model architecture before a prebuilt toolbox carries it, or debugging an
-engine-level issue. To create/refresh the runtime toolbox itself (no build):
+Build when a new model architecture needs newer upstream, or to debug an
+engine-level issue. Every bump must pass the validation gate in
+`docs/llama-cpp-rocm-build-and-deployment.md` (Qwen3-8B text, Gemma-4 vision+MTP,
+Muse Glimmer+mmproj, each by hand on a spare port) BEFORE `./install.sh` switches the
+service. To create/refresh the runtime toolbox itself (no build):
 
 ```bash
 podman pull docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.2.4
@@ -49,10 +52,11 @@ distrobox create --name llama-rocm-7.2.4 \
    LLAMA_CPP_CLEAN=1 scripts/build-llama-cpp.sh  # clean build (use after a big version jump)
    ```
    For a long run, launch it in the background and tail the log.
-5. **Point the manager at your custom binary:** the runtime toolbox runs
-   `/usr/local/bin/llama-server` by default. To run your build instead, set
-   `LLAMA_SERVER_BIN=~/.local/bin/llama-server` in the `llama-manager.service` env
-   (NOT just `.env` — dotenv won't override the systemd user env). Then deploy.
+5. **Point the manager at your custom binary:** `./install.sh` rewrites the
+   `llama-manager.service` unit and prefers `~/.local/bin/llama-server` whenever it
+   exists, so a fresh build is picked up by the deploy step (an explicit
+   `LLAMA_SERVER_BIN=...` env still overrides; `.env` alone does NOT — dotenv won't
+   override the systemd user env).
 6. **Deploy:** `systemctl --user restart llama-manager.service` (or `./install.sh` to also
    rebuild the UI). Verify per the `deploy-llama-manager` skill.
 

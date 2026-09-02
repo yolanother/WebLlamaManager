@@ -134,6 +134,12 @@ HF_TOKEN="${HF_TOKEN:-}"
 # prebuilt binary — the ROCm-7.0-RC toolchain emitted gfx1151-incompatible kernels
 # ("Illegal opcode in command stream") that hard-froze the box under gpt-oss-120b.
 DISTROBOX_CONTAINER="${DISTROBOX_CONTAINER:-llama-rocm-7.2.4}"
+# A custom build (scripts/build-llama-cpp.sh installs to ~/.local/bin) wins over the
+# toolbox's prebuilt binary when present: it is pinned via .llama-cpp-version to a
+# newer upstream than the toolbox ships (b10752 for Muse Glimmer 30B support).
+if [ -z "${LLAMA_SERVER_BIN:-}" ] && [ -x "$HOME/.local/bin/llama-server" ]; then
+  LLAMA_SERVER_BIN="$HOME/.local/bin/llama-server"
+fi
 LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/usr/local/bin/llama-server}"
 
 echo "=== Llama Manager Installation ==="
