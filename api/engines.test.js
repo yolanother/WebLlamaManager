@@ -414,6 +414,18 @@ test('ds4ModelRef: resolves a downloaded GGUF by its listed name', () => {
   assert.equal(ref.preset.engine, 'ds4');
 });
 
+test('ds4ModelRef: carries the fields the ds4 supervisor actually reads', () => {
+  // The supervisor logs `preset: ${preset.id}` and builds the launch env from
+  // preset.config. A ref with only modelPath logged "preset: undefined" and
+  // launched without --rocm, which is not how a stored preset behaves.
+  const files = [{ name: 'DeepSeek-V4-Flash-IQ2XXS.gguf', path: '/m/ds4/x.gguf', sizeBytes: 1 }];
+  const ref = ds4ModelRef('DeepSeek-V4-Flash-IQ2XXS.gguf', files);
+  assert.equal(ref.preset.id, 'DeepSeek-V4-Flash-IQ2XXS.gguf');
+  assert.match(ref.preset.config.extraSwitches, /--rocm/);
+  // context stays unset: the adaptive controller sets DS4_CTX per attempt.
+  assert.equal(ref.preset.context, undefined);
+});
+
 test('ds4ModelRef: matches the name with or without the .gguf suffix', () => {
   const files = [{ name: 'DeepSeek-V4-Flash-IQ2XXS.gguf', path: '/m/ds4/x.gguf', sizeBytes: 1 }];
   assert.ok(ds4ModelRef('DeepSeek-V4-Flash-IQ2XXS', files));

@@ -610,6 +610,17 @@ export function isDs4RepoAllowed(repo, allowedRepos) {
  * @param {Array<{name:string}>} ggufFiles Files from listDs4GgufFiles().
  * @returns {{presetId:string, preset:{engine:string, modelPath:string}}|null}
  */
+// Launch knobs applied to a DS4 model selected straight from the model list
+// (no stored preset). Mirrors the defaults the Presets editor writes, so an
+// implicitly-selected model launches the same way a hand-built preset does —
+// --rocm in particular is what selects the ROCm backend on this hardware.
+const DS4_IMPLICIT_PRESET_CONFIG = {
+  power: 100,
+  kvDiskDir: '',
+  kvDiskSpaceMb: 0,
+  extraSwitches: '--rocm --cors',
+};
+
 export function ds4ModelRef(modelName, ggufFiles) {
   if (typeof modelName !== 'string' || !modelName) return null;
   const want = modelName.toLowerCase().replace(/\.gguf$/i, '');
@@ -617,7 +628,22 @@ export function ds4ModelRef(modelName, ggufFiles) {
     const have = String(f?.name || '');
     if (!have) continue;
     if (have.toLowerCase().replace(/\.gguf$/i, '') === want) {
-      return { presetId: have, preset: { engine: ENGINE_TYPES.DS4, modelPath: have } };
+      // Carries every field the ds4 supervisor reads off a preset, not just
+      // modelPath: `id` (it logs "preset: ${preset.id}", which printed
+      // "undefined" and made a real launch failure unreadable) and `config`
+      // (the ds4 launch knobs, notably extraSwitches). `context` is left unset
+      // deliberately — the adaptive controller overrides DS4_CTX per attempt,
+      // so pinning one here would fight the planner.
+      return {
+        presetId: have,
+        preset: {
+          id: have,
+          name: have,
+          engine: ENGINE_TYPES.DS4,
+          modelPath: have,
+          config: { ...DS4_IMPLICIT_PRESET_CONFIG },
+        },
+      };
     }
   }
   return null;

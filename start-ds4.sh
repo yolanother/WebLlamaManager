@@ -148,14 +148,32 @@ fi
 DISTROBOX="/usr/local/bin/distrobox"
 [ -x "$DISTROBOX" ] || DISTROBOX="$(which distrobox 2>/dev/null || echo distrobox)"
 
-# Enter the container and exec ds4-server. The binary path + full argv are passed
-# as POSITIONAL ARGS to the inner shell (not interpolated into the command string),
-# and argv is rebuilt inside with proper quoting, so a model path containing spaces
-# or shell metacharacters can never be word-split or injected. $0=ds4-launch,
-# $1=binary, $2..=ds4-server args.
-exec "$DISTROBOX" enter "$CONTAINER_NAME" -- bash -c '
-  export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  export HSA_OVERRIDE_GFX_VERSION=11.5.1
-  BIN="$1"; shift
-  exec "$BIN" "$@"
-' ds4-launch "$DS4_EXEC_BIN" "${DS4_ARGS[@]}"
+# Enter the container and exec ds4-server through `env` — NOT through an inner
+# `bash -c` reading positional parameters.
+#
+# distrobox-enter builds a command string and eval's it, so trailing words after
+# a `bash -c 'script'` never arrive as $1/$2: they resolve against
+# distrobox-enter's OWN argv. Measured on the appliance:
+#
+#     $0                     -> /usr/bin/distrobox-enter
+#     BIN="$1"; exec "$BIN"  -> distrobox-enter: eval: BIN: parameter not set
+#
+# which is exactly how ds4-server failed to start — the launcher aborted before
+# the binary ever ran, every attempt, and the adaptive planner then reported the
+# failure as "OOM at the load tail", sending anyone debugging it after memory.
+#
+# The `env VAR=val BIN ARGS` form below is what start-llama.sh already uses in
+# production, and it survives the eval. Arguments containing SPACES are preserved
+# (verified in the container: printf '[%s]\n' "one two" three -> [one two]
+# [three]). A literal `$` is NOT safe — distrobox-enter's eval expands it — so a
+# ds4 model filename must not contain one. The comment this replaces claimed
+# spaces AND metacharacters could "never be word-split or injected"; the
+# mechanism it described never delivered the arguments at all, and the eval it
+# was trying to avoid is still there.
+#
+# LD_LIBRARY_PATH is set absolutely rather than appended: the container defines
+# none of its own (verified), so the append preserved nothing.
+exec "$DISTROBOX" enter "$CONTAINER_NAME" -- /usr/bin/env \
+  LD_LIBRARY_PATH=/opt/rocm/lib \
+  HSA_OVERRIDE_GFX_VERSION=11.5.1 \
+  "$DS4_EXEC_BIN" "${DS4_ARGS[@]}"
