@@ -2,95 +2,77 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Searches and inspects Hugging Face GGUF repositories and starts supported
-// model downloads, including the DS4 catalog, in responsive glass panels.
+// Searches HuggingFace for GGUF repositories, ranks their quantizations by
+// whether they fit this machine's memory budget, and starts downloads
+// (including the ds4/DeepSeek V4 exclusive-engine catalog) in responsive
+// glass panels. Active Downloads is shown first, then a "Recommended models"
+// chip row for one-click repo selection, then the search bar and results.
+// Per-repo fit/recommendation logic lives in ./download-helpers.js so this
+// file stays a thin render layer.
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { API_BASE, formatBytes } from '../api.js';
+import { RECOMMENDED_REPOS, partitionQuantizations, downloadRequests } from './download-helpers.js';
 import '../styles/pages.css';
 
-// Download Page
-// The DS4 / DeepSeek V4 download catalog. Only the antirez/deepseek-v4-gguf repo
-// is allowlisted server-side; oversized variants are shown for context but are
-// NOT one-click downloadable on this 128GB Strix Halo (they OOM the box).
-const DS4_REPO = 'antirez/deepseek-v4-gguf';
-// `pattern` is the HF --include glob sent to the allowlisted download endpoint;
-// `match` is the substring that identifies an already-present file in the ds4 dir.
-const DS4_OPTIONS = [
-  { key: 'q2-imatrix', label: 'Q2 (imatrix)', size: '~81GB', pattern: '*imatrix*', match: 'imatrix', fits: true, recommended: true,
-    desc: 'Recommended — the best-fitting DeepSeek V4 Flash quant for this 128GB Strix Halo.' },
-  { key: 'mtp', label: 'MTP (speculative)', size: '~3.5GB', pattern: '*mtp*', match: 'mtp', fits: true, recommended: false,
-    desc: 'Optional multi-token-prediction file for speculative decoding.' },
-  { key: 'q2-q4', label: 'Q2-Q4 mix', size: '~98GB', pattern: null, match: null, fits: false, recommended: false,
-    desc: 'Does not fit this machine — can cause system OOM.' },
-  { key: 'q4', label: 'Q4', size: '~153GB', pattern: null, match: null, fits: false, recommended: false,
-    desc: 'Does not fit this machine — can cause system OOM.' },
-  { key: 'pro', label: 'Pro variants', size: '≥153GB', pattern: null, match: null, fits: false, recommended: false,
-    desc: 'Does not fit this machine — can cause system OOM.' },
-];
+/**
+ * One quantization/mmproj row in the selected-repo view, rendered via the
+ * shared `.ds4-option` styling. `variant` picks the tag/button treatment:
+ * 'fit' (plain download row), 'unfit' (greyed, disabled), or 'mmproj'
+ * (vision-projector row).
+ */
+function QuantRow({ entry, variant, downloadingKey, onDownload }) {
+  const busy = downloadingKey === entry.quantization;
+  return (
+    <div className={`ds4-option${variant === 'unfit' ? ' unfit' : ''}`}>
+      <div className="ds4-option-info">
+        <span className="ds4-option-title">
+          {entry.quantization}{' '}
+          <span className="ds4-option-size">
+            {formatBytes(entry.totalSize)}
+            {entry.isSplit && ` (${entry.totalParts || entry.files.length} parts)`}
+          </span>
+          {variant === 'unfit' && <span className="ds4-tag unfit">does not fit — can OOM</span>}
+          {variant === 'mmproj' && <span className="ds4-tag">mmproj (vision)</span>}
+          {entry.present && <span className="ds4-tag present">downloaded</span>}
+        </span>
+      </div>
+      {variant === 'unfit' ? (
+        <button className="btn-secondary glass-btn" disabled title="Too large for this machine — can OOM">
+          Unavailable
+        </button>
+      ) : (
+        <button
+          className="btn-secondary glass-btn"
+          onClick={() => onDownload(entry)}
+          disabled={entry.present || busy}
+        >
+          {entry.present ? 'Available' : busy ? 'Starting...' : 'Download'}
+        </button>
+      )}
+    </div>
+  );
+}
 
 function DownloadPage({ stats }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [selectedRepo, setSelectedRepo] = useState(null);
-  const [repoQuantizations, setRepoQuantizations] = useState([]);
+  // The raw /repo/:author/:model/files response plus the repo id it was
+  // fetched for (the endpoint doesn't echo the repo, downloadRequests needs it).
+  const [repoData, setRepoData] = useState(null);
   const [loadingFiles, setLoadingFiles] = useState(false);
   const [repoError, setRepoError] = useState(null);
   const [customPattern, setCustomPattern] = useState('');
-  const [ds4Models, setDs4Models] = useState([]);
-  const [ds4GgufDir, setDs4GgufDir] = useState('');
-  const [ds4Downloading, setDs4Downloading] = useState(null);
-
-  // Poll which ds4 GGUFs are already present so the section can show them as available.
-  const fetchDs4Models = useCallback(async () => {
-    try {
-      const res = await fetch(`${API_BASE}/ds4/models`);
-      const data = await res.json();
-      setDs4Models(data.models || []);
-      setDs4GgufDir(data.ggufDir || '');
-    } catch (err) {
-      console.error('Failed to fetch ds4 models:', err);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchDs4Models();
-    const t = setInterval(fetchDs4Models, 10000);
-    return () => clearInterval(t);
-  }, [fetchDs4Models]);
-
-  // LIVE VERIFICATION PENDING: the DS4 preset editor + Downloads-tab DS4 section
-  // compile and are wired to /api/ds4/models and /api/ds4/download; the actual
-  // browser click-through (create a ds4 preset, run the recommended download,
-  // confirm progress + present-file listing) is verified by the operator after
-  // install.sh deploy — the 81GB model download needs a real memory window.
-  // Kick off an allowlisted ds4 download into the dedicated ggufDir (never ~/models).
-  const downloadDs4 = async (opt) => {
-    if (!opt.fits || !opt.pattern) return;
-    setDs4Downloading(opt.key);
-    try {
-      const res = await fetch(`${API_BASE}/ds4/download`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo: DS4_REPO, pattern: opt.pattern })
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        alert(err.error || 'Failed to start ds4 download');
-      }
-    } catch (err) {
-      console.error('Failed to start ds4 download:', err);
-    }
-    setDs4Downloading(null);
-  };
+  const [downloadingKey, setDownloadingKey] = useState(null);
 
   const searchModels = async () => {
     if (!searchQuery.trim()) return;
     setSearching(true);
     setSelectedRepo(null);
-    setRepoQuantizations([]);
+    setRepoData(null);
     setRepoError(null);
     try {
       const res = await fetch(`${API_BASE}/search?query=${encodeURIComponent(searchQuery)}`);
@@ -104,9 +86,10 @@ function DownloadPage({ stats }) {
 
   const selectRepo = async (repo) => {
     setSelectedRepo(repo);
+    setSearchQuery(repo.id);
     setLoadingFiles(true);
     setRepoError(null);
-    setRepoQuantizations([]);
+    setRepoData(null);
     try {
       const [author, model] = repo.id.split('/');
       const res = await fetch(`${API_BASE}/repo/${author}/${model}/files`);
@@ -114,7 +97,7 @@ function DownloadPage({ stats }) {
       if (data.error) {
         setRepoError(data.error);
       } else {
-        setRepoQuantizations(data.quantizations || []);
+        setRepoData({ ...data, repo: repo.id });
       }
     } catch (err) {
       console.error('Failed to fetch repo files:', err);
@@ -123,16 +106,29 @@ function DownloadPage({ stats }) {
     setLoadingFiles(false);
   };
 
-  const downloadModel = async (repo, quantization) => {
+  // Runs the request(s) from downloadRequests() in order (a "recommended"
+  // download bundles the mmproj file ahead of the main quant, per contract).
+  const runDownload = async (entry) => {
+    const key = entry === 'recommended' ? 'recommended' : entry.quantization;
+    setDownloadingKey(key);
     try {
-      await fetch(`${API_BASE}/pull`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo, quantization })
-      });
+      const requests = downloadRequests(repoData, entry);
+      for (const req of requests) {
+        const res = await fetch(`${API_BASE}${req.url}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req.body)
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          alert(err.error || 'Failed to start download');
+          break;
+        }
+      }
     } catch (err) {
       console.error('Failed to start download:', err);
     }
+    setDownloadingKey(null);
   };
 
   const downloadAllGguf = async (repo) => {
@@ -161,109 +157,15 @@ function DownloadPage({ stats }) {
     }
   };
 
-  const EMBED_SUGGESTIONS = [
-    { repo: 'Qwen/Qwen3-Embedding-0.6B-GGUF', label: 'Qwen3-Embedding-0.6B (1024-dim, recommended)' },
-    { repo: 'nomic-ai/nomic-embed-text-v1.5-GGUF', label: 'nomic-embed-text-v1.5 (768-dim)' },
-    { repo: 'BAAI/bge-m3-GGUF', label: 'BGE-M3 (1024-dim, multilingual)' }
-  ];
-
-  const ds4Names = ds4Models.map(m => m.name.toLowerCase());
-  const isDs4OptPresent = (opt) => !!opt.match && ds4Names.some(n => n.includes(opt.match));
-  const recommended = DS4_OPTIONS.find(o => o.recommended);
+  const partition = repoData
+    ? partitionQuantizations(repoData)
+    : { recommended: null, fits: [], unfit: [], mmproj: [] };
+  const hasQuants = !!repoData && (repoData.quantizations || []).length > 0;
 
   return (
     <div className="page">
       <div className="page-header">
         <h2>Download Models</h2>
-      </div>
-
-      {/* ── DS4 / DeepSeek V4 section ──────────────────────────────────────── */}
-      <div id="ds4" />
-      <section className="page-section glass-panel ds4-download-section">
-        <div className="ds4-section-header">
-          <h3>DS4 / DeepSeek V4</h3>
-          <span className="engine-badge ds4">exclusive engine</span>
-        </div>
-        <p className="page-description">
-          Special ds4-only GGUFs from <code>{DS4_REPO}</code>. These load only in the DS4 engine and
-          download into the dedicated ds4 dir{ds4GgufDir ? ` (${ds4GgufDir})` : ''} — never into <code>~/models</code>.
-        </p>
-        {recommended && (
-          <button
-            className="btn-primary glass-btn ds4-recommended-btn"
-            onClick={() => downloadDs4(recommended)}
-            disabled={ds4Downloading === recommended.key || isDs4OptPresent(recommended)}
-            title={`Download ${recommended.label} (${recommended.size}) into the ds4 dir`}
-          >
-            {isDs4OptPresent(recommended)
-              ? `Recommended already downloaded — ${recommended.label}`
-              : ds4Downloading === recommended.key
-                ? 'Starting...'
-                : `Download recommended — ${recommended.label} (${recommended.size})`}
-          </button>
-        )}
-        <div className="ds4-options-list">
-          {DS4_OPTIONS.map((opt) => {
-            const present = isDs4OptPresent(opt);
-            return (
-              <div key={opt.key} className={`ds4-option${opt.fits ? '' : ' unfit'}${opt.recommended ? ' recommended' : ''}`}>
-                <div className="ds4-option-info">
-                  <span className="ds4-option-title">
-                    {opt.label} <span className="ds4-option-size">{opt.size}</span>
-                    {opt.recommended && <span className="ds4-tag rec">RECOMMENDED</span>}
-                    {!opt.fits && <span className="ds4-tag unfit">does not fit — can OOM</span>}
-                    {present && <span className="ds4-tag present">downloaded</span>}
-                  </span>
-                  <span className="ds4-option-desc">{opt.desc}</span>
-                </div>
-                {opt.fits && opt.pattern ? (
-                  <button
-                    className="btn-secondary glass-btn"
-                    onClick={() => downloadDs4(opt)}
-                    disabled={ds4Downloading === opt.key || present}
-                  >
-                    {present ? 'Available' : ds4Downloading === opt.key ? 'Starting...' : 'Download'}
-                  </button>
-                ) : (
-                  <button className="btn-secondary glass-btn" disabled title="Too large for this machine">Unavailable</button>
-                )}
-              </div>
-            );
-          })}
-        </div>
-        {ds4Models.length > 0 && (
-          <div className="ds4-present-list">
-            <h4>Present in ds4 dir</h4>
-            {ds4Models.map(m => (
-              <div key={m.name} className="ds4-present-item">
-                <span>{m.name}</span>
-                <span className="ds4-option-size">{m.sizeBytes ? formatBytes(m.sizeBytes) : ''}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <div className="search-section">
-        <div className="card glass-panel">
-          <h3>Recommended embedding models</h3>
-          {EMBED_SUGGESTIONS.map(s => (
-            <button key={s.repo} className="btn-secondary glass-btn" onClick={() => { setSearchQuery(s.repo); }} title={s.repo}>{s.label}</button>
-          ))}
-        </div>
-        <div className="search-bar">
-          <input
-            type="text"
-            className="glass-input"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search HuggingFace for GGUF models..."
-            onKeyDown={(e) => e.key === 'Enter' && searchModels()}
-          />
-          <button className="btn-primary glass-btn" onClick={searchModels} disabled={searching}>
-            {searching ? 'Searching...' : 'Search'}
-          </button>
-        </div>
       </div>
 
       {/* Active Downloads */}
@@ -303,6 +205,40 @@ function DownloadPage({ stats }) {
         </section>
       )}
 
+      {/* ── Recommended models chip row ────────────────────────────────── */}
+      <div id="ds4" />
+      <section className="page-section glass-panel">
+        <h3>Recommended models</h3>
+        <div className="ds4-options-list">
+          {RECOMMENDED_REPOS.map((r) => (
+            <button
+              key={r.id}
+              className="btn-secondary glass-btn"
+              onClick={() => selectRepo({ id: r.id })}
+              title={r.id}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <div className="search-section">
+        <div className="search-bar">
+          <input
+            type="text"
+            className="glass-input"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search HuggingFace for GGUF models..."
+            onKeyDown={(e) => e.key === 'Enter' && searchModels()}
+          />
+          <button className="btn-primary glass-btn" onClick={searchModels} disabled={searching}>
+            {searching ? 'Searching...' : 'Search'}
+          </button>
+        </div>
+      </div>
+
       {/* Search Results */}
       {searchResults.length > 0 && !selectedRepo && (
         <section className="page-section glass-panel">
@@ -339,6 +275,14 @@ function DownloadPage({ stats }) {
             </a>
           </div>
 
+          {repoData?.engine === 'ds4' && (
+            <p className="page-description">
+              Exclusive engine — loads only in the DS4 engine and downloads into the dedicated ds4 dir
+              {repoData.ggufDir ? ` (${repoData.ggufDir})` : ''}, never into <code>~/models</code>.
+              <span className="engine-badge ds4">exclusive engine</span>
+            </p>
+          )}
+
           {loadingFiles ? (
             <div className="loading-state">
               <div className="loading-spinner"></div>
@@ -367,7 +311,7 @@ function DownloadPage({ stats }) {
                 </div>
               </div>
             </div>
-          ) : repoQuantizations.length === 0 ? (
+          ) : !hasQuants ? (
             <div className="no-quants-state">
               <p>No recognized quantizations found in this repository.</p>
               <p className="hint">The repository may use different naming conventions or store files in subdirectories.</p>
@@ -413,29 +357,44 @@ function DownloadPage({ stats }) {
               </div>
             </div>
           ) : (
-            <div className="quant-list">
-              {repoQuantizations.map((quant) => (
-                <div key={quant.quantization} className="quant-item">
-                  <div className="quant-info">
-                    <span className="quant-badge">{quant.quantization}</span>
-                    <span className="quant-size">
-                      {formatBytes(quant.totalSize)}
-                      {quant.isSplit && ` (${quant.files.length} parts)`}
+            <div className="ds4-options-list">
+              {partition.recommended && (
+                <div className="ds4-option recommended">
+                  <div className="ds4-option-info">
+                    <span className="ds4-option-title">
+                      {partition.recommended.quantization}{' '}
+                      <span className="ds4-option-size">{formatBytes(partition.recommended.totalSize)}</span>
+                      <span className="ds4-tag rec">RECOMMENDED</span>
+                      {partition.recommended.present && <span className="ds4-tag present">downloaded</span>}
                     </span>
                   </div>
                   <button
-                    className="btn-primary glass-btn"
-                    onClick={() => downloadModel(selectedRepo.id, quant.quantization)}
+                    className="btn-primary glass-btn ds4-recommended-btn"
+                    onClick={() => runDownload('recommended')}
+                    disabled={partition.recommended.present || downloadingKey === 'recommended'}
                   >
-                    Download
+                    {partition.recommended.present
+                      ? 'Recommended already downloaded'
+                      : downloadingKey === 'recommended'
+                        ? 'Starting...'
+                        : `Download recommended — ${partition.recommended.quantization} (${formatBytes(partition.recommended.totalSize)})`}
                   </button>
                 </div>
+              )}
+
+              {partition.fits.map((q) => (
+                <QuantRow key={q.quantization} entry={q} variant="fit" downloadingKey={downloadingKey} onDownload={runDownload} />
+              ))}
+              {partition.unfit.map((q) => (
+                <QuantRow key={q.quantization} entry={q} variant="unfit" downloadingKey={downloadingKey} onDownload={runDownload} />
+              ))}
+              {partition.mmproj.map((q) => (
+                <QuantRow key={q.quantization} entry={q} variant="mmproj" downloadingKey={downloadingKey} onDownload={runDownload} />
               ))}
 
               {/* Also offer custom pattern option */}
-              <div className="quant-item custom-pattern">
-                <div className="quant-info">
-                  <span className="quant-badge secondary">Custom</span>
+              <div className="ds4-option">
+                <div className="ds4-option-info">
                   <input
                     type="text"
                     value={customPattern}
