@@ -152,6 +152,7 @@ import {
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
+  isProjectorModelId,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -378,6 +379,15 @@ let embedIntentionalStop = false;
 let downloadProcesses = new Map();
 let currentMode = 'router'; // 'router' or 'single'
 let currentPreset = null;
+// The preset DS4 is actually serving, tracked separately from `currentPreset`.
+//
+// `currentPreset` is shared llama state: restartLlamaServer() sets it to null
+// when it starts router mode. Once a llama server could be admitted BESIDE DS4
+// (llamaFitsBesideDs4), that null began landing while DS4 was still serving, so
+// ds4ModelIdsForPreset() returned [] and a request for the DS4 model itself no
+// longer matched — it was routed to the co-resident llama, which answered
+// "model not found" for an 87 GB model it had never loaded.
+let ds4ActivePresetId = null;
 // Which inference engine is currently serving: 'llama' (llama.cpp router/preset,
 // the default) or 'ds4' (ds4-server, DeepSeek V4 Flash). Set by preset activation.
 // While 'ds4', llama-server is stopped and the ds4 supervisor owns the box.
@@ -6487,6 +6497,7 @@ async function activateDs4Exclusive(presetId, preset) {
   // Traffic is gated on ds4SwapPromise.
   currentMode = 'single';
   currentPreset = presetId;
+  ds4ActivePresetId = presetId;
   currentEngine = ENGINE_TYPES.DS4;
 
   let releaseGate;
@@ -6631,6 +6642,7 @@ async function deactivateDs4Exclusive() {
     addLog('presets', 'ds4: deactivating exclusive mode — stopping ds4-server and verifying reclaim');
     await stopDs4Server();
     ds4SettledRuntime = null; // no longer serving ds4 — clear the settled runtime state
+    ds4ActivePresetId = null;  // ds4 is gone; stop claiming its model routes locally
     currentEngine = ENGINE_TYPES.LLAMA;
     const targetBytes = ds4HeadroomBytes();
     const poll = await pollForReclaim({
@@ -6757,6 +6769,7 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
   try {
     currentMode = 'single';
     currentPreset = presetId;
+    ds4ActivePresetId = null;  // a llama preset now owns the box
     currentEngine = ENGINE_TYPES.LLAMA;
 
     // All presets use the same script with environment variables
@@ -8944,6 +8957,11 @@ async function handleModels(req, res) {
         context_management: contextCapabilities('embedding'),
       });
     }
+    // Drop mmproj projector companions. The router lists every GGUF it finds,
+    // but a projector has no language model behind it: selecting one made the
+    // router answer `model '<name>' not found`, which reached the caller as an
+    // empty completion rather than an error.
+    data.data = data.data.filter((m) => !isProjectorModelId(m?.id));
     data.data = annotateModelResidency(data.data, desiredResidentModels());
     data.data = addModelCapabilityMetadata(data.data, resolveModelCapabilities, localModels);
     res.json(data);
@@ -10356,7 +10374,7 @@ async function handleChatCompletions(req, res) {
   if (currentEngine === ENGINE_TYPES.DS4) {
     const decision = ds4RequestTarget({
       requestedModel,
-      ds4ModelIds: ds4ModelIdsForPreset(currentPreset),
+      ds4ModelIds: ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset),
       hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'chat/completions', aliasRouting),
       // A llama server admitted beside DS4 serves its own models locally rather
       // than being offloaded or refused.
@@ -10829,18 +10847,40 @@ async function handleChatCompletions(req, res) {
   // entire wait is inside the fetch (llama-cpp doesn't send headers until the
   // full response is composed).
   let nonStreamingHeartbeatTicker = null;
+  // Whether the heartbeat has actually flushed headers and thereby COMMITTED
+  // HTTP 200 for this response. Distinct from the ticker being armed.
+  let nonStreamingHeadersCommitted = false;
   if (!isStreaming) {
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
-    res.flushHeaders();
-    // Disable Nagle's algorithm so the 1-byte heartbeat goes on the wire
-    // immediately instead of waiting up to 200ms for more bytes.
+    // Headers are deliberately NOT flushed yet.
+    //
+    // This used to setHeader+flushHeaders immediately, which committed HTTP 200
+    // before any upstream work had happened. Every later failure could then only
+    // be delivered as a 200 carrying an {error:...} body, so a caller reading
+    // choices[0].message.content saw an empty completion and a successful
+    // status. Callers treat 200 as success: no failover fired, no retry
+    // happened, and the fault surfaced far downstream as "the model did not
+    // return JSON". That cost two debugging cycles before it was traced here.
+    //
+    // The heartbeat exists to stop an intermediate proxy timing out a long
+    // generation, and nothing needs it until the first interval elapses. So arm
+    // the timer but commit nothing: for the first 20s the real status code is
+    // still available, which covers effectively every error worth failing over
+    // on (a missing model or a refused upstream answers immediately). Only a
+    // genuinely long generation commits 200 early, and that is the case the
+    // heartbeat is for.
     try { req.socket?.setNoDelay?.(true); } catch {}
     nonStreamingHeartbeatTicker = setInterval(() => {
-      if (!res.writableEnded) {
-        try { res.write('\n'); } catch {}
+      if (res.writableEnded) return;
+      if (!nonStreamingHeadersCommitted) {
+        nonStreamingHeadersCommitted = true;
+        try {
+          res.setHeader('Content-Type', 'application/json');
+          res.setHeader('Transfer-Encoding', 'chunked');
+          res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+          res.flushHeaders();
+        } catch { /* headers already sent by another path */ }
       }
+      try { res.write('\n'); } catch {}
     }, 20_000);
     // Auto-clear on any response end path (success, error, client disconnect)
     // so we don't leak intervals if a downstream branch forgets.
@@ -10916,7 +10956,7 @@ async function handleChatCompletions(req, res) {
           res.write(`data: ${JSON.stringify({ error: { message: reason, type: wasReroute ? 'rerouted' : 'queue_cancelled', code: 503 } })}\n\n`);
           res.write('data: [DONE]\n\n');
         } catch {}
-      } else if (nonStreamingHeartbeatTicker || !isStreaming) {
+      } else if (nonStreamingHeadersCommitted || (res.headersSent && !isStreaming)) {
         try { res.write(JSON.stringify({ error: { message: reason, type: wasReroute ? 'rerouted' : 'queue_cancelled', code: 503 } })); } catch {}
       }
       try { res.end(); } catch {}
@@ -10998,7 +11038,7 @@ async function handleChatCompletions(req, res) {
       res.write(`data: ${JSON.stringify({ error: { message: errText, type: 'upstream_error', code: status } })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
-    } else if (nonStreamingHeartbeatTicker || (res.headersSent && !isStreaming)) {
+    } else if (nonStreamingHeadersCommitted || (res.headersSent && !isStreaming)) {
       // Non-streaming heartbeat already flushed headers and may have written
       // whitespace bytes. Write the error as a JSON object — the leading
       // whitespace is valid before a JSON value, so the client's JSON.parse
@@ -11545,7 +11585,7 @@ async function handleCompletions(req, res) {
   if (currentEngine === ENGINE_TYPES.DS4) {
     const decision = ds4RequestTarget({
       requestedModel,
-      ds4ModelIds: ds4ModelIdsForPreset(currentPreset),
+      ds4ModelIds: ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset),
       hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'completions', aliasRouting),
     });
     if (decision.target === 'local-ds4') {

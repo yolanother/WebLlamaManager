@@ -245,3 +245,23 @@ test('ds4RequestTarget: non-ds4 request during load window never targets local l
   const local = ds4RequestTarget({ requestedModel: 'deepseek-v4-flash', ds4ModelIds: ds4Ids, hasViableRemote: false });
   assert.equal(local.target, 'local-ds4');
 });
+
+test('ds4RequestTarget: an EMPTY ds4ModelIds misroutes the ds4 model to llama', () => {
+  // This is the shape of a real regression, recorded so the cause stays visible.
+  //
+  // ds4RequestTarget was correct and its precedence test passed. The fault was in
+  // the CALLER: ds4ModelIds came from ds4ModelIdsForPreset(currentPreset), and
+  // restartLlamaServer() sets currentPreset = null when it starts router mode.
+  // Once a llama server could be admitted beside DS4, that null arrived while
+  // DS4 was still serving, so the id list was empty, the ds4 model matched
+  // nothing, and every DS4 request was handed to the co-resident llama — which
+  // answered "model not found" for an 87 GB model it had never loaded.
+  //
+  // The lesson the assertion encodes: with no ids to match, this function
+  // CANNOT protect the ds4 route. The caller must pass ids owned by DS4, not
+  // ids read from mutable llama state.
+  const r = ds4RequestTarget({
+    requestedModel: 'DeepSeek-V4-Flash.gguf', ds4ModelIds: [], llamaRunning: true,
+  });
+  assert.equal(r.target, 'local-llama', 'empty ids cannot match, so the ds4 model is misrouted');
+});

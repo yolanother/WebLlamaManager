@@ -693,6 +693,28 @@ export function llamaFitsBesideDs4({
 const DS4_UNSAFE_ARG_CHARS = /[$`;|&<>(){}\n\r\\'"*?~!#]/;
 
 /**
+ * Whether a model id names a multimodal projector (mmproj) rather than a model.
+ *
+ * The llama.cpp router auto-discovers every GGUF in the models directory, which
+ * includes the `mmproj-*.gguf` vision/audio projectors that ship alongside
+ * multimodal models. A projector holds no language model and cannot answer a
+ * chat request: selecting one returns
+ * `model '<name>' not found` from the router, which reaches the caller as an
+ * empty completion. They must never be offered as selectable models.
+ *
+ * Matches the conventional placements of the token — `mmproj-Model-Q8_0.gguf`,
+ * `Model.mmproj.gguf`, `Model-mmproj.gguf` — while leaving any name that merely
+ * contains the letters (e.g. `mmprojector-chat`) alone.
+ *
+ * @param {string} id Model id or file name, optionally repo-prefixed.
+ * @returns {boolean} True when the id names a projector companion file.
+ */
+export function isProjectorModelId(id) {
+  const base = String(id || '').split('/').pop().replace(/\.gguf$/i, '');
+  return /(^|[-_.])mmproj([-_.]|$)/i.test(base);
+}
+
+/**
  * Whether a ds4 launch argument is safe to pass through the distrobox eval.
  *
  * @param {string} value An extraSwitches string or a model path.

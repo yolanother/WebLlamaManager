@@ -16,6 +16,7 @@ import {
   ds4ModelRef,
   ds4ArgIsShellSafe,
   llamaFitsBesideDs4,
+  isProjectorModelId,
   buildLocalServerRegistry,
   renderModelsPresetIni,
   gemmaMtpPresetSection,
@@ -797,4 +798,26 @@ test('museGlimmerDflashPresetSection: present drafter → Muse Glimmer section w
 
 test('museGlimmerDflashPresetSection: no drafter → null (router serves Muse Glimmer without DFlash)', () => {
   assert.equal(museGlimmerDflashPresetSection({ modelsDir: '/m', draftExists: false }), null);
+});
+
+test('isProjectorModelId identifies mmproj companions in their usual placements', () => {
+  // The exact id that reached the router as a chat model and came back
+  // "model not found", surfacing to the caller as an empty completion.
+  assert.equal(
+    isProjectorModelId('unsloth_Muse-Glimmer-30B-GGUF/mmproj-Muse-Glimmer-30B-Q8_0.gguf'),
+    true,
+  );
+  assert.equal(isProjectorModelId('mmproj-Model-Q8_0.gguf'), true);
+  assert.equal(isProjectorModelId('Model.mmproj.gguf'), true);
+  assert.equal(isProjectorModelId('Model-mmproj.gguf'), true);
+});
+
+test('isProjectorModelId leaves real models alone', () => {
+  assert.equal(isProjectorModelId('Qwen3-8B-Q4_K_M'), false);
+  assert.equal(isProjectorModelId('unsloth_Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-Q8_0.gguf'), false);
+  assert.equal(isProjectorModelId('DeepSeek-V4-Flash-IQ2XXS-w2Q2K.gguf'), false);
+  // Contains the letters but is not the token.
+  assert.equal(isProjectorModelId('mmprojector-chat-7B-Q4_K_M.gguf'), false);
+  assert.equal(isProjectorModelId(''), false);
+  assert.equal(isProjectorModelId(undefined), false);
 });
