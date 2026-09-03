@@ -98,12 +98,13 @@ Streaming start or resume is available only for a background Response originally
 created with `stream: true`. JSON retrieval remains available for background
 Responses created in either streaming mode.
 
-Llama Manager's replay implementation is process-local and bounded by explicit
-per-response and global event/byte caps. Slow or disconnected clients therefore
-cannot cause unbounded retained SSE memory. Replay is available only while the
-Response record and requested sequence range remain retained; it is not durable
-across a manager restart. Exact implementation cap fields and replay errors are
-documented in the generated OpenAPI reference.
+Llama Manager's replay implementation is process-local and defaults to 10,000
+events and 16 MiB per Response, with 64 MiB retained globally. Slow or
+disconnected clients therefore cannot cause unbounded retained SSE memory. A cap
+overflow fails and aborts the new Response with `event_retention_exceeded`; it
+does not drop part of that Response's history or evict active replay state.
+Replay is available only while the Response record and requested sequence range
+remain retained and is not durable across a manager restart.
 
 ## Shared synchronous execution seam
 
@@ -132,7 +133,7 @@ explicit Llama Manager extensions for this self-hosted implementation:
 | One serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | One serialized result | 16 MiB |
-| Streaming replay | Explicit bounded per-response/global event and byte caps; process-local |
+| Streaming replay | 10,000 events and 16 MiB per Response; 64 MiB globally; process-local |
 
 Expired records and the oldest terminal records are reclaimed before admission.
 Active responses are never evicted to admit new work. An oversized request is
@@ -144,7 +145,7 @@ This scoping is not authentication. Multi-tenant deployments must authenticate
 at the manager or a trusted upstream proxy and supply stable, distinct
 authorization contexts.
 
-## Llama Manager prepared-context extension
+## Separate Llama Manager prepared Chat Completions
 
 The separate manager context API remains:
 
@@ -155,23 +156,28 @@ DELETE /api/v1/context/{id}
 ```
 
 `mode: "prefill"` prepares a local llama.cpp prefix and returns a process-local,
-scope-bound handle. Once it is ready, a Responses request may use the additive
-manager fields `prepared_context_id` and
-`prepared_context_mode: "append"` where that Responses input form is supported.
-The new text input is composed with the retained prefix, so the caller does not
-resend it.
+scope-bound handle. Once it is ready, only Chat Completions may use the additive
+manager fields `prepared_context_id`, `prepared_context_mode: "append"`, and
+`context_cache_strict`. A request to `/v1/chat/completions` supplies new text
+messages; the manager composes them with the retained prefix so the caller does
+not resend it.
+
+Responses and prepared append are separate workflows. `/v1/responses` rejects
+all three prepared-context fields with HTTP 400 and
+`prepared_context_not_supported_for_responses`. This fail-closed boundary
+prevents a suffix from executing without its retained Chat Completions prefix.
 
 Append mode fails closed for conflicting input-affecting fields, multimodal
 suffixes that the preparation path cannot reproduce, missing or stale handles,
 wrong authorization scope, a different resolved model or compatibility
 revision, or lost slot ownership. It never silently executes a suffix without
 its prefix. Output controls may vary. Omitting append mode preserves the existing
-full-input prepared-handle validation contract.
+full-message prepared-handle validation contract.
 
 Prepared handles default to a 15-minute TTL and are erased on release, expiry,
 eviction, invalidation, restart, or engine/model changes that invalidate the
-owned slot. These behaviors are Llama Manager extensions, not OpenAI Responses
-fields.
+owned slot. These behaviors are Llama Manager Chat Completions extensions, not
+OpenAI Responses fields.
 
 llama.cpp is the only supported prepared-reuse engine because it exposes
 manager-owned reusable slots and `cache_prompt`. DS4's disk KV directory is
@@ -186,7 +192,7 @@ Responses execution seam:
 - `request_priority` or `X-Llama-Priority` selects the manager admission class;
 - `routing: "local_only"` or `X-Llama-Routing: local_only` prevents remote
   prompt egress; and
-- unsupported policy/context combinations fail closed rather than weakening the
+- unsupported policy combinations fail closed rather than weakening the
   requested guarantee.
 
 These fields are not part of the OpenAI background-mode contract. Their retained
@@ -210,16 +216,17 @@ repointed between requests.
 
 The MCP server uses OpenAI terminology for background Responses:
 
-- `submit_response` creates a Response, including background and streaming
-  options plus additive manager context/policy fields;
+- `submit_response` creates a background Response with optional streaming plus
+  additive manager priority/routing fields;
 - `get_response` retrieves the whole Response by id and can request replay after
   a streaming sequence cursor; and
 - `cancel_response` idempotently cancels a retained background Response.
 
-The existing prepared-context create/get/release tools remain available. MCP
-clients use synchronous `llama_chat` when work is expected to fit the blocking
-client/proxy budget and polling or replay is unnecessary. See [MCP
-server](../mcp.md).
+The existing prepared-context create/get/release tools remain available, and
+prepared handles are consumed only by `llama_chat`. `submit_response` rejects
+prepared-context fields. MCP clients use synchronous `llama_chat` when work is
+expected to fit the blocking client/proxy budget or prepared append is required.
+See [MCP server](../mcp.md).
 
 ## Measured connection and execution ceilings
 
@@ -244,11 +251,12 @@ execution ceilings still apply.
 The generated OpenAPI reference covers both route prefixes, synchronous and
 background create behavior, retrieval, POST cancellation, whole Response
 resources, error/status fields, background SSE creation and cursor-exclusive
-replay, manager limits, and manager context/policy extensions. The checked-in
-`api/openapi.json` is generated from the source API specification and must not be
-edited independently.
+replay, manager limits, priority/routing, and the explicit rejection of prepared
+context on Responses. Chat Completions documents prepared append separately.
+The checked-in `api/openapi.json` is generated from the source API specification
+and must not be edited independently.
 
 Normal synchronous `/api/v1/responses`, `/v1/responses`, chat completions, and
-existing full-input prepared-handle behavior remain unchanged. Background
+existing full-message prepared-handle behavior remain unchanged. Background
 Responses are additive; durable cross-restart persistence, webhooks, and hosted
 tools are outside this implementation.

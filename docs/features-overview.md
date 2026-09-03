@@ -140,17 +140,20 @@ changing OpenAI fields. Terminal polling/replay state is retained for roughly 10
 minutes and is lost on restart. Defaults cap records at 128 globally/32 per
 Authorization scope, requests at 4 MiB, retained active request bytes at 64/16
 MiB globally/per scope, and results at 16 MiB. SSE replay also has explicit
-per-response/global event and byte caps. Active work is never evicted to admit a
-new request. Cancellation remains capacity-accounted until execution settles and
-cannot be overwritten by a late result.
+caps: 10,000 events/16 MiB per Response and 64 MiB globally. Active work is never
+evicted to admit a new request. Cancellation remains capacity-accounted until
+execution settles and cannot be overwritten by a late result.
 
-Prepared context, priority, and routing are additive manager extensions carried
-through the same synchronous Responses execution seam. A ready llama.cpp handle
-plus `prepared_context_mode: "append"` lets a caller send only supported new text
-input. Conflicting input fields, unsupported multimodal suffixes,
-scope/model/revision mismatch, and lost slot ownership fail closed. Existing
-full-input validation remains unchanged; DS4 rejects strict/append reuse because
-it has no compatible reusable slot primitive.
+Priority and routing are additive manager fields carried through the same
+synchronous Responses execution seam. Prepared context is deliberately separate:
+only `/v1/chat/completions` and MCP `llama_chat` accept
+`prepared_context_id`, `prepared_context_mode: "append"`, and
+`context_cache_strict`. `/v1/responses` rejects those fields, ensuring a suffix
+cannot execute without its retained chat prefix. Chat append fails closed on
+conflicting input fields, unsupported multimodal suffixes,
+scope/model/revision mismatch, and lost slot ownership. Existing full-message
+validation remains unchanged; DS4 rejects strict/append reuse because it has no
+compatible reusable slot primitive.
 
 An alias `n_ctx: null` means route-dependent or unknown, not the global default.
 For local preparation, use `resolvedModel` to find the concrete catalog limit. A

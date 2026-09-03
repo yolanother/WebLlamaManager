@@ -59,8 +59,9 @@ throughput formula or performance guarantee.
   inference interval but does not disable manager execution ceilings.
 - Add `stream: true` when the client wants Responses SSE events now and may need
   to reconnect using a sequence cursor.
-- Use a prepared llama.cpp context when multiple calls share a large prefix and
-  the caller should transmit that prefix once.
+- Use the separate Chat Completions prepared-context workflow when multiple
+  calls share a large prefix and the caller should transmit that prefix once.
+  Prepared handles cannot be combined with Responses.
 
 ## Create a non-streaming background Response
 
@@ -174,11 +175,12 @@ Streaming start/resume is valid only for a background Response originally
 created with `stream: true`. A Response created with `stream: false` can still be
 retrieved as JSON, but it cannot later be converted into a resumable stream.
 
-Llama Manager retains SSE events under explicit per-response and global
-event/byte caps. This replay log is process-local and available only while both
-the Response and requested sequence range remain retained. Slow clients cannot
-grow it without bound; a restart loses it. Consult the generated OpenAPI
-reference for exact cap fields and replay error shapes after deployment.
+Llama Manager retains at most 10,000 SSE events and 16 MiB of events per
+Response, with 64 MiB retained globally by default. This replay log is
+process-local and available only while both the Response and requested sequence
+range remain retained. A cap overflow fails the new Response with
+`event_retention_exceeded` rather than dropping its history or evicting active
+replay state. A restart loses all retained events.
 
 ## Scope, temporary retention, and restart behavior
 
@@ -205,7 +207,7 @@ extensions:
 | One serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | One serialized result | 16 MiB |
-| SSE replay | Explicit bounded per-response/global event and byte caps |
+| SSE replay | 10,000 events and 16 MiB per Response; 64 MiB globally |
 
 Expired and oldest terminal records are reclaimed before admission. Active work
 is never evicted to admit a new request. Oversized requests return HTTP 413;
@@ -222,9 +224,10 @@ Response with `status: "failed"` and its bounded `error` field. Error and
 `_llama_manager` diagnostics do not include credentials, prompt bodies, or
 backend API keys.
 
-## Llama Manager prepared-prefix extension
+## Separate Llama Manager prepared Chat Completions
 
-Preparation is separate from the OpenAI surface. Prepare the large prefix once:
+Prepared append is a Chat Completions extension, not a Responses feature. First
+prepare the large chat-message prefix:
 
 ```bash
 curl -i "$BASE_URL/api/v1/context/prepare" \
@@ -234,7 +237,7 @@ curl -i "$BASE_URL/api/v1/context/prepare" \
     "model": "default-big",
     "mode": "prefill",
     "priority": "interactive",
-    "input": [
+    "messages": [
       {"role": "system", "content": "Use only the supplied report."},
       {"role": "user", "content": "<large report supplied once>"}
     ]
@@ -248,19 +251,19 @@ curl "$BASE_URL/api/v1/context/context_opaque-random-value" \
   -H 'authorization: Bearer example-scope'
 ```
 
-Then create a background Response containing only the supported text suffix:
+Then send only the supported text-message suffix to Chat Completions:
 
 ```bash
-curl -i "$BASE_URL/v1/responses" \
+curl -i "$BASE_URL/v1/chat/completions" \
   -H 'content-type: application/json' \
   -H 'authorization: Bearer example-scope' \
   --data '{
     "model": "default-big",
-    "background": true,
     "prepared_context_id": "context_opaque-random-value",
     "prepared_context_mode": "append",
-    "input": [{"role": "user", "content": "List the three principal risks."}],
-    "max_output_tokens": 800
+    "messages": [{"role": "user", "content": "List the three principal risks."}],
+    "stream": false,
+    "max_tokens": 800
   }'
 ```
 
@@ -268,8 +271,15 @@ The manager composes the retained prefix and suffix and asks llama.cpp to verify
 reuse on its owned slot. Conflicting input-affecting fields, unsupported
 multimodal suffixes, stale or wrong-scope handles, a different resolved model or
 compatibility revision, and lost slot ownership fail closed. The suffix is never
-executed alone. Omitting append mode preserves the existing full-input prepared
-validation behavior.
+executed alone. Omitting append mode preserves the existing full-message
+prepared validation behavior.
+
+Do not send `prepared_context_id`, `prepared_context_mode`, or
+`context_cache_strict` to `/v1/responses`. Responses rejects any of those fields
+with HTTP 400 and `prepared_context_not_supported_for_responses`; it never treats
+a suffix as standalone input. Consequently, this release has two separate
+choices: use background Responses for disconnect/retrieve/replay, or use Chat
+Completions for prepared-prefix reuse. They cannot be composed.
 
 Prepared handles have a separate manager-defined 15-minute default TTL and are
 invalidated by release, expiry, eviction, restart, or incompatible model/engine
@@ -283,7 +293,7 @@ curl -X DELETE \
 
 DS4 does not expose a reusable caller-visible slot. Its disk KV support is memory
 offload, so DS4 rejects strict or append prepared-context reuse as unsupported.
-Use a normal synchronous or background Response instead.
+Use an ordinary Chat Completion or a separate background Response instead.
 
 ## Llama Manager priority and routing extensions
 
@@ -316,21 +326,22 @@ The MCP tools mirror the Response terminology:
   "arguments": {
     "model": "default-big",
     "input": "Summarize the report.",
-    "background": true,
     "stream": false
   }
 }
 ```
 
-Use `get_response` to retrieve the whole Response or resume a stream, and
-`cancel_response` for idempotent cancellation. Prepared-context lifecycle tools
-remain available for the manager extension. See [MCP server](../mcp.md) for the
-argument reference.
+`submit_response` always sets `background: true`. Use `get_response` to retrieve
+the whole Response or resume a stream, and `cancel_response` for idempotent
+cancellation. Prepared-context lifecycle tools feed only `llama_chat`, not
+`submit_response`. See [MCP server](../mcp.md) for the argument reference.
 
 ## API reference
 
 The generated OpenAPI document covers both `/api/v1` and `/v1` create,
-retrieval, cancellation, and replay routes, OpenAI field shapes, and additive
-manager limits/context/policy fields. View it through Llama Manager's API docs or
-inspect generated `api/openapi.json`. Architectural rationale is in
-[OpenAI-Compatible Background Responses](../Designs/AsyncInferenceJobs.md).
+retrieval, cancellation, and replay routes, OpenAI field shapes, manager
+limits/policy fields, and the explicit prepared-context rejection. Chat
+Completions documents prepared append separately. View it through Llama
+Manager's API docs or inspect generated `api/openapi.json`. Architectural
+rationale is in [OpenAI-Compatible Background
+Responses](../Designs/AsyncInferenceJobs.md).

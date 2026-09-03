@@ -44,8 +44,9 @@ deployment.
 - Set `stream: true` on `submit_response` when standard Responses SSE events are
   desired and the client may reconnect using `get_response` plus a sequence
   cursor.
-- Use the prepared-context tools when repeated llama.cpp calls share a large
-  prefix and the caller should send the prefix once.
+- Use the prepared-context tools with `llama_chat` when repeated llama.cpp Chat
+  Completions share a large prefix. Prepared handles cannot be passed to
+  `submit_response`.
 
 The measured deployment has a 90-second gateway ceiling. Manager-owned
 600-second remote-attempt and 180-second model-load ceilings still apply inside
@@ -56,19 +57,16 @@ Background Responses and Prepared Contexts](Guides/AsyncInference.md).
 
 ### `submit_response`
 
-Creates a Response through `POST /v1/responses`. Arguments include normal
-Responses input plus background controls:
+Creates a background Response through `POST /v1/responses`. The tool always sets
+`background: true`; its accepted arguments are:
 
 | Argument | Meaning |
 |---|---|
 | `model` | Required model id or alias |
 | `input` | Required Responses input string or supported input items |
-| `background` | Set exactly `true` to retain background execution; other values keep synchronous HTTP behavior |
 | `stream` | Emit standard Responses SSE events; with background mode, events are retained for bounded replay |
-| Normal Responses output fields | Output limits, sampling, tools, and other supported Responses options |
-| `prepared_context_id`, `prepared_context_mode` | Llama Manager extension for full-input validation or append reuse |
-| `context_cache_strict` | Llama Manager fail-closed prepared-reuse control |
-| `priority` / `request_priority` | Llama Manager admission policy |
+| `temperature`, `max_output_tokens` | Supported Responses output controls |
+| `priority` | Llama Manager admission policy; mapped to `request_priority` |
 | `routing` | Llama Manager routing policy, including `local_only` |
 
 Non-streaming example:
@@ -79,7 +77,6 @@ Non-streaming example:
   "arguments": {
     "model": "default-big",
     "input": "Summarize the supplied report.",
-    "background": true,
     "stream": false,
     "max_output_tokens": 1200,
     "priority": "background",
@@ -96,6 +93,10 @@ job/result object.
 For resumable streaming, create the same resource with `stream: true`. The MCP
 transport returns the Responses events with monotonically increasing
 `sequence_number` values while Llama Manager retains a bounded replay log.
+
+`submit_response` does not accept `prepared_context_id`,
+`prepared_context_mode`, or `context_cache_strict`. The Responses HTTP surface
+rejects those fields as unsupported rather than risking suffix-only execution.
 
 ### `get_response`
 
@@ -171,17 +172,21 @@ the following manager-specific implementation bounds:
 | Serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | Serialized result | 16 MiB |
-| SSE replay | Explicit bounded per-response/global event and byte caps |
+| SSE replay | 10,000 events and 16 MiB per Response; 64 MiB globally |
 
 Expired and oldest terminal records are reclaimed before capacity is refused;
 active work is never evicted. Missing, expired, and wrong-scope ids return the
 same standard not-found shape. The manager deletes private request bodies,
 authorization, priority, and routing values after settlement.
 
+Exceeding a replay cap fails and aborts the new Response with
+`event_retention_exceeded`; the manager does not truncate that Response's event
+history or evict active replay state.
+
 ## Prepared-context tools
 
-Prepared context is a Llama Manager extension, not an OpenAI Responses field.
-The lifecycle tools remain:
+Prepared context is a Llama Manager Chat Completions extension, not an OpenAI
+Responses field. The lifecycle tools remain:
 
 - `llama_prepare_context` starts exact counting or local llama.cpp prefill;
 - `llama_get_prepared_context` retrieves a prepared lease by id; and
@@ -196,7 +201,7 @@ Preparation example:
     "model": "default-big",
     "mode": "prefill",
     "priority": "interactive",
-    "input": [
+    "messages": [
       {"role": "system", "content": "Use only the supplied report."},
       {"role": "user", "content": "<large report supplied once>"}
     ]
@@ -204,18 +209,17 @@ Preparation example:
 }
 ```
 
-Poll to `ready`, then combine the retained prefix with a text suffix:
+Poll to `ready`, then use `llama_chat` to combine the retained prefix with a text
+message suffix:
 
 ```json
 {
-  "tool": "submit_response",
+  "tool": "llama_chat",
   "arguments": {
     "model": "default-big",
-    "input": [{"role": "user", "content": "List the three principal risks."}],
-    "background": true,
+    "messages": [{"role": "user", "content": "List the three principal risks."}],
     "prepared_context_id": "context_opaque-random-value",
-    "prepared_context_mode": "append",
-    "routing": "local_only"
+    "prepared_context_mode": "append"
   }
 }
 ```
@@ -227,6 +231,12 @@ closed. Prepared handles have their own manager-defined 15-minute default TTL
 and are invalidated by release, expiry, eviction, restart, or incompatible model
 changes. DS4 rejects strict and append reuse because it exposes no compatible
 caller-visible reusable slot.
+
+Do not pass `prepared_context_id`, `prepared_context_mode`, or
+`context_cache_strict` to `submit_response`. They are excluded from its schema,
+and `/v1/responses` rejects them with
+`prepared_context_not_supported_for_responses`. Background retrieval/replay and
+prepared-prefix reuse are separate workflows in this release.
 
 ## Alias context discovery
 

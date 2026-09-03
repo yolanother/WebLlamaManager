@@ -46,7 +46,7 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
 
 ### Infrastructure
 - **OpenAI-compatible API**: Drop-in replacement proxy (`chat/completions`, `completions`, `embeddings`, `responses`, Anthropic-shaped `messages`, `rerank`) with automatic message sanitization for tool-call edge cases
-- **Background Responses**: Use OpenAI-compatible `background: true` Responses, disconnect, then retrieve, cancel, or resume bounded SSE output by sequence number; manager extensions add scope-safe prepared llama.cpp prefixes and routing policy ([guide](docs/Guides/AsyncInference.md))
+- **Background Responses**: Use OpenAI-compatible `background: true` Responses, disconnect, then retrieve, cancel, or resume bounded SSE output by sequence number; separate Chat Completions extensions provide scope-safe prepared llama.cpp prefixes ([guide](docs/Guides/AsyncInference.md))
 - **MCP Server**: Integration with AI agents like Claude Desktop
 - **Full Chat Interface**: Multi-conversation chat with streaming, code highlighting, and image support
 - **systemd service**: Auto-start on boot, runs in background
@@ -180,10 +180,12 @@ On top of that:
   the returned OpenAI `resp_...` id, and retrieve or cancel the whole Response
   later. A stream created with `stream: true` can reconnect after its last
   `sequence_number`; replay is bounded and process-local. Llama Manager
-  extensions add Authorization scope, temporary retention, priority/routing,
-  and prepared llama.cpp append reuse. DS4 rejects strict/append reuse because
-  it has no compatible reusable slot. See [Using Background Responses and
-  Prepared Contexts](docs/Guides/AsyncInference.md).
+  extensions add Authorization scope, temporary retention, and priority/routing.
+  Prepared llama.cpp append reuse is a separate `/v1/chat/completions` feature;
+  Responses rejects prepared-context fields so a suffix cannot execute alone.
+  DS4 rejects strict/append reuse because it has no compatible reusable slot.
+  See [Using Background Responses and Prepared
+  Contexts](docs/Guides/AsyncInference.md).
 
 See [`docs/features-overview.md`](docs/features-overview.md) for the full picture.
 
@@ -749,7 +751,7 @@ Replace `/path/to/llama-server` with the actual path to this repository.
 | `llama_get_processes` | List running llama-server processes |
 | `llama_get_logs` | Get recent server logs |
 | `llama_chat` | Send a chat completion request |
-| `submit_response` | Create an OpenAI-compatible synchronous or background Response |
+| `submit_response` | Create an OpenAI-compatible background Response |
 | `get_response` | Retrieve the whole Response or resume its retained background stream |
 | `cancel_response` | Idempotently cancel a retained background Response |
 | `llama_prepare_context` | Count or prefill an Authorization-scoped llama.cpp context |
@@ -763,6 +765,9 @@ SSE only when the Response was originally created with `stream: true`. See the
 [MCP tool reference](docs/mcp.md) for schemas, manager limits, append-mode
 examples, and the measured 90-second gateway, 600-second backend-attempt, and
 180-second model-load ceilings.
+
+Prepared contexts are consumed only by `llama_chat`; `submit_response` rejects
+`prepared_context_id`, `prepared_context_mode`, and `context_cache_strict`.
 
 ### Environment Variables
 
