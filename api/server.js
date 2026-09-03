@@ -157,7 +157,7 @@ import {
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
-  isProjectorModelId, remoteStallMs, largestContextBesideDs4,
+  isProjectorModelId, remoteStallMs, remoteStallCeilingMs, largestContextBesideDs4,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -13826,7 +13826,15 @@ setInterval(async () => {
       // ties up the request indefinitely. Abort propagates via the
       // activeRequest signal that we now pass to fetchRemoteBackend, which
       // tears down the fetch + body stream.
-      const remoteStallLimit = currentRemoteStallMs();
+      //
+      // ds4 gets its OWN fixed ceiling (remoteStallCeilingMs), not the
+      // generic context-scaled one: a zero-token ds4 slot holder (including
+      // an abandoned background /v1/responses job — those run through this
+      // same proxy via a loopback HTTP call, so they land in activeRequests
+      // just like any other request) blocks the box's single ds4 generation
+      // slot for every request queued behind it. See DS4_ZERO_TOKEN_STALL_MS
+      // for how that ceiling was derived.
+      const remoteStallLimit = remoteStallCeilingMs(entry, currentRemoteStallMs());
       if (idle < remoteStallLimit) continue;
       entry._watchdogKilled = true;
       const msg = `Stall watchdog: aborting remote request ${id} (backend: ${entry.backend}, model: ${entry.model}, ${entry.tokens} tokens, idle ${Math.round(idle / 1000)}s ≥ ${Math.round(remoteStallLimit / 1000)}s)`;

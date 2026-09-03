@@ -18,6 +18,8 @@ import {
   llamaFitsBesideDs4,
   isProjectorModelId,
   remoteStallMs,
+  DS4_ZERO_TOKEN_STALL_MS,
+  remoteStallCeilingMs,
   largestContextBesideDs4,
   buildLocalServerRegistry,
   renderModelsPresetIni,
@@ -844,6 +846,48 @@ test('remoteStallMs is monotonic in context size', () => {
   const a = remoteStallMs({ contextTokens: 65536 });
   const b = remoteStallMs({ contextTokens: 131072 });
   assert.ok(b > a, 'a bigger context must allow a longer silence');
+});
+
+// ── DS4_ZERO_TOKEN_STALL_MS / remoteStallCeilingMs ──────────────────────────
+
+test('DS4_ZERO_TOKEN_STALL_MS clears the measured 228-287s worst-case prefill plus ~25s cold-load with real margin', () => {
+  const measuredWorstCaseMs = 287_000 + 25_000; // 287s prefill + 25s ds4 cold-load
+  assert.ok(
+    DS4_ZERO_TOKEN_STALL_MS > measuredWorstCaseMs * 1.1,
+    `must clear the measured worst case with real margin, got ${DS4_ZERO_TOKEN_STALL_MS}`,
+  );
+});
+
+test('remoteStallCeilingMs: a ds4-backed entry always gets the fixed ds4 ceiling, regardless of the generic value', () => {
+  assert.equal(remoteStallCeilingMs({ backend: 'ds4' }, 120_000), DS4_ZERO_TOKEN_STALL_MS);
+  assert.equal(remoteStallCeilingMs({ backend: 'ds4' }, 900_000), DS4_ZERO_TOKEN_STALL_MS);
+});
+
+test('remoteStallCeilingMs: any other remote backend keeps the generic (context-scaled) ceiling', () => {
+  assert.equal(remoteStallCeilingMs({ backend: 'drakemore-mtj8prpy' }, 393_216), 393_216);
+  assert.equal(remoteStallCeilingMs({ backend: 'dahaka-ollama-mngx88pk' }, 120_000), 120_000);
+});
+
+test('remoteStallCeilingMs: missing backend falls back to the generic ceiling', () => {
+  assert.equal(remoteStallCeilingMs({}, 120_000), 120_000);
+  assert.equal(remoteStallCeilingMs(undefined, 120_000), 120_000);
+});
+
+test('stall watchdog wires remoteStallCeilingMs into its remote/ds4 branch', () => {
+  // Pure-function tests above only prove remoteStallCeilingMs itself is
+  // correct; they say nothing about whether server.js's watchdog actually
+  // calls it. Lock the wiring structurally so a future edit reverting to a
+  // bare currentRemoteStallMs() call — silently un-fixing this — fails a test
+  // instead of just quietly regressing.
+  const source = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
+  const branchStart = source.indexOf('// Remote backend stall.');
+  assert.ok(branchStart >= 0, 'watchdog remote-stall branch must exist');
+  const branch = source.slice(branchStart, branchStart + 1200);
+  assert.match(
+    branch,
+    /const remoteStallLimit = remoteStallCeilingMs\(entry, currentRemoteStallMs\(\)\);/,
+    'the remote-stall branch must route through remoteStallCeilingMs, not a bare currentRemoteStallMs()',
+  );
 });
 
 const GIB = 1024 ** 3;

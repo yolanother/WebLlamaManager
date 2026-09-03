@@ -865,6 +865,50 @@ export function remoteStallMs({ contextTokens = 0, floorMs = 120000, safetyFacto
 }
 
 /**
+ * Fixed idle-time ceiling for a ds4-backed request that has produced ZERO
+ * tokens, independent of `config.contextSize`.
+ *
+ * remoteStallMs() scales with the box's configured context because that
+ * genuinely bounds a proxied remote request's legitimate prefill time. ds4's
+ * own target context happens to track that same config.contextSize today
+ * (see the `targetContext` chain in the ds4 adaptive spawn path in
+ * server.js), so in practice the two ceilings have been coincidentally
+ * close. But ds4's real zero-token wait should be bounded by what ds4
+ * ACTUALLY does, not by an unrelated system knob that could be raised for
+ * the local llama.cpp lane alone (or a ds4 preset requesting its own larger
+ * `context`), which would silently stretch how long a stuck request can
+ * block the box's single ds4 generation slot.
+ *
+ * Anchored to measured drakemore timings (see PREFILL_TOKENS_PER_SEC's
+ * JSDoc): a 36,636-token prompt took up to 287s at ctx 65536, plus ~25s ds4
+ * cold-load = 312s baseline. Applying the same 1.5x safety factor
+ * remoteStallMs() uses for exactly this kind of uncertainty gives 468s,
+ * rounded up to a clean 480s (8 min). Keep this comfortably above the
+ * measured worst case — cutting the margin thin is the mistake that made a
+ * 15s probe timeout false-negative a healthy backend elsewhere in this
+ * project; do not repeat it here.
+ */
+export const DS4_ZERO_TOKEN_STALL_MS = 480_000;
+
+/**
+ * Choose the idle-time ceiling the stall watchdog applies to a non-local
+ * (remote or ds4) activeRequests entry.
+ *
+ * ds4 has no llama.cpp-style `/slots` probe, so — unlike the local branch,
+ * which can verify real upstream progress — zero tokens is the only signal
+ * available for a ds4-backed request. It gets its own fixed ceiling
+ * (DS4_ZERO_TOKEN_STALL_MS) rather than the generic, context-scaled
+ * remoteStallMs() value used for other remote backends.
+ *
+ * @param {{backend?:string}} entry activeRequests entry (only `backend` is read).
+ * @param {number} genericRemoteStallMs currentRemoteStallMs() — applied to any non-ds4 remote backend.
+ * @returns {number} Idle milliseconds to allow before declaring the entry stalled.
+ */
+export function remoteStallCeilingMs(entry, genericRemoteStallMs) {
+  return entry?.backend === 'ds4' ? DS4_ZERO_TOKEN_STALL_MS : genericRemoteStallMs;
+}
+
+/**
  * Largest context a llama model can take while DS4 stays resident.
  *
  * Co-residency was all-or-nothing: the model was budgeted at the box's FULL
