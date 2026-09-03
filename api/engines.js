@@ -863,3 +863,66 @@ export function remoteStallMs({ contextTokens = 0, floorMs = 120000, safetyFacto
   const prefillMs = (tokens / PREFILL_TOKENS_PER_SEC) * 1000 * safetyFactor;
   return Math.max(floorMs, Math.round(prefillMs));
 }
+
+/**
+ * Largest context a llama model can take while DS4 stays resident.
+ *
+ * Co-residency was all-or-nothing: the model was budgeted at the box's FULL
+ * configured context and refused if that did not fit. Raising the system
+ * context to 65,536 therefore stopped an 8B model fitting beside DS4 at all —
+ * its KV cache alone grew from ~1.1 GiB to ~9 GiB, taking the total past the
+ * ~15 GiB DS4 leaves free, so every small request evicted an 87 GB engine.
+ *
+ * A co-resident model does not need the whole context. Fitting the largest
+ * power-of-two-stepped context that the free memory actually admits keeps both
+ * engines up, which is far more valuable than the difference between a 32k and
+ * a 64k window on a small model.
+ *
+ * @param {object} p
+ * @param {number} p.freeMemBytes      Measured MemAvailable.
+ * @param {number} p.modelBytes        Model weights on disk.
+ * @param {number} p.kvBytesPerToken   KV cache cost per token.
+ * @param {number} p.safetyBytes       Margin to keep free.
+ * @param {number} p.desiredContext    Context we would like (the system default).
+ * @param {number} p.minContext        Below this, co-residency is not worth it.
+ * @returns {{context:number, fits:boolean, requiredBytes:number, reason:string}}
+ */
+export function largestContextBesideDs4({
+  freeMemBytes = 0, modelBytes = 0, kvBytesPerToken = 0, safetyBytes = 0,
+  desiredContext = 0, minContext = 4096,
+} = {}) {
+  const free = num(freeMemBytes, 0);
+  const weights = num(modelBytes, 0);
+  const kvRate = num(kvBytesPerToken, 0);
+  const safety = num(safetyBytes, 0);
+  if (weights <= 0) {
+    return { context: 0, fits: false, requiredBytes: 0, reason: 'Model size is unknown, so co-residency cannot be admitted safely.' };
+  }
+  const budget = free - weights - safety;
+  if (budget <= 0 || kvRate <= 0) {
+    return {
+      context: 0, fits: false, requiredBytes: weights + safety,
+      reason: `Weights alone (${gib(weights)}) do not fit in ${gib(free)} free.`,
+    };
+  }
+  const affordable = Math.floor(budget / kvRate);
+  // Step down in halves from the desired context so the chosen window is a
+  // familiar size rather than an arbitrary token count.
+  let ctx = Math.max(num(desiredContext, 0), 0);
+  while (ctx > minContext && ctx > affordable) ctx = Math.floor(ctx / 2);
+  if (ctx > affordable) {
+    return {
+      context: 0, fits: false, requiredBytes: weights + (minContext * kvRate) + safety,
+      reason: `Even ${minContext} tokens of context do not fit beside DS4 (${gib(free)} free).`,
+    };
+  }
+  const requiredBytes = weights + (ctx * kvRate) + safety;
+  return {
+    context: ctx,
+    fits: true,
+    requiredBytes,
+    reason: ctx < desiredContext
+      ? `Fits beside DS4 at a reduced ${ctx}-token context (needs ~${gib(requiredBytes)}, ${gib(free)} free); the full ${desiredContext} would not fit.`
+      : `Fits beside DS4 at the full ${ctx}-token context (needs ~${gib(requiredBytes)}, ${gib(free)} free).`,
+  };
+}

@@ -18,6 +18,7 @@ import {
   llamaFitsBesideDs4,
   isProjectorModelId,
   remoteStallMs,
+  largestContextBesideDs4,
   buildLocalServerRegistry,
   renderModelsPresetIni,
   gemmaMtpPresetSection,
@@ -843,4 +844,49 @@ test('remoteStallMs is monotonic in context size', () => {
   const a = remoteStallMs({ contextTokens: 65536 });
   const b = remoteStallMs({ contextTokens: 131072 });
   assert.ok(b > a, 'a bigger context must allow a longer silence');
+});
+
+const GIB = 1024 ** 3;
+
+test('largestContextBesideDs4 keeps the full context when it genuinely fits', () => {
+  const r = largestContextBesideDs4({
+    freeMemBytes: 40 * GIB, modelBytes: 4.7 * GIB, kvBytesPerToken: 144 * 1024,
+    safetyBytes: 2 * GIB, desiredContext: 65536, minContext: 4096,
+  });
+  assert.equal(r.fits, true);
+  assert.equal(r.context, 65536);
+});
+
+test('largestContextBesideDs4 steps down instead of refusing', () => {
+  // The real regression: Qwen3-8B at 65,536 needs ~17.7 GiB but DS4 leaves
+  // ~15 GiB, so co-residency was refused and an 87 GB engine was evicted for a
+  // small model. A reduced window keeps both engines up.
+  // Values measured on drakemore: DS4 resident leaves ~15.1 GiB, the ds4 config
+  // budgets KV at 128 KiB/token, and the safety margin is ~5 GiB — which is how
+  // the box arrived at "needs ~17.7 GiB, only 15.1 GiB free".
+  const r = largestContextBesideDs4({
+    freeMemBytes: 15.1 * GIB, modelBytes: 4.68 * GIB, kvBytesPerToken: 128 * 1024,
+    safetyBytes: 5 * GIB, desiredContext: 65536, minContext: 4096,
+  });
+  assert.equal(r.fits, true);
+  assert.ok(r.context < 65536, 'must reduce the window');
+  assert.ok(r.context >= 4096, `must stay usable, got ${r.context}`);
+  assert.match(r.reason, /reduced/);
+});
+
+test('largestContextBesideDs4 refuses when even the floor will not fit', () => {
+  const r = largestContextBesideDs4({
+    freeMemBytes: 3 * GIB, modelBytes: 4.7 * GIB, kvBytesPerToken: 144 * 1024,
+    safetyBytes: 1 * GIB, desiredContext: 65536, minContext: 4096,
+  });
+  assert.equal(r.fits, false);
+  assert.equal(r.context, 0);
+});
+
+test('largestContextBesideDs4 never admits an unknown model size', () => {
+  const r = largestContextBesideDs4({
+    freeMemBytes: 40 * GIB, modelBytes: 0, kvBytesPerToken: 144 * 1024, desiredContext: 8192,
+  });
+  assert.equal(r.fits, false);
+  assert.match(r.reason, /unknown/i);
 });

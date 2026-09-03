@@ -282,12 +282,22 @@ export function ds4EvictionReadiness({ inFlight = 0, waitedMs = 0, maxWaitMs = 0
  */
 export function ds4EvictionPlan({
   fits = false, hasViableRemote = false, ds4IdleMs = 0,
-  idleEvictAfterMs = 600000, requestPriority = 'interactive',
+  idleEvictAfterMs = 600000, requestPriority = 'interactive', relayed = false,
 } = {}) {
   if (fits) {
     return { action: 'co-reside', reason: 'the model fits beside DS4' };
   }
   const idleMin = Math.round(ds4IdleMs / 60000);
+  // Work another manager offloaded to us must not cost an 87 GB eviction. That
+  // node had somewhere else to send it and chose us; evicting DS4 for relayed
+  // traffic spends this box's most expensive resource on someone else's
+  // scheduling decision. Idle DS4 is still fair game, checked next.
+  if (relayed && ds4IdleMs < idleEvictAfterMs) {
+    return {
+      action: hasViableRemote ? 'offload' : 'defer',
+      reason: `request was relayed from another node and DS4 was used ${idleMin} min ago — not evicting for relayed work`,
+    };
+  }
   if (ds4IdleMs >= idleEvictAfterMs) {
     return {
       action: 'evict',
@@ -355,4 +365,64 @@ export function ds4SwapRetryDecision({
     retry: true,
     reason: `engine swapped mid-request — re-serving internally (attempt ${attempt + 2}/${maxRetries + 1})`,
   };
+}
+
+/** Header carrying how many manager hops a request has already taken. */
+export const RELAY_HOPS_HEADER = 'x-llama-manager-hops';
+/** Header naming the node a request originally entered the fleet through. */
+export const RELAY_ORIGIN_HEADER = 'x-llama-manager-origin';
+/** Maximum manager-to-manager hops before a request must be served or refused. */
+export const MAX_RELAY_HOPS = 2;
+
+/**
+ * Read relay state from an inbound request's headers.
+ *
+ * A request that arrived by offload from another manager is materially
+ * different from one a user sent us directly: another node already decided it
+ * could not serve it, so bouncing it onward risks a loop, and paying an
+ * expensive local eviction for someone else's relayed work is the wrong trade.
+ *
+ * @param {object} headers Inbound request headers (lower-cased keys).
+ * @returns {{relayed:boolean, hops:number, origin:string|null}}
+ */
+export function readRelayState(headers = {}) {
+  const raw = Number.parseInt(headers[RELAY_HOPS_HEADER], 10);
+  const hops = Number.isFinite(raw) && raw > 0 ? raw : 0;
+  return {
+    relayed: hops > 0,
+    hops,
+    origin: headers[RELAY_ORIGIN_HEADER] || null,
+  };
+}
+
+/**
+ * Headers to attach when offloading a request to another manager.
+ *
+ * Increments the hop count and preserves the original entry node, so a request
+ * cannot circulate between two nodes indefinitely.
+ *
+ * @param {{hops?:number, origin?:string|null}} inbound Relay state of the request we received.
+ * @param {string} selfNodeId This node's identifier, used when we are the origin.
+ * @returns {Object<string,string>} Headers to merge into the outbound request.
+ */
+export function relayHeadersFor(inbound = {}, selfNodeId = 'unknown') {
+  return {
+    [RELAY_HOPS_HEADER]: String((inbound.hops || 0) + 1),
+    [RELAY_ORIGIN_HEADER]: inbound.origin || selfNodeId,
+  };
+}
+
+/**
+ * Whether this request may be offloaded onward to another manager.
+ *
+ * @param {{hops?:number}} inbound Relay state of the request we received.
+ * @param {number} maxHops Hop ceiling.
+ * @returns {{allowed:boolean, reason:string}}
+ */
+export function mayRelayOnward(inbound = {}, maxHops = MAX_RELAY_HOPS) {
+  const hops = inbound.hops || 0;
+  if (hops >= maxHops) {
+    return { allowed: false, reason: `already relayed ${hops} hop(s); serving here to avoid a loop` };
+  }
+  return { allowed: true, reason: `${hops} hop(s) so far, under the ${maxHops}-hop ceiling` };
 }

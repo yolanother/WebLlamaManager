@@ -14,6 +14,9 @@ import {
   ds4InFlightCount,
   ds4EvictionPlan,
   ds4SwapRetryDecision,
+  readRelayState,
+  relayHeadersFor,
+  mayRelayOnward,
   ds4EvictionReadiness,
   ds4ModelMatches,
   ds4RequestTarget,
@@ -362,4 +365,46 @@ test('ds4SwapRetryDecision gives up after the retry budget', () => {
   const r = ds4SwapRetryDecision({ swapOccurred: true, attempt: 2, maxRetries: 2 });
   assert.equal(r.retry, false);
   assert.match(r.reason, /giving up/);
+});
+
+test('ds4EvictionPlan will not evict DS4 for work relayed from another node', () => {
+  // A default-small request that Frostburn already offloaded to us should not
+  // cost this box an 87 GB reload: Frostburn had alternatives and picked us.
+  const r = ds4EvictionPlan({
+    fits: false, hasViableRemote: false, ds4IdleMs: 60_000,
+    idleEvictAfterMs: 600_000, relayed: true,
+  });
+  assert.notEqual(r.action, 'evict');
+  assert.match(r.reason, /relayed/);
+});
+
+test('ds4EvictionPlan still evicts an idle DS4 even for relayed work', () => {
+  const r = ds4EvictionPlan({
+    fits: false, hasViableRemote: false, ds4IdleMs: 900_000,
+    idleEvictAfterMs: 600_000, relayed: true,
+  });
+  assert.equal(r.action, 'evict');
+});
+
+test('readRelayState reads hops and origin, defaulting to not-relayed', () => {
+  assert.deepEqual(readRelayState({}), { relayed: false, hops: 0, origin: null });
+  const r = readRelayState({ 'x-llama-manager-hops': '1', 'x-llama-manager-origin': 'frostburn' });
+  assert.equal(r.relayed, true);
+  assert.equal(r.hops, 1);
+  assert.equal(r.origin, 'frostburn');
+});
+
+test('relayHeadersFor increments hops and preserves the original origin', () => {
+  const first = relayHeadersFor({ hops: 0, origin: null }, 'frostburn');
+  assert.equal(first['x-llama-manager-hops'], '1');
+  assert.equal(first['x-llama-manager-origin'], 'frostburn');
+  const second = relayHeadersFor({ hops: 1, origin: 'frostburn' }, 'drakemore');
+  assert.equal(second['x-llama-manager-hops'], '2');
+  assert.equal(second['x-llama-manager-origin'], 'frostburn', 'origin must survive the hop');
+});
+
+test('mayRelayOnward stops a request looping between nodes', () => {
+  assert.equal(mayRelayOnward({ hops: 0 }, 2).allowed, true);
+  assert.equal(mayRelayOnward({ hops: 2 }, 2).allowed, false);
+  assert.match(mayRelayOnward({ hops: 2 }, 2).reason, /loop/);
 });

@@ -152,7 +152,7 @@ import {
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
-  isProjectorModelId, remoteStallMs,
+  isProjectorModelId, remoteStallMs, largestContextBesideDs4,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -164,7 +164,8 @@ import { buildRepoRecommendations, computeCapacityBytes } from './repo-recommend
 import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
   shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision,
-  ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan, ds4SwapRetryDecision
+  ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan, ds4SwapRetryDecision,
+  readRelayState, relayHeadersFor
 } from './ds4-exclusive.js';
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
@@ -395,6 +396,9 @@ let ds4ActivePresetId = null;
 let ds4LastServedAt = 0;
 /** Idle time past which evicting DS4 is considered an acceptable cost (ms). */
 const DS4_IDLE_EVICT_AFTER_MS = 600000;
+// Below this context a co-resident llama is not useful enough to justify the
+// memory, so DS4 eviction is reconsidered instead.
+const DS4_CORESIDENT_MIN_CONTEXT = 8192;
 // Incremented every time the ds4 engine is activated or deactivated. A request
 // that fails while this has moved was killed by our own hot-swap, not by a
 // broken backend, and is re-served internally instead of being failed.
@@ -1448,10 +1452,14 @@ function desiredResidentModels() {
  */
 const REMOTE_BACKEND_TIMEOUT_MS = 600000;
 
-function buildRemoteRouting(backend, remoteModel, endpoint) {
+function buildRemoteRouting(backend, remoteModel, endpoint, inboundRelay = null) {
   const baseUrl = backend.url.replace(/\/+$/, '');
   const apiKey = backend.apiKeyEnvVar ? process.env[backend.apiKeyEnvVar] : null;
   const headers = { 'Content-Type': 'application/json' };
+  // Carry the hop count and original entry node so the receiving manager knows
+  // this is relayed work — it must not pay an expensive local eviction for it,
+  // and the count is what stops a request circulating between two nodes.
+  Object.assign(headers, relayHeadersFor(inboundRelay || {}, config.nodeId || systemHostname()));
   if (apiKey) {
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
@@ -5853,7 +5861,7 @@ let modeSwitchPromise = null;
  * @returns {Promise<null|{ok:true}|{ok:false,status:number,error:string}>} the
  *   activation result when a ds4 activation was attempted, else null.
  */
-async function ensureDs4ForModel(rawModel, resolvedModel) {
+async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'interactive', relay = null } = {}) {
   const ref = ds4PresetForModel(config, resolvedModel);
   if (ref) {
     const desiredModels = desiredResidentModels();
@@ -5880,12 +5888,18 @@ async function ensureDs4ForModel(rawModel, resolvedModel) {
     // measures less headroom and evicts exactly as before — the decision comes
     // from free memory now, not from an assumption about the machine.
     const ds4cfg = resolveDs4Config(config, RUNTIME_ENV);
-    const fit = llamaFitsBesideDs4({
+    // Fit the largest context that actually works rather than demanding the
+    // box default. All-or-nothing budgeting meant raising the system context to
+    // 65,536 stopped an 8B model fitting beside DS4 at all — its KV alone grew
+    // from ~1.1 GiB to ~9 GiB — so every small request evicted an 87 GB engine.
+    // A reduced window on the small model is a far better trade than that.
+    const fit = largestContextBesideDs4({
       freeMemBytes: memAvailableBytes(),
       modelBytes: resolveModelSizeBytes(resolvedModel),
-      contextTokens: config.contextSize || 0,
       kvBytesPerToken: ds4cfg.kvBytesPerToken,
       safetyBytes: ds4cfg.safetyBytes,
+      desiredContext: config.contextSize || 0,
+      minContext: DS4_CORESIDENT_MIN_CONTEXT,
     });
     if (fit.fits) {
       console.log(`[ds4] keeping DS4 resident for '${rawModel}' -> '${resolvedModel}': ${fit.reason}`);
@@ -5895,8 +5909,8 @@ async function ensureDs4ForModel(rawModel, resolvedModel) {
       // backend or rejected — worse than the eviction this avoids. Bring llama
       // up beside DS4 now that the memory budget has admitted it.
       if (!llamaProcess) {
-        console.log(`[ds4] starting llama beside DS4 to serve '${resolvedModel}'`);
-        await restartLlamaServer({ governed: false });
+        console.log(`[ds4] starting llama beside DS4 to serve '${resolvedModel}' at context ${fit.context}`);
+        await restartLlamaServer({ governed: false, contextOverride: fit.context });
       }
     } else {
       // The model does not fit beside DS4 — but eviction is the most expensive
@@ -5910,6 +5924,11 @@ async function ensureDs4ForModel(rawModel, resolvedModel) {
         hasViableRemote: !!findFastestAvailableBackend(resolvedModel, 'chat/completions'),
         ds4IdleMs: ds4LastServedAt ? Date.now() - ds4LastServedAt : Number.MAX_SAFE_INTEGER,
         idleEvictAfterMs: DS4_IDLE_EVICT_AFTER_MS,
+        requestPriority,
+        // A request another manager already offloaded to us must not cost an
+        // 87 GB eviction: that node had alternatives and chose us, and bouncing
+        // relayed work around the fleet is how a loop starts.
+        relayed: !!relay?.relayed,
       });
       if (plan.action !== 'evict') {
         // Leave DS4 exactly as it is. ds4RequestTarget then routes this request
@@ -6051,7 +6070,7 @@ function writeModelsPresetFile() {
   }
 }
 
-async function restartLlamaServer({ governed = true } = {}) {
+async function restartLlamaServer({ governed = true, contextOverride = 0 } = {}) {
   // When the active engine is ds4, "restart the local server" means restart the
   // ds4 supervisor's process, NOT llama-server (which is stopped). The ds4
   // supervisor runs its own governor, so we bypass the llama governor here.
@@ -6142,7 +6161,10 @@ async function restartLlamaServer({ governed = true } = {}) {
         ...RUNTIME_ENV,
         MODELS_DIR,
         MODELS_MAX: String(config.modelsMax || 2),
-        CONTEXT: String(config.contextSize || 8192),
+        // contextOverride lets a llama server admitted BESIDE DS4 run a
+        // smaller window than the box default, which is what makes
+        // co-residency possible at all on a box configured for 65k.
+        CONTEXT: String(contextOverride || config.contextSize || 8192),
         PORT: String(LLAMA_PORT),
         NO_WARMUP: config.noWarmup ? '1' : '',
         FLASH_ATTN: config.flashAttn ? '1' : '',
@@ -10526,7 +10548,13 @@ async function handleChatCompletions(req, res) {
   // trigger exclusive DS4 activation before routing (the engine-level equivalent
   // of ensureModelServed). On activation failure, fail cleanly rather than falling
   // through to a stopped llama.
-  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel);
+  // Did another manager already offload this to us? That changes what we are
+  // willing to pay locally, and bounds how far it may travel onward.
+  const inboundRelay = readRelayState(req.headers);
+  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel, {
+    requestPriority: requestPolicy.priority,
+    relay: inboundRelay,
+  });
   if (ds4Activation && !ds4Activation.ok) {
     return res.status(ds4Activation.status || 503).json({ error: { message: ds4Activation.error, type: 'server_error' } });
   }
@@ -11762,7 +11790,13 @@ async function handleCompletions(req, res) {
   const isStreaming = req.body.stream === true;
 
   // Activate/deactivate exclusive ds4 to follow the default-model target (see chat handler).
-  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel);
+  // Did another manager already offload this to us? That changes what we are
+  // willing to pay locally, and bounds how far it may travel onward.
+  const inboundRelay = readRelayState(req.headers);
+  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel, {
+    requestPriority: requestPolicy.priority,
+    relay: inboundRelay,
+  });
   if (ds4Activation && !ds4Activation.ok) {
     return res.status(ds4Activation.status || 503).json({ error: { message: ds4Activation.error, type: 'server_error' } });
   }
