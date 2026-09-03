@@ -12,8 +12,8 @@
 // cannot terminate workers supervised by a different manager.
 // OpenAI routes support both /api/v1 and bare /v1 paths, with URL-based media
 // expanded into standard multimodal parts before chat inference.
-// Manager extensions provide bounded process-local asynchronous chat jobs and
-// scope-safe prepared-context append reuse through the same synchronous route.
+// Manager extensions provide bounded, replayable process-local background
+// Responses and scope-safe prepared-context append reuse through synchronous routes.
 // The same application is served on API_PORT and, best-effort, on the appliance
 // mirror port ALT_PORT (default 80) when the process is allowed to bind it.
 
@@ -11866,67 +11866,6 @@ async function handleChatCompletions(req, res) {
 app.post('/api/v1/chat/completions', handleChatCompletions);
 app.post('/v1/chat/completions', handleChatCompletions);
 
-/**
- * Execute an accepted job through the manager's existing synchronous chat route.
- *
- * @param {Object} input Private retained execution inputs.
- * @param {Record<string, unknown>} input.body Chat-completion request body.
- * @param {Record<string, string>} input.headers Retained authorization and policy headers.
- * @param {AbortSignal} input.signal Cancellation signal owned by the job store.
- * @returns {Promise<{status:number,body:unknown}>} HTTP status and parsed or plain-text body.
- */
-async function executeInferenceJob({ body, headers, signal }) {
-  const response = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify({ ...body, stream: false }),
-    signal,
-  });
-  const text = await response.text();
-  let parsed = text;
-  try { parsed = JSON.parse(text); } catch { /* retain bounded plain-text diagnostics */ }
-  return { status: response.status, body: parsed };
-}
-
-const inferenceJobs = new InferenceJobStore({ execute: executeInferenceJob });
-
-/** Submit a bounded non-streaming chat job without waiting for model execution. */
-app.post('/api/v1/chat/completions/jobs', (req, res) => {
-  try {
-    const job = inferenceJobs.submit({
-      scopeId: deriveCacheScope(req.headers).id,
-      body: req.body,
-      headers: req.headers,
-    });
-    const location = `/api/v1/chat/completions/jobs/${encodeURIComponent(job.id)}`;
-    res.setHeader('Location', location);
-    return res.status(202).json(job);
-  } catch (error) {
-    const status = error.statusCode || 400;
-    return res.status(status).json({
-      error: {
-        message: String(error.message || 'job submission failed').slice(0, 1000),
-        type: status === 429 ? 'capacity_error' : 'invalid_request_error',
-        code: error.code || 'INVALID_REQUEST',
-      },
-    });
-  }
-});
-
-/** Return one caller-owned job without revealing missing or cross-scope records. */
-app.get('/api/v1/chat/completions/jobs/:id', (req, res) => {
-  const job = inferenceJobs.get(req.params.id, deriveCacheScope(req.headers).id);
-  if (!job) return res.status(404).json({ error: { message: 'inference job not found', type: 'not_found_error' } });
-  return res.json(job);
-});
-
-/** Idempotently cancel one queued or running caller-owned chat job. */
-app.delete('/api/v1/chat/completions/jobs/:id', (req, res) => {
-  const job = inferenceJobs.cancel(req.params.id, deriveCacheScope(req.headers).id);
-  if (!job) return res.status(404).json({ error: { message: 'inference job not found', type: 'not_found_error' } });
-  return res.json(job);
-});
-
 // OpenAI-compatible completions (legacy endpoint)
 /**
  * Proxy a legacy OpenAI text completion request to the selected backend.
@@ -12367,12 +12306,146 @@ app.get('/v1/models/:model', handleModel);
 
 // OpenAI Responses API (proxied to llama.cpp)
 /**
+ * Execute background work through the existing Responses HTTP path.
+ *
+ * Streaming SSE is parsed into complete event objects for bounded retention;
+ * the terminal event's whole Response becomes the pollable final result.
+ *
+ * @param {Object} input Private retained execution inputs.
+ * @param {Record<string, unknown>} input.body Responses request without background.
+ * @param {Record<string, string>} input.headers Retained authorization and policy headers.
+ * @param {AbortSignal} input.signal Registry-owned cancellation signal.
+ * @param {(event:Object)=>boolean} input.publish Retained event publisher.
+ * @returns {Promise<{status:number,body:unknown}>} HTTP status and final Response or diagnostic.
+ */
+async function executeBackgroundResponse({ body, headers, signal, publish }) {
+  const response = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/responses`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!body.stream || !response.ok) {
+    const text = await response.text();
+    let parsed = text;
+    try { parsed = JSON.parse(text); } catch { /* preserve bounded plain-text diagnostics */ }
+    return { status: response.status, body: parsed };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = '';
+  let finalResponse = null;
+  const consume = block => {
+    for (const line of block.split('\n')) {
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+      let event;
+      try { event = JSON.parse(payload); } catch { continue; }
+      if (event?.response && ['response.completed', 'response.failed', 'response.cancelled'].includes(event.type)) {
+        finalResponse = event.response;
+      }
+      if (publish(event) === false) return false;
+    }
+    return true;
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    pending += decoder.decode(value || new Uint8Array(), { stream: !done }).replace(/\r\n/g, '\n');
+    let boundary;
+    while ((boundary = pending.indexOf('\n\n')) >= 0) {
+      const block = pending.slice(0, boundary);
+      pending = pending.slice(boundary + 2);
+      if (!consume(block)) await reader.cancel('event capacity exceeded');
+    }
+    if (done) break;
+  }
+  if (pending.trim()) consume(pending);
+  return { status: response.status, body: finalResponse };
+}
+
+const inferenceJobs = new InferenceJobStore({ execute: executeBackgroundResponse });
+
+/**
+ * Write a retained Responses event iterator as OpenAI-compatible SSE.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @param {(signal:AbortSignal)=>AsyncIterable<Object>} iterator Event iterator factory.
+ * @returns {Promise<void>} Resolves after terminal state or disconnect.
+ */
+async function sendBackgroundResponseEvents(req, res, iterator) {
+  const controller = new AbortController();
+  const abort = () => controller.abort('client_disconnect');
+  req.once('aborted', abort);
+  res.once('close', abort);
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+  try {
+    for await (const event of iterator(controller.signal)) {
+      if (controller.signal.aborted || res.writableEnded) break;
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    }
+  } finally {
+    req.off('aborted', abort);
+    res.off('close', abort);
+    if (!res.writableEnded) res.end();
+  }
+}
+
+/**
+ * Send the stable OpenAI error envelope used by background Response routes.
+ * @param {import('express').Response} res Express response.
+ * @param {Error & {statusCode?:number,code?:string}} error Failure to serialize.
+ * @param {string} [fallback] Fallback message.
+ * @returns {import('express').Response} Sent response.
+ */
+function sendBackgroundResponseError(res, error, fallback = 'background Response request failed') {
+  const status = error?.statusCode || 400;
+  return res.status(status).json({
+    error: {
+      message: String(error?.message || fallback).slice(0, 1000),
+      type: status === 429 ? 'capacity_error' : 'invalid_request_error',
+      code: error?.code || 'INVALID_REQUEST',
+    },
+  });
+}
+
+/**
  * Proxy an OpenAI Responses API request to the selected backend.
  * @param {import('express').Request} req Express request.
  * @param {import('express').Response} res Express response.
  * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
  */
 async function handleResponses(req, res) {
+  if (req.body?.background === true) {
+    try {
+      const response = inferenceJobs.submit({
+        scopeId: deriveCacheScope(req.headers).id,
+        body: req.body,
+        headers: req.headers,
+      });
+      const location = `/api/v1/responses/${encodeURIComponent(response.id)}`;
+      res.setHeader('Location', location);
+      if (req.body.stream === true) {
+        return sendBackgroundResponseEvents(req, res, signal => inferenceJobs.follow(
+          response.id,
+          deriveCacheScope(req.headers).id,
+          { signal },
+        ));
+      }
+      return res.json(response);
+    } catch (error) {
+      return sendBackgroundResponseError(res, error);
+    }
+  }
+  const requestAbort = new AbortController();
+  const abortRequest = () => requestAbort.abort('client_disconnect');
+  req.once('aborted', abortRequest);
+  res.once('close', abortRequest);
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
   const requestedModel = req.body.model || 'default';
@@ -12399,7 +12472,7 @@ async function handleResponses(req, res) {
     try {
       const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
         method: 'POST', headers: { ...routing.headers }, body: JSON.stringify(remoteBody)
-      }, { label: 'responses', model: routing.targetModel });
+      }, { label: 'responses', model: routing.targetModel, externalSignal: requestAbort.signal });
       if (!response.ok) {
         const error = await response.text();
         addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: response.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: null, response: null, error, backend: backend.id, requestBody: req.body });
@@ -12453,7 +12526,8 @@ async function handleResponses(req, res) {
   // Hold a local queue slot for the lifetime of the response (released on res close/finish)
   try {
     await acquireLocalSlot(req, res, {
-      model: requestedModel, endpoint: 'responses', activeReqId: null, priority: requestPolicy.priority
+      model: requestedModel, endpoint: 'responses', activeReqId: null,
+      priority: requestPolicy.priority, signal: requestAbort.signal
     });
   } catch (err) {
     if (!res.headersSent) return res.status(503).json({ error: 'Request cancelled while queued', details: err.message });
@@ -12466,7 +12540,7 @@ async function handleResponses(req, res) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(proxyBody)
-    }, { label: 'responses', model: proxyBody.model });
+    }, { label: 'responses', model: proxyBody.model, signal: requestAbort.signal });
     let response = result.response;
     totalRetries = result.retries;
     allRetryErrors = [...result.retryErrors];
@@ -12485,7 +12559,7 @@ async function handleResponses(req, res) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(proxyBody)
-          }, { label: 'responses', model: proxyBody.model });
+          }, { label: 'responses', model: proxyBody.model, signal: requestAbort.signal });
           response = result.response;
           totalRetries += result.retries;
           allRetryErrors.push(...result.retryErrors);
@@ -12630,6 +12704,50 @@ async function handleResponses(req, res) {
 }
 app.post('/api/v1/responses', handleResponses);
 app.post('/v1/responses', handleResponses);
+
+/**
+ * Retrieve or resume one caller-owned background Response.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {Promise<unknown>} Resolves after JSON delivery or SSE completion.
+ */
+async function handleGetBackgroundResponse(req, res) {
+  const scopeId = deriveCacheScope(req.headers).id;
+  const response = inferenceJobs.get(req.params.responseId, scopeId);
+  if (!response) return res.status(404).json({ error: { message: 'Response not found', type: 'not_found_error', code: 'response_not_found' } });
+  if (req.query.stream !== 'true') return res.json(response);
+  if (!inferenceJobs.isStreaming(req.params.responseId, scopeId)) {
+    return res.status(400).json({ error: { message: 'Only a Response created with stream:true can be resumed as a stream', type: 'invalid_request_error', code: 'stream_not_available' } });
+  }
+  try {
+    const startingAfter = req.query.starting_after == null ? 0 : Number(req.query.starting_after);
+    inferenceJobs.replay(req.params.responseId, scopeId, { startingAfter });
+    return await sendBackgroundResponseEvents(req, res, signal => inferenceJobs.follow(
+      req.params.responseId,
+      scopeId,
+      { startingAfter, signal },
+    ));
+  } catch (error) {
+    return sendBackgroundResponseError(res, error);
+  }
+}
+
+/**
+ * Idempotently cancel one caller-owned background Response.
+ * @param {import('express').Request} req Express request.
+ * @param {import('express').Response} res Express response.
+ * @returns {import('express').Response} Sent Response resource or not-found error.
+ */
+function handleCancelBackgroundResponse(req, res) {
+  const response = inferenceJobs.cancel(req.params.responseId, deriveCacheScope(req.headers).id);
+  if (!response) return res.status(404).json({ error: { message: 'Response not found', type: 'not_found_error', code: 'response_not_found' } });
+  return res.json(response);
+}
+
+app.get('/api/v1/responses/:responseId', handleGetBackgroundResponse);
+app.get('/v1/responses/:responseId', handleGetBackgroundResponse);
+app.post('/api/v1/responses/:responseId/cancel', handleCancelBackgroundResponse);
+app.post('/v1/responses/:responseId/cancel', handleCancelBackgroundResponse);
 
 // Anthropic Messages API compatibility (proxied to llama.cpp)
 /**

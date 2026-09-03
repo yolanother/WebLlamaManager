@@ -3,9 +3,9 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Publishes model, runtime, synchronous chat, asynchronous chat-job, and
-// prepared-context REST operations as MCP tools, with import-safe exported
-// definitions and handlers for validation outside the stdio process.
+// Publishes model, runtime, synchronous chat, background Responses (including
+// bounded retained-event replay), and prepared-context REST operations as MCP
+// tools, with import-safe exported definitions and handlers for validation.
 /**
  * Run this file directly to expose Llama Manager APIs as MCP tools.
  *
@@ -37,7 +37,15 @@ import { resolve } from 'node:path';
 
 const LLAMA_MANAGER_URL = process.env.LLAMA_MANAGER_URL || 'http://localhost:5250';
 
-// Helper to make API calls
+/**
+ * Call a manager REST operation and decode JSON or bounded Responses SSE.
+ *
+ * @param {string} method HTTP method.
+ * @param {string} path Manager-relative path.
+ * @param {Object|null} [body] Optional JSON request body.
+ * @returns {Promise<{status:number,data:unknown}>} HTTP status and decoded body.
+ * @throws {Error} If an SSE result exceeds the MCP bridge's 16 MiB safety cap.
+ */
 async function apiCall(method, path, body = null) {
   const url = `${LLAMA_MANAGER_URL}${path}`;
   const options = {
@@ -49,7 +57,38 @@ async function apiCall(method, path, body = null) {
   }
 
   const response = await fetch(url, options);
-  const data = await response.json();
+  if (response.headers?.get?.('content-type')?.includes('text/event-stream')) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = '';
+    let bytes = 0;
+    const events = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 16 * 1024 * 1024) {
+        await reader.cancel('MCP SSE safety cap exceeded');
+        throw new Error('Background Response event stream exceeded 16 MiB');
+      }
+      pending += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let boundary;
+      while ((boundary = pending.indexOf('\n\n')) >= 0) {
+        const block = pending.slice(0, boundary);
+        pending = pending.slice(boundary + 2);
+        for (const line of block.split('\n')) {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === '[DONE]') continue;
+          try { events.push(JSON.parse(payload)); } catch { /* ignore malformed upstream frames */ }
+        }
+      }
+    }
+    return { status: response.status, data: { object: 'response.event_list', events } };
+  }
+  const text = await response.text();
+  let data = text;
+  try { data = JSON.parse(text); } catch { /* return a plain-text error body */ }
   return { status: response.status, data };
 }
 
@@ -273,7 +312,7 @@ export const tools = [
   },
   {
     name: 'llama_chat',
-    description: 'Send a synchronous chat completion through the OpenAI-compatible API. Use this only when the work is expected to finish within the client and proxy time budget; use llama_submit_chat_job for longer inference.',
+    description: 'Send a synchronous chat completion through the OpenAI-compatible API. Use this only when work is expected to fit the client and proxy time budget; use submit_response for longer inference.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -305,44 +344,41 @@ export const tools = [
     }
   },
   {
-    name: 'llama_submit_chat_job',
-    description: 'Submit a non-streaming chat completion for asynchronous execution. Returns immediately with a job id; poll with llama_get_chat_job when inference may outlive the client or proxy time budget.',
+    name: 'submit_response',
+    description: 'Create an OpenAI background Response. Returns a resp_ id immediately for polling with get_response.',
     inputSchema: {
       type: 'object',
       properties: {
         model: { type: 'string', description: 'Model id or configured alias.' },
-        messages: {
-          type: 'array',
-          description: 'OpenAI-compatible message suffix, or the full messages array without append mode.',
-          items: { type: 'object', additionalProperties: true },
-        },
+        input: { description: 'OpenAI Responses input string or item array.' },
         temperature: { type: 'number', description: 'Sampling temperature.' },
-        max_tokens: { type: 'number', description: 'Maximum tokens to generate.' },
-        prepared_context_id: { type: 'string', description: 'Optional prepared-context handle.' },
-        prepared_context_mode: { type: 'string', enum: ['append'], description: 'Append the text-only messages suffix to the retained prepared prefix.' },
-        context_cache_strict: { type: 'boolean', description: 'Fail instead of falling back when exact prepared reuse is unavailable.' },
+        max_output_tokens: { type: 'number', description: 'Maximum output tokens.' },
         priority: { type: 'string', enum: ['realtime', 'interactive', 'background'], description: 'Manager queue priority, mapped to request_priority.' },
         routing: { type: 'string', enum: ['auto', 'local_only'], description: 'Manager routing policy.' },
       },
-      required: ['model', 'messages'],
+      required: ['model', 'input'],
       additionalProperties: true,
     }
   },
   {
-    name: 'llama_get_chat_job',
-    description: 'Get the current scope-owned asynchronous chat job state or collect its complete result.',
+    name: 'get_response',
+    description: 'Retrieve a scope-owned OpenAI background Response by its resp_ id.',
     inputSchema: {
       type: 'object',
-      properties: { id: { type: 'string', description: 'Opaque job id returned by llama_submit_chat_job.' } },
+      properties: {
+        id: { type: 'string', description: 'Opaque id returned by submit_response.' },
+        stream: { type: 'boolean', description: 'Replay and follow retained events; valid only for stream-origin Responses.' },
+        starting_after: { type: 'integer', minimum: 0, description: 'Exclusive event sequence cursor.' },
+      },
       required: ['id'],
     }
   },
   {
-    name: 'llama_cancel_chat_job',
-    description: 'Idempotently cancel a scope-owned queued or running asynchronous chat job.',
+    name: 'cancel_response',
+    description: 'Idempotently cancel a scope-owned queued or in-progress background Response.',
     inputSchema: {
       type: 'object',
-      properties: { id: { type: 'string', description: 'Opaque asynchronous chat job id.' } },
+      properties: { id: { type: 'string', description: 'Opaque background Response id.' } },
       required: ['id'],
     }
   },
@@ -468,20 +504,26 @@ export async function handleTool(name, args) {
       return apiCall('POST', '/api/v1/chat/completions', body);
     }
 
-    case 'llama_submit_chat_job': {
-      const body = { ...args, stream: false };
+    case 'submit_response': {
+      const body = { ...args, background: true, stream: false };
       if (args.priority !== undefined) {
         body.request_priority = args.priority;
         delete body.priority;
       }
-      return apiCall('POST', '/api/v1/chat/completions/jobs', body);
+      return apiCall('POST', '/api/v1/responses', body);
     }
 
-    case 'llama_get_chat_job':
-      return apiCall('GET', `/api/v1/chat/completions/jobs/${encodeURIComponent(args.id)}`);
+    case 'get_response': {
+      const query = new URLSearchParams();
+      if (args.stream === true) query.set('stream', 'true');
+      if (args.starting_after !== undefined) query.set('starting_after', String(args.starting_after));
+      const serializedQuery = query.toString();
+      const suffix = serializedQuery ? `?${serializedQuery}` : '';
+      return apiCall('GET', `/api/v1/responses/${encodeURIComponent(args.id)}${suffix}`);
+    }
 
-    case 'llama_cancel_chat_job':
-      return apiCall('DELETE', `/api/v1/chat/completions/jobs/${encodeURIComponent(args.id)}`);
+    case 'cancel_response':
+      return apiCall('POST', `/api/v1/responses/${encodeURIComponent(args.id)}/cancel`);
 
     case 'llama_prepare_context':
       return apiCall('POST', '/api/v1/context/prepare', args);

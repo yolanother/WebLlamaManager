@@ -173,75 +173,74 @@ const CHAT_REQUEST_SCHEMA = {
   additionalProperties: true,
 };
 
-const INFERENCE_JOB_SCHEMA = {
+const RESPONSE_SCHEMA = {
   type: 'object',
-  required: ['id', 'object', 'status', 'createdAt', 'updatedAt', 'expiresAt', 'progress', 'result', 'error'],
+  required: ['id', 'object', 'created_at', 'completed_at', 'status', 'background', 'output', 'error'],
   properties: {
-    id: { type: 'string', pattern: '^job_', description: 'Opaque process-local capability handle scoped to the caller authorization.' },
-    object: { const: 'inference.job' },
-    status: { type: 'string', enum: ['queued', 'running', 'done', 'failed', 'cancelled'] },
-    createdAt: { type: 'integer', description: 'Epoch milliseconds when accepted.' },
-    updatedAt: { type: 'integer', description: 'Epoch milliseconds of the latest lifecycle transition.' },
-    expiresAt: { oneOf: [{ type: 'integer' }, { type: 'null' }], description: 'Null while execution is unsettled; otherwise settlement plus 60 minutes.' },
-    progress: {
-      type: 'object',
-      required: ['phase', 'percent'],
-      properties: {
-        phase: { type: 'string', enum: ['queued', 'running', 'done', 'failed', 'cancelled'] },
-        percent: { type: 'null', description: 'The manager does not fabricate cross-engine progress.' },
-      },
-      additionalProperties: false,
-    },
-    result: { oneOf: [GENERIC_OBJECT_SCHEMA, { type: 'null' }], description: 'Complete OpenAI chat completion, present only when done.' },
+    id: { type: 'string', pattern: '^resp_', description: 'Process-local capability id scoped to caller authorization.' },
+    object: { const: 'response' },
+    created_at: { type: 'integer', description: 'Creation time in Unix seconds.' },
+    completed_at: { oneOf: [{ type: 'integer' }, { type: 'null' }], description: 'Terminal transition time in Unix seconds.' },
+    status: { type: 'string', enum: ['queued', 'in_progress', 'completed', 'failed', 'cancelled'] },
+    background: { const: true },
+    output: { type: 'array', items: GENERIC_OBJECT_SCHEMA, description: 'Empty while active; complete only when completed.' },
     error: {
-      oneOf: [
-        {
-          type: 'object',
-          properties: {
-            message: { type: 'string', maxLength: 1000 },
-            type: { type: 'string' },
-            code: { type: 'string' },
-            status: { type: 'integer', minimum: 100, maximum: 599 },
-          },
-          additionalProperties: false,
-        },
-        { type: 'null' },
-      ],
-      description: 'Bounded structured failure, present only when failed.',
+      oneOf: [{
+        type: 'object',
+        required: ['code', 'message'],
+        properties: { code: { type: 'string' }, message: { type: 'string', maxLength: 1000 } },
+        additionalProperties: false,
+      }, { type: 'null' }],
+      description: 'OpenAI-shaped bounded error when failed.',
     },
   },
-  additionalProperties: false,
+  additionalProperties: true,
 };
 
-const INFERENCE_JOB_LIFECYCLE = [
-  'Jobs are process-local and do not survive a manager restart. Missing, expired, and differently scoped handles all return HTTP 404.',
-  'Active records expose only queued or running with percent null and no partial output. done contains one complete OpenAI-shaped result; failed contains a bounded structured error; cancelled is terminal and cannot be replaced by late executor output.',
-  'Cancellation is idempotent and public immediately. Queued work is removed and active work is cooperatively aborted, but its count and request bytes remain charged until execution settles.',
-  'Terminal records expire 60 minutes after settlement. Limits are 128 jobs globally, 32 per authorization scope, 4 MiB per serialized request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Expired and oldest settled records are reclaimed first; active work is never evicted.',
+const RESPONSE_BACKGROUND_LIFECYCLE = [
+  'With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return HTTP 404.',
+  'Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work.',
+  'Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles.',
+  'Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result.',
+  'Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history.',
   'This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings.',
 ].join(' ');
 
-const INFERENCE_JOB_SUBMIT_OPTIONS = {
-  description: `${INFERENCE_JOB_LIFECYCLE} Submission validates model/messages and rejects stream:true before scheduling. Execution calls the same synchronous manager chat route, preserving alias resolution, routing, priority, engine admission, and completion validation without duplicating them. Only Authorization, X-Llama-Priority, and X-Llama-Routing policy headers are retained, and they plus the private body are erased at settlement.`,
-  requestSchema: CHAT_REQUEST_SCHEMA,
-  responseSchema: INFERENCE_JOB_SCHEMA,
-  examples: [makeExample('POST', '/api/v1/chat/completions/jobs', 'Submit a long-running chat job', {
+const RESPONSE_REQUEST_SCHEMA = {
+  type: 'object',
+  required: ['model', 'input'],
+  properties: {
+    model: { type: 'string' },
+    input: {},
+    background: { type: 'boolean', default: false },
+    stream: { type: 'boolean', default: false },
+    request_priority: { type: 'string', enum: ['realtime', 'interactive', 'background'] },
+    routing: { type: 'string', enum: ['auto', 'local_only'] },
+  },
+  additionalProperties: true,
+};
+
+const RESPONSE_CREATE_OPTIONS = {
+  description: `${RESPONSE_BACKGROUND_LIFECYCLE} Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement.`,
+  requestSchema: RESPONSE_REQUEST_SCHEMA,
+  responseSchema: RESPONSE_SCHEMA,
+  examples: [makeExample('POST', '/api/v1/responses', 'Create a background Response', {
     model: 'default-big',
-    messages: [{ role: 'user', content: 'Analyze this long document.' }],
+    input: 'Analyze this long document.',
+    background: true,
     request_priority: 'interactive',
     routing: 'auto',
-    stream: false,
   })],
 };
 
-const INFERENCE_JOB_GET_OPTIONS = {
-  description: `${INFERENCE_JOB_LIFECYCLE} Poll explicitly; no partial model output is returned.`,
-  responseSchema: INFERENCE_JOB_SCHEMA,
+const RESPONSE_GET_OPTIONS = {
+  description: `${RESPONSE_BACKGROUND_LIFECYCLE} Add stream=true and optional starting_after to resume a stream-origin Response.`,
+  responseSchema: RESPONSE_SCHEMA,
 };
 
-const INFERENCE_JOB_CANCEL_OPTIONS = {
-  description: `${INFERENCE_JOB_LIFECYCLE} Repeating DELETE on an already terminal owned job returns that record unchanged.`,
-  responseSchema: INFERENCE_JOB_SCHEMA,
+const RESPONSE_CANCEL_OPTIONS = {
+  description: `${RESPONSE_BACKGROUND_LIFECYCLE} Repeating cancellation returns the terminal Response unchanged.`,
+  responseSchema: RESPONSE_SCHEMA,
 };
 
 /**
@@ -260,6 +259,7 @@ function examplePath(path) {
     n: '0',
     pid: '1234',
     presetId: 'default',
+    responseId: 'resp_example',
   };
   return path.replace(/\{([^}]+)\}/g, (_match, name) => values[name] ?? 'example');
 }
@@ -1029,9 +1029,6 @@ const ROUTES = [
   // OpenAI-, Anthropic-, and reranking-compatible inference APIs.
   ['GET', '/api/v1/models', 'openai', 'List OpenAI-compatible models'],
   ['POST', '/api/v1/chat/completions', 'openai', 'Create a chat completion', CHAT_OPTIONS('/api/v1/chat/completions')],
-  ['POST', '/api/v1/chat/completions/jobs', 'openai', 'Submit an asynchronous chat-completion job', INFERENCE_JOB_SUBMIT_OPTIONS],
-  ['GET', '/api/v1/chat/completions/jobs/{id}', 'openai', 'Get an asynchronous chat-completion job', INFERENCE_JOB_GET_OPTIONS],
-  ['DELETE', '/api/v1/chat/completions/jobs/{id}', 'openai', 'Cancel an asynchronous chat-completion job', INFERENCE_JOB_CANCEL_OPTIONS],
   ['POST', '/api/v1/chat/completions/input_tokens', 'openai', 'Count exact rendered chat input tokens'],
   ['POST', '/api/v1/completions', 'openai', 'Create a legacy text completion'],
   ['POST', '/api/v1/embeddings', 'openai', 'Create vector embeddings'],
@@ -1040,7 +1037,9 @@ const ROUTES = [
   ['GET', '/api/embed/model', 'models', 'Get the active embedding model'],
   ['POST', '/api/embed/model', 'models', 'Set the active embedding model'],
   ['GET', '/api/v1/models/{model}', 'openai', 'Get an OpenAI-compatible model'],
-  ['POST', '/api/v1/responses', 'openai', 'Create an OpenAI Responses API response'],
+  ['POST', '/api/v1/responses', 'openai', 'Create an OpenAI Responses API response', RESPONSE_CREATE_OPTIONS],
+  ['GET', '/api/v1/responses/{responseId}', 'openai', 'Retrieve or stream a background Response', RESPONSE_GET_OPTIONS],
+  ['POST', '/api/v1/responses/{responseId}/cancel', 'openai', 'Cancel a background Response', RESPONSE_CANCEL_OPTIONS],
   ['POST', '/api/v1/responses/input_tokens', 'openai', 'Count exact rendered Responses API input tokens'],
   ['POST', '/api/v1/messages', 'openai', 'Create an Anthropic-compatible message'],
   ['POST', '/api/v1/messages/count_tokens', 'openai', 'Count Anthropic message tokens'],
@@ -1061,7 +1060,9 @@ const ROUTES = [
   ['POST', '/v1/chat/completions', 'openai', 'Create a chat completion', CHAT_OPTIONS('/v1/chat/completions')],
   ['POST', '/v1/completions', 'openai', 'Create a legacy text completion'],
   ['POST', '/v1/embeddings', 'openai', 'Create vector embeddings'],
-  ['POST', '/v1/responses', 'openai', 'Create an OpenAI Responses API response'],
+  ['POST', '/v1/responses', 'openai', 'Create an OpenAI Responses API response', RESPONSE_CREATE_OPTIONS],
+  ['GET', '/v1/responses/{responseId}', 'openai', 'Retrieve or stream a background Response', RESPONSE_GET_OPTIONS],
+  ['POST', '/v1/responses/{responseId}/cancel', 'openai', 'Cancel a background Response', RESPONSE_CANCEL_OPTIONS],
   ['POST', '/v1/messages', 'openai', 'Create an Anthropic-compatible message'],
   ['POST', '/v1/messages/count_tokens', 'openai', 'Count Anthropic message tokens'],
   ['POST', '/v1/rerank', 'openai', 'Rerank documents'],
