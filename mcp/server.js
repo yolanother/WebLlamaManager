@@ -1,8 +1,13 @@
 #!/usr/bin/env node
+// Llama Manager — Model Context Protocol bridge for manager operations.
+// Copyright (c) Llama Manager project. Use of this file is governed by the
+// LICENSE file in the repository root.
+//
+// Publishes model, runtime, synchronous chat, asynchronous chat-job, and
+// prepared-context REST operations as MCP tools, with import-safe exported
+// definitions and handlers for validation outside the stdio process.
 /**
- * Llama Manager MCP Server
- *
- * Exposes Llama Manager APIs as MCP tools for AI agents.
+ * Run this file directly to expose Llama Manager APIs as MCP tools.
  *
  * Usage:
  *   node mcp/server.js
@@ -27,6 +32,8 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
 const LLAMA_MANAGER_URL = process.env.LLAMA_MANAGER_URL || 'http://localhost:5250';
 
@@ -46,8 +53,8 @@ async function apiCall(method, path, body = null) {
   return { status: response.status, data };
 }
 
-// Define available tools
-const tools = [
+/** MCP tool definitions exposed by the Llama Manager bridge. */
+export const tools = [
   {
     name: 'llama_get_status',
     description: 'Get the current status of the Llama Manager and llama.cpp server. Returns whether the server is running, healthy, current mode, and active preset.',
@@ -266,7 +273,7 @@ const tools = [
   },
   {
     name: 'llama_chat',
-    description: 'Send a chat completion request to the llama server. Uses the OpenAI-compatible API.',
+    description: 'Send a synchronous chat completion through the OpenAI-compatible API. Use this only when the work is expected to finish within the client and proxy time budget; use llama_submit_chat_job for longer inference.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -296,11 +303,102 @@ const tools = [
       },
       required: ['model', 'messages']
     }
+  },
+  {
+    name: 'llama_submit_chat_job',
+    description: 'Submit a non-streaming chat completion for asynchronous execution. Returns immediately with a job id; poll with llama_get_chat_job when inference may outlive the client or proxy time budget.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        model: { type: 'string', description: 'Model id or configured alias.' },
+        messages: {
+          type: 'array',
+          description: 'OpenAI-compatible message suffix, or the full messages array without append mode.',
+          items: { type: 'object', additionalProperties: true },
+        },
+        temperature: { type: 'number', description: 'Sampling temperature.' },
+        max_tokens: { type: 'number', description: 'Maximum tokens to generate.' },
+        prepared_context_id: { type: 'string', description: 'Optional prepared-context handle.' },
+        prepared_context_mode: { type: 'string', enum: ['append'], description: 'Append the text-only messages suffix to the retained prepared prefix.' },
+        context_cache_strict: { type: 'boolean', description: 'Fail instead of falling back when exact prepared reuse is unavailable.' },
+        priority: { type: 'string', enum: ['realtime', 'interactive', 'background'], description: 'Manager queue priority, mapped to request_priority.' },
+        routing: { type: 'string', enum: ['auto', 'local_only'], description: 'Manager routing policy.' },
+      },
+      required: ['model', 'messages'],
+      additionalProperties: true,
+    }
+  },
+  {
+    name: 'llama_get_chat_job',
+    description: 'Get the current scope-owned asynchronous chat job state or collect its complete result.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Opaque job id returned by llama_submit_chat_job.' } },
+      required: ['id'],
+    }
+  },
+  {
+    name: 'llama_cancel_chat_job',
+    description: 'Idempotently cancel a scope-owned queued or running asynchronous chat job.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Opaque asynchronous chat job id.' } },
+      required: ['id'],
+    }
+  },
+  {
+    name: 'llama_prepare_context',
+    description: 'Count or prefill a reusable local llama.cpp context. Prefill returns a handle that can later be used with prepared_context_mode append.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        model: { type: 'string', description: 'Model id or configured alias.' },
+        messages: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        mode: { type: 'string', enum: ['count', 'prefill'] },
+        priority: { type: 'string', enum: ['interactive', 'background'] },
+        resident_only: { type: 'boolean' },
+        allow_model_load: { type: 'boolean' },
+        conversation_cache_key: { type: 'string' },
+        tools: { type: 'array', items: { type: 'object', additionalProperties: true } },
+        tool_choice: {},
+        response_format: { type: 'object', additionalProperties: true },
+        chat_template: { type: 'string' },
+        chat_template_kwargs: { type: 'object', additionalProperties: true },
+        reasoning_format: { type: 'string' },
+      },
+      required: ['model', 'messages'],
+      additionalProperties: true,
+    }
+  },
+  {
+    name: 'llama_get_prepared_context',
+    description: 'Poll a scope-owned prepared-context handle for ready, failed, cancelled, or invalidated state.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Opaque prepared-context handle.' } },
+      required: ['id'],
+    }
+  },
+  {
+    name: 'llama_release_prepared_context',
+    description: 'Release and invalidate a scope-owned prepared-context handle and its process-local retained prefix.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Opaque prepared-context handle.' } },
+      required: ['id'],
+    }
   }
 ];
 
-// Tool handlers
-async function handleTool(name, args) {
+/**
+ * Dispatch one MCP tool call to its corresponding Llama Manager REST operation.
+ *
+ * @param {string} name Registered MCP tool name.
+ * @param {Record<string, unknown>} args Validated tool arguments.
+ * @returns {Promise<{status:number,data:unknown}>} REST status and decoded response.
+ * @throws {Error} When the tool name is unknown or the REST call fails.
+ */
+export async function handleTool(name, args) {
   switch (name) {
     case 'llama_get_status':
       return apiCall('GET', '/api/status');
@@ -370,6 +468,30 @@ async function handleTool(name, args) {
       return apiCall('POST', '/api/v1/chat/completions', body);
     }
 
+    case 'llama_submit_chat_job': {
+      const body = { ...args, stream: false };
+      if (args.priority !== undefined) {
+        body.request_priority = args.priority;
+        delete body.priority;
+      }
+      return apiCall('POST', '/api/v1/chat/completions/jobs', body);
+    }
+
+    case 'llama_get_chat_job':
+      return apiCall('GET', `/api/v1/chat/completions/jobs/${encodeURIComponent(args.id)}`);
+
+    case 'llama_cancel_chat_job':
+      return apiCall('DELETE', `/api/v1/chat/completions/jobs/${encodeURIComponent(args.id)}`);
+
+    case 'llama_prepare_context':
+      return apiCall('POST', '/api/v1/context/prepare', args);
+
+    case 'llama_get_prepared_context':
+      return apiCall('GET', `/api/v1/context/${encodeURIComponent(args.id)}`);
+
+    case 'llama_release_prepared_context':
+      return apiCall('DELETE', `/api/v1/context/${encodeURIComponent(args.id)}`);
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -427,4 +549,6 @@ async function main() {
   console.error('Llama Manager MCP server running');
 }
 
-main().catch(console.error);
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  main().catch(console.error);
+}

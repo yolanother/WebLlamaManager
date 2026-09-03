@@ -103,12 +103,14 @@ import { createAudioTranscriptionHandler } from './audio-transcriptions.js';
 import { renderLlmsFullReference, renderLlmsIndex } from './api-spec.js';
 import { expandMessages } from './multimodal-expand.js';
 import {
+  composePreparedContextAppend,
   ContextUpstreamError,
   contextPrefixRequestHash,
   managerControlledContextBody,
   requestExactInputTokens,
   requestRenderedPrefix,
 } from './context-endpoints.js';
+import { InferenceJobStore } from './async-inference.js';
 import {
   canonicalHash,
   compatibilityFingerprint,
@@ -692,6 +694,7 @@ async function scheduleSlotSave(model, slotAssignment) {
       model,
       endpoint: 'slot-cache/save',
       priority: 'background',
+      signal: controller.signal,
       onPreempt: reason => controller.abort(reason),
     });
     await saveSlotAfterRequest(model, slotAssignment, controller.signal);
@@ -1808,7 +1811,7 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
   }
 
   const queueStart = Date.now();
-  const queueId = await queue.acquire();
+  const queueId = await queue.acquire({ signal: externalSignal });
   const queueWait = Date.now() - queueStart;
   if (queueWait > 100) {
     console.log(`[${label}][${backend.name}] Queued for ${queueWait}ms`);
@@ -9325,6 +9328,7 @@ async function schedulePreparedPrefill(leaseId, scopeId) {
       model: lease.resolvedModel,
       endpoint: 'context/prepare',
       priority: 'background',
+      signal: controller.signal,
       onPreempt: reason => controller.abort(reason),
     });
     if (lease.slotNeedsReset) {
@@ -9501,6 +9505,7 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       model: resolvedModel,
       endpoint: 'context/prepare',
       priority,
+      signal: controller.signal,
       onPreempt: reason => {
         timing.cancel(String(reason ?? 'preempted'));
         controller.abort(reason);
@@ -9577,6 +9582,7 @@ app.post('/api/v1/context/prepare', async (req, res) => {
       compatibilityHash,
       requestHash,
       preparationBody: mode === 'prefill' ? req.body : null,
+      retainedBody: mode === 'prefill' ? JSON.parse(JSON.stringify(req.body)) : null,
       capabilities,
       timingRecorder: mode === 'prefill' ? timing : null,
       timingEvidence: timing.build(),
@@ -9802,6 +9808,7 @@ async function acquireLocalSlot(req, res, {
   priority = 'interactive',
   onPreempt,
   beforeRelease,
+  signal,
 } = {}) {
   const queueStart = Date.now();
 
@@ -9864,7 +9871,14 @@ async function acquireLocalSlot(req, res, {
 
   let slotId;
   try {
-    slotId = await llamaQueue.acquire({ model: model || endpoint, endpoint, activeReqId, priority, onPreempt });
+    slotId = await llamaQueue.acquire({
+      model: model || endpoint,
+      endpoint,
+      activeReqId,
+      priority,
+      onPreempt,
+      signal: signal || getActiveRequestSignal(activeReqId),
+    });
   } finally {
     if (waitTimer) clearInterval(waitTimer);
   }
@@ -10498,6 +10512,26 @@ async function handleChatCompletions(req, res) {
   } catch (error) {
     return res.status(400).json({ error: { message: error.message, type: 'invalid_request_error', code: 'invalid_manager_policy' } });
   }
+  const preparedContextMode = req.body?.prepared_context_mode;
+  if (preparedContextMode != null && preparedContextMode !== 'append') {
+    return res.status(400).json({
+      error: {
+        message: 'prepared_context_mode must be append when supplied',
+        type: 'invalid_request_error',
+        code: 'INVALID_PREPARED_CONTEXT_MODE',
+      },
+    });
+  }
+  const appendPreparedContext = preparedContextMode === 'append';
+  if (appendPreparedContext && !req.body?.prepared_context_id) {
+    return res.status(409).json({
+      error: {
+        message: 'append mode requires prepared_context_id',
+        type: 'prepared_context_mismatch',
+        code: 'PREPARED_CONTEXT_MISMATCH',
+      },
+    });
+  }
   // Normalize messages: accept stringified JSON arrays for compatibility
   if (typeof req.body.messages === 'string') {
     try {
@@ -10510,7 +10544,10 @@ async function handleChatCompletions(req, res) {
     return res.status(400).json({ error: { message: 'messages must be an array', type: 'invalid_request_error' } });
   }
 
-  injectBaseChatPrompt(req.body, req.headers);
+  // An append request already carries the exact manager-retained prefix, so a
+  // second base-prompt injection would mutate the prepared input and defeat KV
+  // compatibility. Every pre-existing chat mode keeps the original behavior.
+  if (!appendPreparedContext) injectBaseChatPrompt(req.body, req.headers);
   if (req.body.model === 'auto' || req.body.model === 'default-router') {
     const choice = await routeAutoModel(req.body, {
       config,
@@ -10540,6 +10577,39 @@ async function handleChatCompletions(req, res) {
   const rawModel = req.body.model || 'default';
   const { requestedModel, aliasRouting } = resolveRequestModel(rawModel);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
+
+  let appendPrepared = null;
+  let appendScope = null;
+  if (appendPreparedContext) {
+    appendScope = deriveCacheScope(req.headers);
+    appendPrepared = preparedContexts.getInternal(req.body.prepared_context_id, appendScope.id);
+    const prefixAvailable = appendPrepared && appendPrepared.status === 'ready' &&
+      appendPrepared.mode === 'prefill' && appendPrepared.internalSlotId != null &&
+      appendPrepared.resolvedModel === requestedModel && appendPrepared.retainedBody;
+    if (!prefixAvailable) {
+      return res.status(409).json({
+        error: {
+          message: 'prepared context is missing, not ready, or incompatible with this request',
+          type: 'prepared_context_mismatch',
+          code: 'PREPARED_CONTEXT_MISMATCH',
+        },
+      });
+    }
+    try {
+      req.body = composePreparedContextAppend({
+        preparedBody: appendPrepared.retainedBody,
+        suffixBody: req.body,
+      });
+    } catch (error) {
+      return res.status(error.statusCode || 409).json({
+        error: {
+          message: error.message,
+          type: 'prepared_context_mismatch',
+          code: error.code || 'PREPARED_CONTEXT_APPEND_CONFLICT',
+        },
+      });
+    }
+  }
 
   console.log(`[chat/completions] Request for model: ${requestedModel}`);
 
@@ -10584,6 +10654,7 @@ async function handleChatCompletions(req, res) {
 
   // Inject reasoning_effort if configured (shallow copy preserves req.body for logs)
   const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(stripManagerRequestFields(req.body)));
+  delete proxyBody.prepared_context_mode;
 
   // ── ds4 engine active (EXCLUSIVE mode) ───────────────────────────────────────
   // ds4 owns the box: a request for the ds4 model is served locally on ds4-server
@@ -10601,6 +10672,15 @@ async function handleChatCompletions(req, res) {
       llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
+      if (req.body?.prepared_context_id && (req.body?.context_cache_strict === true || appendPreparedContext)) {
+        return res.status(501).json({
+          error: {
+            message: 'prepared contexts are unsupported by DS4',
+            type: 'not_supported_error',
+            code: 'CONTEXT_PREFILL_UNSUPPORTED',
+          },
+        });
+      }
       req.body = proxyBody;
       return serveDs4WithSwapRecovery(req, res, { requestedModel, isStreaming, startTime, mediaMetadata });
     }
@@ -10664,7 +10744,8 @@ async function handleChatCompletions(req, res) {
   const slotOperationsSupported = !routing.remote && Array.isArray(req.body.messages)
     ? await modelHasSlotOperations(requestedModel)
     : false;
-  if (!slotOperationsSupported && req.body?.prepared_context_id && req.body?.context_cache_strict === true) {
+  if (!slotOperationsSupported && req.body?.prepared_context_id &&
+      (req.body?.context_cache_strict === true || appendPreparedContext)) {
     return res.status(501).json({
       error: {
         message: 'prepared contexts are unsupported by this concrete model child',
@@ -10677,13 +10758,18 @@ async function handleChatCompletions(req, res) {
     try {
       const preparedId = req.body?.prepared_context_id;
       if (preparedId) {
-        const scope = deriveCacheScope(req.headers);
+        const scope = appendScope || deriveCacheScope(req.headers);
         const prepared = preparedContexts.getInternal(preparedId, scope.id);
-        const requestHash = contextPrefixRequestHash(req.body, requestedModel);
         const currentCompatibility = await modelCompatibilityHash(requestedModel);
+        const currentAffinity = appendPreparedContext && prepared?.lineageKey
+          ? slotAffinity.get(requestedModel, prepared.lineageKey)
+          : null;
+        const requestCompatible = appendPreparedContext
+          ? currentAffinity?.slotId === prepared?.internalSlotId
+          : prepared?.requestHash === contextPrefixRequestHash(req.body, requestedModel);
         const reusable = prepared && prepared.status === 'ready' && prepared.mode === 'prefill' &&
           prepared.internalSlotId != null && prepared.resolvedModel === requestedModel &&
-          prepared.requestHash === requestHash && prepared.compatibilityHash === currentCompatibility;
+          requestCompatible && prepared.compatibilityHash === currentCompatibility;
         if (reusable) {
           slotAssignment = {
             slotId: prepared.internalSlotId,
@@ -10695,7 +10781,7 @@ async function handleChatCompletions(req, res) {
             compatibilityHash: currentCompatibility,
             prefixHash: prepared.prefixHash,
           };
-        } else if (req.body?.context_cache_strict === true) {
+        } else if (req.body?.context_cache_strict === true || appendPreparedContext) {
           return res.status(409).json({
             error: {
               message: 'prepared context is missing, not ready, or incompatible with this request',
@@ -11768,6 +11854,67 @@ async function handleChatCompletions(req, res) {
 }
 app.post('/api/v1/chat/completions', handleChatCompletions);
 app.post('/v1/chat/completions', handleChatCompletions);
+
+/**
+ * Execute an accepted job through the manager's existing synchronous chat route.
+ *
+ * @param {Object} input Private retained execution inputs.
+ * @param {Record<string, unknown>} input.body Chat-completion request body.
+ * @param {Record<string, string>} input.headers Retained authorization and policy headers.
+ * @param {AbortSignal} input.signal Cancellation signal owned by the job store.
+ * @returns {Promise<{status:number,body:unknown}>} HTTP status and parsed or plain-text body.
+ */
+async function executeInferenceJob({ body, headers, signal }) {
+  const response = await fetch(`http://127.0.0.1:${API_PORT}/api/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify({ ...body, stream: false }),
+    signal,
+  });
+  const text = await response.text();
+  let parsed = text;
+  try { parsed = JSON.parse(text); } catch { /* retain bounded plain-text diagnostics */ }
+  return { status: response.status, body: parsed };
+}
+
+const inferenceJobs = new InferenceJobStore({ execute: executeInferenceJob });
+
+/** Submit a bounded non-streaming chat job without waiting for model execution. */
+app.post('/api/v1/chat/completions/jobs', (req, res) => {
+  try {
+    const job = inferenceJobs.submit({
+      scopeId: deriveCacheScope(req.headers).id,
+      body: req.body,
+      headers: req.headers,
+    });
+    const location = `/api/v1/chat/completions/jobs/${encodeURIComponent(job.id)}`;
+    res.setHeader('Location', location);
+    return res.status(202).json(job);
+  } catch (error) {
+    const status = error.statusCode || 400;
+    return res.status(status).json({
+      error: {
+        message: String(error.message || 'job submission failed').slice(0, 1000),
+        type: status === 429 ? 'capacity_error' : 'invalid_request_error',
+        code: error.code || 'INVALID_REQUEST',
+      },
+    });
+  }
+});
+
+/** Return one caller-owned job without revealing missing or cross-scope records. */
+app.get('/api/v1/chat/completions/jobs/:id', (req, res) => {
+  const job = inferenceJobs.get(req.params.id, deriveCacheScope(req.headers).id);
+  if (!job) return res.status(404).json({ error: { message: 'inference job not found', type: 'not_found_error' } });
+  return res.json(job);
+});
+
+/** Idempotently cancel one queued or running caller-owned chat job. */
+app.delete('/api/v1/chat/completions/jobs/:id', (req, res) => {
+  const job = inferenceJobs.cancel(req.params.id, deriveCacheScope(req.headers).id);
+  if (!job) return res.status(404).json({ error: { message: 'inference job not found', type: 'not_found_error' } });
+  return res.json(job);
+});
 
 // OpenAI-compatible completions (legacy endpoint)
 /**

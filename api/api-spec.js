@@ -164,8 +164,84 @@ const CHAT_REQUEST_SCHEMA = {
       },
     },
     stream: { type: 'boolean', default: false },
+    prepared_context_id: { type: 'string', description: 'Opaque handle returned by POST /api/v1/context/prepare.' },
+    prepared_context_mode: { type: 'string', enum: ['append'], description: 'Compose text-only suffix messages with the manager-retained prepared prefix.' },
+    context_cache_strict: { type: 'boolean', description: 'Reject unavailable exact prepared reuse instead of falling back cold.' },
+    request_priority: { type: 'string', enum: ['realtime', 'interactive', 'background'] },
+    routing: { type: 'string', enum: ['auto', 'local_only'] },
   },
   additionalProperties: true,
+};
+
+const INFERENCE_JOB_SCHEMA = {
+  type: 'object',
+  required: ['id', 'object', 'status', 'createdAt', 'updatedAt', 'expiresAt', 'progress', 'result', 'error'],
+  properties: {
+    id: { type: 'string', pattern: '^job_', description: 'Opaque process-local capability handle scoped to the caller authorization.' },
+    object: { const: 'inference.job' },
+    status: { type: 'string', enum: ['queued', 'running', 'done', 'failed', 'cancelled'] },
+    createdAt: { type: 'integer', description: 'Epoch milliseconds when accepted.' },
+    updatedAt: { type: 'integer', description: 'Epoch milliseconds of the latest lifecycle transition.' },
+    expiresAt: { oneOf: [{ type: 'integer' }, { type: 'null' }], description: 'Null while execution is unsettled; otherwise settlement plus 60 minutes.' },
+    progress: {
+      type: 'object',
+      required: ['phase', 'percent'],
+      properties: {
+        phase: { type: 'string', enum: ['queued', 'running', 'done', 'failed', 'cancelled'] },
+        percent: { type: 'null', description: 'The manager does not fabricate cross-engine progress.' },
+      },
+      additionalProperties: false,
+    },
+    result: { oneOf: [GENERIC_OBJECT_SCHEMA, { type: 'null' }], description: 'Complete OpenAI chat completion, present only when done.' },
+    error: {
+      oneOf: [
+        {
+          type: 'object',
+          properties: {
+            message: { type: 'string', maxLength: 1000 },
+            type: { type: 'string' },
+            code: { type: 'string' },
+            status: { type: 'integer', minimum: 100, maximum: 599 },
+          },
+          additionalProperties: false,
+        },
+        { type: 'null' },
+      ],
+      description: 'Bounded structured failure, present only when failed.',
+    },
+  },
+  additionalProperties: false,
+};
+
+const INFERENCE_JOB_LIFECYCLE = [
+  'Jobs are process-local and do not survive a manager restart. Missing, expired, and differently scoped handles all return HTTP 404.',
+  'Active records expose only queued or running with percent null and no partial output. done contains one complete OpenAI-shaped result; failed contains a bounded structured error; cancelled is terminal and cannot be replaced by late executor output.',
+  'Cancellation is idempotent and public immediately. Queued work is removed and active work is cooperatively aborted, but its count and request bytes remain charged until execution settles.',
+  'Terminal records expire 60 minutes after settlement. Limits are 128 jobs globally, 32 per authorization scope, 4 MiB per serialized request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Expired and oldest settled records are reclaimed first; active work is never evicted.',
+  'This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings.',
+].join(' ');
+
+const INFERENCE_JOB_SUBMIT_OPTIONS = {
+  description: `${INFERENCE_JOB_LIFECYCLE} Submission validates model/messages and rejects stream:true before scheduling. Execution calls the same synchronous manager chat route, preserving alias resolution, routing, priority, engine admission, and completion validation without duplicating them. Only Authorization, X-Llama-Priority, and X-Llama-Routing policy headers are retained, and they plus the private body are erased at settlement.`,
+  requestSchema: CHAT_REQUEST_SCHEMA,
+  responseSchema: INFERENCE_JOB_SCHEMA,
+  examples: [makeExample('POST', '/api/v1/chat/completions/jobs', 'Submit a long-running chat job', {
+    model: 'default-big',
+    messages: [{ role: 'user', content: 'Analyze this long document.' }],
+    request_priority: 'interactive',
+    routing: 'auto',
+    stream: false,
+  })],
+};
+
+const INFERENCE_JOB_GET_OPTIONS = {
+  description: `${INFERENCE_JOB_LIFECYCLE} Poll explicitly; no partial model output is returned.`,
+  responseSchema: INFERENCE_JOB_SCHEMA,
+};
+
+const INFERENCE_JOB_CANCEL_OPTIONS = {
+  description: `${INFERENCE_JOB_LIFECYCLE} Repeating DELETE on an already terminal owned job returns that record unchanged.`,
+  responseSchema: INFERENCE_JOB_SCHEMA,
 };
 
 /**
@@ -252,7 +328,7 @@ function youtubeChatExample(path) {
  * @returns {object} Endpoint description, request schema, and YouTube example.
  */
 const CHAT_OPTIONS = path => ({
-  description: 'Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side. Question-mark-only assistant output is rejected with upstream_output_error / QUESTION_MARK_ONLY_OUTPUT; streamed clients must honor the structured SSE error envelope because heartbeat headers may already be committed. Non-streaming responses carry a versioned `_llama_manager.timingEvidence` record; streamed responses publish the same record on the LLM capture log. Served completions report queue admission and first emitted content as manager-measured, while input tokenization and inference start are explicitly unsupported because llama.cpp folds tokenization into prompt processing and never reports decode start — use POST /api/v1/context/prepare for certifiable tokenization and prefill measurements.',
+  description: 'Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side. A ready llama.cpp prefill handle may be supplied with prepared_context_mode:"append" to combine manager-retained prefix messages with a new text-only suffix; conflicting input-affecting fields, multimodal suffixes, stale/wrong-scope/wrong-model handles, compatibility revision changes, and displaced slot ownership fail closed. Omitting append preserves exact full-prompt prepared-handle validation. DS4 rejects strict and append reuse because it has no compatible caller-visible slot primitive. Question-mark-only assistant output is rejected with upstream_output_error / QUESTION_MARK_ONLY_OUTPUT; streamed clients must honor the structured SSE error envelope because heartbeat headers may already be committed. Non-streaming responses carry a versioned `_llama_manager.timingEvidence` record; streamed responses publish the same record on the LLM capture log. Served completions report queue admission and first emitted content as manager-measured, while input tokenization and inference start are explicitly unsupported because llama.cpp folds tokenization into prompt processing and never reports decode start — use POST /api/v1/context/prepare for certifiable tokenization and prefill measurements.',
   requestSchema: CHAT_REQUEST_SCHEMA,
   examples: [youtubeChatExample(path)],
 });
@@ -630,6 +706,8 @@ const CONTEXT_PREPARE_OPTIONS = {
     'allow_model_load remains supported for existing callers but is unsafe for realtime background prewarming.',
     'Every lease carries a versioned timingEvidence record separating admission wait, input tokenization, and KV prefill as independently measured monotonic dimensions; a dimension that cannot be measured carries a typed reason and is never reported as zero.',
     'A prefill lease publishes an incomplete record at creation (HTTP 202) and a finalized one once background preparation settles, so poll GET /api/v1/context/{id} for the final measurements.',
+    'Ready prefill leases retain a private immutable copy of input-affecting fields for prepared_context_mode:"append"; callers send only a new text-message suffix and may vary output controls. The retained prefix is erased on release, 15-minute expiry, eviction, invalidation, or manager restart.',
+    'For aliases, requestedModel identifies the caller alias while resolvedModel and compatibilityHash identify the effective concrete context; validate the effective fields returned by GET /api/v1/context/{id} before reuse.',
   ].join(' '),
   requestSchema: CONTEXT_PREPARE_REQUEST_SCHEMA,
   responseSchema: CONTEXT_PREPARE_RESPONSE_SCHEMA,
@@ -951,6 +1029,9 @@ const ROUTES = [
   // OpenAI-, Anthropic-, and reranking-compatible inference APIs.
   ['GET', '/api/v1/models', 'openai', 'List OpenAI-compatible models'],
   ['POST', '/api/v1/chat/completions', 'openai', 'Create a chat completion', CHAT_OPTIONS('/api/v1/chat/completions')],
+  ['POST', '/api/v1/chat/completions/jobs', 'openai', 'Submit an asynchronous chat-completion job', INFERENCE_JOB_SUBMIT_OPTIONS],
+  ['GET', '/api/v1/chat/completions/jobs/{id}', 'openai', 'Get an asynchronous chat-completion job', INFERENCE_JOB_GET_OPTIONS],
+  ['DELETE', '/api/v1/chat/completions/jobs/{id}', 'openai', 'Cancel an asynchronous chat-completion job', INFERENCE_JOB_CANCEL_OPTIONS],
   ['POST', '/api/v1/chat/completions/input_tokens', 'openai', 'Count exact rendered chat input tokens'],
   ['POST', '/api/v1/completions', 'openai', 'Create a legacy text completion'],
   ['POST', '/api/v1/embeddings', 'openai', 'Create vector embeddings'],

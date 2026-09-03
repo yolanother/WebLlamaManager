@@ -143,6 +143,7 @@ function publicPreparedRecord(record) {
     lineageKey: _lineageKey,
     slotNeedsReset: _slotNeedsReset,
     preparationBody: _preparationBody,
+    retainedBody: _retainedBody,
     timingRecorder: _timingRecorder,
     ...safe
   } = record;

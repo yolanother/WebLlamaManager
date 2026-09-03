@@ -72,10 +72,14 @@ export class PriorityRequestQueue {
   /**
    * Acquire capacity for an item.
    * @param {object} meta Metadata exposed in queue telemetry.
+   * @param {AbortSignal} [meta.signal] Cancellation signal while waiting.
    * @returns {Promise<number>} Queue item identifier used for release/cancel.
+   * @throws {Error} With name `AbortError` when cancelled before activation.
    */
   async acquire(meta = {}) {
     const priority = normalizeRequestPriority(meta.priority);
+    const signal = meta.signal;
+    if (signal?.aborted) throw this._abortError(signal.reason);
     if (priority === 'background') {
       const pendingBackground = this.queue.filter(item => item.priority === 'background').length;
       if (pendingBackground >= this.maxBackgroundQueued) {
@@ -87,7 +91,7 @@ export class PriorityRequestQueue {
     }
 
     const id = this._nextId++;
-    const item = { id, ...meta, priority, enqueuedAt: Date.now(), status: 'active' };
+    const item = { id, ...meta, signal: undefined, priority, enqueuedAt: Date.now(), status: 'active' };
     if (this.running < this.concurrency) {
       this._activate(item);
       return id;
@@ -99,6 +103,12 @@ export class PriorityRequestQueue {
       item._resolve = resolve;
       item._reject = reject;
       this.queue.push(item);
+      if (signal) {
+        const onAbort = () => this._cancelPendingItem(item, this._abortError(signal.reason));
+        signal.addEventListener('abort', onAbort, { once: true });
+        item._abortCleanup = () => signal.removeEventListener('abort', onAbort);
+        if (signal.aborted) onAbort();
+      }
     });
     if (priority === 'realtime') this._requestBackgroundPreemption();
     return pending;
@@ -107,7 +117,10 @@ export class PriorityRequestQueue {
   /** Reject and remove all pending items. */
   flush() {
     const count = this.queue.length;
-    for (const entry of this.queue) entry._reject(new Error('Queue flushed'));
+    for (const entry of this.queue) {
+      entry._abortCleanup?.();
+      entry._reject(new Error('Queue flushed'));
+    }
     this.queue = [];
     return count;
   }
@@ -117,6 +130,7 @@ export class PriorityRequestQueue {
     const index = this.queue.findIndex(item => item.id === id);
     if (index < 0) return false;
     const [entry] = this.queue.splice(index, 1);
+    entry._abortCleanup?.();
     entry._reject(new Error('Request cancelled'));
     return true;
   }
@@ -157,6 +171,7 @@ export class PriorityRequestQueue {
 
   /** Activate a queued item and resolve its acquisition promise. */
   _activate(item) {
+    item._abortCleanup?.();
     this.running++;
     item.status = 'active';
     item.startedAt = Date.now();
@@ -205,5 +220,23 @@ export class PriorityRequestQueue {
       const [item] = this.queue.splice(index, 1);
       this._activate(item);
     }
+  }
+
+  /** Remove and reject one still-pending item. */
+  _cancelPendingItem(item, error) {
+    const index = this.queue.indexOf(item);
+    if (index < 0) return false;
+    this.queue.splice(index, 1);
+    item._abortCleanup?.();
+    item._reject(error);
+    return true;
+  }
+
+  /** Build the standard abort error used for cancelled queue waits. */
+  _abortError(reason) {
+    const error = new Error(typeof reason === 'string' && reason ? reason : 'Request aborted while queued');
+    error.name = 'AbortError';
+    error.code = 'ABORT_ERR';
+    return error;
   }
 }

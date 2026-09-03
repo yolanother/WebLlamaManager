@@ -34,6 +34,62 @@ const PREFIX_FIELDS = Object.freeze([
   'chat_template', 'chat_template_kwargs', 'reasoning_format',
 ]);
 
+/** Clone JSON-compatible request data so retained prefixes cannot be mutated by callers. */
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+/** Build a fail-closed append-mode validation error for the HTTP handler. */
+function appendConflict(message, code = 'PREPARED_CONTEXT_APPEND_CONFLICT') {
+  const error = new TypeError(message);
+  error.statusCode = 409;
+  error.code = code;
+  return error;
+}
+
+/**
+ * Compose a retained prepared-context prefix with a text-only message suffix.
+ *
+ * Input-affecting fields other than `messages` always come from the retained
+ * prefix. A suffix may repeat an identical value but cannot replace, add, or
+ * otherwise conflict with prepared template/tool/input state. Output controls
+ * and manager scheduling fields remain caller-controlled through `suffixBody`.
+ *
+ * @param {Object} input Append composition inputs.
+ * @param {Record<string, unknown>} input.preparedBody Private prepared request copy.
+ * @param {Record<string, unknown>} input.suffixBody Caller append-mode request.
+ * @returns {Record<string, unknown>} New full request body with prefix and suffix messages.
+ * @throws {TypeError} With statusCode 409 when retained state or suffix input is unsafe.
+ */
+export function composePreparedContextAppend({ preparedBody, suffixBody } = {}) {
+  if (!preparedBody || typeof preparedBody !== 'object' || !Array.isArray(preparedBody.messages)) {
+    throw appendConflict('prepared context does not retain a reusable message prefix', 'PREPARED_CONTEXT_PREFIX_UNAVAILABLE');
+  }
+  if (!suffixBody || typeof suffixBody !== 'object' || !Array.isArray(suffixBody.messages) || suffixBody.messages.length === 0) {
+    throw appendConflict('append mode requires a non-empty messages suffix');
+  }
+  for (const message of suffixBody.messages) {
+    if (!message || typeof message !== 'object' || typeof message.role !== 'string' || typeof message.content !== 'string') {
+      throw appendConflict('append mode accepts text-only message suffixes', 'PREPARED_CONTEXT_MULTIMODAL_UNSUPPORTED');
+    }
+  }
+
+  const composed = cloneJson(suffixBody);
+  for (const field of PREFIX_FIELDS) {
+    if (field === 'messages') continue;
+    const preparedValue = preparedBody[field];
+    if (suffixBody[field] !== undefined && (
+      preparedValue === undefined || canonicalHash(suffixBody[field]) !== canonicalHash(preparedValue)
+    )) {
+      throw appendConflict(`append mode cannot replace prepared field: ${field}`);
+    }
+    if (preparedValue !== undefined) composed[field] = cloneJson(preparedValue);
+    else delete composed[field];
+  }
+  composed.messages = [...cloneJson(preparedBody.messages), ...cloneJson(suffixBody.messages)];
+  return composed;
+}
+
 /** Error returned when a native context operation fails upstream. */
 export class ContextUpstreamError extends Error {
   /**
