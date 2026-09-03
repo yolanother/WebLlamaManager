@@ -265,6 +265,11 @@ test('OpenAPI generator emits a structurally complete OpenAPI 3.1 document', () 
     );
   }
 
+  for (const path of ['/api/v1/responses', '/v1/responses', '/api/v1/responses/{response_id}', '/v1/responses/{response_id}']) {
+    const method = path.includes('{response_id}') ? 'get' : 'post';
+    assert.ok(document.paths[path][method].responses['200'].content['text/event-stream']);
+  }
+
   assert.deepEqual(JSON.parse(JSON.stringify(document)), document);
 });
 
@@ -302,7 +307,8 @@ test('contracts 1-8: Responses docs expose OpenAI background create, retrieve, c
       new Set(['queued', 'in_progress', 'completed', 'failed', 'cancelled', 'incomplete']),
     );
     assert.equal(response.created_at.type, 'integer');
-    assert.ok(response.completed_at);
+    assert.equal(response.completed_at.type, 'integer');
+    assert.equal(retrieve.responseSchema.required.includes('completed_at'), false);
     assert.equal(response.store.type, 'boolean');
     assert.ok(retrieve.responseSchema.required.includes('store'));
     assert.ok(response.output);

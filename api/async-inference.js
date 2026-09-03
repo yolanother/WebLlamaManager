@@ -10,6 +10,7 @@
 import { randomBytes } from 'node:crypto';
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'incomplete']);
+const TERMINAL_EVENT_RESERVE_BYTES = 4 * 1024;
 const RETAINED_HEADER_NAMES = new Set(['authorization', 'x-llama-priority', 'x-llama-routing']);
 const PREPARED_CONTEXT_FIELDS = ['prepared_context_id', 'prepared_context_mode', 'context_cache_strict'];
 
@@ -82,7 +83,6 @@ function responseSkeleton(record) {
     id: record.id,
     object: 'response',
     created_at: Math.floor(record.createdAt / 1000),
-    completed_at: record.publicCompletedAt == null ? null : Math.floor(record.publicCompletedAt / 1000),
     status: record.status,
     background: true,
     store: record.store,
@@ -90,6 +90,7 @@ function responseSkeleton(record) {
     output: [],
     error: record.status === 'failed' ? record.error : null,
   };
+  if (record.status === 'completed') response.completed_at = Math.floor(record.publicCompletedAt / 1000);
   if (record.managerDiagnostics) response._llama_manager = cloneJson(record.managerDiagnostics);
   return response;
 }
@@ -103,12 +104,13 @@ function publicResponse(record) {
     id: record.id,
     object: 'response',
     created_at: Math.floor(record.createdAt / 1000),
-    completed_at: record.publicCompletedAt == null ? null : Math.floor(record.publicCompletedAt / 1000),
     status: record.status,
     background: true,
     store: record.store,
     error: record.status === 'failed' ? record.error : (record.response.error ?? null),
   };
+  if (record.status === 'completed') response.completed_at = Math.floor(record.publicCompletedAt / 1000);
+  else delete response.completed_at;
   if (record.managerDiagnostics) response._llama_manager = cloneJson(record.managerDiagnostics);
   return cloneJson(response);
 }
@@ -121,16 +123,16 @@ function upstreamError(status, body) {
   return boundedError(detail || `Responses request failed with HTTP ${status}`, { status, type: 'upstream_error', code: 'UPSTREAM_HTTP_ERROR' });
 }
 
-/** Return whether a payload contains a complete OpenAI Response output. */
-function isCompleteResponse(body) {
-  return Boolean(body && typeof body === 'object' && !Array.isArray(body) && Array.isArray(body.output) && body.output.length > 0);
+/** Return whether a payload is a completed OpenAI Response, including empty output. */
+function isCompletedResponse(body) {
+  return Boolean(body && typeof body === 'object' && !Array.isArray(body) && body.status === 'completed' && Array.isArray(body.output));
 }
 
 /** Normalize one retained SSE event to the manager-owned Response id. */
 function normalizeEvent(record, event) {
   if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string') return null;
   const normalized = cloneJson(event);
-  normalized.sequence_number = record.nextSequence++;
+  normalized.sequence_number = record.nextSequence;
   if ('response_id' in normalized) normalized.response_id = record.id;
   if (normalized.response && typeof normalized.response === 'object') {
     normalized.response.id = record.id;
@@ -401,36 +403,14 @@ export class InferenceJobStore {
           },
         };
       } else if (result?.body?.status === 'failed') {
-        record.status = 'failed';
-        record.error = boundedError(result.body.error, { code: 'response_failed' });
-        record.response = cloneJson(result.body);
+        this.#retainTerminalResponse(record, result.body, 'failed');
       } else if (result?.body?.status === 'incomplete' && Array.isArray(result.body.output)) {
-        const incomplete = { ...result.body, id: record.id, object: 'response', status: 'incomplete', background: true };
-        const serialized = JSON.stringify(incomplete);
-        if (Buffer.byteLength(serialized) > this.maxResultBytes) {
-          record.status = 'failed';
-          record.error = boundedError(`Response result exceeds ${this.maxResultBytes} bytes`, { code: 'result_too_large' });
-        } else {
-          record.status = 'incomplete';
-          record.response = cloneJson(null, serialized);
-        }
-      } else if (!isCompleteResponse(result?.body)) {
+        this.#retainTerminalResponse(record, result.body, 'incomplete');
+      } else if (!isCompletedResponse(result?.body)) {
         record.status = 'failed';
         record.error = boundedError('Responses request returned no complete output', { code: 'invalid_upstream_response' });
       } else {
-        const completed = { ...result.body, id: record.id, object: 'response', status: 'completed', background: true };
-        let serialized;
-        try { serialized = JSON.stringify(completed); } catch { serialized = null; }
-        if (!serialized) {
-          record.status = 'failed';
-          record.error = boundedError('Response result was not JSON serializable', { code: 'invalid_upstream_response' });
-        } else if (Buffer.byteLength(serialized) > this.maxResultBytes) {
-          record.status = 'failed';
-          record.error = boundedError(`Response result exceeds ${this.maxResultBytes} bytes`, { code: 'result_too_large' });
-        } else {
-          record.status = 'completed';
-          record.response = cloneJson(null, serialized);
-        }
+        this.#retainTerminalResponse(record, result.body, 'completed');
       }
     } catch (error) {
       if (record.status !== 'cancelled' && record.status !== 'failed') {
@@ -440,37 +420,67 @@ export class InferenceJobStore {
     } finally {
       if (!record.publicCompletedAt) record.publicCompletedAt = this.now();
       if (record.streaming && TERMINAL_STATUSES.has(record.status) && !record.terminalEventPublished) {
-        try { this.#appendEvent(record, { type: `response.${record.status}`, response: publicResponse(record) }); } catch { /* state remains pollable */ }
+        try { this.#appendEvent(record, { type: `response.${record.status}`, response: publicResponse(record) }); }
+        catch (error) { this.#failEventCapacity(record, error); }
       }
       record.streamClosed = true;
       this.#settle(record);
     }
   }
 
+  /** Retain a terminal upstream Response only when it is serializable and bounded. */
+  #retainTerminalResponse(record, body, status) {
+    const normalized = { ...body, id: record.id, object: 'response', status, background: true, store: record.store };
+    let serialized;
+    try { serialized = JSON.stringify(normalized); } catch { serialized = null; }
+    if (!serialized) {
+      record.status = 'failed';
+      record.response = null;
+      record.error = boundedError('Response result was not JSON serializable', { code: 'invalid_upstream_response' });
+      return;
+    }
+    if (Buffer.byteLength(serialized) > this.maxResultBytes) {
+      record.status = 'failed';
+      record.response = null;
+      record.error = boundedError(`Response result exceeds ${this.maxResultBytes} bytes`, { code: 'result_too_large' });
+      return;
+    }
+    record.status = status;
+    record.response = cloneJson(null, serialized);
+    record.error = status === 'failed' ? boundedError(body.error, { code: 'response_failed' }) : null;
+  }
+
   /** Retain one normalized event while respecting all event caps. */
   #appendEvent(record, event) {
     const normalized = normalizeEvent(record, event);
     if (!normalized) return null;
+    const terminal = /^response\.(?:completed|failed|cancelled|incomplete)$/.test(normalized.type);
     const bytes = Buffer.byteLength(JSON.stringify(normalized));
     this.#reclaimSettledEvents(bytes, record.id);
-    if (record.events.length >= this.maxEventsPerResponse || record.eventBytes + bytes > this.maxEventBytesPerResponse || this.#eventBytes() + bytes > this.maxRetainedEventBytes) {
+    const eventLimit = this.maxEventsPerResponse + (terminal ? 1 : 0);
+    const responseByteLimit = this.maxEventBytesPerResponse + (terminal ? TERMINAL_EVENT_RESERVE_BYTES : 0);
+    const globalByteLimit = this.maxRetainedEventBytes + (terminal ? TERMINAL_EVENT_RESERVE_BYTES * this.maxJobs : 0);
+    if (record.events.length >= eventLimit || record.eventBytes + bytes > responseByteLimit || this.#eventBytes() + bytes > globalByteLimit) {
       throw new InferenceJobSubmissionError('retained streaming event capacity exceeded', 502, 'event_retention_exceeded');
     }
     record.events.push(normalized);
+    record.nextSequence += 1;
     record.eventBytes += bytes;
-    if (/^response\.(?:completed|failed|cancelled|incomplete)$/.test(normalized.type)) record.terminalEventPublished = true;
+    if (terminal) record.terminalEventPublished = true;
     this.#notify(record);
     return cloneJson(normalized);
   }
 
   /** Mark an event-cap overflow terminal and cooperatively abort its executor. */
   #failEventCapacity(record, error) {
-    if (TERMINAL_STATUSES.has(record.status)) return;
+    if (record.terminalEventPublished) return;
     record.status = 'failed';
+    record.response = null;
     record.error = boundedError(error, { code: 'event_retention_exceeded' });
     record.publicCompletedAt = this.now();
-    record.streamClosed = true;
     try { record.abortController.abort('event_capacity'); } catch { /* best effort */ }
+    try { this.#appendEvent(record, { type: 'response.failed', response: publicResponse(record) }); } catch { /* reserve itself is strictly bounded */ }
+    record.streamClosed = true;
     this.#notify(record);
   }
 

@@ -100,7 +100,7 @@ test('contracts 2, 3, and 5: submit returns one OpenAI Response resource through
   assert.equal(submitted.object, 'response');
   assert.equal(submitted.created_at, 1);
   assert.equal(Number.isInteger(submitted.created_at), true);
-  assert.equal(submitted.completed_at, null);
+  assert.equal(Object.hasOwn(submitted, 'completed_at'), false);
   assert.equal(submitted.background, true);
   assert.equal(submitted.status, 'queued');
   assert.deepEqual(submitted.output, []);
@@ -113,7 +113,7 @@ test('contracts 2, 3, and 5: submit returns one OpenAI Response resource through
     const response = store.get(submitted.id, 'scope_a');
     return response?.status === 'in_progress' ? response : null;
   }, 'accepted response never entered in_progress');
-  assert.equal(running.completed_at, null);
+  assert.equal(Object.hasOwn(running, 'completed_at'), false);
   assert.deepEqual(running.output, [], 'active responses must not leak partial output');
   assert.equal(running.error, null);
 
@@ -260,7 +260,11 @@ test('contract 5: transport, HTTP, oversized, and empty outcomes become bounded 
     { execute: async () => { throw new Error(huge); } },
     { execute: async () => ({ status: 502, body: huge }), expectedStatus: 502 },
     { execute: async () => ({ status: 200, body: completedResponse('x'.repeat(1_000)) }), maxResultBytes: 200, expectedCode: 'result_too_large' },
-    { execute: async () => ({ status: 200, body: { id: 'resp_empty', object: 'response', status: 'completed', output: [] } }), expectedCode: 'invalid_upstream_response' },
+    {
+      execute: async () => ({ status: 200, body: { ...completedResponse(), status: 'failed', error: { code: 'upstream_failed', message: 'failed' }, metadata: { padding: 'x'.repeat(5_000) } } }),
+      maxResultBytes: 200,
+      expectedCode: 'result_too_large',
+    },
   ];
 
   for (const scenario of cases) {
@@ -284,8 +288,19 @@ test('contract 5: transport, HTTP, oversized, and empty outcomes become bounded 
     if (scenario.expectedStatus) assert.match(managerDiagnostics, new RegExp(String(scenario.expectedStatus)));
     if (scenario.expectedType) assert.match(managerDiagnostics, new RegExp(scenario.expectedType));
     if (scenario.expectedCode) assert.equal(failed.error.code, scenario.expectedCode);
+    assert.equal(Object.hasOwn(failed, 'completed_at'), false);
     assert.ok(JSON.stringify(failed).length < 3_000);
   }
+});
+
+test('contract 5: a completed OpenAI Response may have an empty output array', async () => {
+  const upstream = { ...completedResponse(), output: [] };
+  const store = new InferenceJobStore({ execute: async () => ({ status: 200, body: upstream }) });
+  const submitted = store.submit({ scopeId: 'scope_a', body: requestBody() });
+  const completed = await waitFor(() => store.get(submitted.id, 'scope_a')?.status === 'completed'
+    && store.get(submitted.id, 'scope_a'));
+  assert.deepEqual(completed.output, []);
+  assert.equal(Number.isInteger(completed.completed_at), true);
 });
 
 test('contract 5: incomplete remains an OpenAI incomplete background Response', async () => {
@@ -306,6 +321,7 @@ test('contract 5: incomplete remains an OpenAI incomplete background Response', 
   assert.deepEqual(incomplete.output, upstream.output);
   assert.deepEqual(incomplete.incomplete_details, { reason: 'max_output_tokens' });
   assert.equal(incomplete.error, null);
+  assert.equal(Object.hasOwn(incomplete, 'completed_at'), false);
 });
 
 test('contract 4: cancelling queued work is immediate, terminal, and idempotent', async () => {
@@ -321,7 +337,7 @@ test('contract 4: cancelling queued work is immediate, terminal, and idempotent'
   assert.equal(cancelled.object, 'response');
   assert.equal(cancelled.background, true);
   assert.equal(cancelled.status, 'cancelled');
-  assert.equal(cancelled.completed_at, 2);
+  assert.equal(Object.hasOwn(cancelled, 'completed_at'), false);
   assert.deepEqual(cancelled.output, []);
   assert.equal(cancelled.error, null);
   assert.deepEqual(store.cancel(submitted.id, 'scope_a'), cancelled);
@@ -467,7 +483,10 @@ test('contracts 6 and 7: event count and byte overflow fail instead of dropping 
     && countStore.get(countResponse.id, 'scope_a'));
   assert.equal(countFailed.error.code, 'event_retention_exceeded');
   assert.equal(countSignal.aborted, true);
-  assert.equal(countStore.replay(countResponse.id, 'scope_a').length, 2, 'earlier cursors remain replayable');
+  const countEvents = countStore.replay(countResponse.id, 'scope_a');
+  assert.equal(countEvents.length, 3, 'the bounded terminal reserve must not remove earlier events');
+  assert.equal(countEvents.at(-1).type, 'response.failed');
+  assert.equal(countEvents.at(-1).response.error.code, 'event_retention_exceeded');
 
   const byteStore = new InferenceJobStore({
     maxEventsPerResponse: 10,
@@ -483,6 +502,7 @@ test('contracts 6 and 7: event count and byte overflow fail instead of dropping 
     && byteStore.get(byteResponse.id, 'scope_a'));
   assert.equal(byteFailed.error.code, 'event_retention_exceeded');
   assert.ok(byteFailed.error.message.length <= 1_024);
+  assert.equal(byteStore.replay(byteResponse.id, 'scope_a').at(-1).type, 'response.failed');
 
   const globalExecutions = [deferred(), deferred()];
   let globalCall = 0;
@@ -503,6 +523,7 @@ test('contracts 6 and 7: event count and byte overflow fail instead of dropping 
   const globalFailed = await waitFor(() => globalStore.get(second.id, 'scope_b')?.status === 'failed'
     && globalStore.get(second.id, 'scope_b'));
   assert.equal(globalFailed.error.code, 'event_retention_exceeded');
+  assert.equal(globalStore.replay(second.id, 'scope_b').at(-1).type, 'response.failed');
   assert.equal(globalStore.get(first.id, 'scope_a').status, 'in_progress');
   assert.equal(globalStore.replay(first.id, 'scope_a').length, 1, 'existing replay history must not be evicted');
   globalExecutions[0].resolve();

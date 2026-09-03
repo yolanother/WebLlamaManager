@@ -175,12 +175,12 @@ const CHAT_REQUEST_SCHEMA = {
 
 const RESPONSE_SCHEMA = {
   type: 'object',
-  required: ['id', 'object', 'created_at', 'completed_at', 'status', 'background', 'store', 'output', 'error'],
+  required: ['id', 'object', 'created_at', 'status', 'background', 'store', 'output', 'error'],
   properties: {
     id: { type: 'string', pattern: '^resp_', description: 'Process-local capability id scoped to caller authorization.' },
     object: { const: 'response' },
     created_at: { type: 'integer', description: 'Creation time in Unix seconds.' },
-    completed_at: { oneOf: [{ type: 'integer' }, { type: 'null' }], description: 'Terminal transition time in Unix seconds.' },
+    completed_at: { type: 'integer', description: 'Completion time in Unix seconds; present only when status is completed.' },
     status: { type: 'string', enum: ['queued', 'in_progress', 'completed', 'failed', 'cancelled', 'incomplete'] },
     background: { type: 'boolean' },
     store: { type: 'boolean', description: 'Whether the manager retains this background Response beyond the temporary polling window, subject to bounded capacity and restart.' },

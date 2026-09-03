@@ -87,9 +87,9 @@ Non-streaming example:
 ```
 
 The result is the OpenAI Response resource itself. It uses an opaque `resp_...`
-id, `object: "response"`, integer-second `created_at`, nullable `completed_at`,
-`background: true`, and OpenAI status names. It is never wrapped in a manager
-job/result object.
+id, `object: "response"`, integer-second `created_at`, completion-only
+`completed_at`, `background: true`, and OpenAI status names. It is never wrapped
+in a manager job/result object.
 
 For resumable streaming, create the same resource with `stream: true`. The MCP
 transport returns the Responses events with monotonically increasing
@@ -173,7 +173,7 @@ the following manager-specific implementation bounds:
 | Serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | Serialized result | 16 MiB |
-| SSE replay | 10,000 events and 16 MiB per Response; 64 MiB globally |
+| SSE replay | 10,000 non-terminal events and 16 MiB per Response; 64 MiB globally; plus one bounded terminal event per Response |
 
 Expired and oldest terminal records, including stored records, are reclaimed
 before capacity is refused; active work is never evicted. Missing, expired, and wrong-scope ids return the

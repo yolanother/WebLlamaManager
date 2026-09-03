@@ -5271,7 +5271,6 @@
                     "id",
                     "object",
                     "created_at",
-                    "completed_at",
                     "status",
                     "background",
                     "store",
@@ -5292,15 +5291,8 @@
                       "description": "Creation time in Unix seconds."
                     },
                     "completed_at": {
-                      "oneOf": [
-                        {
-                          "type": "integer"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "Terminal transition time in Unix seconds."
+                      "type": "integer",
+                      "description": "Completion time in Unix seconds; present only when status is completed."
                     },
                     "status": {
                       "type": "string",
@@ -5360,6 +5352,12 @@
                     }
                   },
                   "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "OpenAI Responses SSE event stream when stream=true."
                 }
               }
             }
@@ -5487,7 +5485,6 @@
                     "id",
                     "object",
                     "created_at",
-                    "completed_at",
                     "status",
                     "background",
                     "store",
@@ -5508,15 +5505,8 @@
                       "description": "Creation time in Unix seconds."
                     },
                     "completed_at": {
-                      "oneOf": [
-                        {
-                          "type": "integer"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "Terminal transition time in Unix seconds."
+                      "type": "integer",
+                      "description": "Completion time in Unix seconds; present only when status is completed."
                     },
                     "status": {
                       "type": "string",
@@ -5577,6 +5567,12 @@
                   },
                   "additionalProperties": true
                 }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "OpenAI Responses SSE event stream when stream=true."
+                }
               }
             }
           }
@@ -5627,7 +5623,6 @@
                     "id",
                     "object",
                     "created_at",
-                    "completed_at",
                     "status",
                     "background",
                     "store",
@@ -5648,15 +5643,8 @@
                       "description": "Creation time in Unix seconds."
                     },
                     "completed_at": {
-                      "oneOf": [
-                        {
-                          "type": "integer"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "Terminal transition time in Unix seconds."
+                      "type": "integer",
+                      "description": "Completion time in Unix seconds; present only when status is completed."
                     },
                     "status": {
                       "type": "string",
@@ -9024,7 +9012,6 @@
                     "id",
                     "object",
                     "created_at",
-                    "completed_at",
                     "status",
                     "background",
                     "store",
@@ -9045,15 +9032,8 @@
                       "description": "Creation time in Unix seconds."
                     },
                     "completed_at": {
-                      "oneOf": [
-                        {
-                          "type": "integer"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "Terminal transition time in Unix seconds."
+                      "type": "integer",
+                      "description": "Completion time in Unix seconds; present only when status is completed."
                     },
                     "status": {
                       "type": "string",
@@ -9113,6 +9093,12 @@
                     }
                   },
                   "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "OpenAI Responses SSE event stream when stream=true."
                 }
               }
             }
@@ -9240,7 +9226,6 @@
                     "id",
                     "object",
                     "created_at",
-                    "completed_at",
                     "status",
                     "background",
                     "store",
@@ -9261,15 +9246,8 @@
                       "description": "Creation time in Unix seconds."
                     },
                     "completed_at": {
-                      "oneOf": [
-                        {
-                          "type": "integer"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "Terminal transition time in Unix seconds."
+                      "type": "integer",
+                      "description": "Completion time in Unix seconds; present only when status is completed."
                     },
                     "status": {
                       "type": "string",
@@ -9330,6 +9308,12 @@
                   },
                   "additionalProperties": true
                 }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "OpenAI Responses SSE event stream when stream=true."
+                }
               }
             }
           }
@@ -9380,7 +9364,6 @@
                     "id",
                     "object",
                     "created_at",
-                    "completed_at",
                     "status",
                     "background",
                     "store",
@@ -9401,15 +9384,8 @@
                       "description": "Creation time in Unix seconds."
                     },
                     "completed_at": {
-                      "oneOf": [
-                        {
-                          "type": "integer"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "Terminal transition time in Unix seconds."
+                      "type": "integer",
+                      "description": "Completion time in Unix seconds; present only when status is completed."
                     },
                     "status": {
                       "type": "string",

@@ -93,7 +93,6 @@ look like:
   "id": "resp_opaque-random-value",
   "object": "response",
   "created_at": 1788400000,
-  "completed_at": null,
   "background": true,
   "status": "queued",
   "output": [],
@@ -103,7 +102,8 @@ look like:
 
 The actual resource also contains normal Responses request options and result
 fields. Creation may report `in_progress` if execution starts before the initial
-resource is serialized. Timestamps are integer seconds and use snake_case.
+resource is serialized. Timestamps are integer seconds and use snake_case;
+`completed_at` appears only on a successfully completed Response.
 
 ## Retrieve the whole Response
 
@@ -175,8 +175,9 @@ Streaming start/resume is valid only for a background Response originally
 created with `stream: true`. A Response created with `stream: false` can still be
 retrieved as JSON, but it cannot later be converted into a resumable stream.
 
-Llama Manager retains at most 10,000 SSE events and 16 MiB of events per
-Response, with 64 MiB retained globally by default. This replay log is
+Llama Manager retains at most 10,000 non-terminal SSE events and 16 MiB of
+events per Response, with 64 MiB retained globally by default. A small bounded
+reserve retains the one terminal event even when the ordinary cap is full. This replay log is
 process-local and available only while both the Response and requested sequence
 range remain retained. A cap overflow fails the new Response with
 `event_retention_exceeded` rather than dropping its history or evicting active
@@ -208,12 +209,13 @@ extensions:
 | One serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | One serialized result | 16 MiB |
-| SSE replay | 10,000 events and 16 MiB per Response; 64 MiB globally |
+| SSE replay | 10,000 non-terminal events and 16 MiB per Response; 64 MiB globally; plus one bounded terminal event per Response |
 
 Expired and oldest terminal records are reclaimed before admission. Active work
 is never evicted to admit a new request. Oversized requests return HTTP 413;
-exhausted record/request-byte capacity returns HTTP 429. Oversized results become
-failed Responses rather than empty successes. Retained request bodies,
+exhausted record/request-byte capacity returns HTTP 429. Oversized terminal
+results become bounded failed Responses; an empty output array remains a valid
+completed Response. Retained request bodies,
 authorization, priority, and routing values are deleted when execution settles.
 
 ## Failure behavior

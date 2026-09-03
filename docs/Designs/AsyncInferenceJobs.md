@@ -38,7 +38,8 @@ resource itself, never an `inference.job` envelope. The resource uses:
 
 - an opaque `resp_...` id;
 - `object: "response"`;
-- integer-second `created_at` and nullable `completed_at` timestamps;
+- an integer-second `created_at`, plus integer-second `completed_at` only after
+  successful completion;
 - `background: true`;
 - `queued`, `in_progress`, `completed`, `failed`, `cancelled`, or `incomplete`
   status values; and
@@ -99,7 +100,9 @@ created with `stream: true`. JSON retrieval remains available for background
 Responses created in either streaming mode.
 
 Llama Manager's replay implementation is process-local and defaults to 10,000
-events and 16 MiB per Response, with 64 MiB retained globally. Slow or
+non-terminal events and 16 MiB per Response, with 64 MiB retained globally. One
+small bounded terminal-event reserve guarantees a final `response.completed`,
+`response.failed`, `response.cancelled`, or `response.incomplete` event. Slow or
 disconnected clients therefore cannot cause unbounded retained SSE memory. A cap
 overflow fails and aborts the new Response with `event_retention_exceeded`; it
 does not drop part of that Response's history or evict active replay state.
@@ -133,13 +136,15 @@ explicit Llama Manager extensions for this self-hosted implementation:
 | One serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | One serialized result | 16 MiB |
-| Streaming replay | 10,000 events and 16 MiB per Response; 64 MiB globally; process-local |
+| Streaming replay | 10,000 non-terminal events and 16 MiB per Response; 64 MiB globally; plus one bounded terminal event per Response; process-local |
 
 Expired records and the oldest terminal records, including stored records, are reclaimed before admission.
 Active responses are never evicted to admit new work. An oversized request is
 rejected with HTTP 413; exhausted count or retained-request-byte capacity returns
-HTTP 429. An oversized completion becomes a failed Response rather than an empty
-success. Private bodies and policy values stay retained only until settlement.
+HTTP 429. An oversized terminal Response, including an upstream failed
+Response, becomes a bounded failed Response rather than bypassing the result
+cap. An empty `output` array is still a valid completed Response. Private bodies
+and policy values stay retained only until settlement.
 
 This scoping is not authentication. Multi-tenant deployments must authenticate
 at the manager or a trusted upstream proxy and supply stable, distinct

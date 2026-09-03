@@ -42,25 +42,33 @@ function requestMediaType(endpoint) {
 }
 
 /**
- * Selects the response media type and schema used by one endpoint.
+ * Selects the response media types and schemas used by one endpoint.
  *
  * @param {object} endpoint Endpoint catalog entry.
- * @returns {{mediaType: string, schema: object}} Response content description.
+ * @returns {Record<string,{schema:object}>} OpenAPI response content map.
  */
 function responseContent(endpoint) {
   if (endpoint.path.endsWith('.jpg')) {
-    return { mediaType: 'image/jpeg', schema: { type: 'string', format: 'binary' } };
+    return { 'image/jpeg': { schema: { type: 'string', format: 'binary' } } };
   }
   if (endpoint.path.endsWith('.wav')) {
-    return { mediaType: 'audio/wav', schema: { type: 'string', format: 'binary' } };
+    return { 'audio/wav': { schema: { type: 'string', format: 'binary' } } };
   }
   if (endpoint.path.endsWith('/file')) {
-    return { mediaType: 'application/octet-stream', schema: { type: 'string', format: 'binary' } };
+    return { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } };
   }
   if (endpoint.path.endsWith('llms.txt') || endpoint.path.endsWith('llms-full.txt')) {
-    return { mediaType: 'text/markdown', schema: { type: 'string' } };
+    return { 'text/markdown': { schema: { type: 'string' } } };
   }
-  return { mediaType: 'application/json', schema: endpoint.responseSchema };
+  const content = { 'application/json': { schema: endpoint.responseSchema } };
+  const isResponsesStream = endpoint.path.endsWith('/responses')
+    || (endpoint.method === 'GET' && endpoint.path.endsWith('/responses/{response_id}'));
+  if (isResponsesStream) {
+    content['text/event-stream'] = {
+      schema: { type: 'string', description: 'OpenAI Responses SSE event stream when stream=true.' },
+    };
+  }
+  return content;
 }
 
 /**
@@ -96,9 +104,7 @@ function buildOperation(endpoint) {
     responses: {
       200: {
         description: 'Successful response.',
-        content: {
-          [response.mediaType]: { schema: response.schema },
-        },
+        content: response,
       },
     },
     'x-codeSamples': [
