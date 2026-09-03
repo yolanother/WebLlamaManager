@@ -3,7 +3,11 @@
 // LICENSE file in the repository root.
 //
 // Proves package/environment defaults populate an empty persisted config while
-// explicit operator values always remain authoritative.
+// explicit operator values always remain authoritative — except autoStart,
+// where AUTO_START=false is a fail-safe veto over a persisted autoStart:true
+// (T31079087d6a20: a persisted autoStart:true from a prior run silently
+// defeated a boot-time AUTO_START=false override, letting an instance
+// auto-start an engine it wasn't supposed to).
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -45,4 +49,14 @@ test('explicit persisted values override every environment default', () => {
   assert.equal(config.autoStart, false);
   assert.equal(config.modelsMax, 7);
   assert.equal(config.contextSize, 32768);
+});
+
+test('AUTO_START=false vetoes autoStart even over a persisted autoStart:true', () => {
+  const config = applyConfigDefaults({ autoStart: true }, { AUTO_START: 'false' });
+  assert.equal(config.autoStart, false);
+});
+
+test('AUTO_START=false vetoes autoStart with no persisted autoStart key at all', () => {
+  const config = applyConfigDefaults({}, { AUTO_START: 'false' });
+  assert.equal(config.autoStart, false);
 });
