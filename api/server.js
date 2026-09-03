@@ -165,7 +165,7 @@ import {
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
   isProjectorModelId, remoteStallMs, remoteStallCeilingMs, remoteStallVerdict, largestContextBesideDs4,
-  ds4ChatDeltaText, ds4ResponsesEventText,
+  ds4ChatDeltaText, ds4ResponsesEventText, shouldLogDs4Verdict,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -14006,6 +14006,16 @@ setInterval(async () => {
         now,
         genericRemoteStallMs: currentRemoteStallMs(),
       });
+      // Observability only, no behavior change: make the watchdog's own
+      // reasoning about a ds4 entry answerable from logs instead of live
+      // polling a box that has already moved on. See shouldLogDs4Verdict.
+      if (entry.backend === 'ds4' && shouldLogDs4Verdict(verdict, entry._lastLoggedVerdict, entry._verdictLogAt, now)) {
+        entry._lastLoggedVerdict = { action: verdict.action, reason: verdict.reason };
+        entry._verdictLogAt = now;
+        const verdictMsg = `Stall watchdog verdict for ds4 request ${id}: action=${verdict.action} idleMs=${verdict.idleMs} limitMs=${verdict.limitMs} reason="${verdict.reason}"`;
+        console.log(`[watchdog] ${verdictMsg}`);
+        addLog('system', verdictMsg);
+      }
       if (verdict.action === 'skip') continue;
       // Silence from ANOTHER manager is ambiguous in exactly the same way, and
       // unlike a wedge it can be checked: ask the provider before giving up.

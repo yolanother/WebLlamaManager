@@ -10,8 +10,10 @@
 // response.output_text.delta alone — otherwise a ds4-server THINKING-phase
 // stream (delta.reasoning_content / response.reasoning_summary_text.delta)
 // is reported as zero tokens again, even though api/engines.test.js's unit
-// tests for the helpers themselves still pass. Anchored on the actual call
-// expression inside each function body, not a comment, so a revert of the
+// tests for the helpers themselves still pass. Also pins the stall watchdog's
+// call to shouldLogDs4Verdict, which makes the watchdog's own reasoning about
+// a ds4 entry answerable from logs instead of live-guessed. All three are
+// anchored on the actual call expression, not a comment, so a revert of the
 // wiring alone (leaving the helpers untouched) fails this test.
 
 import { test } from 'node:test';
@@ -47,5 +49,19 @@ test('proxyResponsesToDs4 derives streamed progress text via ds4ResponsesEventTe
     body,
     /const text = ds4ResponsesEventText\(event\)/,
     'proxyResponsesToDs4 must call ds4ResponsesEventText on the parsed event, not match response.output_text.delta alone'
+  );
+});
+
+test('the stall watchdog logs its ds4 verdict via shouldLogDs4Verdict', async () => {
+  const source = await readServerSource();
+  const start = source.indexOf('for (const [id, entry] of activeRequests) {', source.indexOf("const stallMs = config?.localStallMs"));
+  assert.notEqual(start, -1, 'the watchdog\'s activeRequests scan must still exist');
+  const end = source.indexOf('}, STALL_WATCHDOG_INTERVAL);', start);
+  assert.notEqual(end, -1, 'the watchdog interval body must be found');
+  const body = source.slice(start, end);
+  assert.match(
+    body,
+    /shouldLogDs4Verdict\(verdict, entry\._lastLoggedVerdict, entry\._verdictLogAt, now\)/,
+    'the watchdog must gate its ds4 verdict log line through shouldLogDs4Verdict, not log unconditionally or not at all'
   );
 });

@@ -1011,6 +1011,31 @@ export function remoteStallVerdict({ entry, holdsDs4Slot = false, queuedForDs4Sl
 }
 
 /**
+ * Decide whether the stall watchdog should log its remoteStallVerdict() for
+ * one ds4-backed activeRequests entry this tick.
+ *
+ * Live-polling a ds4 entry mid-incident and guessing whether it's stuck (three
+ * separate wrong guesses in one night, all against a request that was working
+ * fine — see the ds4-reasoning-tokens task) is exactly what a log line removes:
+ * logging the verdict every tick, unthrottled, is too noisy to read back later,
+ * so this logs on every action/reason CHANGE (a request flipping from 'skip'
+ * to 'stalled' is never silent) plus a periodic heartbeat while the verdict
+ * holds steady, so a long wait is still visible without a line every 5s tick.
+ *
+ * @param {{action:string, reason:string}} verdict Latest remoteStallVerdict() result.
+ * @param {{action?:string, reason?:string}|null|undefined} lastLogged Verdict last written to the log, or null/undefined if never logged.
+ * @param {number|null|undefined} lastLogAt When that line was written (epoch ms), or null/undefined if never logged.
+ * @param {number} now Epoch ms.
+ * @param {number} [heartbeatMs] Max silence before a heartbeat re-logs an unchanged verdict.
+ * @returns {boolean} True when this tick should emit a log line.
+ */
+export function shouldLogDs4Verdict(verdict, lastLogged, lastLogAt, now, heartbeatMs = 60_000) {
+  const changed = !lastLogged || lastLogged.action !== verdict.action || lastLogged.reason !== verdict.reason;
+  const heartbeatDue = lastLogAt == null || (now - lastLogAt) >= heartbeatMs;
+  return changed || heartbeatDue;
+}
+
+/**
  * Largest context a llama model can take while DS4 stays resident.
  *
  * Co-residency was all-or-nothing: the model was budgeted at the box's FULL

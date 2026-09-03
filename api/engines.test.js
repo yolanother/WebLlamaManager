@@ -41,6 +41,7 @@ import {
   validateDs4DownloadRequest,
   ds4ChatDeltaText,
   ds4ResponsesEventText,
+  shouldLogDs4Verdict,
 } from './engines.js';
 
 // ── isEngineProcessComm (heat/RSS attribution) ───────────────────────────────
@@ -961,7 +962,7 @@ test('stall watchdog wires remoteStallVerdict — with ds4 slot ownership — in
   const source = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
   const branchStart = source.indexOf('// Remote backend stall.');
   assert.ok(branchStart >= 0, 'watchdog remote-stall branch must exist');
-  const branch = source.slice(branchStart, branchStart + 3000);
+  const branch = source.slice(branchStart, branchStart + 4000);
   assert.match(
     branch,
     /const verdict = remoteStallVerdict\(\{[\s\S]*?holdsDs4Slot: ds4SlotHolders\.has\(id\),[\s\S]*?queuedForDs4Slot: ds4SlotWaiters\.has\(id\),[\s\S]*?genericRemoteStallMs: currentRemoteStallMs\(\),[\s\S]*?\}\);/,
@@ -1074,4 +1075,32 @@ test('ds4ResponsesEventText: a reasoning_summary_text delta (THINKING phase) is 
 
 test('ds4ResponsesEventText: an unrelated event type yields empty string', () => {
   assert.equal(ds4ResponsesEventText({ type: 'response.completed', delta: 'ignored' }), '');
+});
+
+// ── shouldLogDs4Verdict (watchdog verdict-logging throttle) ────────────────
+
+test('shouldLogDs4Verdict: first-ever tick (nothing logged yet) always logs', () => {
+  assert.equal(shouldLogDs4Verdict({ action: 'skip', reason: 'x' }, null, null, 1000), true);
+});
+
+test('shouldLogDs4Verdict: an action change logs immediately, ignoring the heartbeat', () => {
+  const lastLogged = { action: 'skip', reason: 'x' };
+  assert.equal(shouldLogDs4Verdict({ action: 'stalled', reason: 'x' }, lastLogged, 999, 1000), true);
+});
+
+test('shouldLogDs4Verdict: a reason change logs immediately even if the action is the same', () => {
+  const lastLogged = { action: 'skip', reason: 'queued' };
+  assert.equal(shouldLogDs4Verdict({ action: 'skip', reason: 'within the idle ceiling' }, lastLogged, 999, 1000), true);
+});
+
+test('shouldLogDs4Verdict: an unchanged verdict stays quiet inside the heartbeat window', () => {
+  const lastLogged = { action: 'skip', reason: 'x' };
+  const now = 1000 + 59_000;
+  assert.equal(shouldLogDs4Verdict({ action: 'skip', reason: 'x' }, lastLogged, 1000, now, 60_000), false);
+});
+
+test('shouldLogDs4Verdict: an unchanged verdict re-logs once the heartbeat elapses', () => {
+  const lastLogged = { action: 'skip', reason: 'x' };
+  const now = 1000 + 60_000;
+  assert.equal(shouldLogDs4Verdict({ action: 'skip', reason: 'x' }, lastLogged, 1000, now, 60_000), true);
 });
