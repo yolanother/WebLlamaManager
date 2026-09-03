@@ -1414,6 +1414,27 @@ function desiredResidentModels() {
   }
 }
 
+/**
+ * How long to wait on a remote backend before aborting the attempt (ms).
+ *
+ * This was 120s, which is shorter than a legitimate long-context request. The
+ * boxes prefill at roughly 250 tokens/sec, measured on drakemore:
+ *
+ *     36,636-token prompt -> 287s
+ *     50,636-token prompt -> 228s
+ *
+ * so with a 65,536-token context the prefill alone can approach five minutes
+ * before a single token is generated. At 120s an offloaded request was aborted
+ * mid-prefill and reported as a backend failure, even though the far side was
+ * working correctly and would have answered.
+ *
+ * Ten minutes covers a full context at the measured rate with headroom. It is a
+ * per-attempt ceiling for a wedged backend, not a target: a healthy small
+ * request still returns in seconds, and `backend.timeoutMs` still overrides it
+ * per backend.
+ */
+const REMOTE_BACKEND_TIMEOUT_MS = 600000;
+
 function buildRemoteRouting(backend, remoteModel, endpoint) {
   const baseUrl = backend.url.replace(/\/+$/, '');
   const apiKey = backend.apiKeyEnvVar ? process.env[backend.apiKeyEnvVar] : null;
@@ -1784,7 +1805,7 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
       // first cancellation), every subsequent retry immediately threw
       // "This operation was aborted" without actually contacting the backend.
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || 120000);
+      const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || REMOTE_BACKEND_TIMEOUT_MS);
       // Compose with the caller's externalSignal (e.g. activeRequest's
       // abortController) so the watchdog or a user-initiated kill can also
       // tear down a hung remote fetch — including after headers arrive but
@@ -5857,6 +5878,20 @@ async function ensureDs4ForModel(rawModel, resolvedModel) {
       console.log(`[ds4] default-model alias '${rawModel}' now points at llama target '${resolvedModel}' — deactivating exclusive ds4 mode (${fit.reason})`);
       addLog('presets', `default-model alias '${rawModel}' re-pointed at llama target '${resolvedModel}' — reversing exclusive ds4 mode. ${fit.reason}`);
       await deactivateDs4Exclusive();
+      // Symmetric to the fit branch above, and for the same reason. Evicting
+      // DS4 frees the box but leaves NO local engine running, so the request
+      // then waits out the whole load timeout against a server that never
+      // starts: observed as ECONNREFUSED on :8080 followed by
+      // "did not finish loading within 180s", and — because that is slower than
+      // the non-streaming heartbeat — delivered to the caller as an empty 200.
+      //
+      // This hid behind the fit branch until now: whenever a llama server was
+      // already co-resident the alias switch appeared to work, because the
+      // router it needed happened to be up already.
+      if (!llamaProcess) {
+        console.log(`[ds4] starting llama to serve '${resolvedModel}' after evicting DS4`);
+        await restartLlamaServer({ governed: false });
+      }
     }
   }
   return null;
@@ -6563,7 +6598,20 @@ async function activateDs4Exclusive(presetId, preset) {
   // backstop only after settle. currentEngine stays ds4 for the WHOLE plan, so a
   // request flood keeps offloading and never re-admits a competing local llama load.
   const adaptive = ds4AdaptiveSettings(preset, ds4cfg);
-  const targetContext = Number(preset.context) || adaptive.minContext;
+  // Context target: an explicit preset value wins, then the system-wide
+  // contextSize, and only then the adaptive floor.
+  //
+  // The system setting was missing from this chain, and a DS4 preset selected
+  // from the model list carries no `context` of its own (the adaptive
+  // controller sets DS4_CTX per attempt), so DS4 always fell through to
+  // minContext — 8192. Raising the system context to 65536 moved the router but
+  // left DS4 rejecting anything over 8k, with nothing in the settings UI to
+  // explain why. The ladder below still steps the target down when the memory
+  // budget cannot hold it, so honouring the setting requests more context
+  // without promising it.
+  const targetContext = Number(preset.context)
+    || Number(config.contextSize)
+    || adaptive.minContext;
   const plan = planDs4Attempts({
     configuredContext: targetContext,
     minContext: adaptive.minContext,

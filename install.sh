@@ -125,7 +125,11 @@ API_PORT="${API_PORT:-3001}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
 MODELS_DIR="${MODELS_DIR:-$HOME/models}"
 MODELS_MAX="${MODELS_MAX:-2}"
-CONTEXT_SIZE="${CONTEXT_SIZE:-8192}"
+# 64Ki tokens. This installer targets the Strix Halo boxes, which have 128 GB of
+# unified memory, and the agent pipelines driving them assemble evidence into
+# single prompts measured at ~48k tokens. An engine that cannot hold this for a
+# given model steps down rather than failing.
+CONTEXT_SIZE="${CONTEXT_SIZE:-65536}"
 AUTO_START="${AUTO_START:-true}"
 STATS_INTERVAL="${STATS_INTERVAL:-1000}"
 LLAMA_UI_URL="${LLAMA_UI_URL:-}"

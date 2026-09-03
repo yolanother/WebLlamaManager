@@ -74,7 +74,13 @@ declare -A SERVICE_ENV=(
   [LLAMA_PORT]=8080
   [EMBED_PORT]=5252
   [MODELS_MAX]=2
-  [CONTEXT_SIZE]=8192
+  # 64Ki tokens. These boxes have 128 GB of unified memory, so the KV cache for
+  # a large context is affordable, and the workloads driving them (agent
+  # pipelines assembling evidence into a single prompt) routinely exceed 8k —
+  # measured stages run to ~48k. Engines that cannot hold this much for a given
+  # model step down: the router reports its real n_ctx, and DS4's adaptive
+  # ladder lowers the target until it fits.
+  [CONTEXT_SIZE]=65536
   [AUTO_START]=true
   [STATS_INTERVAL]=1000
 )
