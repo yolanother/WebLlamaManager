@@ -177,6 +177,8 @@ test('contracts 8 and 9: execution strips background recursion, retains policy, 
       authorization: 'Bearer tenant-secret',
       'x-llama-priority': 'background',
       'x-llama-routing': 'local_only',
+      'x-llama-manager-hops': '1',
+      'x-llama-manager-origin': 'node-a',
       cookie: 'session=must-not-be-retained',
       'x-unrelated': 'must-not-be-replayed',
     },
@@ -190,6 +192,8 @@ test('contracts 8 and 9: execution strips background recursion, retains policy, 
   assert.equal(headerValue(captured.headers, 'authorization'), 'Bearer tenant-secret');
   assert.equal(headerValue(captured.headers, 'x-llama-priority'), 'background');
   assert.equal(headerValue(captured.headers, 'x-llama-routing'), 'local_only');
+  assert.equal(headerValue(captured.headers, 'x-llama-manager-hops'), '1');
+  assert.equal(headerValue(captured.headers, 'x-llama-manager-origin'), 'node-a');
   assert.equal(headerValue(captured.headers, 'cookie'), undefined);
   assert.equal(headerValue(captured.headers, 'x-unrelated'), undefined);
 
@@ -497,12 +501,18 @@ test('contracts 6 and 7: event count and byte overflow fail instead of dropping 
       return { status: 200, body: completedResponse() };
     },
   });
-  const byteResponse = byteStore.submit({ scopeId: 'scope_a', body: requestBody({ stream: true }), headers: {} });
+  const byteResponse = byteStore.submit({
+    scopeId: 'scope_a',
+    body: requestBody({ stream: true, model: `model-${'x'.repeat(5_000)}` }),
+    headers: {},
+  });
   const byteFailed = await waitFor(() => byteStore.get(byteResponse.id, 'scope_a')?.status === 'failed'
     && byteStore.get(byteResponse.id, 'scope_a'));
   assert.equal(byteFailed.error.code, 'event_retention_exceeded');
   assert.ok(byteFailed.error.message.length <= 1_024);
-  assert.equal(byteStore.replay(byteResponse.id, 'scope_a').at(-1).type, 'response.failed');
+  const byteFailureEvent = byteStore.replay(byteResponse.id, 'scope_a').at(-1);
+  assert.equal(byteFailureEvent.type, 'response.failed');
+  assert.ok(Buffer.byteLength(JSON.stringify(byteFailureEvent)) <= 4 * 1024);
 
   const globalExecutions = [deferred(), deferred()];
   let globalCall = 0;

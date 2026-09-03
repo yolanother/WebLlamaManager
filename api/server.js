@@ -1117,14 +1117,14 @@ function estimateLocalProcessingMs(inputTokens) {
  * @param {string} requestedModel the concrete model the LOCAL engine would serve.
  * @param {string} endpoint the OpenAI endpoint path, e.g. 'chat/completions'.
  * @param {object|null} body the request body, used only for size-based offload estimates.
- * @param {{localOnly?: boolean, aliasRouting?: AliasRouting|null}} [options] `aliasRouting`
+ * @param {{localOnly?: boolean, aliasRouting?: AliasRouting|null, inboundRelay?:object|null}} [options] `aliasRouting`
  *   is the tiers resolved from the ORIGINAL request name; pass it explicitly whenever the
  *   alias name differs from `requestedModel`, since it cannot be re-derived from the
  *   resolved name. Omit it and it is derived from `requestedModel`.
  * @returns {object} a routing decision: `{remote:false}` for local, a remote routing
  *   envelope from `buildRemoteRouting()`, or a blocked-residency marker.
  */
-function resolveBackend(requestedModel, endpoint, body, { localOnly = false, aliasRouting } = {}) {
+function resolveBackend(requestedModel, endpoint, body, { localOnly = false, aliasRouting, inboundRelay = null } = {}) {
   const alias = aliasRouting !== undefined ? aliasRouting : resolveAliasRouting(requestedModel);
   const backends = config.backends || {};
   const desiredModels = desiredResidentModels();
@@ -1155,7 +1155,7 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false, ali
         return { remote: false, localOnly: true, offloadSuppressed: true, suppressionReason: 'explicit_remote_backend' };
       }
       const remoteModel = requestedModel.substring(slashIdx + 1);
-      return buildRemoteRouting(explicitBackend, remoteModel, endpoint);
+      return buildRemoteRouting(explicitBackend, remoteModel, endpoint, inboundRelay);
     }
   }
 
@@ -1397,7 +1397,7 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false, ali
   const chosenQueue = backendQueues.get(chosen.id);
   const chosenStats = backendStats.get(chosen.id);
   console.log(`[routing] Selected backend: ${chosen.name} (${chosenQueue?.active || 0}/${chosenQueue?.concurrency || '?'} active, ${Math.round(chosenStats?.avgTokPerSec || 0)} tok/s, priority=${chosen.priority ?? 50})`);
-  return buildRemoteRouting(chosen, remoteTargetModel(chosen, alias), endpoint);
+  return buildRemoteRouting(chosen, remoteTargetModel(chosen, alias), endpoint, inboundRelay);
 }
 
 /** Return a stable routing rejection for a local load that would evict a desired model. */
@@ -10210,7 +10210,8 @@ async function serveDs4WithSwapRecovery(req, res, opts) {
   for (let attempt = 0; ; attempt++) {
     const genBefore = ds4SwapGeneration;
     try {
-      return await proxyChatToDs4(req, res, opts);
+      const proxy = opts.proxy || proxyChatToDs4;
+      return await proxy(req, res, opts);
     } catch (err) {
       const decision = ds4SwapRetryDecision({
         swapOccurred: ds4SwapGeneration !== genBefore || !!ds4SwapPromise,
@@ -10233,7 +10234,10 @@ async function serveDs4WithSwapRecovery(req, res, opts) {
       // Let the swap finish before trying again, then make sure ds4 is the
       // engine for this model once more; the alias may since have moved.
       if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
-      await ensureDs4ForModel(opts.requestedModel, opts.requestedModel);
+      await ensureDs4ForModel(opts.rawModel || opts.requestedModel, opts.requestedModel, {
+        requestPriority: opts.priority,
+        relay: opts.relay,
+      });
     }
   }
 }
@@ -12415,6 +12419,130 @@ function sendBackgroundResponseError(res, error, fallback = 'background Response
 }
 
 /**
+ * Forward a Responses request to DS4 while registering it for swap/eviction drain.
+ *
+ * The proxy preserves the OpenAI JSON or SSE body, records local DS4 activity,
+ * and deliberately throws uncommitted transport failures so
+ * `serveDs4WithSwapRecovery` can retry work interrupted by an engine swap.
+ *
+ * @param {import('express').Request} req Express request carrying the stripped upstream body.
+ * @param {import('express').Response} res Express response.
+ * @param {{requestedModel:string,isStreaming:boolean,startTime:number,priority:string,routing:string}} ctx Routing context.
+ * @returns {Promise<void>} Resolves after the complete JSON or SSE response is delivered.
+ */
+async function proxyResponsesToDs4(req, res, {
+  requestedModel,
+  isStreaming,
+  startTime,
+  priority = 'interactive',
+  routing = 'auto',
+}) {
+  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
+  const url = ds4TargetUrl(ds4.port, '/v1/responses');
+  const messages = req.body.input
+    ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }])
+    : null;
+  const activeReqId = startActiveRequest({
+    model: requestedModel,
+    endpoint: 'responses',
+    messages,
+    backend: 'ds4',
+    priority,
+    routing,
+  });
+  const controller = activeRequests.get(activeReqId)?.abortController;
+  const abort = () => { try { controller?.abort('client_disconnect'); } catch { /* best effort */ } };
+  res.once('close', abort);
+
+  try {
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+      signal: controller?.signal,
+    });
+    if (!upstream.ok) {
+      const error = await upstream.text().catch(() => '');
+      addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages, prompt: null, response: null, error, backend: 'ds4', requestBody: req.body });
+      endActiveRequest(activeReqId, { status: 'error' });
+      return res.status(upstream.status).send(error);
+    }
+
+    if (isStreaming) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let completionTokens = 0;
+      let promptTokens = 0;
+      let responseText = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        res.write(chunk);
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.type === 'response.output_text.delta' && event.delta) {
+              responseText += event.delta;
+              updateActiveRequest(activeReqId, event.delta);
+            }
+            const usage = event.usage || event.response?.usage;
+            if (usage) {
+              promptTokens = usage.input_tokens || usage.prompt_tokens || promptTokens;
+              completionTokens = usage.output_tokens || usage.completion_tokens || completionTokens;
+            }
+          } catch { /* non-JSON keepalive */ }
+        }
+      }
+      const tail = decoder.decode();
+      if (tail) res.write(tail);
+      res.end();
+      const duration = Date.now() - startTime;
+      const tokensPerSecond = duration > 0 ? completionTokens / (duration / 1000) : 0;
+      recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: 'ds4' });
+      addLlmLog({ endpoint: 'responses', model: requestedModel, stream: true, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
+      ds4LastServedAt = Date.now();
+      endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
+      return;
+    }
+
+    const data = await upstream.json();
+    const duration = Date.now() - startTime;
+    const usage = data.usage || {};
+    const promptTokens = usage.input_tokens || usage.prompt_tokens || 0;
+    const completionTokens = usage.output_tokens || usage.completion_tokens || 0;
+    const tokensPerSecond = duration > 0 ? completionTokens / (duration / 1000) : 0;
+    let responseText = '';
+    for (const item of data.output || []) {
+      if (item.type === 'message' && Array.isArray(item.content)) {
+        responseText = item.content.map(content => content.text || '').join('');
+        break;
+      }
+    }
+    recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || requestedModel, duration, backend: 'ds4' });
+    addLlmLog({ endpoint: 'responses', model: data.model || requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
+    data._llama_manager = enrichLlamaManagerMeta(
+      { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: 'ds4' },
+      { completionTokens },
+    );
+    ds4LastServedAt = Date.now();
+    endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
+    res.json(data);
+  } catch (error) {
+    endActiveRequest(activeReqId, { status: 'error' });
+    addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages, prompt: null, response: null, error: error.message, backend: 'ds4', requestBody: req.body });
+    if (!res.headersSent) throw error;
+    if (!res.writableEnded) res.end();
+  } finally {
+    res.off('close', abort);
+  }
+}
+
+/**
  * Proxy an OpenAI Responses API request to the selected backend.
  * @param {import('express').Request} req Express request.
  * @param {import('express').Response} res Express response.
@@ -12460,7 +12588,11 @@ async function handleResponses(req, res) {
 
   console.log(`[responses] Request for model: ${requestedModel}`);
 
-  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel);
+  const inboundRelay = readRelayState(req.headers);
+  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel, {
+    requestPriority: requestPolicy.priority,
+    relay: inboundRelay,
+  });
   if (ds4Activation && !ds4Activation.ok) {
     return res.status(ds4Activation.status || 503).json({ error: { message: ds4Activation.error, type: 'server_error' } });
   }
@@ -12472,8 +12604,6 @@ async function handleResponses(req, res) {
   // Match Chat Completions alias and exclusive-engine routing semantics while
   // preserving the Responses wire format on the selected backend.
   let routing;
-  let localResponsesIsDs4 = false;
-  let localResponsesUrl = `http://localhost:${LLAMA_PORT}/v1/responses`;
   if (currentEngine === ENGINE_TYPES.DS4) {
     const decision = ds4RequestTarget({
       requestedModel,
@@ -12482,12 +12612,23 @@ async function handleResponses(req, res) {
       llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
-      const ds4 = resolveDs4Config(config, RUNTIME_ENV);
-      localResponsesIsDs4 = true;
-      localResponsesUrl = ds4TargetUrl(ds4.port, '/v1/responses');
-      routing = { remote: false };
+      req.body = proxyBody;
+      return serveDs4WithSwapRecovery(req, res, {
+        proxy: proxyResponsesToDs4,
+        rawModel,
+        requestedModel,
+        isStreaming,
+        startTime,
+        priority: requestPolicy.priority,
+        routing: requestPolicy.routing,
+        relay: inboundRelay,
+      });
     } else if (decision.target === 'local-llama') {
-      routing = resolveBackend(requestedModel, 'responses', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
+      routing = resolveBackend(requestedModel, 'responses', req.body, {
+        localOnly: requestPolicy.localOnly,
+        aliasRouting,
+        inboundRelay,
+      });
     } else if (requestPolicy.localOnly) {
       contextRoutingStats.offloadSuppressedLocalOnly++;
       contextRoutingStats.localOnlyRejected++;
@@ -12505,10 +12646,14 @@ async function handleResponses(req, res) {
     } else {
       const backend = findFastestAvailableBackend(requestedModel, 'responses', aliasRouting);
       const remoteModel = remoteTargetModel(backend, aliasRouting);
-      routing = buildRemoteRouting(backend, remoteModel, 'responses');
+      routing = buildRemoteRouting(backend, remoteModel, 'responses', inboundRelay);
     }
   } else {
-    routing = resolveBackend(requestedModel, 'responses', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
+    routing = resolveBackend(requestedModel, 'responses', req.body, {
+      localOnly: requestPolicy.localOnly,
+      aliasRouting,
+      inboundRelay,
+    });
   }
   if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
@@ -12584,16 +12729,12 @@ async function handleResponses(req, res) {
     return;
   }
   try {
-    if (!localResponsesIsDs4) await ensureModelServed(requestedModel);
-    const requestOptions = {
+    await ensureModelServed(requestedModel);
+    let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(proxyBody),
-      signal: requestAbort.signal,
-    };
-    let result = localResponsesIsDs4
-      ? { response: await fetch(localResponsesUrl, requestOptions), retries: 0, retryErrors: [], restarted: false }
-      : await fetchWithRetry(localResponsesUrl, requestOptions, { label: 'responses', model: proxyBody.model, signal: requestAbort.signal });
+    }, { label: 'responses', model: proxyBody.model, signal: requestAbort.signal });
     let response = result.response;
     totalRetries = result.retries;
     allRetryErrors = [...result.retryErrors];
@@ -12604,11 +12745,11 @@ async function handleResponses(req, res) {
     // If model failed to load, unload others and retry
     if (!response.ok) {
       const error = await response.text();
-      if (!localResponsesIsDs4 && isModelLoadFailure(response.status, error)) {
+      if (isModelLoadFailure(response.status, error)) {
         console.log(`[responses] Model load failure for ${requestedModel}, attempting to free memory`);
         const unloaded = await unloadOtherModels(requestedModel);
         if (unloaded) {
-          result = await fetchWithRetry(localResponsesUrl, {
+          result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(proxyBody)
@@ -12736,7 +12877,7 @@ async function handleResponses(req, res) {
         {
           duration,
           tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
-          backend: localResponsesIsDs4 ? 'ds4' : 'local'
+          backend: 'local'
         },
         { completionTokens }
       );

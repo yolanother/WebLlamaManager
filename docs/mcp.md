@@ -173,12 +173,12 @@ the following manager-specific implementation bounds:
 | Serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | Serialized result | 16 MiB |
-| SSE replay | 10,000 non-terminal events and 16 MiB per Response; 64 MiB globally; plus one bounded terminal event per Response |
+| SSE replay | 10,000 non-terminal events and 16 MiB per Response; 64 MiB globally; plus one 4 KiB terminal-failure reserve per Response |
 
 Expired and oldest terminal records, including stored records, are reclaimed
 before capacity is refused; active work is never evicted. Missing, expired, and wrong-scope ids return the
 same standard not-found shape. The manager deletes private request bodies,
-authorization, priority, and routing values after settlement.
+authorization, priority, routing, and fleet-relay values after settlement.
 
 Exceeding a replay cap fails and aborts the new Response with
 `event_retention_exceeded`; the manager does not truncate that Response's event

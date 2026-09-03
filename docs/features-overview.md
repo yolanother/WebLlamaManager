@@ -143,7 +143,7 @@ restarts. Defaults cap records at 128 globally/32 per
 Authorization scope, requests at 4 MiB, retained active request bytes at 64/16
 MiB globally/per scope, and results at 16 MiB. SSE replay also has explicit
 caps: 10,000 non-terminal events/16 MiB per Response and 64 MiB globally, plus
-one bounded terminal event per Response. Active work is never evicted to admit
+one 4 KiB terminal-failure reserve per Response. Active work is never evicted to admit
 a new request; terminal stored records remain reclaimable.
 Cancellation remains capacity-accounted until execution settles and cannot be
 overwritten by a late result.

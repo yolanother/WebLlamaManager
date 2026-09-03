@@ -501,9 +501,19 @@ test('bare v1 aliases register the same named handlers before the SPA catch-all'
     source.indexOf("app.post('/api/v1/responses'"),
   );
   assert.match(responsesHandler, /resolveRequestModel\(rawModel\)/);
-  assert.match(responsesHandler, /ensureDs4ForModel\(rawModel, requestedModel\)/);
+  assert.match(responsesHandler, /ensureDs4ForModel\(rawModel, requestedModel,/);
+  assert.match(responsesHandler, /readRelayState\(req\.headers\)/);
+  assert.match(responsesHandler, /requestPriority: requestPolicy\.priority/);
   assert.match(responsesHandler, /ds4RequestTarget\(/);
-  assert.match(responsesHandler, /ds4TargetUrl\(ds4\.port, '\/v1\/responses'\)/);
+  assert.match(responsesHandler, /proxy: proxyResponsesToDs4/);
+
+  const responsesDs4Proxy = source.slice(
+    source.indexOf('async function proxyResponsesToDs4'),
+    source.indexOf('async function handleResponses'),
+  );
+  assert.match(responsesDs4Proxy, /ds4TargetUrl\(ds4\.port, '\/v1\/responses'\)/);
+  assert.match(responsesDs4Proxy, /startActiveRequest\([^)]*endpoint: 'responses'[^)]*backend: 'ds4'/s);
+  assert.match(responsesDs4Proxy, /endActiveRequest\(activeReqId/);
 });
 
 test('audio without normalized artifacts preserves the original part', async () => {

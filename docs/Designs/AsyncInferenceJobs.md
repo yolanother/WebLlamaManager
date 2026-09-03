@@ -101,8 +101,8 @@ Responses created in either streaming mode.
 
 Llama Manager's replay implementation is process-local and defaults to 10,000
 non-terminal events and 16 MiB per Response, with 64 MiB retained globally. One
-small bounded terminal-event reserve guarantees a final `response.completed`,
-`response.failed`, `response.cancelled`, or `response.incomplete` event. Slow or
+separate 4 KiB terminal-failure reserve guarantees a final `response.failed`
+when the ordinary log cannot retain another event. Slow or
 disconnected clients therefore cannot cause unbounded retained SSE memory. A cap
 overflow fails and aborts the new Response with `event_retention_exceeded`; it
 does not drop part of that Response's history or evict active replay state.
@@ -118,9 +118,10 @@ admission, model loading, retry, cancellation, output validation, or timing
 behavior. Removing `background` on the internal request prevents recursion.
 
 The retained private request includes only the values required to preserve
-authorization scope and explicit manager policy. Request bodies, authorization,
-priority, and routing values are erased after execution settles. Credentials and
-prompt content never appear in the public Response or manager diagnostics.
+authorization scope, explicit manager policy, and bounded fleet-relay state.
+Request bodies, authorization, priority, routing, relay-hop, and relay-origin
+values are erased after execution settles. Credentials and prompt content never
+appear in the public Response or manager diagnostics.
 
 ## Llama Manager storage and scope extensions
 
@@ -136,7 +137,7 @@ explicit Llama Manager extensions for this self-hosted implementation:
 | One serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | One serialized result | 16 MiB |
-| Streaming replay | 10,000 non-terminal events and 16 MiB per Response; 64 MiB globally; plus one bounded terminal event per Response; process-local |
+| Streaming replay | 10,000 non-terminal events and 16 MiB per Response; 64 MiB globally; plus one 4 KiB terminal-failure reserve per Response; process-local |
 
 Expired records and the oldest terminal records, including stored records, are reclaimed before admission.
 Active responses are never evicted to admit new work. An oversized request is

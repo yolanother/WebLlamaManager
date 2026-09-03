@@ -11,7 +11,13 @@ import { randomBytes } from 'node:crypto';
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'incomplete']);
 const TERMINAL_EVENT_RESERVE_BYTES = 4 * 1024;
-const RETAINED_HEADER_NAMES = new Set(['authorization', 'x-llama-priority', 'x-llama-routing']);
+const RETAINED_HEADER_NAMES = new Set([
+  'authorization',
+  'x-llama-priority',
+  'x-llama-routing',
+  'x-llama-manager-hops',
+  'x-llama-manager-origin',
+]);
 const PREPARED_CONTEXT_FIELDS = ['prepared_context_id', 'prepared_context_mode', 'context_cache_strict'];
 
 /** Error carrying the HTTP status and stable code for rejected submission. */
@@ -56,7 +62,7 @@ export function assertResponsesPreparedContextAbsent(body = {}) {
 /** Clone JSON-compatible data without retaining caller-owned references. */
 function cloneJson(value, serialized) { return JSON.parse(serialized ?? JSON.stringify(value)); }
 
-/** Retain only authorization and explicit manager policy headers. */
+/** Retain only authorization, manager policy, and bounded relay-state headers. */
 function retainedHeaders(headers = {}) {
   const retained = {};
   for (const [name, value] of Object.entries(headers || {})) {
@@ -228,7 +234,9 @@ export class InferenceJobStore {
     }
     const createdAt = this.now();
     const id = this.createId();
-    if (typeof id !== 'string' || !id.startsWith('resp_') || this.records.has(id)) throw new InferenceJobSubmissionError('could not allocate an opaque Response id', 500, 'RESPONSE_ID_ALLOCATION_FAILED');
+    if (typeof id !== 'string' || !id.startsWith('resp_') || Buffer.byteLength(id) > 256 || this.records.has(id)) {
+      throw new InferenceJobSubmissionError('could not allocate an opaque Response id', 500, 'RESPONSE_ID_ALLOCATION_FAILED');
+    }
     const record = {
       id, scopeId, model: body.model || 'default', status: 'queued', createdAt, publicCompletedAt: null,
       store: body.store === true, settledAt: null, expiresAt: null, response: null, error: null, requestBytes,
@@ -280,7 +288,7 @@ export class InferenceJobStore {
     try {
       return this.#appendEvent(record, event);
     } catch (error) {
-      this.#failEventCapacity(record, error);
+      this.#failEventCapacity(record);
       throw error;
     }
   }
@@ -387,7 +395,7 @@ export class InferenceJobStore {
         publish: event => {
           if (record.status === 'cancelled' || record.status === 'failed') return false;
           try { this.#appendEvent(record, event); return true; }
-          catch (error) { this.#failEventCapacity(record, error); return false; }
+          catch { this.#failEventCapacity(record); return false; }
         },
       });
       if (record.status === 'cancelled' || record.status === 'failed') return;
@@ -421,7 +429,7 @@ export class InferenceJobStore {
       if (!record.publicCompletedAt) record.publicCompletedAt = this.now();
       if (record.streaming && TERMINAL_STATUSES.has(record.status) && !record.terminalEventPublished) {
         try { this.#appendEvent(record, { type: `response.${record.status}`, response: publicResponse(record) }); }
-        catch (error) { this.#failEventCapacity(record, error); }
+        catch { this.#failEventCapacity(record); }
       }
       record.streamClosed = true;
       this.#settle(record);
@@ -457,10 +465,7 @@ export class InferenceJobStore {
     const terminal = /^response\.(?:completed|failed|cancelled|incomplete)$/.test(normalized.type);
     const bytes = Buffer.byteLength(JSON.stringify(normalized));
     this.#reclaimSettledEvents(bytes, record.id);
-    const eventLimit = this.maxEventsPerResponse + (terminal ? 1 : 0);
-    const responseByteLimit = this.maxEventBytesPerResponse + (terminal ? TERMINAL_EVENT_RESERVE_BYTES : 0);
-    const globalByteLimit = this.maxRetainedEventBytes + (terminal ? TERMINAL_EVENT_RESERVE_BYTES * this.maxJobs : 0);
-    if (record.events.length >= eventLimit || record.eventBytes + bytes > responseByteLimit || this.#eventBytes() + bytes > globalByteLimit) {
+    if (record.events.length >= this.maxEventsPerResponse || record.eventBytes + bytes > this.maxEventBytesPerResponse || this.#eventBytes() + bytes > this.maxRetainedEventBytes) {
       throw new InferenceJobSubmissionError('retained streaming event capacity exceeded', 502, 'event_retention_exceeded');
     }
     record.events.push(normalized);
@@ -472,16 +477,42 @@ export class InferenceJobStore {
   }
 
   /** Mark an event-cap overflow terminal and cooperatively abort its executor. */
-  #failEventCapacity(record, error) {
+  #failEventCapacity(record) {
     if (record.terminalEventPublished) return;
     record.status = 'failed';
     record.response = null;
-    record.error = boundedError(error, { code: 'event_retention_exceeded' });
+    record.error = {
+      code: 'event_retention_exceeded',
+      message: 'retained streaming event capacity exceeded',
+    };
     record.publicCompletedAt = this.now();
     try { record.abortController.abort('event_capacity'); } catch { /* best effort */ }
-    try { this.#appendEvent(record, { type: 'response.failed', response: publicResponse(record) }); } catch { /* reserve itself is strictly bounded */ }
+    this.#appendCapacityFailure(record);
     record.streamClosed = true;
     this.#notify(record);
+  }
+
+  /** Append the fixed-size terminal failure kept outside ordinary replay caps. */
+  #appendCapacityFailure(record) {
+    const normalized = normalizeEvent(record, {
+      type: 'response.failed',
+      response: {
+        id: record.id,
+        object: 'response',
+        created_at: Math.floor(record.createdAt / 1000),
+        status: 'failed',
+        background: true,
+        store: record.store,
+        output: [],
+        error: record.error,
+      },
+    });
+    const bytes = Buffer.byteLength(JSON.stringify(normalized));
+    if (bytes > TERMINAL_EVENT_RESERVE_BYTES) throw new Error('capacity failure event exceeded its fixed reserve');
+    record.events.push(normalized);
+    record.nextSequence += 1;
+    record.eventBytes += bytes;
+    record.terminalEventPublished = true;
   }
 
   /** Wake all live stream followers. */
