@@ -179,8 +179,10 @@ On top of that:
 - **Background Responses**: send `background: true` to `/v1/responses`, keep
   the returned OpenAI `resp_...` id, and retrieve or cancel the whole Response
   later. A stream created with `stream: true` can reconnect after its last
-  `sequence_number`; replay is bounded and process-local. Llama Manager
-  extensions add Authorization scope, temporary retention, and priority/routing.
+  `sequence_number`; replay is bounded and process-local. Omitted/false `store`
+  uses the roughly ten-minute OpenAI polling window, while explicit `store: true`
+  retains until bounded terminal-record reclamation or manager restart. Llama
+  Manager extensions add Authorization scope and priority/routing.
   Prepared llama.cpp append reuse is a separate `/v1/chat/completions` feature;
   Responses rejects prepared-context fields so a suffix cannot execute alone.
   DS4 rejects strict/append reuse because it has no compatible reusable slot.

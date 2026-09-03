@@ -356,6 +356,7 @@ export const tools = [
         input: { description: 'OpenAI Responses input string or item array.' },
         temperature: { type: 'number', description: 'Sampling temperature.' },
         max_output_tokens: { type: 'number', description: 'Maximum output tokens.' },
+        store: { type: 'boolean', description: 'Retain the background Response beyond the temporary polling window, subject to manager bounds.' },
         priority: { type: 'string', enum: ['realtime', 'interactive', 'background'], description: 'Manager queue priority, mapped to request_priority.' },
         routing: { type: 'string', enum: ['auto', 'local_only'], description: 'Manager routing policy.' },
         stream: { type: 'boolean', description: 'Stream now while retaining events for later resume.' },

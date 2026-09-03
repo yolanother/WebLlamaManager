@@ -175,7 +175,7 @@ const CHAT_REQUEST_SCHEMA = {
 
 const RESPONSE_SCHEMA = {
   type: 'object',
-  required: ['id', 'object', 'created_at', 'completed_at', 'status', 'background', 'output', 'error'],
+  required: ['id', 'object', 'created_at', 'completed_at', 'status', 'background', 'store', 'output', 'error'],
   properties: {
     id: { type: 'string', pattern: '^resp_', description: 'Process-local capability id scoped to caller authorization.' },
     object: { const: 'response' },
@@ -183,6 +183,7 @@ const RESPONSE_SCHEMA = {
     completed_at: { oneOf: [{ type: 'integer' }, { type: 'null' }], description: 'Terminal transition time in Unix seconds.' },
     status: { type: 'string', enum: ['queued', 'in_progress', 'completed', 'failed', 'cancelled', 'incomplete'] },
     background: { type: 'boolean' },
+    store: { type: 'boolean', description: 'Whether the manager retains this background Response beyond the temporary polling window, subject to bounded capacity and restart.' },
     output: { type: 'array', items: GENERIC_OBJECT_SCHEMA, description: 'Empty while active; complete only when completed.' },
     error: {
       oneOf: [{
@@ -202,7 +203,7 @@ const RESPONSE_BACKGROUND_LIFECYCLE = [
   'With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404.',
   'Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work.',
   'Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles.',
-  'Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result.',
+  'When store is omitted or false, terminal records are retained for about 10 minutes after settlement. Explicit store:true retains beyond that polling window until bounded capacity reclaims the oldest terminal record or the manager restarts. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result.',
   'Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history.',
   'A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete.',
   'This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings.',
@@ -216,6 +217,7 @@ const RESPONSE_REQUEST_SCHEMA = {
     input: {},
     background: { type: 'boolean', default: false },
     stream: { type: 'boolean', default: false },
+    store: { type: 'boolean', description: 'Retain a background Response beyond the temporary polling window, subject to manager capacity and restart.' },
     request_priority: { type: 'string', enum: ['realtime', 'interactive', 'background'] },
     routing: { type: 'string', enum: ['auto', 'local_only'] },
   },

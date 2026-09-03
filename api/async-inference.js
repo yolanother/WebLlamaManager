@@ -85,6 +85,7 @@ function responseSkeleton(record) {
     completed_at: record.publicCompletedAt == null ? null : Math.floor(record.publicCompletedAt / 1000),
     status: record.status,
     background: true,
+    store: record.store,
     model: record.model,
     output: [],
     error: record.status === 'failed' ? record.error : null,
@@ -105,6 +106,7 @@ function publicResponse(record) {
     completed_at: record.publicCompletedAt == null ? null : Math.floor(record.publicCompletedAt / 1000),
     status: record.status,
     background: true,
+    store: record.store,
     error: record.status === 'failed' ? record.error : (record.response.error ?? null),
   };
   if (record.managerDiagnostics) response._llama_manager = cloneJson(record.managerDiagnostics);
@@ -227,7 +229,7 @@ export class InferenceJobStore {
     if (typeof id !== 'string' || !id.startsWith('resp_') || this.records.has(id)) throw new InferenceJobSubmissionError('could not allocate an opaque Response id', 500, 'RESPONSE_ID_ALLOCATION_FAILED');
     const record = {
       id, scopeId, model: body.model || 'default', status: 'queued', createdAt, publicCompletedAt: null,
-      expiresAt: null, response: null, error: null, requestBytes,
+      store: body.store === true, settledAt: null, expiresAt: null, response: null, error: null, requestBytes,
       requestBody: cloneJson(null, serialized), requestHeaders: retainedHeaders(headers),
       abortController: new AbortController(), executionSettled: false,
       streaming: body.stream === true, events: [], eventBytes: 0, nextSequence: 1,
@@ -479,11 +481,12 @@ export class InferenceJobStore {
   #settle(record) {
     if (record.executionSettled) return;
     record.executionSettled = true;
+    record.settledAt = this.now();
     delete record.requestBody;
     delete record.requestHeaders;
     delete record.requestBytes;
     delete record.abortController;
-    record.expiresAt = this.now() + this.ttlMs;
+    record.expiresAt = record.store ? null : record.settledAt + this.ttlMs;
     this.#notify(record);
   }
 
@@ -506,7 +509,7 @@ export class InferenceJobStore {
     while (this.#eventBytes() + requiredBytes > this.maxRetainedEventBytes) {
       const candidate = [...this.records.values()]
         .filter(record => record.id !== exceptId && record.executionSettled && TERMINAL_STATUSES.has(record.status))
-        .sort((a, b) => (a.expiresAt || 0) - (b.expiresAt || 0))[0];
+        .sort((a, b) => (a.settledAt || 0) - (b.settledAt || 0))[0];
       if (!candidate) break;
       this.records.delete(candidate.id);
     }
@@ -518,7 +521,7 @@ export class InferenceJobStore {
     const reclaimOldest = predicate => {
       const candidate = [...this.records.values()]
         .filter(record => record.executionSettled && TERMINAL_STATUSES.has(record.status) && predicate(record))
-        .sort((a, b) => (a.expiresAt || 0) - (b.expiresAt || 0))[0];
+        .sort((a, b) => (a.settledAt || 0) - (b.settledAt || 0))[0];
       if (!candidate) return false;
       this.records.delete(candidate.id);
       return true;

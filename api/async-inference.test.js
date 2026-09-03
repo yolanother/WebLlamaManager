@@ -230,6 +230,25 @@ test('contracts 5 and 6: ids are scope-bound and expire about 10 minutes after s
   assert.equal(store.get(submitted.id, 'scope_a'), null);
 });
 
+test('OpenAI store semantics retain explicit store:true beyond the temporary polling window', async () => {
+  let now = 1_000;
+  const store = new InferenceJobStore({
+    now: () => now,
+    ttlMs: 100,
+    execute: async () => ({ status: 200, body: completedResponse() }),
+  });
+  const temporary = store.submit({ scopeId: 'scope_a', body: requestBody({ store: false }) });
+  const stored = store.submit({ scopeId: 'scope_a', body: requestBody({ store: true }) });
+  await waitFor(() => store.get(temporary.id, 'scope_a')?.status === 'completed');
+  await waitFor(() => store.get(stored.id, 'scope_a')?.status === 'completed');
+
+  assert.equal(store.get(temporary.id, 'scope_a').store, false);
+  assert.equal(store.get(stored.id, 'scope_a').store, true);
+  now += 101;
+  assert.equal(store.get(temporary.id, 'scope_a'), null);
+  assert.equal(store.get(stored.id, 'scope_a')?.status, 'completed');
+});
+
 test('contract 5: transport, HTTP, oversized, and empty outcomes become bounded failed Responses', async () => {
   const huge = 'backend diagnostic '.repeat(500);
   const cases = [
@@ -551,7 +570,7 @@ test('contract 6: oldest terminal Responses are reclaimed but active Responses a
       : Promise.resolve({ status: 200, body: completedResponse(body.input[0].content) }),
   });
 
-  const old = store.submit({ scopeId: 'scope_a', body: requestBody({ input: [{ role: 'user', content: 'old' }] }), headers: {} });
+  const old = store.submit({ scopeId: 'scope_a', body: requestBody({ input: [{ role: 'user', content: 'old' }], store: true }), headers: {} });
   await waitFor(() => store.get(old.id, 'scope_a')?.status === 'completed');
   const active = store.submit({ scopeId: 'scope_a', body: requestBody({ input: [{ role: 'user', content: 'active' }] }), headers: {} });
   await waitFor(() => store.get(active.id, 'scope_a')?.status === 'in_progress');

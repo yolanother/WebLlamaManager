@@ -58,6 +58,7 @@ test('contract 10: MCP catalog exposes OpenAI Response and prepared-context tool
     assert.ok(submit.inputSchema.properties[field], `submit tool omits ${field}`);
   }
   assert.equal(submit.inputSchema.properties.prepared_context_id, undefined);
+  assert.equal(submit.inputSchema.properties.store.type, 'boolean');
   assert.equal(submit.inputSchema.additionalProperties, false);
   assert.match(submit.description, /llama_chat/);
   assert.match(submit.description, /client|proxy/i);
@@ -90,6 +91,7 @@ test('contract 10: Response MCP tools mirror extensions and OpenAI-compatible RE
     priority: 'background',
     routing: 'local_only',
     stream: true,
+    store: true,
   };
   const submitted = await captureToolCall('submit_response', argumentsBody);
   assert.equal(submitted.captured.url, 'http://localhost:5250/api/v1/responses');

@@ -128,14 +128,14 @@ explicit Llama Manager extensions for this self-hosted implementation:
 |---|---|
 | Authorization scope | Opaque hash of the complete `Authorization` value; anonymous callers share one local trusted scope |
 | Persistence | Process-local only; responses and replay logs do not survive restart |
-| Terminal retention | Roughly 10 minutes after settlement |
+| Terminal retention | Roughly 10 minutes when `store` is omitted/false; explicit `store: true` retains beyond that window until bounded reclamation or restart |
 | Response records | 128 globally, 32 per scope |
 | One serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | One serialized result | 16 MiB |
 | Streaming replay | 10,000 events and 16 MiB per Response; 64 MiB globally; process-local |
 
-Expired records and the oldest terminal records are reclaimed before admission.
+Expired records and the oldest terminal records, including stored records, are reclaimed before admission.
 Active responses are never evicted to admit new work. An oversized request is
 rejected with HTTP 413; exhausted count or retained-request-byte capacity returns
 HTTP 429. An oversized completion becomes a failed Response rather than an empty

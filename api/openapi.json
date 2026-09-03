@@ -5255,7 +5255,7 @@
       "post": {
         "operationId": "post_api_v1_responses",
         "summary": "Create an OpenAI Responses API response",
-        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement. Prepared-context reuse remains a Chat Completions extension and is rejected on Responses so a suffix can never execute without its retained prefix.",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. When store is omitted or false, terminal records are retained for about 10 minutes after settlement. Explicit store:true retains beyond that polling window until bounded capacity reclaims the oldest terminal record or the manager restarts. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement. Prepared-context reuse remains a Chat Completions extension and is rejected on Responses so a suffix can never execute without its retained prefix.",
         "tags": [
           "openai"
         ],
@@ -5274,6 +5274,7 @@
                     "completed_at",
                     "status",
                     "background",
+                    "store",
                     "output",
                     "error"
                   ],
@@ -5314,6 +5315,10 @@
                     },
                     "background": {
                       "type": "boolean"
+                    },
+                    "store": {
+                      "type": "boolean",
+                      "description": "Whether the manager retains this background Response beyond the temporary polling window, subject to bounded capacity and restart."
                     },
                     "output": {
                       "type": "array",
@@ -5394,6 +5399,10 @@
                     "type": "boolean",
                     "default": false
                   },
+                  "store": {
+                    "type": "boolean",
+                    "description": "Retain a background Response beyond the temporary polling window, subject to manager capacity and restart."
+                  },
                   "request_priority": {
                     "type": "string",
                     "enum": [
@@ -5433,7 +5442,7 @@
       "get": {
         "operationId": "get_api_v1_responses_response_id",
         "summary": "Retrieve or stream a background Response",
-        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Add stream=true and optional starting_after to resume a stream-origin Response.",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. When store is omitted or false, terminal records are retained for about 10 minutes after settlement. Explicit store:true retains beyond that polling window until bounded capacity reclaims the oldest terminal record or the manager restarts. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Add stream=true and optional starting_after to resume a stream-origin Response.",
         "tags": [
           "openai"
         ],
@@ -5481,6 +5490,7 @@
                     "completed_at",
                     "status",
                     "background",
+                    "store",
                     "output",
                     "error"
                   ],
@@ -5521,6 +5531,10 @@
                     },
                     "background": {
                       "type": "boolean"
+                    },
+                    "store": {
+                      "type": "boolean",
+                      "description": "Whether the manager retains this background Response beyond the temporary polling window, subject to bounded capacity and restart."
                     },
                     "output": {
                       "type": "array",
@@ -5587,7 +5601,7 @@
       "post": {
         "operationId": "post_api_v1_responses_response_id_cancel",
         "summary": "Cancel a background Response",
-        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Repeating cancellation returns the terminal Response unchanged.",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. When store is omitted or false, terminal records are retained for about 10 minutes after settlement. Explicit store:true retains beyond that polling window until bounded capacity reclaims the oldest terminal record or the manager restarts. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Repeating cancellation returns the terminal Response unchanged.",
         "tags": [
           "openai"
         ],
@@ -5616,6 +5630,7 @@
                     "completed_at",
                     "status",
                     "background",
+                    "store",
                     "output",
                     "error"
                   ],
@@ -5656,6 +5671,10 @@
                     },
                     "background": {
                       "type": "boolean"
+                    },
+                    "store": {
+                      "type": "boolean",
+                      "description": "Whether the manager retains this background Response beyond the temporary polling window, subject to bounded capacity and restart."
                     },
                     "output": {
                       "type": "array",
@@ -8989,7 +9008,7 @@
       "post": {
         "operationId": "post_v1_responses",
         "summary": "Create an OpenAI Responses API response",
-        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement. Prepared-context reuse remains a Chat Completions extension and is rejected on Responses so a suffix can never execute without its retained prefix.",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. When store is omitted or false, terminal records are retained for about 10 minutes after settlement. Explicit store:true retains beyond that polling window until bounded capacity reclaims the oldest terminal record or the manager restarts. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement. Prepared-context reuse remains a Chat Completions extension and is rejected on Responses so a suffix can never execute without its retained prefix.",
         "tags": [
           "openai"
         ],
@@ -9008,6 +9027,7 @@
                     "completed_at",
                     "status",
                     "background",
+                    "store",
                     "output",
                     "error"
                   ],
@@ -9048,6 +9068,10 @@
                     },
                     "background": {
                       "type": "boolean"
+                    },
+                    "store": {
+                      "type": "boolean",
+                      "description": "Whether the manager retains this background Response beyond the temporary polling window, subject to bounded capacity and restart."
                     },
                     "output": {
                       "type": "array",
@@ -9128,6 +9152,10 @@
                     "type": "boolean",
                     "default": false
                   },
+                  "store": {
+                    "type": "boolean",
+                    "description": "Retain a background Response beyond the temporary polling window, subject to manager capacity and restart."
+                  },
                   "request_priority": {
                     "type": "string",
                     "enum": [
@@ -9167,7 +9195,7 @@
       "get": {
         "operationId": "get_v1_responses_response_id",
         "summary": "Retrieve or stream a background Response",
-        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Add stream=true and optional starting_after to resume a stream-origin Response.",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. When store is omitted or false, terminal records are retained for about 10 minutes after settlement. Explicit store:true retains beyond that polling window until bounded capacity reclaims the oldest terminal record or the manager restarts. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Add stream=true and optional starting_after to resume a stream-origin Response.",
         "tags": [
           "openai"
         ],
@@ -9215,6 +9243,7 @@
                     "completed_at",
                     "status",
                     "background",
+                    "store",
                     "output",
                     "error"
                   ],
@@ -9255,6 +9284,10 @@
                     },
                     "background": {
                       "type": "boolean"
+                    },
+                    "store": {
+                      "type": "boolean",
+                      "description": "Whether the manager retains this background Response beyond the temporary polling window, subject to bounded capacity and restart."
                     },
                     "output": {
                       "type": "array",
@@ -9321,7 +9354,7 @@
       "post": {
         "operationId": "post_v1_responses_response_id_cancel",
         "summary": "Cancel a background Response",
-        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Repeating cancellation returns the terminal Response unchanged.",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. When store is omitted or false, terminal records are retained for about 10 minutes after settlement. Explicit store:true retains beyond that polling window until bounded capacity reclaims the oldest terminal record or the manager restarts. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Repeating cancellation returns the terminal Response unchanged.",
         "tags": [
           "openai"
         ],
@@ -9350,6 +9383,7 @@
                     "completed_at",
                     "status",
                     "background",
+                    "store",
                     "output",
                     "error"
                   ],
@@ -9390,6 +9424,10 @@
                     },
                     "background": {
                       "type": "boolean"
+                    },
+                    "store": {
+                      "type": "boolean",
+                      "description": "Whether the manager retains this background Response beyond the temporary polling window, subject to bounded capacity and restart."
                     },
                     "output": {
                       "type": "array",

@@ -280,6 +280,7 @@ test('contracts 1-8: Responses docs expose OpenAI background create, retrieve, c
 
     assert.equal(create.requestSchema.properties.background.type, 'boolean');
     assert.equal(create.requestSchema.properties.stream.type, 'boolean');
+    assert.equal(create.requestSchema.properties.store.type, 'boolean');
     assert.equal(create.requestSchema.required.includes('background'), false);
     assert.match(create.description, /background/i);
     assert.match(create.description, /synchronous/i);
@@ -290,6 +291,8 @@ test('contracts 1-8: Responses docs expose OpenAI background create, retrieve, c
       assert.equal(create.requestSchema.properties[unsupported], undefined);
     }
     assert.match(create.description, /chat completions/i);
+    assert.match(create.description, /store:true/i);
+    assert.match(create.description, /capacity|restart/i);
 
     const response = retrieve.responseSchema.properties;
     assert.match(response.id.pattern, /resp_/);
@@ -300,6 +303,8 @@ test('contracts 1-8: Responses docs expose OpenAI background create, retrieve, c
     );
     assert.equal(response.created_at.type, 'integer');
     assert.ok(response.completed_at);
+    assert.equal(response.store.type, 'boolean');
+    assert.ok(retrieve.responseSchema.required.includes('store'));
     assert.ok(response.output);
     const errorSchema = [response.error, ...(response.error?.oneOf || []), ...(response.error?.anyOf || [])]
       .find(schema => schema?.properties?.code && schema?.properties?.message);

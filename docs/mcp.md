@@ -65,6 +65,7 @@ Creates a background Response through `POST /v1/responses`. The tool always sets
 | `model` | Required model id or alias |
 | `input` | Required Responses input string or supported input items |
 | `stream` | Emit standard Responses SSE events; with background mode, events are retained for bounded replay |
+| `store` | Explicit `true` retains beyond the roughly ten-minute polling window, until bounded terminal-record reclamation or manager restart |
 | `temperature`, `max_output_tokens` | Supported Responses output controls |
 | `priority` | Llama Manager admission policy; mapped to `request_priority` |
 | `routing` | Llama Manager routing policy, including `local_only` |
@@ -167,15 +168,15 @@ the following manager-specific implementation bounds:
 |---|---|
 | Authorization scope | Derived from the full Authorization header; anonymous callers share a local trusted scope |
 | Persistence | Process-local; Responses and replay logs do not survive restart |
-| Terminal polling/replay retention | Roughly 10 minutes after settlement |
+| Terminal polling/replay retention | Roughly 10 minutes when `store` is omitted/false; `store: true` extends retention until bounded reclamation or restart |
 | Response records | 128 globally, 32 per scope |
 | Serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
 | Serialized result | 16 MiB |
 | SSE replay | 10,000 events and 16 MiB per Response; 64 MiB globally |
 
-Expired and oldest terminal records are reclaimed before capacity is refused;
-active work is never evicted. Missing, expired, and wrong-scope ids return the
+Expired and oldest terminal records, including stored records, are reclaimed
+before capacity is refused; active work is never evicted. Missing, expired, and wrong-scope ids return the
 same standard not-found shape. The manager deletes private request bodies,
 authorization, priority, and routing values after settlement.
 

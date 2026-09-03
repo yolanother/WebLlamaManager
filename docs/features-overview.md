@@ -136,13 +136,16 @@ to Responses originally created with streaming enabled; JSON retrieval works for
 either mode.
 
 Llama Manager adds bounded process-local storage and scope isolation rather than
-changing OpenAI fields. Terminal polling/replay state is retained for roughly 10
-minutes and is lost on restart. Defaults cap records at 128 globally/32 per
+changing OpenAI fields. With `store` omitted or false, terminal polling/replay
+state is retained for roughly 10 minutes. Explicit `store: true` retains beyond
+that window until capacity reclaims an old terminal record or the manager
+restarts. Defaults cap records at 128 globally/32 per
 Authorization scope, requests at 4 MiB, retained active request bytes at 64/16
 MiB globally/per scope, and results at 16 MiB. SSE replay also has explicit
 caps: 10,000 events/16 MiB per Response and 64 MiB globally. Active work is never
-evicted to admit a new request. Cancellation remains capacity-accounted until
-execution settles and cannot be overwritten by a late result.
+evicted to admit a new request; terminal stored records remain reclaimable.
+Cancellation remains capacity-accounted until execution settles and cannot be
+overwritten by a late result.
 
 Priority and routing are additive manager fields carried through the same
 synchronous Responses execution seam. Prepared context is deliberately separate:

@@ -191,18 +191,19 @@ must authenticate at the manager or a trusted proxy and supply distinct, stable
 authorization contexts.
 
 Missing, expired, and wrong-scope ids all return the standard not-found error
-shape and do not reveal cross-scope existence. Llama Manager keeps terminal
-background Responses and their replay state temporarily for roughly 10 minutes,
-matching the intended short polling/reconnection window. Records are
-process-local and do not survive a manager restart. Persist the input needed to
-resubmit; this is not a durable workflow queue.
+shape and do not reveal cross-scope existence. When `store` is omitted or
+`false`, Llama Manager keeps terminal background Responses and replay state for
+roughly 10 minutes, matching OpenAI's temporary polling window. Explicit
+`store: true` retains the Response beyond that window, but only until bounded
+capacity reclaims an old terminal record or the manager restarts. Persist the
+input needed to resubmit; this is not a durable workflow queue.
 
 The retention interval, scope boundary, and limits below are Llama Manager
 extensions:
 
 | Manager extension | Default/behavior |
 |---|---|
-| Terminal polling/replay retention | Roughly 10 minutes after settlement |
+| Terminal polling/replay retention | Roughly 10 minutes after settlement when `store` is omitted/false; `store: true` extends retention until capacity reclamation or restart |
 | Response records | 128 globally, 32 per scope |
 | One serialized request | 4 MiB |
 | Retained active request bytes | 64 MiB globally, 16 MiB per scope |
