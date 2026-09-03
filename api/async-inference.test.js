@@ -234,7 +234,11 @@ test('contracts 5 and 6: ids are scope-bound and expire about 10 minutes after s
 test('contract 5: transport, HTTP, oversized, and empty outcomes become bounded failed Responses', async () => {
   const huge = 'backend diagnostic '.repeat(500);
   const cases = [
-    { execute: async () => ({ status: 503, body: { error: { message: huge, type: 'backend_error', code: 'MODEL_LOAD_FAILED' } } }), expectedStatus: 503 },
+    {
+      execute: async () => ({ status: 503, body: { error: { message: huge, type: 'backend_error', code: 'MODEL_LOAD_FAILED' } } }),
+      expectedStatus: 503,
+      expectedType: 'backend_error',
+    },
     { execute: async () => { throw new Error(huge); } },
     { execute: async () => ({ status: 502, body: huge }), expectedStatus: 502 },
     { execute: async () => ({ status: 200, body: completedResponse('x'.repeat(1_000)) }), maxResultBytes: 200, expectedCode: 'result_too_large' },
@@ -252,9 +256,15 @@ test('contract 5: transport, HTTP, oversized, and empty outcomes become bounded 
     assert.deepEqual(failed.output, []);
     assert.equal(typeof failed.error.message, 'string');
     assert.ok(failed.error.message.length > 0 && failed.error.message.length <= 1_024);
-    assert.equal(typeof failed.error.type, 'string');
     assert.equal(typeof failed.error.code, 'string');
-    if (scenario.expectedStatus) assert.equal(failed.error.status, scenario.expectedStatus);
+    assert.deepEqual(
+      Object.keys(failed.error).sort(),
+      ['code', 'message'],
+      'OpenAI Response.error must not contain manager-specific type/status fields',
+    );
+    const managerDiagnostics = JSON.stringify(failed._llama_manager || {});
+    if (scenario.expectedStatus) assert.match(managerDiagnostics, new RegExp(String(scenario.expectedStatus)));
+    if (scenario.expectedType) assert.match(managerDiagnostics, new RegExp(scenario.expectedType));
     if (scenario.expectedCode) assert.equal(failed.error.code, scenario.expectedCode);
     assert.ok(JSON.stringify(failed).length < 3_000);
   }

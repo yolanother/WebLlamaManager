@@ -300,7 +300,13 @@ test('contracts 1-8: Responses docs expose OpenAI background create, retrieve, c
     assert.equal(response.created_at.type, 'integer');
     assert.ok(response.completed_at);
     assert.ok(response.output);
-    assert.ok(response.error);
+    const errorSchema = [response.error, ...(response.error?.oneOf || []), ...(response.error?.anyOf || [])]
+      .find(schema => schema?.properties?.code && schema?.properties?.message);
+    assert.ok(errorSchema, 'Response.error needs its OpenAI object schema');
+    assert.deepEqual(Object.keys(errorSchema.properties).sort(), ['code', 'message']);
+    assert.deepEqual(new Set(errorSchema.required), new Set(['code', 'message']));
+    assert.equal(errorSchema.additionalProperties, false);
+    assert.ok(response._llama_manager, 'manager diagnostics must be additive outside Response.error');
     const params = new Map(retrieve.params.map(param => [param.name, param]));
     assert.equal(params.get('stream').in, 'query');
     assert.equal(params.get('starting_after').in, 'query');
