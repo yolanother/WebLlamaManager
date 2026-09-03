@@ -4603,9 +4603,12 @@ app.post('/api/backends/:id/test', async (req, res) => {
       });
     }
 
-    // Step 3: Send a test chat completion
+    // Step 3: Send a test chat completion. A cold DS4/large-model backend can take well
+    // over a minute just to load before it answers even this 5-token probe (~25s measured
+    // on Drakemore), so this reuses the same generous ceiling REMOTE_BACKEND_TIMEOUT_MS
+    // gives every other remote backend call rather than a probe-specific short fuse.
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    const timeout = setTimeout(() => controller.abort(), REMOTE_BACKEND_TIMEOUT_MS);
     const response = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
       headers,
@@ -4671,12 +4674,19 @@ app.post('/api/backends/:id/test', async (req, res) => {
   } catch (err) {
     const duration = Date.now() - startTime;
 
-    // Mark test as failed
-    const idx = config.backends?.directory?.findIndex(b => b.id === backend.id);
-    if (idx !== undefined && idx !== -1) {
-      config.backends.directory[idx].tested = false;
-      config.backends.directory[idx].lastTestTime = Date.now();
-      saveConfig(config);
+    // A timeout (our own AbortController firing) means "still loading" — the eventual
+    // ds4-mode fix for T31078a98ec6a2 already proved a backend can legitimately take
+    // ~25s+ to answer a cold probe. That is evidence of "slow or busy", not "unreachable",
+    // so it must not flip a live backend out of routing the way a real connection failure
+    // (DNS, ECONNREFUSED, TLS, etc.) should. Only the latter clears `tested`.
+    const isTimeout = err?.name === 'AbortError';
+    if (!isTimeout) {
+      const idx = config.backends?.directory?.findIndex(b => b.id === backend.id);
+      if (idx !== undefined && idx !== -1) {
+        config.backends.directory[idx].tested = false;
+        config.backends.directory[idx].lastTestTime = Date.now();
+        saveConfig(config);
+      }
     }
 
     res.json({
@@ -4684,7 +4694,9 @@ app.post('/api/backends/:id/test', async (req, res) => {
       status: 0,
       latencyMs: duration,
       error: err.message,
-      message: `Connection failed: ${err.message}`
+      message: isTimeout
+        ? `Backend did not respond within ${REMOTE_BACKEND_TIMEOUT_MS}ms (still loading?); leaving previous tested state unchanged`
+        : `Connection failed: ${err.message}`
     });
   }
 });
