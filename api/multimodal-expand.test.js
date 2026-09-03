@@ -495,6 +495,15 @@ test('bare v1 aliases register the same named handlers before the SPA catch-all'
   assert.match(chatHandler, /const isStreaming = req\.body\.stream === true/);
   assert.equal((chatHandler.match(/expandMessages\(/g) || []).length, 1);
   assert.match(chatHandler, /res\.setHeader\('x-llama-manager-media', JSON\.stringify\(mediaMetadata\)\)/);
+
+  const responsesHandler = source.slice(
+    source.indexOf('async function handleResponses'),
+    source.indexOf("app.post('/api/v1/responses'"),
+  );
+  assert.match(responsesHandler, /resolveRequestModel\(rawModel\)/);
+  assert.match(responsesHandler, /ensureDs4ForModel\(rawModel, requestedModel\)/);
+  assert.match(responsesHandler, /ds4RequestTarget\(/);
+  assert.match(responsesHandler, /ds4TargetUrl\(ds4\.port, '\/v1\/responses'\)/);
 });
 
 test('audio without normalized artifacts preserves the original part', async () => {

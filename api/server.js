@@ -12450,19 +12450,66 @@ async function handleResponses(req, res) {
   res.once('close', abortRequest);
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
-  const requestedModel = req.body.model || 'default';
+  const rawModel = req.body.model || 'default';
   let requestPolicy;
   try { requestPolicy = managerRequestPolicy(req.body, req.headers); }
   catch (error) { return res.status(400).json({ error: { message: error.message, code: 'invalid_manager_policy' } }); }
   req.body = stripManagerRequestFields(req.body);
+  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel);
+  if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   console.log(`[responses] Request for model: ${requestedModel}`);
+
+  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel);
+  if (ds4Activation && !ds4Activation.ok) {
+    return res.status(ds4Activation.status || 503).json({ error: { message: ds4Activation.error, type: 'server_error' } });
+  }
+  if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
 
   // Inject reasoning_effort if configured
   const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
-  // Route to remote backend if applicable
-  const routing = resolveBackend(requestedModel, 'responses', req.body, { localOnly: requestPolicy.localOnly });
+  // Match Chat Completions alias and exclusive-engine routing semantics while
+  // preserving the Responses wire format on the selected backend.
+  let routing;
+  let localResponsesIsDs4 = false;
+  let localResponsesUrl = `http://localhost:${LLAMA_PORT}/v1/responses`;
+  if (currentEngine === ENGINE_TYPES.DS4) {
+    const decision = ds4RequestTarget({
+      requestedModel,
+      ds4ModelIds: ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset),
+      hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'responses', aliasRouting),
+      llamaRunning: !!llamaProcess,
+    });
+    if (decision.target === 'local-ds4') {
+      const ds4 = resolveDs4Config(config, RUNTIME_ENV);
+      localResponsesIsDs4 = true;
+      localResponsesUrl = ds4TargetUrl(ds4.port, '/v1/responses');
+      routing = { remote: false };
+    } else if (decision.target === 'local-llama') {
+      routing = resolveBackend(requestedModel, 'responses', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
+    } else if (requestPolicy.localOnly) {
+      contextRoutingStats.offloadSuppressedLocalOnly++;
+      contextRoutingStats.localOnlyRejected++;
+      return res.status(503).json({
+        error: {
+          message: 'Local-only request cannot be served while DS4 exclusively owns the local engine',
+          type: 'local_backend_unavailable',
+          code: 'LOCAL_ONLY_UNAVAILABLE',
+        },
+        _llama_manager: { routing: 'local_only', routing_outcome: 'rejected', offload_suppressed: true },
+      });
+    } else if (decision.target === 'reject') {
+      const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
+      return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
+    } else {
+      const backend = findFastestAvailableBackend(requestedModel, 'responses', aliasRouting);
+      const remoteModel = remoteTargetModel(backend, aliasRouting);
+      routing = buildRemoteRouting(backend, remoteModel, 'responses');
+    }
+  } else {
+    routing = resolveBackend(requestedModel, 'responses', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
+  }
   if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;
@@ -12537,12 +12584,16 @@ async function handleResponses(req, res) {
     return;
   }
   try {
-    await ensureModelServed(requestedModel);
-    let result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
+    if (!localResponsesIsDs4) await ensureModelServed(requestedModel);
+    const requestOptions = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(proxyBody)
-    }, { label: 'responses', model: proxyBody.model, signal: requestAbort.signal });
+      body: JSON.stringify(proxyBody),
+      signal: requestAbort.signal,
+    };
+    let result = localResponsesIsDs4
+      ? { response: await fetch(localResponsesUrl, requestOptions), retries: 0, retryErrors: [], restarted: false }
+      : await fetchWithRetry(localResponsesUrl, requestOptions, { label: 'responses', model: proxyBody.model, signal: requestAbort.signal });
     let response = result.response;
     totalRetries = result.retries;
     allRetryErrors = [...result.retryErrors];
@@ -12553,11 +12604,11 @@ async function handleResponses(req, res) {
     // If model failed to load, unload others and retry
     if (!response.ok) {
       const error = await response.text();
-      if (isModelLoadFailure(response.status, error)) {
+      if (!localResponsesIsDs4 && isModelLoadFailure(response.status, error)) {
         console.log(`[responses] Model load failure for ${requestedModel}, attempting to free memory`);
         const unloaded = await unloadOtherModels(requestedModel);
         if (unloaded) {
-          result = await fetchWithRetry(`http://localhost:${LLAMA_PORT}/v1/responses`, {
+          result = await fetchWithRetry(localResponsesUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(proxyBody)
@@ -12685,7 +12736,7 @@ async function handleResponses(req, res) {
         {
           duration,
           tokensPerSecond: Math.round(tokensPerSecond * 10) / 10,
-          backend: 'local'
+          backend: localResponsesIsDs4 ? 'ds4' : 'local'
         },
         { completionTokens }
       );
