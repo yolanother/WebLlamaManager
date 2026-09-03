@@ -3,9 +3,9 @@
 // LICENSE file in the repository root.
 //
 // Defines opaque caller scope, canonical compatibility fingerprints, prepared
-// context leases, and bidirectional conversation-to-slot ownership. It keeps
-// credentials, prompts, token arrays, and raw llama.cpp slot identifiers out of
-// public handles while providing deterministic primitives for server routing.
+// context leases, private prepared prefixes, and bidirectional conversation-to-slot
+// ownership. It keeps credentials, prompts, token arrays, and raw llama.cpp slot
+// identifiers out of public handles while providing deterministic server routing.
 
 import { createHash, randomBytes } from 'node:crypto';
 

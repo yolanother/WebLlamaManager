@@ -4,7 +4,8 @@
 //
 // This module serializes work against constrained inference lanes while letting
 // realtime requests skip queued lower-priority work, cooperatively preempting
-// background work, bounding background admission, and preventing starvation.
+// background work, bounding background admission, removing aborted pending
+// work before activation, and preventing starvation.
 
 /** Supported request priority classes, ordered from highest to lowest. */
 export const REQUEST_PRIORITIES = Object.freeze(['realtime', 'interactive', 'background']);

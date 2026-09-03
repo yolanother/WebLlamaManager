@@ -2,9 +2,10 @@
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
-// Builds safe llama.cpp requests for exact OpenAI chat/Responses input counting
-// and KV preparation. Manager-only identity, prepared-handle, and raw slot
-// controls are removed before proxying so actual slot ownership remains local.
+// Builds safe llama.cpp requests for exact OpenAI chat/Responses input counting,
+// KV preparation, and text-only suffix composition with a retained prepared
+// prefix. Manager-only identity, prepared-handle, and raw slot controls are
+// removed before proxying so actual slot ownership remains local.
 // The exact-count call optionally brackets itself on a timing-evidence recorder
 // so input tokenization is measured discretely and never inferred from prefill.
 

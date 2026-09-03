@@ -12,6 +12,8 @@
 // cannot terminate workers supervised by a different manager.
 // OpenAI routes support both /api/v1 and bare /v1 paths, with URL-based media
 // expanded into standard multimodal parts before chat inference.
+// Manager extensions provide bounded process-local asynchronous chat jobs and
+// scope-safe prepared-context append reuse through the same synchronous route.
 // The same application is served on API_PORT and, best-effort, on the appliance
 // mirror port ALT_PORT (default 80) when the process is allowed to bind it.
 
@@ -10581,6 +10583,15 @@ async function handleChatCompletions(req, res) {
   let appendPrepared = null;
   let appendScope = null;
   if (appendPreparedContext) {
+    if (ds4PresetForModel(config, requestedModel)) {
+      return res.status(501).json({
+        error: {
+          message: 'prepared contexts are unsupported by DS4',
+          type: 'not_supported_error',
+          code: 'CONTEXT_PREFILL_UNSUPPORTED',
+        },
+      });
+    }
     appendScope = deriveCacheScope(req.headers);
     appendPrepared = preparedContexts.getInternal(req.body.prepared_context_id, appendScope.id);
     const prefixAvailable = appendPrepared && appendPrepared.status === 'ready' &&
