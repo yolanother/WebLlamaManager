@@ -13,6 +13,7 @@ import {
   DS4_EXCLUSIVE_ERROR,
   ds4InFlightCount,
   ds4EvictionPlan,
+  ds4SwapRetryDecision,
   ds4EvictionReadiness,
   ds4ModelMatches,
   ds4RequestTarget,
@@ -333,4 +334,32 @@ test('ds4EvictionPlan defers background work instead of evicting', () => {
     fits: false, hasViableRemote: false, ds4IdleMs: 0, requestPriority: 'background',
   });
   assert.equal(r.action, 'defer');
+});
+
+test('ds4SwapRetryDecision re-serves a request our own swap killed', () => {
+  // The observed failure: a request 300s into its work died with
+  // "ds4-server request failed: fetch failed" because the drain deadline
+  // expired and we stopped ds4-server underneath it.
+  const r = ds4SwapRetryDecision({ swapOccurred: true, attempt: 0, maxRetries: 2 });
+  assert.equal(r.retry, true);
+});
+
+test('ds4SwapRetryDecision does NOT retry a genuine backend fault', () => {
+  // Retrying a broken model forever would turn one bad request into a loop.
+  const r = ds4SwapRetryDecision({ swapOccurred: false, attempt: 0, maxRetries: 2 });
+  assert.equal(r.retry, false);
+  assert.match(r.reason, /not caused by an engine swap/);
+});
+
+test('ds4SwapRetryDecision cannot retry once bytes are on the wire', () => {
+  const r = ds4SwapRetryDecision({ swapOccurred: true, attempt: 0, maxRetries: 2, bodyCommitted: true });
+  assert.equal(r.retry, false);
+  assert.match(r.reason, /already committed/);
+});
+
+test('ds4SwapRetryDecision gives up after the retry budget', () => {
+  // A box swapping repeatedly must not trap a request in an endless re-serve.
+  const r = ds4SwapRetryDecision({ swapOccurred: true, attempt: 2, maxRetries: 2 });
+  assert.equal(r.retry, false);
+  assert.match(r.reason, /giving up/);
 });

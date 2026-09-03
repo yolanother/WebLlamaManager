@@ -314,3 +314,45 @@ export function ds4EvictionPlan({
     reason: 'nothing else can serve this model and DS4 is in recent use — evicting as the last resort',
   };
 }
+
+/**
+ * Whether a failed ds4 request should be retried internally after an engine swap.
+ *
+ * A caller has no idea this box hot-swaps engines, and should never be told
+ * about it. When ds4-server is stopped to make room for another model, any
+ * request it was answering dies with a transport error — observed as
+ * `ds4-server request failed: fetch failed` after the caller had already waited
+ * out most of a long prefill. That is not a backend fault; it is a scheduling
+ * decision this manager made, and the request should be re-served once the swap
+ * settles rather than failed.
+ *
+ * Only a swap-caused failure is retried. A genuine upstream error must still
+ * surface, or a broken model would retry forever.
+ *
+ * Retrying is impossible once the response body has been committed — bytes are
+ * already on the wire and the completion cannot be replaced.
+ *
+ * @param {object} p
+ * @param {boolean} p.swapOccurred  Whether an engine swap ran during the request.
+ * @param {number}  p.attempt       0-based attempt already made.
+ * @param {number}  p.maxRetries    Extra attempts permitted.
+ * @param {boolean} p.bodyCommitted Whether response bytes were already sent.
+ * @returns {{retry:boolean, reason:string}}
+ */
+export function ds4SwapRetryDecision({
+  swapOccurred = false, attempt = 0, maxRetries = 2, bodyCommitted = false,
+} = {}) {
+  if (!swapOccurred) {
+    return { retry: false, reason: 'failure was not caused by an engine swap' };
+  }
+  if (bodyCommitted) {
+    return { retry: false, reason: 'response already committed; cannot re-serve' };
+  }
+  if (attempt >= maxRetries) {
+    return { retry: false, reason: `engine swapped again after ${maxRetries} retries; giving up` };
+  }
+  return {
+    retry: true,
+    reason: `engine swapped mid-request — re-serving internally (attempt ${attempt + 2}/${maxRetries + 1})`,
+  };
+}

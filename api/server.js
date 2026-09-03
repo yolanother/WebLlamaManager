@@ -164,7 +164,7 @@ import { buildRepoRecommendations, computeCapacityBytes } from './repo-recommend
 import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
   shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision,
-  ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan
+  ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan, ds4SwapRetryDecision
 } from './ds4-exclusive.js';
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
@@ -395,6 +395,12 @@ let ds4ActivePresetId = null;
 let ds4LastServedAt = 0;
 /** Idle time past which evicting DS4 is considered an acceptable cost (ms). */
 const DS4_IDLE_EVICT_AFTER_MS = 600000;
+// Incremented every time the ds4 engine is activated or deactivated. A request
+// that fails while this has moved was killed by our own hot-swap, not by a
+// broken backend, and is re-served internally instead of being failed.
+let ds4SwapGeneration = 0;
+/** Internal re-serve attempts after a hot-swap kills a ds4 request. */
+const DS4_SWAP_MAX_RETRIES = 2;
 // Which inference engine is currently serving: 'llama' (llama.cpp router/preset,
 // the default) or 'ds4' (ds4-server, DeepSeek V4 Flash). Set by preset activation.
 // While 'ds4', llama-server is stopped and the ds4 supervisor owns the box.
@@ -6571,6 +6577,7 @@ async function activateDs4Exclusive(presetId, preset) {
   currentMode = 'single';
   currentPreset = presetId;
   ds4ActivePresetId = presetId;
+  ds4SwapGeneration += 1;
   currentEngine = ENGINE_TYPES.DS4;
 
   let releaseGate;
@@ -6775,6 +6782,7 @@ async function deactivateDs4Exclusive() {
     await stopDs4Server();
     ds4SettledRuntime = null; // no longer serving ds4 — clear the settled runtime state
     ds4ActivePresetId = null;  // ds4 is gone; stop claiming its model routes locally
+    ds4SwapGeneration += 1;
     currentEngine = ENGINE_TYPES.LLAMA;
     const targetBytes = ds4HeadroomBytes();
     const poll = await pollForReclaim({
@@ -10146,6 +10154,52 @@ function writeGuardedCompletionFragments(res, fragments) {
  * @param {import('express').Response} res
  * @param {{requestedModel:string, isStreaming:boolean, startTime:number, mediaMetadata?:object}} ctx
  */
+/**
+ * Serve a ds4 request, re-serving it internally if our own hot-swap kills it.
+ *
+ * A caller must never be told about hot-swaps. When ds4-server is stopped to
+ * make room for another model, whatever it was answering dies with a transport
+ * error; that is a scheduling decision this manager made, not a backend fault,
+ * so the request is re-served once the swap settles. Only swap-caused failures
+ * are retried — a genuine upstream error still surfaces.
+ *
+ * @param {import('express').Request} req Incoming request.
+ * @param {import('express').Response} res Response to write.
+ * @param {object} opts Same options as proxyChatToDs4.
+ * @returns {Promise<void>}
+ */
+async function serveDs4WithSwapRecovery(req, res, opts) {
+  for (let attempt = 0; ; attempt++) {
+    const genBefore = ds4SwapGeneration;
+    try {
+      return await proxyChatToDs4(req, res, opts);
+    } catch (err) {
+      const decision = ds4SwapRetryDecision({
+        swapOccurred: ds4SwapGeneration !== genBefore || !!ds4SwapPromise,
+        attempt,
+        maxRetries: DS4_SWAP_MAX_RETRIES,
+        bodyCommitted: res.headersSent || res.writableEnded,
+      });
+      if (!decision.retry) {
+        console.warn(`[ds4] not re-serving '${opts.requestedModel}': ${decision.reason} (${err.message})`);
+        if (!res.headersSent) {
+          return res.status(502).json({
+            error: { message: `ds4-server request failed: ${err.message}`, type: 'ds4_backend_error' },
+          });
+        }
+        try { res.end(); } catch { /* ignore */ }
+        return;
+      }
+      console.log(`[ds4] ${decision.reason} — '${opts.requestedModel}' (${err.message})`);
+      addLog('presets', `ds4 request re-served after an engine swap: ${decision.reason}`);
+      // Let the swap finish before trying again, then make sure ds4 is the
+      // engine for this model once more; the alias may since have moved.
+      if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
+      await ensureDs4ForModel(opts.requestedModel, opts.requestedModel);
+    }
+  }
+}
+
 async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime, mediaMetadata }) {
   const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const url = ds4TargetUrl(ds4.port, '/v1/chat/completions');
@@ -10240,7 +10294,11 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
   } catch (err) {
     endActiveRequest(activeReqId, { status: 'error' });
     addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: err.message, backend: 'ds4', requestBody: req.body });
-    if (!res.headersSent) return res.status(502).json({ error: { message: `ds4-server request failed: ${err.message}`, type: 'ds4_backend_error' } });
+    // Rethrow rather than answering here. serveDs4WithSwapRecovery decides
+    // whether this was our own hot-swap killing the request (retry internally,
+    // invisible to the caller) or a real backend fault (answer 502). Sending
+    // the 502 here would make a swap indistinguishable from a broken engine.
+    if (!res.headersSent) throw err;
     try { res.end(); } catch { /* ignore */ }
   }
 }
@@ -10516,7 +10574,7 @@ async function handleChatCompletions(req, res) {
     });
     if (decision.target === 'local-ds4') {
       req.body = proxyBody;
-      return proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime, mediaMetadata });
+      return serveDs4WithSwapRecovery(req, res, { requestedModel, isStreaming, startTime, mediaMetadata });
     }
     // A llama server was admitted beside DS4, so this model is served LOCALLY by
     // it. Skip the whole exclusive-mode offload block below: that path assumes
