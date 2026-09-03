@@ -57,7 +57,7 @@ import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots } from './slot-reaper.js';
 import {
-  resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries,
+  resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries, expandGlob,
   BIG_ALIAS, SMALL_ALIAS, RESERVED_ALIAS_NAMES,
 } from './model-aliases.js';
 import { migrateModelMappings, synthesizeModelMapping, foldModelMapping } from './alias-migration.js';
@@ -169,7 +169,7 @@ import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
   shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision,
   ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan, ds4SwapRetryDecision,
-  readRelayState, relayHeadersFor
+  readRelayState, relayHeadersFor, DS4_EXCLUSIVE_ERROR
 } from './ds4-exclusive.js';
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
@@ -4518,6 +4518,37 @@ app.post('/api/backends/refresh-models', async (req, res) => {
   res.json(await probeBackendModels(req.body));
 });
 
+/**
+ * Choose the model name to probe when testing a backend's connectivity.
+ *
+ * `backend.modelMapping` is deprecated and no longer stored (it migrated into the global
+ * alias table), so probing it always finds nothing and used to fall back to an arbitrary
+ * first remote model — which can legitimately be refused by the backend (e.g. exclusive
+ * DS4 mode rejecting a model it isn't currently serving), producing a false "backend
+ * down" result. This instead synthesizes the backend's live alias mapping the same way
+ * `GET /api/backends` does, preferring the `default-big` target since that is the alias
+ * production routing depends on, then any other configured target, and only falls back
+ * to an arbitrary remote model when the backend has no alias target at all.
+ *
+ * @param {{id: string}|null|undefined} backend the backend under test.
+ * @param {object|null|undefined} cfg server config, read for the global alias table.
+ * @param {string[]} remoteModels models the backend just reported to `/models` (used to
+ *   expand a glob alias target, and as the last-resort fallback).
+ * @returns {string} the model name to send, or '' when nothing is known to probe.
+ */
+function selectBackendTestModel(backend, cfg, remoteModels) {
+  const mapping = synthesizeModelMapping(cfg, backend?.id);
+  const ordered = [mapping[BIG_ALIAS], ...Object.values(mapping)];
+  const seen = new Set();
+  for (const pattern of ordered) {
+    if (!pattern || pattern === '*' || seen.has(pattern)) continue;
+    seen.add(pattern);
+    const [concrete] = expandGlob(pattern, remoteModels);
+    if (concrete) return concrete;
+  }
+  return remoteModels[0] || '';
+}
+
 app.post('/api/backends/:id/test', async (req, res) => {
   const backend = config.backends?.directory?.find(b => b.id === req.params.id);
   if (!backend) {
@@ -4552,14 +4583,13 @@ app.post('/api/backends/:id/test', async (req, res) => {
       clearTimeout(modelsTimeout);
     }
 
-    // Step 2: Pick a test model — prefer configured mapping, fall back to first available remote model
-    let testModel = '';
-    const mappingValues = Object.values(backend.modelMapping || {}).filter(v => v && v !== '*');
-    if (mappingValues.length > 0) {
-      testModel = mappingValues[0];
-    } else if (remoteModels.length > 0) {
-      testModel = remoteModels[0];
-    }
+    // Step 2: Pick a test model. An explicit override in the request body always wins
+    // (documented here, not silently ignored); otherwise prefer a configured alias
+    // target for this backend, falling back to an arbitrary remote model only when the
+    // backend has no alias target at all. See selectBackendTestModel() for why
+    // `backend.modelMapping` itself is never consulted.
+    const bodyTestModel = typeof req.body?.testModel === 'string' ? req.body.testModel.trim() : '';
+    const testModel = bodyTestModel || selectBackendTestModel(backend, config, remoteModels);
 
     if (!testModel) {
       const duration = Date.now() - startTime;
@@ -4591,11 +4621,17 @@ app.post('/api/backends/:id/test', async (req, res) => {
 
     const duration = Date.now() - startTime;
     const body = await response.text();
+    let parsed;
+    try { parsed = JSON.parse(body); } catch { parsed = null; }
 
-    if (response.ok) {
-      let parsed;
-      try { parsed = JSON.parse(body); } catch { parsed = null; }
+    // A 503 exclusive_ds4_mode rejection proves the backend answered — it refused this
+    // particular probe model because the box is pinned to its ds4 model, not because the
+    // backend is down. Treat it as reachable/healthy rather than a failed test, so a
+    // still-imperfect probe-model choice can't untest a live backend (T31078a98ec6a2).
+    const isDs4ExclusiveRejection = response.status === 503 &&
+      (parsed?.error?.type === DS4_EXCLUSIVE_ERROR || parsed?.error?.code === DS4_EXCLUSIVE_ERROR);
 
+    if (response.ok || isDs4ExclusiveRejection) {
       // Mark backend as tested
       const idx = config.backends.directory.findIndex(b => b.id === backend.id);
       if (idx !== -1) {
@@ -4610,7 +4646,9 @@ app.post('/api/backends/:id/test', async (req, res) => {
         latencyMs: duration,
         model: parsed?.model || testModel,
         remoteModels,
-        message: `Connected successfully in ${duration}ms (model: ${parsed?.model || testModel})`
+        message: isDs4ExclusiveRejection
+          ? `Backend reachable in ${duration}ms, but is in exclusive DS4 mode and refused '${testModel}'`
+          : `Connected successfully in ${duration}ms (model: ${parsed?.model || testModel})`
       });
     } else {
       // Mark test as failed
