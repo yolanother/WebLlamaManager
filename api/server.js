@@ -164,7 +164,7 @@ import { buildRepoRecommendations, computeCapacityBytes } from './repo-recommend
 import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
   shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision,
-  ds4InFlightCount, ds4EvictionReadiness
+  ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan
 } from './ds4-exclusive.js';
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
@@ -389,6 +389,12 @@ let currentPreset = null;
 // longer matched — it was routed to the co-resident llama, which answered
 // "model not found" for an 87 GB model it had never loaded.
 let ds4ActivePresetId = null;
+// When ds4-server last finished serving a request. Eviction weighs this: an
+// engine in active use is expensive to throw away (~87 GB to reload), while one
+// nobody has touched for a long time is cheap to reload later.
+let ds4LastServedAt = 0;
+/** Idle time past which evicting DS4 is considered an acceptable cost (ms). */
+const DS4_IDLE_EVICT_AFTER_MS = 600000;
 // Which inference engine is currently serving: 'llama' (llama.cpp router/preset,
 // the default) or 'ds4' (ds4-server, DeepSeek V4 Flash). Set by preset activation.
 // While 'ds4', llama-server is stopped and the ds4 supervisor owns the box.
@@ -5887,8 +5893,28 @@ async function ensureDs4ForModel(rawModel, resolvedModel) {
         await restartLlamaServer({ governed: false });
       }
     } else {
-      console.log(`[ds4] default-model alias '${rawModel}' now points at llama target '${resolvedModel}' — deactivating exclusive ds4 mode (${fit.reason})`);
-      addLog('presets', `default-model alias '${rawModel}' re-pointed at llama target '${resolvedModel}' — reversing exclusive ds4 mode. ${fit.reason}`);
+      // The model does not fit beside DS4 — but eviction is the most expensive
+      // option on the table (~87 GB to reload), not the automatic one. Prefer
+      // another node that can already serve this, unless DS4 has been idle long
+      // enough that reloading it later is cheap.
+      const plan = ds4EvictionPlan({
+        fits: false,
+        // aliasRouting is a local of the chat handler and is NOT in scope here;
+        // findFastestAvailableBackend resolves it itself when omitted.
+        hasViableRemote: !!findFastestAvailableBackend(resolvedModel, 'chat/completions'),
+        ds4IdleMs: ds4LastServedAt ? Date.now() - ds4LastServedAt : Number.MAX_SAFE_INTEGER,
+        idleEvictAfterMs: DS4_IDLE_EVICT_AFTER_MS,
+      });
+      if (plan.action !== 'evict') {
+        // Leave DS4 exactly as it is. ds4RequestTarget then routes this request
+        // to a remote backend (or refuses it cleanly), which is what the
+        // exclusive-mode path already does for any non-alias model.
+        console.log(`[ds4] keeping DS4 for '${rawModel}' -> '${resolvedModel}': ${plan.reason} (${fit.reason})`);
+        addLog('presets', `Kept DS4 rather than evicting it for '${resolvedModel}': ${plan.reason}`);
+        return null;
+      }
+      console.log(`[ds4] default-model alias '${rawModel}' now points at llama target '${resolvedModel}' — deactivating exclusive ds4 mode (${plan.reason}; ${fit.reason})`);
+      addLog('presets', `default-model alias '${rawModel}' re-pointed at llama target '${resolvedModel}' — reversing exclusive ds4 mode. ${plan.reason} ${fit.reason}`);
       await deactivateDs4Exclusive();
       // Symmetric to the fit branch above, and for the same reason. Evicting
       // DS4 frees the box but leaves NO local engine running, so the request
@@ -10188,7 +10214,8 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
         return;
       }
       addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: 200, duration: dur, promptTokens, completionTokens, tokensPerSecond: completionTokens / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
-      endActiveRequest(activeReqId, { status: 'complete' });
+      ds4LastServedAt = Date.now();
+    endActiveRequest(activeReqId, { status: 'complete' });
       return;
     }
 
@@ -10207,6 +10234,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
     const dur = Date.now() - startTime;
     const usage = data.usage || {};
     addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: 200, duration: dur, promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0, tokensPerSecond: (usage.completion_tokens || 0) / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: data.choices?.[0]?.message?.content || null, error: null, backend: 'ds4', requestBody: req.body });
+    ds4LastServedAt = Date.now();
     endActiveRequest(activeReqId, { status: 'complete' });
     return res.json(data);
   } catch (err) {

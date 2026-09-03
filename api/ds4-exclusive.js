@@ -252,3 +252,65 @@ export function ds4EvictionReadiness({ inFlight = 0, waitedMs = 0, maxWaitMs = 0
     reason: `waiting for ${inFlight} in-flight ds4 request(s) to finish before evicting`,
   };
 }
+
+/**
+ * What to do when an alias points at a llama model while DS4 owns the box.
+ *
+ * Evicting DS4 is by far the most expensive option available: the weights are
+ * ~87 GB, so a reload costs far more than serving the request somewhere else.
+ * The decision used to consider only whether the new model fit beside DS4, so a
+ * single low-priority request could throw away a resident engine that other
+ * callers were actively using.
+ *
+ * Order of preference:
+ *   1. co-reside, when the memory budget genuinely admits it;
+ *   2. offload to another node, when one can serve the model — cheaper than a
+ *      reload even if that node is slower;
+ *   3. evict, only when nothing else can serve it, or when DS4 has been idle
+ *      long enough that nobody is likely to miss it.
+ *
+ * A background-priority request never evicts DS4: by definition it is work that
+ * can wait, and it should not cost an interactive caller an 87 GB reload.
+ *
+ * @param {object} p
+ * @param {boolean} p.fits              Whether the llama model fits beside DS4.
+ * @param {boolean} p.hasViableRemote   Whether some remote backend can serve it.
+ * @param {number} p.ds4IdleMs          Time since DS4 last served a request.
+ * @param {number} p.idleEvictAfterMs   Idle time past which eviction is cheap.
+ * @param {string} p.requestPriority    'interactive' | 'background'.
+ * @returns {{action:'co-reside'|'offload'|'evict'|'defer', reason:string}}
+ */
+export function ds4EvictionPlan({
+  fits = false, hasViableRemote = false, ds4IdleMs = 0,
+  idleEvictAfterMs = 600000, requestPriority = 'interactive',
+} = {}) {
+  if (fits) {
+    return { action: 'co-reside', reason: 'the model fits beside DS4' };
+  }
+  const idleMin = Math.round(ds4IdleMs / 60000);
+  if (ds4IdleMs >= idleEvictAfterMs) {
+    return {
+      action: 'evict',
+      reason: `DS4 has been idle ${idleMin} min (>= ${Math.round(idleEvictAfterMs / 60000)} min), so reloading it later is an acceptable cost`,
+    };
+  }
+  if (hasViableRemote) {
+    return {
+      action: 'offload',
+      reason: `another node can serve this, and DS4 was used ${idleMin} min ago — offloading is cheaper than an 87 GB reload`,
+    };
+  }
+  if (requestPriority === 'background') {
+    // Nothing can serve it elsewhere, but background work is by definition
+    // deferrable — and it must not cost an interactive caller an 87 GB reload.
+    // 'offload' would be incoherent here: there is no backend to offload TO.
+    return {
+      action: 'defer',
+      reason: 'background-priority work waits rather than evicting DS4',
+    };
+  }
+  return {
+    action: 'evict',
+    reason: 'nothing else can serve this model and DS4 is in recent use — evicting as the last resort',
+  };
+}

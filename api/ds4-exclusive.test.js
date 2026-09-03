@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import {
   DS4_EXCLUSIVE_ERROR,
   ds4InFlightCount,
+  ds4EvictionPlan,
   ds4EvictionReadiness,
   ds4ModelMatches,
   ds4RequestTarget,
@@ -293,4 +294,43 @@ test('ds4EvictionReadiness gives up at the deadline so the box is not pinned', (
   const r = ds4EvictionReadiness({ inFlight: 2, waitedMs: 300000, maxWaitMs: 300000 });
   assert.equal(r.evict, true);
   assert.match(r.reason, /evicting anyway/);
+});
+
+test('ds4EvictionPlan co-resides whenever the model actually fits', () => {
+  const r = ds4EvictionPlan({ fits: true, hasViableRemote: false, ds4IdleMs: 0 });
+  assert.equal(r.action, 'co-reside');
+});
+
+test('ds4EvictionPlan offloads rather than evicting a recently-used DS4', () => {
+  // The case this exists for: a low-priority default-small request, itself
+  // already an offload from another node, threw away an 87 GB resident engine.
+  const r = ds4EvictionPlan({
+    fits: false, hasViableRemote: true, ds4IdleMs: 30_000, idleEvictAfterMs: 600_000,
+  });
+  assert.equal(r.action, 'offload');
+});
+
+test('ds4EvictionPlan evicts once DS4 has been idle long enough', () => {
+  // Idle long enough that nobody is likely to miss it; a reload is then an
+  // acceptable cost and keeping it resident just wastes the memory.
+  const r = ds4EvictionPlan({
+    fits: false, hasViableRemote: true, ds4IdleMs: 900_000, idleEvictAfterMs: 600_000,
+  });
+  assert.equal(r.action, 'evict');
+});
+
+test('ds4EvictionPlan evicts as a last resort when nothing else can serve it', () => {
+  const r = ds4EvictionPlan({
+    fits: false, hasViableRemote: false, ds4IdleMs: 0, requestPriority: 'interactive',
+  });
+  assert.equal(r.action, 'evict');
+});
+
+test('ds4EvictionPlan defers background work instead of evicting', () => {
+  // 'offload' would be incoherent with no remote to offload to; background work
+  // is deferrable by definition and must not cost an interactive caller a reload.
+  const r = ds4EvictionPlan({
+    fits: false, hasViableRemote: false, ds4IdleMs: 0, requestPriority: 'background',
+  });
+  assert.equal(r.action, 'defer');
 });
