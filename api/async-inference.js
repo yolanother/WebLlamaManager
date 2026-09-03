@@ -358,7 +358,8 @@ export class InferenceJobStore {
     record.status = 'cancelled';
     record.publicCompletedAt = this.now();
     if (record.streaming) {
-      try { this.#appendEvent(record, { type: 'response.cancelled', response: publicResponse(record) }); } catch { /* cancellation remains terminal */ }
+      try { this.#appendEvent(record, { type: 'response.cancelled', response: publicResponse(record) }); }
+      catch { this.#failEventCapacity(record); }
       record.streamClosed = true;
     }
     try { record.abortController.abort('cancelled'); } catch { /* best effort */ }
@@ -465,7 +466,8 @@ export class InferenceJobStore {
     const terminal = /^response\.(?:completed|failed|cancelled|incomplete)$/.test(normalized.type);
     const bytes = Buffer.byteLength(JSON.stringify(normalized));
     this.#reclaimSettledEvents(bytes, record.id);
-    if (record.events.length >= this.maxEventsPerResponse || record.eventBytes + bytes > this.maxEventBytesPerResponse || this.#eventBytes() + bytes > this.maxRetainedEventBytes) {
+    const eventLimit = this.maxEventsPerResponse + (terminal ? 1 : 0);
+    if (record.events.length >= eventLimit || record.eventBytes + bytes > this.maxEventBytesPerResponse || this.#eventBytes() + bytes > this.maxRetainedEventBytes) {
       throw new InferenceJobSubmissionError('retained streaming event capacity exceeded', 502, 'event_retention_exceeded');
     }
     record.events.push(normalized);

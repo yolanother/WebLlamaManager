@@ -540,6 +540,59 @@ test('contracts 6 and 7: event count and byte overflow fail instead of dropping 
   globalExecutions[1].resolve();
 });
 
+test('contract 7: the event cap reserves a normal terminal slot and cancellation cannot close silently', async () => {
+  const completedStore = new InferenceJobStore({
+    maxEventsPerResponse: 2,
+    execute: async ({ publish }) => {
+      publish({ type: 'response.created' });
+      publish({ type: 'response.output_text.delta', delta: 'done' });
+      return { status: 200, body: { ...completedResponse(), output: [] } };
+    },
+  });
+  const completing = completedStore.submit({ scopeId: 'scope_a', body: requestBody({ stream: true }) });
+  await waitFor(() => completedStore.get(completing.id, 'scope_a')?.status === 'completed');
+  const completedEvents = completedStore.replay(completing.id, 'scope_a');
+  assert.equal(completedEvents.length, 3);
+  assert.equal(completedEvents.at(-1).type, 'response.completed');
+
+  const countExecution = deferred();
+  const countStore = new InferenceJobStore({
+    maxEventsPerResponse: 1,
+    execute: async ({ publish }) => {
+      publish({ type: 'response.created' });
+      await countExecution.promise;
+      return { status: 200, body: completedResponse() };
+    },
+  });
+  const cancelling = countStore.submit({ scopeId: 'scope_a', body: requestBody({ stream: true }) });
+  await waitFor(() => countStore.replay(cancelling.id, 'scope_a')?.length === 1);
+  const cancelled = countStore.cancel(cancelling.id, 'scope_a');
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(countStore.replay(cancelling.id, 'scope_a').at(-1).type, 'response.cancelled');
+  countExecution.resolve();
+
+  const byteExecution = deferred();
+  const byteStore = new InferenceJobStore({
+    maxEventBytesPerResponse: 120,
+    maxRetainedEventBytes: 120,
+    execute: async ({ publish }) => {
+      publish({ type: 'response.created' });
+      await byteExecution.promise;
+      return { status: 200, body: completedResponse() };
+    },
+  });
+  const oversizedCancellation = byteStore.submit({
+    scopeId: 'scope_a',
+    body: requestBody({ stream: true, model: `model-${'x'.repeat(5_000)}` }),
+  });
+  await waitFor(() => byteStore.replay(oversizedCancellation.id, 'scope_a')?.length === 1);
+  const failed = byteStore.cancel(oversizedCancellation.id, 'scope_a');
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.error.code, 'event_retention_exceeded');
+  assert.equal(byteStore.replay(oversizedCancellation.id, 'scope_a').at(-1).type, 'response.failed');
+  byteExecution.resolve();
+});
+
 test('contracts 4 and 6: cancelled work retains count and byte capacity until execution settles', async () => {
   const firstExecution = deferred();
   const firstBody = requestBody({ metadata: { padding: 'x'.repeat(100) } });
