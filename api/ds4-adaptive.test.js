@@ -252,6 +252,46 @@ test('runDs4AdaptivePlan: empty plan aborts immediately without spawning', async
   assert.equal(h.calls.start.length, 0);
 });
 
+test('runDs4AdaptivePlan: an unconfirmed stop aborts the ladder instead of spawning a second engine on top', async () => {
+  // stopAttempt returning {ok:false} means the previous ds4-server process (or
+  // its port) could not be confirmed dead — see ds4-supervisor.js's stop(),
+  // which used to discard this signal entirely and let the plan advance
+  // regardless. Advancing anyway risks a second ds4-server spawning while the
+  // first is still alive/wedged (D-state), fighting over the port and GPU.
+  const attempts = [
+    { context: 32768, ssdStreaming: false, cacheExperts: '32GB' },
+    { context: 8192, ssdStreaming: false, cacheExperts: '32GB' },
+  ];
+  const calls = { start: [], stop: 0 };
+  let idx = -1;
+  const h = {
+    calls,
+    startAttempt: (attempt) => { calls.start.push(attempt); idx += 1; },
+    waitForOutcome: async () => ['load-failure', 'ready'][idx],
+    stopAttempt: async () => { calls.stop += 1; return { ok: false, remainingPids: [1234] }; },
+  };
+  const res = await runDs4AdaptivePlan({ attempts, ...h });
+  assert.equal(res.ok, false);
+  assert.equal(res.settled, null);
+  assert.equal(res.reason, 'stop-unconfirmed');
+  assert.equal(res.attemptsMade, 1, 'must not have started the second attempt');
+  assert.equal(h.calls.start.length, 1, 'the second ds4-server must never be spawned on top of an unconfirmed-dead first one');
+});
+
+test('runDs4AdaptivePlan: stopAttempt with no return value (existing callers) still advances normally', async () => {
+  // Backward compatibility: a stopAttempt that doesn't report {ok:false} — the
+  // default no-op, or any existing caller ignoring the new contract — must
+  // keep advancing exactly as before.
+  const attempts = [
+    { context: 32768, ssdStreaming: false, cacheExperts: '32GB' },
+    { context: 8192, ssdStreaming: false, cacheExperts: '32GB' },
+  ];
+  const h = makeHarness(['load-failure', 'ready']);
+  const res = await runDs4AdaptivePlan({ attempts, ...h });
+  assert.equal(res.ok, true);
+  assert.equal(res.attemptsMade, 2);
+});
+
 test('runDs4AdaptivePlan: onAttempt is invoked for each attempt made', async () => {
   const attempts = [
     { context: 32768, ssdStreaming: false, cacheExperts: '32GB' },

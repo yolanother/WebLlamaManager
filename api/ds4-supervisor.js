@@ -12,9 +12,18 @@
 // the process plus frees the ds4 port via an injected external-kill hook. A
 // supervisor that never spawned DS4 performs no host-wide cleanup. All I/O
 // (spawn, fetch, timers, sleeps, external kill) is injected so tests can drive the
-// machine deterministically.
+// machine deterministically. Also buffers the process's last output lines and
+// attaches them (via addLog, not just console) to the exit log line, since a
+// non-zero exit was previously undiagnosable after the fact — see the
+// RECENT_OUTPUT_LINES constant below.
 
 import { resolveDs4Config, resolveDs4ModelPath } from './engines.js';
+
+/** How many trailing stdout/stderr lines to keep and attach to the exit log
+ *  line — enough to catch a CLI arg-parse error message (ds4-server's own
+ *  exit(2) reason) without accumulating unbounded output for a long-lived
+ *  process. */
+const RECENT_OUTPUT_LINES = 20;
 
 /**
  * Create a ds4-server supervisor.
@@ -210,11 +219,27 @@ export function createDs4Supervisor({
     const ds4 = resolveDs4Config(getConfig() || {}, env);
     log(`[ds4] Starting ds4-server on :${ds4.port} (preset: ${preset.id})`);
     addLog('system', `Starting ds4-server on :${ds4.port} (preset: ${preset.id})`);
-    child.stdout?.on('data', (d) => addLog('ds4', d));
-    child.stderr?.on('data', (d) => addLog('ds4', d));
+    // Bounded trailing-line buffer for THIS attempt, so a crash's own stderr
+    // (e.g. ds4-server's CLI arg-parser naming the bad flag) can be attached to
+    // the exit log line below instead of vanishing once the process is gone.
+    const recentLines = [];
+    const captureOutput = (chunk) => {
+      for (const line of String(chunk).split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        recentLines.push(trimmed);
+        if (recentLines.length > RECENT_OUTPUT_LINES) recentLines.shift();
+      }
+    };
+    child.stdout?.on('data', (d) => { addLog('ds4', d); captureOutput(d); });
+    child.stderr?.on('data', (d) => { addLog('ds4', d); captureOutput(d); });
     child.on('exit', (code) => {
       if (proc !== child) return; // superseded; ignore late exit
-      log(`[ds4] ds4-server exited (code ${code})`);
+      const tail = recentLines.length
+        ? ` — last output:\n${recentLines.join('\n')}`
+        : ' — no stdout/stderr captured before exit';
+      log(`[ds4] ds4-server exited (code ${code})${tail}`);
+      addLog('system', `ds4-server exited (code ${code})${tail}`);
       const wasIntentional = intentionalStop;
       proc = null;
       if (wasIntentional) return;
@@ -246,10 +271,18 @@ export function createDs4Supervisor({
   /**
    * Stop the ds4 server (no auto-restart). SIGTERM, grace, then SIGKILL, then a
    * host-side external kill to reap any container-side worker and free the port.
+   *
+   * Propagates runKill()'s confirmation rather than discarding it: a caller (the
+   * adaptive plan's stopAttempt) needs to know whether the old process/port was
+   * actually confirmed gone before it is safe to spawn a new ds4-server on top of
+   * it — advancing regardless is how two engines end up fighting over the same
+   * port and GPU. A runKill() that reports nothing (legacy/unknown) is treated as
+   * confirmed, matching the prior behavior.
+   * @returns {Promise<{ok:boolean, remainingPids:number[]}>}
    */
   async function stop() {
     intentionalStop = true;
-    if (!ownsEngine) return;
+    if (!ownsEngine) return { ok: true, remainingPids: [] };
     const child = proc;
     if (child && !child.killed) {
       child.kill('SIGTERM');
@@ -257,8 +290,9 @@ export function createDs4Supervisor({
       if (child && !child.killed) child.kill('SIGKILL');
     }
     proc = null;
-    await runKill();
+    const killed = await runKill();
     ownsEngine = false;
+    return { ok: killed?.ok !== false, remainingPids: killed?.remainingPids || [] };
   }
 
   /**

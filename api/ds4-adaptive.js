@@ -183,7 +183,10 @@ export function planDs4Attempts({
  * @param {(attempt:object)=>void} params.startAttempt Spawn ds4 for the attempt (ctx + streaming env).
  * @param {(attempt:object)=>Promise<('ready'|'load-failure'|'timeout')>} params.waitForOutcome
  *   Resolve once ds4 is serving (`ready`) or the process exited/timed out before ever serving.
- * @param {()=>Promise<void>} [params.stopAttempt] Stop the current (failed) ds4 before the next attempt.
+ * @param {()=>Promise<({ok:boolean}|void)>} [params.stopAttempt] Stop the current (failed) ds4
+ *   before the next attempt. An explicit `{ok:false}` (kill could not confirm the old
+ *   process/port is gone) aborts the ladder rather than risking a second engine spawned
+ *   on top of the first; any other return (including none) advances normally.
  * @param {(attempt:object, index:number)=>void} [params.onAttempt] Per-attempt hook (logging).
  * @returns {Promise<{ok:boolean, settled:(object|null), attemptsMade:number, reason:string}>}
  */
@@ -206,8 +209,15 @@ export async function runDs4AdaptivePlan({
       return { ok: true, settled: attempt, attemptsMade: i + 1, reason: 'ready' };
     }
     // Load failure (or timeout): stop the dead/half-started process before retrying so
-    // the next attempt starts from a clean slate (freed port, unmapped weights).
-    await stopAttempt();
+    // the next attempt starts from a clean slate (freed port, unmapped weights). If the
+    // stop could not CONFIRM the old process/port is actually gone ({ok:false} — a
+    // wedged/D-state kill), do NOT spawn the next attempt on top of it: that is how a
+    // second ds4-server ends up fighting the first for the same port and GPU. Abort the
+    // ladder instead, same as exhausting every attempt.
+    const stopped = await stopAttempt();
+    if (stopped?.ok === false) {
+      return { ok: false, settled: null, attemptsMade: i + 1, reason: 'stop-unconfirmed' };
+    }
   }
   return { ok: false, settled: null, attemptsMade: attempts.length, reason: 'exhausted' };
 }

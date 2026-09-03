@@ -20,7 +20,7 @@ function fakeProc(pid = 1234) {
 
 /** Build a supervisor with recording fakes; returns { sup, calls, procs, opts }. */
 function makeSup(overrides = {}) {
-  const calls = { spawn: [], runKill: 0, scheduled: [] };
+  const calls = { spawn: [], runKill: 0, scheduled: [], log: [], addLog: [] };
   const procs = [];
   const spawn = (cmd, args, opts) => {
     const p = fakeProc(1000 + procs.length);
@@ -37,9 +37,9 @@ function makeSup(overrides = {}) {
     projectRoot: '/proj',
     restartDecision: overrides.restartDecision || ((a) => ({ allow: true, reason: 'ok', history: [...(a.history || []), a.now], retryAfterMs: 0 })),
     restartDefaults: {},
-    log: () => {},
-    addLog: () => {},
-    runKill: async () => { calls.runKill++; },
+    log: (m) => calls.log.push(m),
+    addLog: (channel, message) => calls.addLog.push({ channel, message }),
+    runKill: overrides.runKill || (async () => { calls.runKill++; }),
     getWedged: overrides.getWedged,
     now: overrides.now || (() => 1000),
     sleep: async () => {},
@@ -93,6 +93,37 @@ test('stop: kills process, calls external kill, clears running', async () => {
   assert.ok(procs[0].signals.includes('SIGTERM'));
   assert.equal(calls.runKill, 1);
   assert.equal(sup.isRunning(), false);
+});
+
+test('stop: propagates runKill()\'s confirmation instead of discarding it', async () => {
+  // Previously stop() awaited runKill() and threw the result away, so a caller
+  // (runDs4AdaptivePlan's stopAttempt) could never tell a confirmed-dead
+  // process apart from one that survived the kill window (D-state/wedged) —
+  // see the "ds4 host fuser timed out" incident this locks a fix for.
+  const { sup, procs } = makeSup({
+    runKill: async () => ({ ok: false, remainingPids: [4242] }),
+  });
+  sup.start(PRESET);
+  const result = await sup.stop();
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.remainingPids, [4242]);
+});
+
+test('stop: a confirmed kill reports ok:true', async () => {
+  const { sup } = makeSup({
+    runKill: async () => ({ ok: true, remainingPids: [] }),
+  });
+  sup.start(PRESET);
+  const result = await sup.stop();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.remainingPids, []);
+});
+
+test('stop: a runKill that reports nothing (existing/legacy callers) is treated as confirmed', async () => {
+  const { sup } = makeSup(); // default runKill returns undefined
+  sup.start(PRESET);
+  const result = await sup.stop();
+  assert.equal(result.ok, true);
 });
 
 test('stop: intentional exit does NOT auto-restart', async () => {
@@ -342,4 +373,49 @@ test('load-failure breaker: fresh (non-auto) activation resets the failure count
   procs[1].emit('exit', 137);        // this would be #2 without reset... but re-activation reset it above only if not running
   // The meaningful guarantee: after the breaker trips, a brand-new start() gets fresh attempts.
   assert.ok(calls.spawn.length >= 2);
+});
+
+// ── stderr/stdout capture on exit (diagnosability for "exited (code N)") ────
+//
+// A crash-driven exit previously logged only a bare "exited (code N)" line via
+// the console-only `log()` — nothing reached addLog()/`/api/logs`, and nothing
+// captured what the process actually printed before dying. That made every
+// non-zero exit permanently undiagnosable after the fact: exactly what
+// happened to the exit(2) incident this test locks in a fix for (ds4-server's
+// own CLI arg-parser exits 2 on a bad flag value, but the message naming the
+// bad flag was never captured anywhere).
+
+test('exit: recent stdout/stderr output is attached to the exit log line, via addLog too', () => {
+  const { sup, calls, procs } = makeSup();
+  sup.start(PRESET);
+  const proc = procs[0];
+  proc.stdout.emit('data', 'ds4-server: listening on http://127.0.0.1:5253\n');
+  proc.stderr.emit('data', 'ds4-server: invalid value for -c: abc\n');
+  proc.emit('exit', 2);
+  const exitLog = calls.log.find((m) => m.includes('exited (code 2)'));
+  assert.ok(exitLog, 'console log must still report the exit');
+  assert.match(exitLog, /invalid value for -c: abc/, 'the captured stderr line must be attached to the exit log, not silently dropped');
+  const exitAddLog = calls.addLog.find((c) => c.channel === 'system' && /exited \(code 2\)/.test(c.message));
+  assert.ok(exitAddLog, 'the exit line must also reach addLog(\'system\', ...) so it shows up in /api/logs, not just console');
+  assert.match(exitAddLog.message, /invalid value for -c: abc/);
+});
+
+test('exit: an exit with nothing captured says so explicitly (proves loss vs silence)', () => {
+  const { sup, calls, procs } = makeSup();
+  sup.start(PRESET);
+  procs[0].emit('exit', 2); // no stdout/stderr data emitted first
+  const exitAddLog = calls.addLog.find((c) => c.channel === 'system' && /exited \(code 2\)/.test(c.message));
+  assert.ok(exitAddLog);
+  assert.match(exitAddLog.message, /no stdout\/stderr captured/i);
+});
+
+test('exit: only the last N output lines are kept, not an unbounded log', () => {
+  const { sup, calls, procs } = makeSup();
+  sup.start(PRESET);
+  const proc = procs[0];
+  for (let i = 0; i < 30; i++) proc.stdout.emit('data', `line ${i}\n`);
+  proc.emit('exit', 1);
+  const exitAddLog = calls.addLog.find((c) => c.channel === 'system' && /exited \(code 1\)/.test(c.message));
+  assert.doesNotMatch(exitAddLog.message, /line 0\n/, 'the earliest lines must have been dropped once the buffer filled');
+  assert.match(exitAddLog.message, /line 29/, 'the most recent line must be kept');
 });

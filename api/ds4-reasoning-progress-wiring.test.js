@@ -65,3 +65,26 @@ test('the stall watchdog logs its ds4 verdict via shouldLogDs4Verdict', async ()
     'the watchdog must gate its ds4 verdict log line through shouldLogDs4Verdict, not log unconditionally or not at all'
   );
 });
+
+test('the adaptive plan\'s stopAttempt propagates stopDs4Server()\'s confirmation, not just calls it', async () => {
+  // ds4-supervisor.js's stop() now returns {ok, remainingPids} instead of being
+  // discarded; runDs4AdaptivePlan aborts the ladder on {ok:false} (see
+  // ds4-adaptive.test.js). Neither matters if server.js's stopAttempt still
+  // swallows the result with a bare try/catch — lock the actual propagation.
+  const source = await readServerSource();
+  const start = source.indexOf('runDs4AdaptivePlan({');
+  assert.notEqual(start, -1, 'the adaptive plan call site must still exist');
+  // The first '});' after start closes startAttempt's own nested sup.start(...)
+  // call, not the runDs4AdaptivePlan({...}) call — anchor past onAttempt (the
+  // last named param) so the slice reaches stopAttempt's real closing brace.
+  const onAttemptAt = source.indexOf('onAttempt:', start);
+  assert.notEqual(onAttemptAt, -1, 'onAttempt param must still exist to anchor past');
+  const end = source.indexOf('});', onAttemptAt);
+  assert.notEqual(end, -1);
+  const body = source.slice(start, end);
+  assert.match(
+    body,
+    /stopAttempt:\s*async \(\) => \{\s*try \{ return await stopDs4Server\(\); \}/,
+    'stopAttempt must return stopDs4Server()\'s result, not discard it in a bare try/catch'
+  );
+});

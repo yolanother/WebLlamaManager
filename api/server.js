@@ -6929,7 +6929,13 @@ async function activateDs4Exclusive(presetId, preset) {
           sup.start(preset, { planMode: true, override: attempt });
         },
         waitForOutcome: () => waitDs4AttemptOutcome(),
-        stopAttempt: async () => { try { await stopDs4Server(); } catch { /* already gone */ } },
+        // Propagate stopDs4Server()'s confirmation rather than swallowing it: an
+        // {ok:false} (old process/port not confirmed dead — D-state/wedged) must
+        // abort the ladder instead of spawning a second ds4-server on top of it.
+        // See runDs4AdaptivePlan's stop-unconfirmed handling.
+        stopAttempt: async () => {
+          try { return await stopDs4Server(); } catch { return { ok: true, remainingPids: [] }; }
+        },
         onAttempt: (attempt, i) => {
           if (i > 0) addLog('presets', `ds4: previous attempt failed to load; stepping to attempt ${i + 1}/${plan.length}`);
         },
@@ -6943,15 +6949,28 @@ async function activateDs4Exclusive(presetId, preset) {
         };
         addLog('presets', `ds4: SETTLED — serving at ctx=${result.settled.context}${result.settled.ssdStreaming ? ` with SSD streaming (cache ${result.settled.cacheExperts})` : ' (no streaming)'} after attempt ${result.attemptsMade}/${plan.length}`);
       } else {
-        // Exhausted every attempt without serving. STAY exclusive (engine=ds4): the
-        // flood offloads / returns a clean 503 — never re-admit a local llama load.
+        // Aborted without serving — either every attempt was tried (exhausted) or a
+        // stop between attempts couldn't confirm the old process/port was actually
+        // gone (stop-unconfirmed, see runDs4AdaptivePlan). STAY exclusive (engine=ds4)
+        // either way: the flood offloads / returns a clean 503 — never re-admit a
+        // local llama load.
         sup.endPlan({ settled: null });
         try { await stopDs4Server(); } catch { /* already gone */ }
+        const status = result.reason === 'stop-unconfirmed' ? 'stop-unconfirmed' : 'exhausted';
         ds4SettledRuntime = {
-          target, effective: null, status: 'exhausted',
+          target, effective: null, status,
           plannedAttempts: plan.length, attemptsMade: result.attemptsMade, settledAt: Date.now(),
         };
-        addLog('presets', `ds4 activation exhausted all ${plan.length} attempt(s) without serving (OOM at the load tail each time). Box stays in exclusive-DS4 offload mode; local ds4 requests get a clean 503. Consider a dedicated box, a higher minContext floor, or forcing SSD streaming (ssdStreaming='on').`);
+        if (status === 'stop-unconfirmed') {
+          // Do NOT blame OOM here — this is a DIFFERENT failure: the previous
+          // ds4-server (or its port) could not be confirmed dead between attempts,
+          // so the ladder stopped rather than risk two engines fighting over the
+          // GPU/port. Misreporting this as "OOM at the load tail" is exactly the
+          // kind of misdiagnosis that cost hours tonight.
+          addLog('presets', `ds4 activation aborted after attempt ${result.attemptsMade}/${plan.length}: the previous ds4-server process/port could not be confirmed stopped (possible D-state/wedged GPU). Box stays in exclusive-DS4 offload mode; local ds4 requests get a clean 503. Manual recovery may be needed.`);
+        } else {
+          addLog('presets', `ds4 activation exhausted all ${plan.length} attempt(s) without serving (OOM at the load tail each time). Box stays in exclusive-DS4 offload mode; local ds4 requests get a clean 503. Consider a dedicated box, a higher minContext floor, or forcing SSD streaming (ssdStreaming='on').`);
+        }
       }
     } catch (err) {
       sup.endPlan({ settled: null });
