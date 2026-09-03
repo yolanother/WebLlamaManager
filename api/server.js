@@ -5742,7 +5742,22 @@ function runKillCommand({ label, command, useContainer, timeoutMs = 4000 }) {
   });
 }
 
-async function stopLlamaServer({ explicitReclaim = true } = {}) {
+/**
+ * Stop the llama-server engine. Defaults to ownership-scoped shutdown: an
+ * instance that spawned no engine of its own (`ownsEngine` false) skips the
+ * host-wide PID sweep entirely, per {@link shouldRunGlobalEngineCleanup}. Pass
+ * `explicitReclaim: true` ONLY for an operator-facing action that is
+ * deliberately taking supervision of a possibly-stale engine slot (process
+ * exit already opts out explicitly with `false`; no caller here needs `true`
+ * today — every existing call site owns the engine it starts).
+ *
+ * @param {{explicitReclaim?:boolean}} [params] Shutdown options.
+ * @param {boolean} [params.explicitReclaim=false] Authorize host-wide cleanup
+ *   even when this instance does not own the running engine.
+ * @returns {Promise<{ok:boolean, remainingPids:number[]}>} Whether the stop
+ *   completed cleanly and any pids that survived.
+ */
+async function stopLlamaServer({ explicitReclaim = false } = {}) {
   console.log('[stop] Stopping llama server...');
   intentionalStop = true;
   const ownsEngine = Boolean(llamaProcess);
