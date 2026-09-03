@@ -88,3 +88,31 @@ test('the adaptive plan\'s stopAttempt propagates stopDs4Server()\'s confirmatio
     'stopAttempt must return stopDs4Server()\'s result, not discard it in a bare try/catch'
   );
 });
+
+test('ensureDs4ForModel never treats a ds4-preset-miss as a re-point when the model is still active', async () => {
+  // Root-cause fix for the "ds4 model routed to the local llama router" fall-
+  // through: ds4PresetForModel(config, resolvedModel) can spuriously return
+  // null for a ds4 model that has no hand-built config.presets entry (this
+  // deployment's case) because its fallback re-lists the ggufDir from disk on
+  // every call, and separately ds4EvictionPlan reads an unset ds4LastServedAt
+  // as "idle forever" on a genuinely idle box. Either alone can make
+  // ensureDs4ForModel believe an alias has been re-pointed at llama and
+  // evict a live ds4 engine, dropping the very next request onto llama.cpp's
+  // own router, which answers "model not found" for a model it never loaded.
+  // This locks the guard that cross-checks against the model actually active
+  // (ds4ActivePresetId/currentPreset via the same ds4ModelMatches llama.cpp
+  // and the responses/chat handlers already trust) before ever reversing.
+  const source = await readServerSource();
+  const start = source.indexOf('async function ensureDs4ForModel(');
+  assert.notEqual(start, -1, 'ensureDs4ForModel must still exist');
+  const end = source.indexOf('\n}\n', start);
+  assert.notEqual(end, -1, 'ensureDs4ForModel body must be found');
+  const body = source.slice(start, end);
+  const guardIdx = body.search(
+    /if \(currentEngine === ENGINE_TYPES\.DS4\s*\n\s*&& ds4ModelMatches\(resolvedModel, ds4ModelIdsForPreset\(ds4ActivePresetId \|\| currentPreset\)\)\) \{\s*\n\s*return null;/
+  );
+  assert.notEqual(guardIdx, -1, 'ensureDs4ForModel must return early when the model is still the active ds4 model, before ever reaching the BIG_ALIAS/SMALL_ALIAS eviction branch');
+  const evictBranchIdx = body.indexOf("rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS");
+  assert.notEqual(evictBranchIdx, -1);
+  assert.ok(guardIdx < evictBranchIdx, 'the still-active-ds4-model guard must come BEFORE the eviction branch, not after');
+});

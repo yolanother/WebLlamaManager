@@ -6081,6 +6081,23 @@ async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'i
     addLog('presets', `Request for ds4 preset '${ref.presetId}' (via default-model alias or name) — activating exclusive ds4 mode`);
     return activateDs4Exclusive(ref.presetId, ref.preset);
   }
+  // ds4PresetForModel() found no ref for resolvedModel. That does NOT prove the
+  // alias/model has moved to llama: for a ds4 model with no hand-built preset
+  // entry (this deployment's case — see config.presets, which never keys a ds4
+  // GGUF by its full filename), ds4PresetForModel falls back to re-listing the
+  // ggufDir from disk on every call, and a transient miss there (or simply an
+  // idle box, where ds4LastServedAt being unset makes ds4EvictionPlan's idle
+  // clock read as "forever" and evict unconditionally) was misread as a genuine
+  // re-point. That evicted a live, correctly-serving ds4 engine and dropped the
+  // very next request straight onto the local llama router, which answered
+  // "model not found" for a request that was never actually routing wrong in
+  // the first place — the fall-through this incident exposed. Cross-check
+  // against the model actually active before ever treating a ref-miss as a
+  // real re-point.
+  if (currentEngine === ENGINE_TYPES.DS4
+    && ds4ModelMatches(resolvedModel, ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset))) {
+    return null; // still the ds4 model; nothing to reverse
+  }
   // Resolved target is a llama model. Reverse exclusive ds4 ONLY for an alias request
   // whose target has been re-pointed at llama — the alias follows the operator's
   // preferred-big choice. Arbitrary non-alias models keep offloading (task-3).
