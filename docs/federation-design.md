@@ -155,6 +155,37 @@ drags a mean somewhere no request actually went — refuses to answer at all on 
 partial run, and reports a gain below 1.25x as marginal rather than as a green
 light.
 
+### What a router may conclude from a silent provider *(built)*
+
+A forwarded request produces no bytes at all while the provider has it queued —
+the ds4 engine serializes to one generation, so a request behind another one is
+simply waiting its turn. Both of a router's give-up clocks (the stall watchdog's
+remote ceiling, and `fetchRemoteBackend`'s per-attempt deadline) used to read
+that silence as a wedged backend and tear the request down; the caller then
+resent it and landed at the *back* of the same queue it had been waiting in, so
+repetition could starve an otherwise healthy dispatch indefinitely.
+
+Silence is therefore not evidence, and no timeout tuned on this side can make it
+evidence. The provider knows which it is and already publishes the answer:
+`/api/queue` reports a request as `pending` while it waits for a generation slot
+and `active` once it owns one. So a router **asks** instead of guessing. Each
+forwarded request carries `x-llama-manager-request-id`; the provider echoes it in
+`/api/queue`; and while the provider reports that id as still queued, the router
+holds the request open rather than aborting it.
+
+The failure modes are deliberately one-sided — only a positive "still queued"
+answer buys time. A provider that is unreachable, does not know the request,
+reports it as generating, or is not a Llama Manager at all leaves the existing
+timeouts exactly as they were, so a genuinely wedged remote still dies on
+schedule. Believing the answer is capped at 30 minutes for the one case where it
+cannot be trusted: a provider queue that is not draining at all.
+
+The same distinction is enforced locally on the provider. A ds4 request's
+zero-token ceiling applies only while it *owns* the generation slot, measured
+from acquisition, so a request's queue wait can no longer be mistaken for its
+own stall — and a slot holder that produces nothing is still bounded and still
+releases the slot.
+
 ## Phase 4 — managed model downloads *(built)*
 
 From the main node's screen, pull a model onto any node, or all of them.
