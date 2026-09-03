@@ -4324,7 +4324,7 @@ app.post('/api/backends', (req, res) => {
     enabled: enabled !== false,
     priority: Math.max(1, Math.min(100, parseInt(priority) || 10)),
     apiKeyEnvVar: apiKeyEnvVar || '',
-    supportedEndpoints: supportedEndpoints || ['chat/completions', 'completions', 'embeddings'],
+    supportedEndpoints: supportedEndpoints || ['chat/completions', 'completions', 'embeddings', 'responses'],
     costs: {
       inputTokenCostPer1M: parseFloat(costs?.inputTokenCostPer1M) || 0,
       outputTokenCostPer1M: parseFloat(costs?.outputTokenCostPer1M) || 0,
