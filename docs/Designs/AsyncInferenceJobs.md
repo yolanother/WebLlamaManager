@@ -1,141 +1,152 @@
-# Async Inference Jobs
+<!--
+Copyright (c) Llama Manager contributors.
+Use of this document is governed by the LICENSE file in the repository root.
+
+Design contract for Llama Manager's OpenAI-compatible Responses background
+mode. This document separates the standard Response resource, retrieval,
+cancellation, and resumable streaming surface from Llama Manager's bounded
+process-local storage, authorization scope, routing, and prepared-context
+extensions.
+-->
+
+# OpenAI-Compatible Background Responses
 
 ## Decision
 
-Llama Manager adds a manager-specific asynchronous chat-completion surface while
-leaving the existing synchronous OpenAI-compatible routes unchanged:
+Long-running inference uses the OpenAI Responses background-mode surface rather
+than a manager-specific job wrapper:
 
 ```text
-POST   /api/v1/chat/completions/jobs       submit
-GET    /api/v1/chat/completions/jobs/{id}  poll or collect
-DELETE /api/v1/chat/completions/jobs/{id}  cancel
+POST /v1/responses                         create
+GET  /v1/responses/{response_id}           retrieve
+POST /v1/responses/{response_id}/cancel    cancel
 ```
 
-The consumer and operator workflow, including curl and MCP examples, is in
-[Using Async Inference and Prepared Contexts](../Guides/AsyncInference.md).
+Each route also has the manager-prefixed `/api/v1/...` alias. Existing
+synchronous Responses behavior is unchanged unless `background` is exactly
+`true`.
 
-Submission accepts the same JSON body as `POST /api/v1/chat/completions`, except
-that `stream: true` is rejected with HTTP 400 instead of being silently changed.
-The manager executes the retained request as a non-streaming completion because
-the submit response, rather than a long-lived stream, is the transport contract.
-It validates the body has a model and messages, returns HTTP 202 with a
-`Location` header after retaining the job, and does so before alias/model lookup,
-model loading, queue waiting, prefill, or generation begins. Failures discovered
-by those later steps are retained job failures.
+This choice keeps the public lifecycle compatible with OpenAI while allowing
+Llama Manager to add bounded, process-local execution suitable for long-context
+local and remote inference. The consumer workflow is in [Using Background
+Responses and Prepared Contexts](../Guides/AsyncInference.md).
 
-The worker invokes the existing chat-completions handler through the manager's
-loopback HTTP interface. That is intentional: aliases, DS4 exclusivity,
-co-residency, remote routing, queue admission, model loading, cancellation, and
-completion-integrity checks continue to have one implementation. The async
-surface must not fork those policies. The loopback request forwards only the
-private retained `Authorization`, `X-Llama-Priority`, and `X-Llama-Routing`
-headers, because they define scope and policy; cookies and arbitrary inbound
-headers are never retained or replayed. Those values and the request body are
-deleted from the record when execution settles and never appear in public job
-records or logs.
+## OpenAI-compatible Response resource
 
-## Observable job contract
+A non-streaming create request with `background: true` returns the Response
+resource itself, never an `inference.job` envelope. The resource uses:
 
-Every public record has this shape:
+- an opaque `resp_...` id;
+- `object: "response"`;
+- integer-second `created_at` and nullable `completed_at` timestamps;
+- `background: true`;
+- `queued`, `in_progress`, `completed`, `failed`, `cancelled`, or `incomplete`
+  status values; and
+- the ordinary Responses `output`, `error`, `usage`, and request-option fields.
 
-```json
-{
-  "id": "job_<opaque random value>",
-  "object": "inference.job",
-  "status": "queued | running | done | failed | cancelled",
-  "createdAt": 0,
-  "updatedAt": 0,
-  "expiresAt": null,
-  "progress": {
-    "phase": "queued | running | done | failed | cancelled",
-    "percent": null
-  },
-  "result": null,
-  "error": null
-}
-```
+A create response may already be `in_progress` if execution starts before the
+HTTP response is serialized. While queued or in progress, output is empty or
+incomplete. Retrieval returns the same owned resource. At completion it returns
+the exact whole non-streaming Responses result with the retained id and
+`background: true`; it is not nested under another result field.
 
 The lifecycle is:
 
 ```text
-queued -> running -> done
-   |         |
-   +---------+-> cancelled
-             +-> failed
+queued -> in_progress -> completed
+   |           |--------> failed
+   |           |--------> incomplete
+   +-----------+--------> cancelled
 ```
 
-`done`, `failed`, and `cancelled` are terminal. `result` is present only for
-`done` and is the same OpenAI-shaped non-streaming chat completion the sync path
-would return. `error` is present only for `failed` and contains a bounded
-`message`, `type`, `code`, and upstream HTTP `status` when known. A successful
-HTTP response with no valid completion choice is an invalid upstream response
-and therefore a failed job, never `done` with empty content.
+Failures use the Response `error` field. Any manager diagnostics are additive
+under `_llama_manager` and never replace or rename OpenAI fields.
 
-Polling deliberately returns no partial model output. The manager can observe
-that its loopback request has started but cannot truthfully separate engine
-prefill from generation on every supported route, especially DS4 and remote
-backends. It therefore reports only `queued` or `running` with `percent: null`.
-Callers must not infer a phase or percentage from elapsed time. A future engine
-correlation channel may add optional detail without changing the lifecycle.
-This keeps polling cheap and prevents an incomplete answer from being mistaken
-for a completion.
+## Retrieval and cancellation
 
-## Ownership, retention, and limits
+`GET /v1/responses/{response_id}` is the polling resource. Pollers continue only
+while `status` is `queued` or `in_progress`. A missing, expired, or differently
+scoped id returns the standard not-found error shape without disclosing whether
+another scope owns it.
 
-Jobs and results live in the manager process. Handles are random capability
-references scoped with the same authorization-derived hashing used by prepared
-contexts. A missing, expired, or differently scoped handle returns the same 404
-response so the API does not disclose another caller's jobs. Anonymous callers
-share the documented local trusted scope.
+Cancellation uses `POST /v1/responses/{response_id}/cancel`, not DELETE. It is
+valid only for a retained background response and returns the final Response
+resource. Repeated cancellation is idempotent. Queued cancellation removes work
+before activation; in-progress cancellation aborts queue, local engine, DS4, or
+remote work where the relevant seam cooperates. `cancelled` is publicly terminal
+immediately, capacity remains charged until execution settles, and a late
+success or failure cannot overwrite it.
 
-Jobs do **not** survive a manager restart. A caller that receives 404 after a
-restart must resubmit. This is an execution API, not a durable workflow queue;
-adding database-backed recovery would introduce delivery and replay semantics
-that the manager cannot currently guarantee.
+## Background streaming and replay
 
-Defaults are intentionally bounded:
+OpenAI background mode can stream. A create request with both `background: true`
+and `stream: true` emits standard Responses server-sent events. Each event keeps
+its OpenAI event type and has a monotonically increasing `sequence_number`.
 
-| Limit | Default |
-|---|---:|
-| Terminal-result retention | 60 minutes |
-| Jobs, global | 128 |
-| Jobs, per scope | 32 |
-| Serialized request | 4 MiB |
-| Retained active requests, global | 64 MiB |
-| Retained active requests, per scope | 16 MiB |
-| Serialized completion result | 16 MiB |
+A disconnected client resumes with:
 
-Active jobs are never evicted to admit another caller. After lazy expiry and
-oldest-terminal eviction, submission returns HTTP 429 when a job-count or
-aggregate-active-request-byte cap remains full. One oversized request returns
-HTTP 413. These limits comfortably admit a 50k-token text prompt without allowing
-the server's 200 MiB Express parser limit to multiply across 128 jobs. Request
-bodies and retained policy headers are held only until execution settles, then
-removed. Results larger than the serialized-result limit fail with
-`result_too_large` rather than consuming unbounded memory. `expiresAt` is null
-while work is active and becomes terminal-time plus 60 minutes.
+```text
+GET /v1/responses/{response_id}?stream=true&starting_after=<sequence_number>
+```
 
-## Cancellation
+The cursor is exclusive: the resumed stream begins after the supplied sequence
+number and does not replay earlier events. Omitting `starting_after` replays the
+retained event log from the beginning. After replay, the connection follows live
+events until the Response reaches a terminal status.
 
-Cancellation is idempotent. Cancelling an already terminal job returns that
-terminal record unchanged. Cancelling queued or active work immediately marks
-the public record `cancelled`, aborts the loopback request, and discards any late
-result. Internally, cancelled work remains capacity-accounted until the loopback
-promise settles; no active slot or byte capacity is freed early.
+Streaming start or resume is available only for a background Response originally
+created with `stream: true`. JSON retrieval remains available for background
+Responses created in either streaming mode.
 
-Cancellation requires strengthening the shared queue seam rather than assuming
-that closing a socket cancels every wait. `PriorityRequestQueue.acquire()` must
-accept an abort signal (or equivalent active-request correlation), remove and
-reject a matching pending entry on abort, and preserve the existing cooperative
-abort path once active. Tests cover cancellation while queued, during local
-prefill/model loading and generation, and through DS4 and remote fetches. Engine
-cancellation is cooperative: an engine already inside a batch can stop only at
-an engine-supported boundary, but the public job remains cancelled and a late
-inner success/error can never overwrite it.
+Llama Manager's replay implementation is process-local and bounded by explicit
+per-response and global event/byte caps. Slow or disconnected clients therefore
+cannot cause unbounded retained SSE memory. Replay is available only while the
+Response record and requested sequence range remain retained; it is not durable
+across a manager restart. Exact implementation cap fields and replay errors are
+documented in the generated OpenAPI reference.
 
-## Prepared-context relationship
+## Shared synchronous execution seam
 
-The existing context API remains separate:
+Background execution invokes the existing synchronous Responses handler through
+the manager's loopback HTTP interface with `background` removed. It does not
+duplicate alias resolution, DS4 exclusivity, co-residency, remote routing, queue
+admission, model loading, retry, cancellation, output validation, or timing
+behavior. Removing `background` on the internal request prevents recursion.
+
+The retained private request includes only the values required to preserve
+authorization scope and explicit manager policy. Request bodies, authorization,
+priority, and routing values are erased after execution settles. Credentials and
+prompt content never appear in the public Response or manager diagnostics.
+
+## Llama Manager storage and scope extensions
+
+The Response fields and lifecycle above are OpenAI-compatible. The following are
+explicit Llama Manager extensions for this self-hosted implementation:
+
+| Extension | Default/behavior |
+|---|---|
+| Authorization scope | Opaque hash of the complete `Authorization` value; anonymous callers share one local trusted scope |
+| Persistence | Process-local only; responses and replay logs do not survive restart |
+| Terminal retention | Roughly 10 minutes after settlement |
+| Response records | 128 globally, 32 per scope |
+| One serialized request | 4 MiB |
+| Retained active request bytes | 64 MiB globally, 16 MiB per scope |
+| One serialized result | 16 MiB |
+| Streaming replay | Explicit bounded per-response/global event and byte caps; process-local |
+
+Expired records and the oldest terminal records are reclaimed before admission.
+Active responses are never evicted to admit new work. An oversized request is
+rejected with HTTP 413; exhausted count or retained-request-byte capacity returns
+HTTP 429. An oversized completion becomes a failed Response rather than an empty
+success. Private bodies and policy values stay retained only until settlement.
+
+This scoping is not authentication. Multi-tenant deployments must authenticate
+at the manager or a trusted upstream proxy and supply stable, distinct
+authorization contexts.
+
+## Llama Manager prepared-context extension
+
+The separate manager context API remains:
 
 ```text
 POST   /api/v1/context/prepare
@@ -143,130 +154,101 @@ GET    /api/v1/context/{id}
 DELETE /api/v1/context/{id}
 ```
 
-`mode: "prefill"` already returns HTTP 202 and completes on the background lane.
-For the epic's send-once workflow, chat completions add the manager-only field
-`prepared_context_mode: "append"`. With that field and a ready
-`prepared_context_id`, the request's `messages` are a text-only suffix appended
-to the process-local prepared prefix retained by the lease. The composed full
-message list is sent to llama.cpp with the manager-owned slot, allowing llama.cpp
-to verify and reuse the cached prefix without the caller resending it. The
-default mode remains exact validation of a caller-resubmitted full prompt,
-preserving the existing prepared-handle contract.
+`mode: "prefill"` prepares a local llama.cpp prefix and returns a process-local,
+scope-bound handle. Once it is ready, a Responses request may use the additive
+manager fields `prepared_context_id` and
+`prepared_context_mode: "append"` where that Responses input form is supported.
+The new text input is composed with the retained prefix, so the caller does not
+resend it.
 
-Append mode fails closed when the handle is missing, expired, not ready, owned by
-another scope, uses a different resolved model/compatibility revision, or lacks
-a retained message prefix. It never silently falls back to a suffix-only cold
-request. Preparation retains an immutable private copy of every input-affecting
-field: `messages`, `input`, `prompt`, `tools`, `tool_choice`, `response_format`,
-`chat_template`, `chat_template_kwargs`, and `reasoning_format`. Append mode v1
-accepts only new text `messages`; it reuses all other retained input-affecting
-fields and returns HTTP 409 if the suffix request supplies a conflicting value.
-Only output controls such as `max_tokens`, `temperature`, and `stream: false`,
-plus manager scheduling/routing controls, may vary. Multimodal URL expansion is
-out of scope for append mode v1 because preparation does not run the chat
-handler's media-expansion pipeline.
+Append mode fails closed for conflicting input-affecting fields, multimodal
+suffixes that the preparation path cannot reproduce, missing or stale handles,
+wrong authorization scope, a different resolved model or compatibility
+revision, or lost slot ownership. It never silently executes a suffix without
+its prefix. Output controls may vary. Omitting append mode preserves the existing
+full-input prepared-handle validation contract.
 
-Prepared prefix bodies are process-local, private lease state and are erased on
-release, expiry, eviction, invalidation, or restart. The existing 15-minute
-prepared-handle TTL bounds their lifetime. Append mode bypasses full-request-hash
-equality only after scope, ready-state, resolved-model, compatibility-revision,
-slot-ownership, and retained-prefix checks pass.
+Prepared handles default to a 15-minute TTL and are erased on release, expiry,
+eviction, invalidation, restart, or engine/model changes that invalidate the
+owned slot. These behaviors are Llama Manager extensions, not OpenAI Responses
+fields.
 
-llama.cpp is the only currently supported engine because it exposes manager-owned
-slots and `cache_prompt`. DS4 does not expose a reusable conversation-slot or
-prefix-handle operation; its `--kv-disk-dir` is memory offload, not caller-visible
-KV reuse. DS4 therefore advertises prepared-context support as false and rejects
-strict/append prepared-context use instead of claiming a cache hit.
+llama.cpp is the only supported prepared-reuse engine because it exposes
+manager-owned reusable slots and `cache_prompt`. DS4's disk KV directory is
+memory offload, not a caller-visible prefix handle, so DS4 rejects strict or
+append prepared-context reuse as unsupported.
 
-### Alias effective-context discovery
+## Llama Manager policy extensions
 
-An alias can route to targets with different context limits, so an alias row's
-`n_ctx: null` means "route-dependent or unknown," not the manager's global
-default. A local preparation response identifies both `requestedModel` and the
-concrete `resolvedModel`; callers look up the latter in `GET /api/v1/models` and
-use that concrete row's advertised `n_ctx`. If it is still absent, the limit is
-unknown and must not be inferred. An async job eligible for multiple local or
-remote targets has no single effective context before routing; callers that
-require a particular limit select an explicit routing policy and consult the
-selected backend's concrete catalog.
+Priority and routing are additive manager controls carried through the same
+Responses execution seam:
+
+- `request_priority` or `X-Llama-Priority` selects the manager admission class;
+- `routing: "local_only"` or `X-Llama-Routing: local_only` prevents remote
+  prompt egress; and
+- unsupported policy/context combinations fail closed rather than weakening the
+  requested guarantee.
+
+These fields are not part of the OpenAI background-mode contract. Their retained
+values are private and are deleted at settlement.
+
+## Alias effective-context discovery
+
+An alias may target models or backends with different context limits. Therefore
+an alias catalog row with `n_ctx: null` means route-dependent or unknown, not a
+global default. For local preparation, read `resolvedModel` from the context
+response, find that concrete model in `GET /api/v1/models`, and use its advertised
+`n_ctx`. If the concrete row has no value, treat the limit as unknown.
+
+A Response eligible for multiple local or remote targets has no single effective
+context before routing. Use an explicit manager routing policy when a particular
+target or data-egress guarantee is required, then consult that selected backend's
+concrete limit. `requestedModel` must also be retained because an alias can be
+repointed between requests.
 
 ## MCP mapping
 
-The MCP server mirrors the REST contract with six tools:
+The MCP server uses OpenAI terminology for background Responses:
 
-- `llama_submit_chat_job` submits the normal chat arguments and returns the 202
-  job record.
-- `llama_get_chat_job` polls or collects by `id`.
-- `llama_cancel_chat_job` cancels by `id`.
-- `llama_prepare_context` starts `count` or `prefill` preparation and returns the
-  context lease.
-- `llama_get_prepared_context` polls a prepared handle by `id`.
-- `llama_release_prepared_context` cancels/releases a prepared handle by `id`.
+- `submit_response` creates a Response, including background and streaming
+  options plus additive manager context/policy fields;
+- `get_response` retrieves the whole Response by id and can request replay after
+  a streaming sequence cursor; and
+- `cancel_response` idempotently cancels a retained background Response.
 
-The async tool descriptions direct agents to use synchronous `llama_chat` for
-small prompts that finish within their client/proxy budget, and jobs for work
-that can outlive that budget. MCP calls never implement their own waiting loop;
-the agent polls explicitly and can yield between calls. Chat-job submission
-exposes the manager extensions required for prepared reuse and policy selection,
-including `prepared_context_id`, `prepared_context_mode`, `context_cache_strict`,
-`priority`, and `routing`.
-
-The complete tool argument and lifecycle reference is in [MCP server](../mcp.md).
-
-## Error and HTTP semantics
-
-| Operation | Success | Client/ownership error | Capacity | Upstream failure |
-|---|---:|---:|---:|---:|
-| Submit | 202 | 400 | 429 | recorded asynchronously |
-| Poll | 200 | 404 | n/a | 200 with `status: failed` |
-| Cancel | 200 | 404 | n/a | cancellation remains terminal |
-
-Only submit-time schema/capacity failures are immediate HTTP errors. Once a job
-id has been accepted, inference failures belong to the retained job record so a
-polling client can distinguish them from transport failure. Error messages are
-bounded and normalize non-JSON/plain-text upstream failures without including
-authorization values, prompt bodies, or backend API keys. Async execution avoids
-client and proxy socket lifetimes; it does not remove the manager's model-load or
-remote-backend attempt timeouts.
+The existing prepared-context create/get/release tools remain available. MCP
+clients use synchronous `llama_chat` when work is expected to fit the blocking
+client/proxy budget and polling or replay is unnecessary. See [MCP
+server](../mcp.md).
 
 ## Measured connection and execution ceilings
 
-The deployment evidence that drove this design separates the connection cut
-from work that remains bounded inside a job:
+The deployment evidence that motivated background execution is:
 
 | Cut | Value | Owner |
 |---|---:|---|
 | OpenResty in front of `llama.lair.jaxns.net` | 90 seconds | Infrastructure gateway |
 | Remote backend, per attempt | 600 seconds | Llama Manager |
-| Chat model-load wait | 180 seconds | Llama Manager |
+| Chat/model execution load wait | 180 seconds | Llama Manager |
 
 On `drakemore` with DS4 at a 65,536-token context, a 36,636-token prompt took
 287 seconds, a 50,636-token prompt took 228 seconds, and a 73,252-token prompt
-was refused as over context. The first prompt returned HTTP 504 at 90 seconds
-through the gateway and HTTP 200 at 287 seconds when sent directly. These are
-observations for those inputs and that deployment, not general performance
-claims. Jobs remove the need for the caller/gateway response to remain open
-during inference; the 600- and 180-second manager ceilings still apply.
+was refused as over context. The first request returned HTTP 504 at 90 seconds
+through the gateway and HTTP 200 at 287 seconds direct. These measurements are
+not predictions or performance guarantees. Background mode removes the need for
+one caller/proxy response to stay open for the inference interval; manager-owned
+execution ceilings still apply.
 
-## OpenAPI and documentation contract
+## OpenAPI and compatibility
 
-The checked-in OpenAPI document describes all six HTTP operations: job submit,
-poll, and cancel plus prepared-context create, get, and release. It includes the
-public lifecycle shapes, manager extension fields, 400/404/409/413/429 responses,
-and retained asynchronous failures. `api/openapi.json` is generated from the
-source API specification and must not be edited independently.
+The generated OpenAPI reference covers both route prefixes, synchronous and
+background create behavior, retrieval, POST cancellation, whole Response
+resources, error/status fields, background SSE creation and cursor-exclusive
+replay, manager limits, and manager context/policy extensions. The checked-in
+`api/openapi.json` is generated from the source API specification and must not be
+edited independently.
 
-The [consumer guide](../Guides/AsyncInference.md) records sync-versus-async
-selection, measured ceilings, scope and restart behavior, retention and limits,
-cancellation and failure handling, alias effective-context lookup, and prepared
-append invalidation. [MCP server](../mcp.md) maps the same contract to agent
-tools.
-
-## Compatibility
-
-The synchronous `/api/v1/chat/completions` and `/v1/chat/completions` behavior is
-unchanged. The job routes and `prepared_context_mode` are additive manager
-extensions. Existing clients that resend a full prompt with
-`prepared_context_id` retain exact-hash validation and do not enter append mode.
-DELETE is cancellation/release only; terminal job results remain available until
-normal expiry.
+Normal synchronous `/api/v1/responses`, `/v1/responses`, chat completions, and
+existing full-input prepared-handle behavior remain unchanged. Background
+Responses are additive; durable cross-restart persistence, webhooks, and hosted
+tools are outside this implementation.

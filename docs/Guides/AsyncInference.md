@@ -1,312 +1,336 @@
-# Using Async Inference and Prepared Contexts
+<!--
+Copyright (c) Llama Manager contributors.
+Use of this document is governed by the LICENSE file in the repository root.
 
-Use Llama Manager's asynchronous chat API when inference may outlive the HTTP
-connection budget of the caller or a proxy. A submission retains the work and
-returns an opaque job handle; the caller can disconnect, then poll that handle
-until the complete OpenAI-shaped response is available.
+Consumer and operator guide for choosing synchronous inference or
+OpenAI-compatible Responses background mode in Llama Manager. It provides
+create, polling, cancellation, resumable streaming, prepared-prefix, scope,
+retention, limit, error, and alias-context workflows without presenting measured
+deployment observations as performance guarantees.
+-->
 
-This API is additive. Continue using synchronous
-`POST /api/v1/chat/completions` for work expected to finish within every client
-and proxy budget. Existing synchronous behavior, including streaming, is
-unchanged.
+# Using Background Responses and Prepared Contexts
 
-## Choose sync or async
+Use OpenAI Responses background mode when inference may outlive an HTTP client
+or proxy connection. Llama Manager returns an ordinary Response resource with a
+`resp_...` id; the caller can disconnect and later retrieve, cancel, or resume a
+stream for that resource.
 
-The relevant measured and configured ceilings are:
+Background mode is additive. `POST /v1/responses` remains synchronous unless
+`background` is exactly `true`, and normal chat/completion behavior is unchanged.
 
-| Cut | Ceiling | Owner and effect |
+## OpenAI surface versus manager extensions
+
+The public create/retrieve/cancel and resumable-stream shapes follow OpenAI:
+
+- `POST /v1/responses` with `background: true`;
+- `GET /v1/responses/{response_id}`;
+- `POST /v1/responses/{response_id}/cancel`; and
+- for a Response originally created with both background and streaming enabled,
+  `GET /v1/responses/{response_id}?stream=true&starting_after=N`.
+
+Llama Manager adds self-hosted execution details: bounded process-local
+retention, Authorization-derived scope isolation, request/result/replay caps,
+prepared llama.cpp prefixes, and priority/routing controls. Those are manager
+extensions, not portable OpenAI fields.
+
+## Choose sync or background
+
+The measured and configured deployment ceilings are:
+
+| Cut | Ceiling | Effect |
 |---|---:|---|
-| OpenResty in front of `llama.lair.jaxns.net` | 90 seconds | Infrastructure gateway; an open synchronous response can become HTTP 504 |
-| One remote-backend attempt | 600 seconds | Llama Manager `REMOTE_BACKEND_TIMEOUT_MS`; still applies inside an async job |
-| Chat model-load wait | 180 seconds | Llama Manager; still applies inside an async job |
+| OpenResty in front of `llama.lair.jaxns.net` | 90 seconds | An open synchronous response can become HTTP 504 |
+| One remote-backend attempt | 600 seconds | Manager ceiling that still applies inside background work |
+| Model-load wait | 180 seconds | Manager ceiling that still applies inside background work |
 
-On `drakemore`, with DS4 configured for a 65,536-token context, observations
-that motivated this API were:
+On `drakemore`, with DS4 configured for a 65,536-token context, a 36,636-token
+prompt completed in 287 seconds, a 50,636-token prompt completed in 228 seconds,
+and a 73,252-token prompt was refused as over context. The first request returned
+HTTP 504 at 90 seconds through the gateway and HTTP 200 at 287 seconds direct.
+These observations apply to those inputs and that deployment; they are not a
+throughput formula or performance guarantee.
 
-- a 36,636-token prompt completed in 287 seconds;
-- a 50,636-token prompt completed in 228 seconds; and
-- a 73,252-token prompt was refused because it exceeded the 65,536-token
-  context ceiling.
+- Use a normal synchronous Response, or MCP `llama_chat`, when the whole call is
+  expected to fit every client and proxy budget and later retrieval is not
+  useful.
+- Use `background: true` when the caller must be able to disconnect and collect
+  the result later. It removes the long-lived caller/proxy response from the
+  inference interval but does not disable manager execution ceilings.
+- Add `stream: true` when the client wants Responses SSE events now and may need
+  to reconnect using a sequence cursor.
+- Use a prepared llama.cpp context when multiple calls share a large prefix and
+  the caller should transmit that prefix once.
 
-The same 36,636-token request returned HTTP 504 at 90 seconds through the
-gateway and HTTP 200 at 287 seconds when sent directly to `drakemore`. These are
-measurements from that model, host, and workload, not performance promises or a
-formula for predicting another request.
+## Create a non-streaming background Response
 
-Choose the path as follows:
-
-- Use synchronous chat only when the entire operation is expected to fit the
-  smallest applicable client, proxy, model-load, and backend-attempt budget.
-- Use an async job when the caller must be able to disconnect and collect the
-  result later. Async removes the long-lived caller/proxy response from the
-  inference interval; it does not disable the 600-second backend-attempt or
-  180-second model-load ceilings.
-- Use a prepared llama.cpp context when several requests share a large prefix
-  and the caller should send that prefix once. Preparation and async jobs solve
-  different problems and can be composed.
-
-## Submit, poll, and cancel over HTTP
-
-Set `BASE_URL` to the manager's `/api` prefix. The examples use the canonical
-port 5250 deployment:
+The examples use both supported prefixes through the canonical port 5250:
 
 ```bash
-BASE_URL=http://localhost:5250/api
+BASE_URL=http://localhost:5250
 ```
 
-Submit the same non-streaming chat body accepted by synchronous chat:
-
 ```bash
-curl -i "$BASE_URL/v1/chat/completions/jobs" \
+curl -i "$BASE_URL/v1/responses" \
   -H 'content-type: application/json' \
   -H 'authorization: Bearer example-scope' \
-  -H 'x-llama-priority: background' \
-  -H 'x-llama-routing: local_only' \
   --data '{
     "model": "default-big",
-    "messages": [{"role": "user", "content": "Summarize the supplied report."}],
+    "input": "Summarize the supplied report.",
+    "background": true,
     "stream": false,
-    "max_tokens": 1200
+    "max_output_tokens": 1200
   }'
 ```
 
-A valid submission returns HTTP 202 before alias/model lookup, model loading,
-queue waiting, prefill, or generation. It includes a `Location` header pointing
-to the poll resource and a public record such as:
+`/api/v1/responses` is equivalent. An accepted request immediately returns the
+whole Response resource, not a custom job wrapper. Selected lifecycle fields
+look like:
 
 ```json
 {
-  "id": "job_opaque-random-value",
-  "object": "inference.job",
+  "id": "resp_opaque-random-value",
+  "object": "response",
+  "created_at": 1788400000,
+  "completed_at": null,
+  "background": true,
   "status": "queued",
-  "createdAt": 0,
-  "updatedAt": 0,
-  "expiresAt": null,
-  "progress": {"phase": "queued", "percent": null},
-  "result": null,
+  "output": [],
   "error": null
 }
 ```
 
-Persist the returned `id` or `Location`; handles cannot be listed or recovered
-after they are lost. Poll with the same authorization scope used to submit:
+The actual resource also contains normal Responses request options and result
+fields. Creation may report `in_progress` if execution starts before the initial
+resource is serialized. Timestamps are integer seconds and use snake_case.
+
+## Retrieve the whole Response
+
+Poll with the same authorization scope:
 
 ```bash
-curl "$BASE_URL/v1/chat/completions/jobs/job_opaque-random-value" \
+curl "$BASE_URL/v1/responses/resp_opaque-random-value" \
   -H 'authorization: Bearer example-scope'
 ```
 
-While active, a record reports only `queued` or `running`, has
-`progress.percent: null`, and contains no partial output. Do not infer progress
-from elapsed time. Terminal states are:
+Continue only while `status` is `queued` or `in_progress`. Terminal statuses are
+`completed`, `failed`, `cancelled`, and `incomplete`. A completed retrieval is
+the exact whole non-streaming Responses result with the original id and
+`background: true`; there is no nested `result` object. Failures use the normal
+Response `error` field. Optional manager diagnostics remain additive under
+`_llama_manager`.
 
-- `done`: `result` contains the complete non-streaming OpenAI chat-completion
-  object;
-- `failed`: `error` contains bounded `message`, `type`, and `code` values, plus
-  an upstream HTTP `status` when known; or
-- `cancelled`: cancellation won and no later success or error can replace it.
+JSON retrieval works whether the Response was originally created with
+`stream: false` or `stream: true`.
 
-Cancel with the same scope:
+## Cancel idempotently
+
+Cancellation uses POST:
 
 ```bash
-curl -X DELETE \
-  "$BASE_URL/v1/chat/completions/jobs/job_opaque-random-value" \
+curl -X POST \
+  "$BASE_URL/v1/responses/resp_opaque-random-value/cancel" \
   -H 'authorization: Bearer example-scope'
 ```
 
-Cancellation is idempotent. Queued work is removed from admission; active local,
-remote, and DS4 work is cooperatively aborted. The public record becomes
-`cancelled` immediately, but internal count and byte capacity remain charged
-until execution actually settles. Cancelling an already-terminal job returns it
-unchanged. A request cancelled while waiting for constrained inference capacity
-is removed from that queue and never activates.
+It applies only to retained background Responses and returns the final whole
+Response. Repeating the call is idempotent. A queued cancellation removes the
+work before execution; an in-progress cancellation cooperatively aborts pending
+queue, local llama.cpp, DS4, or remote work where possible. The public status is
+`cancelled` immediately and cannot be replaced by a late success or failure.
+Manager capacity remains charged until inner execution actually settles.
 
-## Scope, retention, and restart behavior
+## Stream and resume by sequence number
 
-Job and prepared-context handles are random, process-local capability
-references. Their scope is derived from the complete `Authorization` header;
-the credential itself is not exposed in public records. Anonymous callers share
-one local trusted scope, so a multi-tenant deployment must authenticate at the
-manager or an upstream proxy and provide stable, distinct authorization
-contexts.
+Start background streaming by creating the Response with both flags:
 
-Missing, expired, and differently scoped job handles all return HTTP 404. This
-prevents one caller from probing another caller's records. Job records do not
-survive a manager restart; resubmit after a restart-related 404. Terminal jobs
-expire 60 minutes after settlement. `expiresAt` is null while active and is set
-to the settlement time plus 60 minutes only after the job becomes terminal.
+```bash
+curl -N "$BASE_URL/v1/responses" \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer example-scope' \
+  --data '{
+    "model": "default-big",
+    "input": "Analyze the supplied report.",
+    "background": true,
+    "stream": true
+  }'
+```
 
-The default job-store limits are:
+The stream uses standard Responses SSE event types. Events carry monotonically
+increasing `sequence_number` values. Save the last sequence number the client
+has durably processed, then reconnect with an exclusive cursor:
 
-| Limit | Default |
-|---|---:|
-| Terminal job/result retention | 60 minutes |
-| Job records, global | 128 |
-| Job records, per authorization scope | 32 |
+```bash
+curl -N \
+  "$BASE_URL/v1/responses/resp_opaque-random-value?stream=true&starting_after=42" \
+  -H 'authorization: Bearer example-scope'
+```
+
+The resumed connection starts after event 42, does not replay earlier events,
+then follows live events until terminal status. Omitting `starting_after`
+replays retained events from the beginning and follows live output.
+
+Streaming start/resume is valid only for a background Response originally
+created with `stream: true`. A Response created with `stream: false` can still be
+retrieved as JSON, but it cannot later be converted into a resumable stream.
+
+Llama Manager retains SSE events under explicit per-response and global
+event/byte caps. This replay log is process-local and available only while both
+the Response and requested sequence range remain retained. Slow clients cannot
+grow it without bound; a restart loses it. Consult the generated OpenAPI
+reference for exact cap fields and replay error shapes after deployment.
+
+## Scope, temporary retention, and restart behavior
+
+The `resp_...` id is an opaque capability reference whose Llama Manager scope is
+derived from the complete `Authorization` header. The credential itself is not
+public. Anonymous callers share one trusted local scope; multi-tenant deployments
+must authenticate at the manager or a trusted proxy and supply distinct, stable
+authorization contexts.
+
+Missing, expired, and wrong-scope ids all return the standard not-found error
+shape and do not reveal cross-scope existence. Llama Manager keeps terminal
+background Responses and their replay state temporarily for roughly 10 minutes,
+matching the intended short polling/reconnection window. Records are
+process-local and do not survive a manager restart. Persist the input needed to
+resubmit; this is not a durable workflow queue.
+
+The retention interval, scope boundary, and limits below are Llama Manager
+extensions:
+
+| Manager extension | Default/behavior |
+|---|---|
+| Terminal polling/replay retention | Roughly 10 minutes after settlement |
+| Response records | 128 globally, 32 per scope |
 | One serialized request | 4 MiB |
-| Retained active request bytes, global | 64 MiB |
-| Retained active request bytes, per scope | 16 MiB |
-| One serialized completion result | 16 MiB |
+| Retained active request bytes | 64 MiB globally, 16 MiB per scope |
+| One serialized result | 16 MiB |
+| SSE replay | Explicit bounded per-response/global event and byte caps |
 
-Before rejecting capacity, the manager lazily removes expired records and may
-evict the oldest terminal records. It never evicts active work to admit a new
-request. A request larger than 4 MiB returns HTTP 413. Exhausted record or active
-request-byte capacity returns HTTP 429. A result larger than 16 MiB settles as a
-structured `failed` job with `result_too_large`; it is never exposed as an empty
-success.
-
-The retained request body and the private authorization, priority, and routing
-policy are deleted when execution settles. Cookies and unrelated inbound
-headers are not retained or replayed.
+Expired and oldest terminal records are reclaimed before admission. Active work
+is never evicted to admit a new request. Oversized requests return HTTP 413;
+exhausted record/request-byte capacity returns HTTP 429. Oversized results become
+failed Responses rather than empty successes. Retained request bodies,
+authorization, priority, and routing values are deleted when execution settles.
 
 ## Failure behavior
 
-Only validation and admission failures happen on submission:
-
-| Condition | Submission response |
-|---|---:|
-| Missing or malformed chat fields | HTTP 400 |
-| `stream: true` | HTTP 400 |
-| Serialized request larger than 4 MiB | HTTP 413 |
-| Count or retained-byte capacity still full after reclamation | HTTP 429 |
-
-After HTTP 202, failures are collected in the job record. Upstream HTTP errors,
-transport failures, non-JSON/plain-text errors, oversized results, and a nominal
-success without a valid completion choice become bounded structured `failed`
-records. Error records do not include authorization values, request bodies, or
+Submit-time schema and admission errors are immediate. Once background creation
+is accepted, upstream HTTP errors, transport failures, plain-text errors,
+oversized results, and nominal successes without valid Response output become a
+Response with `status: "failed"` and its bounded `error` field. Error and
+`_llama_manager` diagnostics do not include credentials, prompt bodies, or
 backend API keys.
 
-## Send a large prefix once with llama.cpp
+## Llama Manager prepared-prefix extension
 
-Prepared append mode combines a ready, scope-bound llama.cpp prefix with new
-text messages. First prepare the complete prefix:
+Preparation is separate from the OpenAI surface. Prepare the large prefix once:
 
 ```bash
-curl -i "$BASE_URL/v1/context/prepare" \
+curl -i "$BASE_URL/api/v1/context/prepare" \
   -H 'content-type: application/json' \
   -H 'authorization: Bearer example-scope' \
   --data '{
     "model": "default-big",
     "mode": "prefill",
     "priority": "interactive",
-    "messages": [
+    "input": [
       {"role": "system", "content": "Use only the supplied report."},
       {"role": "user", "content": "<large report supplied once>"}
     ]
   }'
 ```
 
-`mode: "prefill"` returns HTTP 202 with an opaque prepared-context `id`. Poll
-until its `status` is `ready`:
+Poll the returned handle until it is ready:
 
 ```bash
-curl "$BASE_URL/v1/context/context_opaque-random-value" \
+curl "$BASE_URL/api/v1/context/context_opaque-random-value" \
   -H 'authorization: Bearer example-scope'
 ```
 
-Every prepared response identifies `requestedModel` and the concrete
-`resolvedModel`. Keep both with the handle. Once ready, submit only the new
-text-message suffix:
+Then create a background Response containing only the supported text suffix:
 
 ```bash
-curl -i "$BASE_URL/v1/chat/completions/jobs" \
+curl -i "$BASE_URL/v1/responses" \
   -H 'content-type: application/json' \
   -H 'authorization: Bearer example-scope' \
   --data '{
     "model": "default-big",
+    "background": true,
     "prepared_context_id": "context_opaque-random-value",
     "prepared_context_mode": "append",
-    "messages": [
-      {"role": "user", "content": "List the three principal risks."}
-    ],
-    "stream": false,
-    "max_tokens": 800
+    "input": [{"role": "user", "content": "List the three principal risks."}],
+    "max_output_tokens": 800
   }'
 ```
 
-The manager composes the retained prefix and suffix, then asks llama.cpp to
-verify reuse on the manager-owned slot. It never sends a suffix-only fallback.
-Append mode v1 accepts text messages only. Multimodal suffixes fail closed.
+The manager composes the retained prefix and suffix and asks llama.cpp to verify
+reuse on its owned slot. Conflicting input-affecting fields, unsupported
+multimodal suffixes, stale or wrong-scope handles, a different resolved model or
+compatibility revision, and lost slot ownership fail closed. The suffix is never
+executed alone. Omitting append mode preserves the existing full-input prepared
+validation behavior.
 
-Preparation retains immutable copies of input-affecting fields from the prefix:
-`messages`, `input`, `prompt`, `tools`, `tool_choice`, `response_format`,
-`chat_template`, `chat_template_kwargs`, and `reasoning_format`. Do not repeat
-one of those fields with a different value in the suffix request; a conflict
-returns HTTP 409. Output controls such as `max_tokens`, `temperature`, and
-`stream: false`, plus scheduling/routing controls, may vary.
-
-The existing prepared-handle mode is unchanged: if
-`prepared_context_mode: "append"` is omitted, a caller using
-`prepared_context_id` must resend the full prompt and pass exact request-hash
-validation. Ordinary synchronous chat is also unchanged.
-
-Prepared handles default to a 15-minute TTL and are invalidated by explicit
-release, expiry, eviction, manager restart, model or compatibility-revision
-change, engine/model switch that loses the owned slot, wrong authorization
-scope, or failed slot-ownership verification. Stale, wrong-scope, wrong-model,
-and incompatible handles fail closed instead of silently running the suffix as
-a cold prompt.
-
-Release the handle when it is no longer needed:
+Prepared handles have a separate manager-defined 15-minute default TTL and are
+invalidated by release, expiry, eviction, restart, or incompatible model/engine
+changes. Release explicitly with:
 
 ```bash
 curl -X DELETE \
-  "$BASE_URL/v1/context/context_opaque-random-value" \
+  "$BASE_URL/api/v1/context/context_opaque-random-value" \
   -H 'authorization: Bearer example-scope'
 ```
 
-DS4 does not expose the reusable conversation-slot primitive required for
-strict or append prepared-context reuse. Its SSD KV directory is memory offload,
-not a caller-visible prepared prefix. DS4 advertises prepared contexts as
-unsupported and rejects strict/append use; use an ordinary sync or async chat
-request instead.
+DS4 does not expose a reusable caller-visible slot. Its disk KV support is memory
+offload, so DS4 rejects strict or append prepared-context reuse as unsupported.
+Use a normal synchronous or background Response instead.
 
-## Determine the effective context behind an alias
+## Llama Manager priority and routing extensions
 
-Do not interpret an alias model row with `n_ctx: null` as a default such as
-8,192. It means the alias has no single context size: routing may select a local
-llama.cpp model, a DS4 preset, or a remote backend with a different limit.
+Background Responses traverse the same synchronous manager routing seam. The
+additive `request_priority` / `X-Llama-Priority` and `routing` /
+`X-Llama-Routing` controls therefore keep their existing meanings. In particular,
+`routing: "local_only"` forbids remote prompt egress. Unsupported combinations
+fail closed, and private policy values are deleted at settlement.
 
-For local preparation, submit `POST /api/v1/context/prepare` with the alias and
-read `resolvedModel` from the response. Then inspect the concrete model's row in
-`GET /api/v1/models` and use its `n_ctx` value as the advertised context for
-that selected local model. Also retain `requestedModel`, because an alias can be
-repointed between calls. If the catalog still cannot advertise a concrete
-limit, treat it as unknown and do not infer one from global configuration.
+## Determine an alias's effective context
 
-For an async request that is eligible for multiple local or remote targets,
-there is no route-independent effective context to query before routing. Apply
-an explicit routing policy when a particular target or data-egress guarantee is
-required, and use that selected backend's concrete catalog/limit. A successful
-count or prepared-context response binds its token evidence to its
-`resolvedModel`; it does not certify every possible target of the alias.
+An alias may have targets with different context limits. Do not interpret
+`n_ctx: null` on an alias row as 8,192 or another global default. For local
+preparation, read the returned concrete `resolvedModel`, find that id in
+`GET /api/v1/models`, and use its advertised `n_ctx`. If the concrete entry
+still has no limit, treat it as unknown.
+
+A multi-target local/remote Response has no route-independent effective context
+before routing. Apply an explicit manager routing policy when a specific target
+or egress guarantee is required, and consult the selected backend's concrete
+catalog. Retain `requestedModel` too because an alias can change between calls.
 
 ## MCP equivalent
 
-The MCP server exposes the same workflow as six tools:
+The MCP tools mirror the Response terminology:
 
 ```json
 {
-  "tool": "llama_submit_chat_job",
+  "tool": "submit_response",
   "arguments": {
     "model": "default-big",
-    "messages": [{"role": "user", "content": "Summarize the report."}],
-    "max_tokens": 1200,
-    "priority": "background",
-    "routing": "local_only"
+    "input": "Summarize the report.",
+    "background": true,
+    "stream": false
   }
 }
 ```
 
-Poll or cancel with `llama_get_chat_job` / `llama_cancel_chat_job` and the
-returned `id`. Use `llama_prepare_context`, `llama_get_prepared_context`, and
-`llama_release_prepared_context` for the prepared-prefix lifecycle. A complete
-MCP argument reference and append example are in [MCP server](../mcp.md).
+Use `get_response` to retrieve the whole Response or resume a stream, and
+`cancel_response` for idempotent cancellation. Prepared-context lifecycle tools
+remain available for the manager extension. See [MCP server](../mcp.md) for the
+argument reference.
 
 ## API reference
 
-The generated OpenAPI document covers all submit, poll, cancel, prepare, get,
-and release routes, their manager extension fields, success records, and error
-responses. View it through Llama Manager's API documentation page or inspect
-`api/openapi.json`. The architectural rationale and store/cancellation contract
-are in [Async Inference Jobs](../Designs/AsyncInferenceJobs.md).
+The generated OpenAPI document covers both `/api/v1` and `/v1` create,
+retrieval, cancellation, and replay routes, OpenAI field shapes, and additive
+manager limits/context/policy fields. View it through Llama Manager's API docs or
+inspect generated `api/openapi.json`. Architectural rationale is in
+[OpenAI-Compatible Background Responses](../Designs/AsyncInferenceJobs.md).

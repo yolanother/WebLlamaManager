@@ -1,14 +1,20 @@
+<!--
+Copyright (c) Llama Manager contributors.
+Use of this document is governed by the LICENSE file in the repository root.
+
+Setup and public tool reference for Llama Manager's Model Context Protocol
+server. This document explains synchronous chat, OpenAI-compatible background
+Responses, resumable streaming, and the manager-specific prepared-context and
+routing extensions exposed to MCP clients.
+-->
+
 # Llama Manager MCP Server
 
-The bundled Model Context Protocol server lets an agent inspect and operate
-Llama Manager, run ordinary synchronous chat, or manage asynchronous chat jobs
-and prepared llama.cpp contexts. It calls the manager HTTP API; it does not run
-an inference engine itself.
+The bundled MCP server calls the Llama Manager HTTP API so agents can inspect
+the host, run synchronous chat, manage OpenAI-compatible background Responses,
+and use prepared llama.cpp contexts.
 
 ## Configure a client
-
-Add the server to the MCP client's configuration, replacing the repository path
-as needed:
 
 ```json
 {
@@ -25,128 +31,163 @@ as needed:
 ```
 
 `LLAMA_MANAGER_URL` defaults to `http://localhost:5250`. Configure the manager
-or its trusted proxy to provide the authorization scope required by the
-deployment. Async job and prepared-context handles are scope-bound exactly like
-their REST equivalents; a missing, expired, restarted, or differently scoped
-handle is not visible.
+or its trusted proxy to provide the authorization context required by the
+deployment.
 
-## Choose the chat tool
+## Choose synchronous or background
 
-- Use `llama_chat` only for synchronous work expected to finish within the MCP
-  client and every proxy budget. It remains the simplest path for ordinary
-  short-lived calls.
-- Use `llama_submit_chat_job` when inference may outlive a caller or proxy
-  connection. It returns a retained job record; poll explicitly with
-  `llama_get_chat_job` and yield between calls.
-- Use `llama_prepare_context` before either path when repeated llama.cpp calls
-  share a large prefix. Append mode allows a later chat-job submission to send
-  only new text messages.
+- Use `llama_chat` when a blocking synchronous request is expected to fit the
+  MCP client and every proxy budget. It remains the simple alternative when
+  polling or stream reconnection is unnecessary.
+- Use `submit_response` when the operation must be retrievable after the caller
+  disconnects.
+- Set `stream: true` on `submit_response` when standard Responses SSE events are
+  desired and the client may reconnect using `get_response` plus a sequence
+  cursor.
+- Use the prepared-context tools when repeated llama.cpp calls share a large
+  prefix and the caller should send the prefix once.
 
-The deployment that motivated async jobs has a measured 90-second gateway
-ceiling. Llama Manager also applies a 600-second ceiling to each remote-backend
-attempt and a 180-second chat model-load wait. Async jobs avoid holding the MCP
-or gateway response open during inference, but the two manager-owned ceilings
-still apply to the work. See [Using Async Inference and Prepared
-Contexts](Guides/AsyncInference.md) for the measurements and decision guide.
+The measured deployment has a 90-second gateway ceiling. Manager-owned
+600-second remote-attempt and 180-second model-load ceilings still apply inside
+background work. These are not model performance estimates. See [Using
+Background Responses and Prepared Contexts](Guides/AsyncInference.md).
 
-## Async chat-job tools
+## OpenAI-compatible background Response tools
 
-### `llama_submit_chat_job`
+### `submit_response`
 
-Submits a non-streaming chat request. A valid call returns the HTTP 202 job
-record with `status: "queued"`, `expiresAt: null`, and an opaque `id` before
-model lookup, loading, queue waiting, or inference.
-
-Arguments mirror chat plus the manager extensions:
+Creates a Response through `POST /v1/responses`. Arguments include normal
+Responses input plus background controls:
 
 | Argument | Meaning |
 |---|---|
 | `model` | Required model id or alias |
-| `messages` | Required OpenAI-shaped message array; append mode treats it as the text-only suffix |
-| `temperature`, `max_tokens` | Optional output controls |
-| `prepared_context_id` | Optional prepared-context handle |
-| `prepared_context_mode` | Set to `append` to combine the retained prefix with `messages`; omit for existing full-prompt validation |
-| `context_cache_strict` | Require prepared-context reuse instead of allowing ordinary fallback where the existing full-prompt contract permits it |
-| `priority` | Explicit manager admission policy, such as `realtime`, `interactive`, or `background` |
-| `routing` | Explicit routing policy, including `local_only` when remote egress is forbidden |
+| `input` | Required Responses input string or supported input items |
+| `background` | Set exactly `true` to retain background execution; other values keep synchronous HTTP behavior |
+| `stream` | Emit standard Responses SSE events; with background mode, events are retained for bounded replay |
+| Normal Responses output fields | Output limits, sampling, tools, and other supported Responses options |
+| `prepared_context_id`, `prepared_context_mode` | Llama Manager extension for full-input validation or append reuse |
+| `context_cache_strict` | Llama Manager fail-closed prepared-reuse control |
+| `priority` / `request_priority` | Llama Manager admission policy |
+| `routing` | Llama Manager routing policy, including `local_only` |
 
-`stream: true` is not part of the async tool: async results are complete,
-non-streaming chat completions. Submission also rejects malformed chat input,
-requests over 4 MiB, and exhausted job/request-byte capacity.
-
-Example:
+Non-streaming example:
 
 ```json
 {
-  "tool": "llama_submit_chat_job",
+  "tool": "submit_response",
   "arguments": {
     "model": "default-big",
-    "messages": [
-      {"role": "user", "content": "Summarize the supplied report."}
-    ],
-    "max_tokens": 1200,
+    "input": "Summarize the supplied report.",
+    "background": true,
+    "stream": false,
+    "max_output_tokens": 1200,
     "priority": "background",
     "routing": "local_only"
   }
 }
 ```
 
-### `llama_get_chat_job`
+The result is the OpenAI Response resource itself. It uses an opaque `resp_...`
+id, `object: "response"`, integer-second `created_at`, nullable `completed_at`,
+`background: true`, and OpenAI status names. It is never wrapped in a manager
+job/result object.
 
-Takes the opaque job `id` and returns its current public record. Active records
-expose only `queued` or `running`, `progress.percent: null`, and no partial
-completion. A `done` record contains the complete OpenAI-shaped result. A
-`failed` record contains a bounded structured error; upstream HTTP, transport,
-plain-text, oversized-result, and invalid-empty completion failures never become
-empty successes.
+For resumable streaming, create the same resource with `stream: true`. The MCP
+transport returns the Responses events with monotonically increasing
+`sequence_number` values while Llama Manager retains a bounded replay log.
 
-```json
-{
-  "tool": "llama_get_chat_job",
-  "arguments": {"id": "job_opaque-random-value"}
-}
-```
+### `get_response`
 
-Poll at a cadence appropriate to the agent workflow and yield between calls.
-Elapsed time is not a completion percentage.
-
-### `llama_cancel_chat_job`
-
-Takes the job `id`. Cancellation is idempotent: it immediately publishes a
-terminal `cancelled` record for queued or running work and leaves an already
-terminal record unchanged. Queued work is removed; active local, remote, and DS4
-work is cooperatively aborted. A late inner result cannot overwrite
-`cancelled`, although store capacity remains charged until execution settles.
+Retrieves the whole Response through `GET /v1/responses/{id}`:
 
 ```json
 {
-  "tool": "llama_cancel_chat_job",
-  "arguments": {"id": "job_opaque-random-value"}
+  "tool": "get_response",
+  "arguments": {"id": "resp_opaque-random-value"}
 }
 ```
+
+Poll while `status` is `queued` or `in_progress`. Terminal values are
+`completed`, `failed`, `cancelled`, and `incomplete`. A completed result is the
+whole ordinary Responses object with the retained id and `background: true`.
+Failures use its `error` field; manager diagnostics, if present, are additive
+under `_llama_manager`.
+
+JSON retrieval works for background Responses created with either
+`stream: false` or `stream: true`.
+
+To resume a stream originally created with `background: true, stream: true`,
+pass streaming retrieval arguments:
+
+```json
+{
+  "tool": "get_response",
+  "arguments": {
+    "id": "resp_opaque-random-value",
+    "stream": true,
+    "starting_after": 42
+  }
+}
+```
+
+This maps to
+`GET /v1/responses/{id}?stream=true&starting_after=42`. The cursor is exclusive:
+events through 42 are not replayed. Omitting `starting_after` replays retained
+events from the beginning, then follows live events until terminal status.
+
+A Response originally created with `stream: false` cannot later start or resume
+a stream. Replay is bounded and process-local; it is available only while the
+Response and requested sequence range remain retained.
+
+### `cancel_response`
+
+Cancels a retained background Response through idempotent
+`POST /v1/responses/{id}/cancel`:
+
+```json
+{
+  "tool": "cancel_response",
+  "arguments": {"id": "resp_opaque-random-value"}
+}
+```
+
+The tool returns the final whole Response. Queued work is removed before
+activation; in-progress local, remote, or DS4 work is cooperatively aborted when
+possible. A late result cannot overwrite `cancelled`, although Llama Manager
+keeps capacity charged until execution settles.
+
+## Llama Manager retention and scope extensions
+
+OpenAI defines the Response resources and operations above. This deployment adds
+the following manager-specific implementation bounds:
+
+| Manager extension | Default/behavior |
+|---|---|
+| Authorization scope | Derived from the full Authorization header; anonymous callers share a local trusted scope |
+| Persistence | Process-local; Responses and replay logs do not survive restart |
+| Terminal polling/replay retention | Roughly 10 minutes after settlement |
+| Response records | 128 globally, 32 per scope |
+| Serialized request | 4 MiB |
+| Retained active request bytes | 64 MiB globally, 16 MiB per scope |
+| Serialized result | 16 MiB |
+| SSE replay | Explicit bounded per-response/global event and byte caps |
+
+Expired and oldest terminal records are reclaimed before capacity is refused;
+active work is never evicted. Missing, expired, and wrong-scope ids return the
+same standard not-found shape. The manager deletes private request bodies,
+authorization, priority, and routing values after settlement.
 
 ## Prepared-context tools
 
-### `llama_prepare_context`
+Prepared context is a Llama Manager extension, not an OpenAI Responses field.
+The lifecycle tools remain:
 
-Starts exact input counting or llama.cpp prefill and returns the prepared lease.
-Important arguments mirror the REST preparation surface:
+- `llama_prepare_context` starts exact counting or local llama.cpp prefill;
+- `llama_get_prepared_context` retrieves a prepared lease by id; and
+- `llama_release_prepared_context` cancels/releases it.
 
-| Argument | Meaning |
-|---|---|
-| `model` | Required model id or alias |
-| `messages` | Input messages retained for later append use when prefill succeeds |
-| `mode` | `count` or `prefill` |
-| `priority` / `request_priority` | Preparation scheduling policy; `realtime` is invalid |
-| `resident_only` | Fail closed without loading, switching, or evicting a model |
-| `allow_model_load` | Legacy compatibility control; do not combine it with fail-closed/background preparation expectations |
-| `conversation_cache_key` | Optional stable conversation lineage |
-| Input-affecting chat fields | `tools`, `tool_choice`, `response_format`, `chat_template`, `chat_template_kwargs`, and `reasoning_format` are attested with the prefix |
-
-Every response mirrors manager extension fields including
-`contextCacheContract`, `requestedModel`, `resolvedModel`, engine, status,
-preparation outcome, policy, exact input evidence, and timing evidence where
-the manager can truthfully measure it.
+Preparation example:
 
 ```json
 {
@@ -155,7 +196,7 @@ the manager can truthfully measure it.
     "model": "default-big",
     "mode": "prefill",
     "priority": "interactive",
-    "messages": [
+    "input": [
       {"role": "system", "content": "Use only the supplied report."},
       {"role": "user", "content": "<large report supplied once>"}
     ]
@@ -163,102 +204,50 @@ the manager can truthfully measure it.
 }
 ```
 
-Prefill is asynchronous. Keep the returned id and poll it to `ready` before
-using append mode.
-
-### `llama_get_prepared_context`
-
-Takes a prepared-context `id` and returns its current lease, including the final
-count/prefill timing evidence after it settles:
+Poll to `ready`, then combine the retained prefix with a text suffix:
 
 ```json
 {
-  "tool": "llama_get_prepared_context",
-  "arguments": {"id": "context_opaque-random-value"}
-}
-```
-
-Prepared handles are process-local and default to a 15-minute TTL. They are
-invalidated by release, expiry, eviction, restart, a model or compatibility
-revision change, loss of manager-owned slot compatibility, or a scope mismatch.
-
-### `llama_release_prepared_context`
-
-Releases/cancels the prepared lease by `id`:
-
-```json
-{
-  "tool": "llama_release_prepared_context",
-  "arguments": {"id": "context_opaque-random-value"}
-}
-```
-
-## Handle plus suffix through MCP
-
-After `llama_get_prepared_context` reports `ready`, submit the new text messages
-without resending the retained prefix:
-
-```json
-{
-  "tool": "llama_submit_chat_job",
+  "tool": "submit_response",
   "arguments": {
     "model": "default-big",
+    "input": [{"role": "user", "content": "List the three principal risks."}],
+    "background": true,
     "prepared_context_id": "context_opaque-random-value",
     "prepared_context_mode": "append",
-    "messages": [
-      {"role": "user", "content": "List the three principal risks."}
-    ],
-    "max_tokens": 800,
-    "priority": "interactive",
     "routing": "local_only"
   }
 }
 ```
 
-Append mode reuses the prepared prefix's input-affecting fields and accepts only
-new text messages. Conflicting input fields and multimodal suffixes fail closed.
-The handle must still belong to the same authorization scope and resolve to the
-same compatible llama.cpp model and owned slot. DS4 has no compatible reusable
-slot primitive and rejects strict/append prepared-context reuse as unsupported.
+The handle must be ready, in the same scope, and compatible with the same
+resolved llama.cpp model and owned slot. Conflicting input-affecting fields,
+unsupported multimodal suffixes, stale handles, and lost compatibility fail
+closed. Prepared handles have their own manager-defined 15-minute default TTL
+and are invalidated by release, expiry, eviction, restart, or incompatible model
+changes. DS4 rejects strict and append reuse because it exposes no compatible
+caller-visible reusable slot.
 
-## Job limits and lifecycle
+## Alias context discovery
 
-The MCP tools mirror, rather than replace, manager enforcement:
-
-| Limit | Default |
-|---|---:|
-| Terminal job retention | 60 minutes |
-| Jobs, global / per scope | 128 / 32 |
-| Serialized request | 4 MiB |
-| Retained active request bytes, global / per scope | 64 MiB / 16 MiB |
-| Serialized result | 16 MiB |
-
-Expired and old terminal records are reclaimed before capacity is refused;
-active jobs are never evicted. Job records and prepared handles are lost on a
-manager restart. The manager deletes private retained request bodies and policy
-headers after each job settles.
+An alias row may have `n_ctx: null` because its targets can have different
+limits. For local preparation, take `resolvedModel` from the prepared response,
+match that concrete id in `llama_list_models`, and use its advertised `n_ctx`.
+Never substitute a global default for an unknown alias context. A multi-target
+local/remote Response has no single effective context before routing.
 
 ## Other available tools
-
-The MCP server also exposes:
 
 | Tool | Description |
 |---|---|
 | `llama_get_status` | Get server mode and health |
 | `llama_get_stats` | Get CPU, memory, GPU, and context usage |
 | `llama_get_analytics` | Get time-series performance data |
-| `llama_list_models` | List concrete models and aliases, including advertised context and context-management capability fields |
+| `llama_list_models` | List concrete models and aliases with capability metadata |
 | `llama_load_model` / `llama_unload_model` | Load or unload a llama.cpp model |
 | `llama_start_server` / `llama_stop_server` | Start or stop the local server |
 | `llama_get_settings` / `llama_update_settings` | Read or update manager settings |
 | `llama_list_presets` / `llama_activate_preset` | Inspect or activate presets |
 | `llama_search_models` / `llama_download_model` | Search Hugging Face or download a model |
 | `llama_get_processes` / `llama_get_logs` | Inspect processes or recent logs |
-| `llama_chat` | Run synchronous chat expected to fit the client/proxy budget |
-
-An alias catalog row may have `n_ctx: null` because its targets can have
-different limits. For local preparation, use `resolvedModel` from
-`llama_prepare_context`, then match that concrete id in `llama_list_models` and
-read its advertised `n_ctx`; never substitute a global default for an unknown
-alias context. For route-dependent remote jobs, apply explicit routing when a
-specific effective limit is required.
+| `llama_chat` | Run synchronous work expected to fit the client/proxy budget |
