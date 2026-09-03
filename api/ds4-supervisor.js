@@ -36,6 +36,14 @@ import { resolveDs4Config, resolveDs4ModelPath } from './engines.js';
  * @param {Function} [deps.now] () => ms clock (Date.now).
  * @param {Function} [deps.sleep] async (ms) => void — grace delay between SIGTERM and SIGKILL.
  * @param {Function} [deps.setTimeoutFn] setTimeout (or a fake) for scheduling auto-restart.
+ * @param {Function} [deps.onRestartBegin] () => void, called the instant a restart the
+ *   REQUEST-triggered activation flow does not know about is about to happen — a
+ *   crash-driven auto-restart, or an explicit restart() (e.g. the ds4 auto-updater).
+ *   server.js's activateDs4Exclusive/deactivateDs4Exclusive gate concurrent requests on
+ *   its own ds4SwapPromise, but neither of THOSE restarts ever touched it: currentEngine
+ *   stays ds4 throughout, so the gate stayed a no-op and requests were routed straight at
+ *   a ds4-server that was mid-restart (not yet holding the model), landing a raw
+ *   "model not found" instead of queueing. server.js wires this hook to arm the same gate.
  * @returns {{start:Function, stop:Function, restart:Function, health:Function,
  *   isRunning:Function, getPid:Function, getActivePreset:Function,
  *   getActiveOverride:Function, endPlan:Function}}
@@ -55,6 +63,7 @@ export function createDs4Supervisor({
   now = () => Date.now(),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   setTimeoutFn = setTimeout,
+  onRestartBegin = () => {},
 }) {
   let proc = null;
   let ownsEngine = false;
@@ -155,7 +164,10 @@ export function createDs4Supervisor({
     }
     restartHistory = decision.history;
     setTimeoutFn(() => {
-      if (!isRunning() && !intentionalStop) start(activePreset, { isAutoRestart: true });
+      if (!isRunning() && !intentionalStop) {
+        onRestartBegin();
+        start(activePreset, { isAutoRestart: true });
+      }
     }, 3000);
   }
 
@@ -258,6 +270,7 @@ export function createDs4Supervisor({
     if (restartInProgress) return;
     restartInProgress = true;
     try {
+      onRestartBegin();
       await stop();
       intentionalStop = false;
       start(preset);

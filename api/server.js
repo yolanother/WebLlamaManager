@@ -6556,6 +6556,23 @@ function getDs4Supervisor() {
       getWedged: () => containerExecWedged >= CONTAINER_EXEC_WEDGED_LIMIT
         || consecutiveFailedRestarts >= FAILED_RESTART_LIMIT,
       now: () => Date.now(),
+      // A crash-driven auto-restart or an explicit restart() (the ds4 auto-updater)
+      // never went through activateDs4Exclusive, so ds4SwapPromise — the gate
+      // handleChatCompletions/handleCompletions/handleResponses await before routing —
+      // stayed null the whole time and requests were sent straight at a ds4-server
+      // that was mid-restart, landing "model not found" instead of queueing. Arm the
+      // SAME gate here (skip if a swap is already in flight) and clear it once the
+      // restart reaches a terminal outcome, reusing waitDs4AttemptOutcome rather than
+      // duplicating its health-poll loop.
+      onRestartBegin: () => {
+        if (ds4SwapPromise) return;
+        let releaseGate;
+        ds4SwapPromise = new Promise((resolve) => { releaseGate = resolve; });
+        (async () => {
+          try { await waitDs4AttemptOutcome(); }
+          finally { releaseGate(); ds4SwapPromise = null; }
+        })();
+      },
     });
   }
   return ds4Supervisor;

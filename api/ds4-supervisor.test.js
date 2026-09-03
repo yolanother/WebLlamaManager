@@ -44,6 +44,7 @@ function makeSup(overrides = {}) {
     now: overrides.now || (() => 1000),
     sleep: async () => {},
     setTimeoutFn: (cb) => { calls.scheduled.push(cb); return 0; },
+    onRestartBegin: overrides.onRestartBegin,
   });
   return { sup, calls, procs };
 }
@@ -177,6 +178,59 @@ test('restart: stops then starts a fresh process', async () => {
   assert.equal(calls.spawn.length, 2);
   assert.ok(procs[0].signals.includes('SIGTERM'));
   assert.equal(sup.isRunning(), true);
+});
+
+// ── onRestartBegin: gate hook for restarts the request-triggered swap gate
+// (server.js's ds4SwapPromise) never sees ──────────────────────────────────
+// Bug: a crash-triggered auto-restart or an explicit restart() (e.g. the ds4
+// auto-updater) never told server.js a restart was happening, so its
+// ds4SwapPromise gate stayed null/already-resolved and concurrent requests
+// sailed straight through to a ds4-server that was mid-restart, landing a
+// fast "model not found" instead of queueing. onRestartBegin is the hook
+// server.js wires its gate through.
+
+test('restart: notifies onRestartBegin before stopping/respawning', async () => {
+  const order = [];
+  const { sup } = makeSup({
+    onRestartBegin: () => { order.push('onRestartBegin'); },
+  });
+  sup.start(PRESET);
+  order.push('started');
+  await sup.restart();
+  order.push('restarted');
+  assert.deepEqual(order, ['started', 'onRestartBegin', 'restarted']);
+});
+
+test('exit: unexpected crash notifies onRestartBegin before the deferred respawn', () => {
+  const order = [];
+  const { sup, calls, procs } = makeSup({
+    onRestartBegin: () => { order.push('onRestartBegin'); },
+  });
+  sup.start(PRESET);
+  procs[0].emit('exit', 1); // crash
+  assert.equal(order.length, 0, 'not notified until the deferred restart actually fires');
+  calls.scheduled[0](); // fire the scheduled restart
+  order.push('respawned');
+  assert.deepEqual(order, ['onRestartBegin', 'respawned']);
+});
+
+test('exit: a suppressed (governor-held) auto-restart does NOT notify onRestartBegin', () => {
+  const order = [];
+  const { sup, procs } = makeSup({
+    onRestartBegin: () => { order.push('onRestartBegin'); },
+    restartDecision: () => ({ allow: false, reason: 'circuit-open', history: [], retryAfterMs: 60000 }),
+  });
+  sup.start(PRESET);
+  procs[0].emit('exit', 1);
+  assert.deepEqual(order, [], 'no restart was actually scheduled, so no gate should open');
+});
+
+test('onRestartBegin is optional (defaults to a no-op)', async () => {
+  const { sup, procs } = makeSup(); // no onRestartBegin override
+  sup.start(PRESET);
+  await sup.restart();
+  procs[1].emit('exit', 1);
+  // Just must not throw.
 });
 
 test('health: ok when /v1/models returns 200', async () => {
