@@ -143,3 +143,43 @@ test('serves background after a bounded burst of interactive requests', async ()
   queue.release(await interactiveThree);
   assert.deepEqual(order, ['interactive-1', 'interactive-2', 'background', 'interactive-3']);
 });
+
+test('contract 7: aborting a pending acquisition removes it and it never activates', async () => {
+  const queue = new PriorityRequestQueue(1);
+  const holder = await queue.acquire({ endpoint: 'chat', priority: 'interactive' });
+  const controller = new AbortController();
+  const pending = queue.acquire({
+    endpoint: 'chat-job',
+    priority: 'interactive',
+    signal: controller.signal,
+  });
+
+  assert.equal(queue.pending, 1);
+  controller.abort('job_cancelled');
+  await assert.rejects(
+    pending,
+    error => error?.name === 'AbortError' || error?.code === 'ABORT_ERR',
+  );
+  assert.equal(queue.pending, 0);
+
+  queue.release(holder);
+  await Promise.resolve();
+  assert.equal(queue.active, 0, 'the aborted waiter must not activate after capacity opens');
+
+  const next = await queue.acquire({ endpoint: 'chat', priority: 'interactive' });
+  assert.equal(queue.active, 1, 'capacity remains usable by a later request');
+  queue.release(next);
+});
+
+test('contract 7: an already-aborted acquisition is rejected without consuming capacity', async () => {
+  const queue = new PriorityRequestQueue(1);
+  const controller = new AbortController();
+  controller.abort('client_disconnect');
+
+  await assert.rejects(
+    queue.acquire({ endpoint: 'chat-job', signal: controller.signal }),
+    error => error?.name === 'AbortError' || error?.code === 'ABORT_ERR',
+  );
+  assert.equal(queue.pending, 0);
+  assert.equal(queue.active, 0);
+});

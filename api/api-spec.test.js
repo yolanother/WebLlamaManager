@@ -11,6 +11,7 @@ import {
   ENDPOINTS,
   MULTIMODAL_CONTENT_PARTS,
   OPENAI_BASE_URL,
+  renderLlmsFullReference,
 } from './api-spec.js';
 import { CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
 import { buildOpenApiDocument } from '../scripts/gen-openapi.mjs';
@@ -95,6 +96,9 @@ const CURRENT_ENDPOINT_KEYS = [
   'GET /api/analytics/crashes',
   'GET /api/v1/models',
   'POST /api/v1/chat/completions',
+  'POST /api/v1/chat/completions/jobs',
+  'GET /api/v1/chat/completions/jobs/{id}',
+  'DELETE /api/v1/chat/completions/jobs/{id}',
   'POST /api/v1/completions',
   'POST /api/v1/embeddings',
   'POST /api/embeddings',
@@ -261,4 +265,73 @@ test('OpenAPI generator emits a structurally complete OpenAPI 3.1 document', () 
   }
 
   assert.deepEqual(JSON.parse(JSON.stringify(document)), document);
+});
+
+test('contracts 1, 2, 4, 6, and 8: async job routes document lifecycle, ownership, limits, and Location polling', () => {
+  const byKey = new Map(ENDPOINTS.map(endpoint => [`${endpoint.method} ${endpoint.path}`, endpoint]));
+  const submit = byKey.get('POST /api/v1/chat/completions/jobs');
+  const poll = byKey.get('GET /api/v1/chat/completions/jobs/{id}');
+  const cancel = byKey.get('DELETE /api/v1/chat/completions/jobs/{id}');
+  assert.ok(submit);
+  assert.ok(poll);
+  assert.ok(cancel);
+
+  assert.ok(submit.requestSchema.required.includes('model'));
+  assert.ok(submit.requestSchema.required.includes('messages'));
+  assert.equal(submit.requestSchema.properties.stream.const, false);
+  for (const extension of [
+    'prepared_context_id', 'prepared_context_mode', 'context_cache_strict',
+    'request_priority', 'routing',
+  ]) {
+    assert.ok(submit.requestSchema.properties[extension], `submit must document ${extension}`);
+  }
+  assert.deepEqual(submit.requestSchema.properties.prepared_context_mode.enum, ['append']);
+  assert.match(submit.description, /202/);
+  assert.match(submit.description, /Location/i);
+  assert.match(submit.description, /4\s*MiB/i);
+  assert.match(submit.description, /429/);
+  assert.match(submit.description, /128/);
+  assert.match(submit.description, /32/);
+  assert.match(submit.description, /64\s*MiB/i);
+  assert.match(submit.description, /16\s*MiB/i);
+
+  const status = poll.responseSchema.properties.status;
+  assert.deepEqual(status.enum, ['queued', 'running', 'done', 'failed', 'cancelled']);
+  assert.equal(poll.responseSchema.properties.progress.properties.percent.const, null);
+  assert.match(poll.description, /scope/i);
+  assert.match(poll.description, /404/);
+  assert.match(poll.description, /60 minutes/i);
+  assert.match(poll.description, /restart/i);
+  assert.match(cancel.description, /idempotent/i);
+  assert.match(cancel.description, /late/i);
+});
+
+test('contracts 9 and 10: prepared-context docs distinguish exact reuse, append reuse, and unsupported DS4', () => {
+  const prepare = ENDPOINTS.find(endpoint => endpoint.path === '/api/v1/context/prepare');
+  const chat = ENDPOINTS.find(endpoint => endpoint.path === '/api/v1/chat/completions');
+  const context = ENDPOINTS.find(endpoint => endpoint.path === '/api/v1/context/{id}');
+  assert.ok(prepare);
+  assert.ok(chat);
+  assert.ok(context);
+
+  const reference = [prepare.description, chat.description, context.description, renderLlmsFullReference()].join('\n');
+  assert.match(reference, /prepared_context_mode/);
+  assert.match(reference, /append/);
+  assert.match(reference, /text[- ]only/i);
+  assert.match(reference, /input[- ]affecting/i);
+  assert.match(reference, /scope/i);
+  assert.match(reference, /resolved model/i);
+  assert.match(reference, /compatib/i);
+  assert.match(reference, /slot/i);
+  assert.match(reference, /15 minutes/i);
+  assert.match(reference, /DS4/);
+  assert.match(reference, /unsupported/i);
+  assert.match(reference, /alias/i);
+});
+
+test('contract 12: agent-facing API reference publishes measured timeout ceilings', () => {
+  const reference = renderLlmsFullReference();
+  assert.match(reference, /(?:90\s*(?:s|seconds).*gateway|gateway.*90\s*(?:s|seconds))/is);
+  assert.match(reference, /(?:600\s*(?:s|seconds).*backend|backend.*600\s*(?:s|seconds))/is);
+  assert.match(reference, /(?:180\s*(?:s|seconds).*model[- ]load|model[- ]load.*180\s*(?:s|seconds))/is);
 });

@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  composePreparedContextAppend,
   contextPrefixRequestHash,
   requestExactInputTokens,
   requestRenderedPrefix,
@@ -208,4 +209,118 @@ test('contextPrefixRequestHash binds input-affecting fields and the resolved mod
   // The hash is opaque: no prompt text or credential material survives into it.
   assert.equal(base.includes('hello'), false);
   assert.equal(base.includes('gemma-real'), false);
+});
+
+test('contract 9: append mode composes a text suffix with the retained prepared prefix', () => {
+  const preparedBody = {
+    model: 'gemma-real',
+    messages: [
+      { role: 'system', content: 'Private retained instructions.' },
+      { role: 'user', content: 'Retained source material.' },
+    ],
+    tools: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }],
+    tool_choice: 'auto',
+    response_format: { type: 'json_object' },
+    chat_template_kwargs: { enable_thinking: false },
+    reasoning_format: 'none',
+  };
+  const suffixBody = {
+    model: 'gemma-real',
+    messages: [{ role: 'user', content: 'Answer one new question.' }],
+    prepared_context_id: 'ctx_private',
+    prepared_context_mode: 'append',
+    max_tokens: 80,
+    temperature: 0.2,
+    stream: false,
+    request_priority: 'realtime',
+    routing: 'local_only',
+  };
+
+  const composed = composePreparedContextAppend({ preparedBody, suffixBody });
+  assert.deepEqual(composed.messages, [...preparedBody.messages, ...suffixBody.messages]);
+  assert.deepEqual(composed.tools, preparedBody.tools);
+  assert.equal(composed.tool_choice, preparedBody.tool_choice);
+  assert.deepEqual(composed.response_format, preparedBody.response_format);
+  assert.deepEqual(composed.chat_template_kwargs, preparedBody.chat_template_kwargs);
+  assert.equal(composed.reasoning_format, preparedBody.reasoning_format);
+  assert.equal(composed.max_tokens, 80);
+  assert.equal(composed.temperature, 0.2);
+  assert.equal(composed.stream, false);
+  assert.equal(composed.request_priority, 'realtime');
+  assert.equal(composed.routing, 'local_only');
+  assert.equal(composed.prepared_context_id, 'ctx_private');
+  assert.equal(composed.prepared_context_mode, 'append');
+});
+
+test('contract 9: append mode rejects conflicting retained input-affecting fields', () => {
+  const preparedBody = {
+    messages: [{ role: 'system', content: 'Retained prefix.' }],
+    tools: [{ type: 'function', function: { name: 'lookup' } }],
+    response_format: { type: 'json_object' },
+  };
+
+  for (const conflict of [
+    { tools: [] },
+    { tool_choice: 'none' },
+    { response_format: { type: 'text' } },
+    { chat_template: 'different-template' },
+    { chat_template_kwargs: { enable_thinking: true } },
+    { reasoning_format: 'deepseek' },
+    { input: 'conflicting input' },
+    { prompt: 'conflicting prompt' },
+  ]) {
+    assert.throws(
+      () => composePreparedContextAppend({
+        preparedBody,
+        suffixBody: {
+          messages: [{ role: 'user', content: 'suffix' }],
+          prepared_context_mode: 'append',
+          ...conflict,
+        },
+      }),
+      error => error?.code === 'PREPARED_CONTEXT_APPEND_CONFLICT',
+      JSON.stringify(conflict),
+    );
+  }
+});
+
+test('contract 9: append mode rejects multimodal and malformed suffix messages', () => {
+  const preparedBody = { messages: [{ role: 'system', content: 'Retained prefix.' }] };
+  for (const messages of [
+    [],
+    [{ role: 'user', content: [{ type: 'text', text: 'not v1 text-only' }] }],
+    [{ role: 'user', content: { type: 'text', text: 'not a string' } }],
+    [{ role: 'user', content: 'ok' }, { role: 'user' }],
+  ]) {
+    assert.throws(
+      () => composePreparedContextAppend({ preparedBody, suffixBody: { messages } }),
+      error => error?.code === 'PREPARED_CONTEXT_APPEND_INVALID_SUFFIX',
+      JSON.stringify(messages),
+    );
+  }
+});
+
+test('contract 10: exact prepared-context hashing remains unchanged outside append mode', () => {
+  const fullPrompt = {
+    model: 'voice-fast',
+    messages: [
+      { role: 'system', content: 'Retained prefix.' },
+      { role: 'user', content: 'Full caller-resubmitted prompt.' },
+    ],
+    prepared_context_id: 'ctx_handle',
+    context_cache_strict: true,
+  };
+  const resolvedModel = 'gemma-real';
+  const expected = contextPrefixRequestHash(fullPrompt, resolvedModel);
+
+  assert.equal(
+    expected,
+    contextPrefixRequestHash({ ...fullPrompt, max_tokens: 200, stream: false }, resolvedModel),
+    'output controls must not change existing exact-hash validation',
+  );
+  assert.notEqual(
+    expected,
+    contextPrefixRequestHash({ ...fullPrompt, messages: [{ role: 'user', content: 'suffix only' }] }, resolvedModel),
+    'a suffix-only request must not accidentally pass the existing full-prompt contract',
+  );
 });

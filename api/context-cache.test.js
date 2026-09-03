@@ -193,3 +193,61 @@ test('a lease created without a request hash never invents one', () => {
   const created = store.create({ scopeId: 'scope_a', resolvedModel: 'gemma-real', status: 'queued' });
   assert.equal('requestHash' in created, false);
 });
+
+test('contract 9: append prerequisites fail closed after scope, lifecycle, or slot ownership changes', () => {
+  let now = 1_000;
+  const contexts = new PreparedContextStore({
+    ttlMs: 500,
+    now: () => now,
+    createId: () => 'ctx_append_ready',
+  });
+  const affinity = new SlotAffinityRegistry();
+  const assigned = affinity.assign({
+    model: 'gemma-real',
+    lineageKey: 'lineage_prepared',
+    scopeId: 'scope_a',
+    slotCount: 1,
+  });
+  const created = contexts.create({
+    scopeId: 'scope_a',
+    requestedModel: 'voice-fast',
+    resolvedModel: 'gemma-real',
+    engine: 'llama',
+    mode: 'prefill',
+    status: 'ready',
+    compatibilityHash: 'compat_revision_a',
+    requestHash: 'request_prefix_a',
+    internalSlotId: assigned.slotId,
+    lineageKey: 'lineage_prepared',
+    preparationBody: { messages: [{ role: 'system', content: 'private prefix' }] },
+  });
+
+  assert.equal(contexts.get(created.id, 'scope_b'), null, 'wrong-scope handles are indistinguishable from missing');
+  assert.equal(contexts.get(created.id, 'scope_a').resolvedModel, 'gemma-real');
+  assert.equal(contexts.get(created.id, 'scope_a').compatibilityHash, 'compat_revision_a');
+  assert.equal(JSON.stringify(contexts.get(created.id, 'scope_a')).includes('private prefix'), false);
+
+  affinity.assign({ model: 'gemma-real', lineageKey: 'lineage_replacement', scopeId: 'scope_a', slotCount: 1 });
+  assert.equal(affinity.get('gemma-real', 'lineage_prepared'), null, 'lost slot ownership must not look reusable');
+
+  now += 501;
+  assert.equal(contexts.get(created.id, 'scope_a'), null, 'stale handles fail closed');
+});
+
+test('contract 9: explicit release makes a prepared prefix immediately unavailable', () => {
+  const store = new PreparedContextStore({ createId: () => 'ctx_release' });
+  const created = store.create({
+    scopeId: 'scope_a',
+    resolvedModel: 'gemma-real',
+    engine: 'llama',
+    mode: 'prefill',
+    status: 'ready',
+    preparationBody: { messages: [{ role: 'system', content: 'private prefix' }] },
+  });
+
+  const released = store.invalidate(created.id, 'scope_a', 'released');
+  assert.equal(released.status, 'invalidated');
+  assert.equal(released.invalidationReason, 'released');
+  assert.equal(store.get(created.id, 'scope_a'), null);
+  assert.equal(store.invalidate(created.id, 'scope_b', 'released'), null);
+});
