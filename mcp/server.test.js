@@ -34,12 +34,12 @@ async function captureToolCall(name, args) {
   }
 }
 
-test('contract 11: MCP catalog exposes the six async job and prepared-context tools', () => {
+test('contract 10: MCP catalog exposes OpenAI Response and prepared-context tools', () => {
   const byName = new Map(tools.map(tool => [tool.name, tool]));
   const expected = [
-    'llama_submit_chat_job',
-    'llama_get_chat_job',
-    'llama_cancel_chat_job',
+    'submit_response',
+    'get_response',
+    'cancel_response',
     'llama_prepare_context',
     'llama_get_prepared_context',
     'llama_release_prepared_context',
@@ -52,11 +52,11 @@ test('contract 11: MCP catalog exposes the six async job and prepared-context to
     assert.ok(tool.description.trim());
   }
 
-  const submit = byName.get('llama_submit_chat_job');
-  assert.deepEqual(submit.inputSchema.required, ['model', 'messages']);
+  const submit = byName.get('submit_response');
+  assert.deepEqual(submit.inputSchema.required, ['model', 'input']);
   for (const field of [
     'prepared_context_id', 'prepared_context_mode', 'context_cache_strict',
-    'priority', 'routing',
+    'priority', 'routing', 'stream',
   ]) {
     assert.ok(submit.inputSchema.properties[field], `submit tool omits ${field}`);
   }
@@ -65,6 +65,12 @@ test('contract 11: MCP catalog exposes the six async job and prepared-context to
   assert.match(submit.description, /client|proxy/i);
   assert.match(submit.description, /budget/i);
 
+  const getResponse = byName.get('get_response');
+  assert.deepEqual(getResponse.inputSchema.required, ['id']);
+  assert.equal(getResponse.inputSchema.properties.stream.type, 'boolean');
+  assert.equal(getResponse.inputSchema.properties.starting_after.type, 'integer');
+  assert.match(getResponse.description, /sequence_number/);
+
   const prepare = byName.get('llama_prepare_context');
   assert.deepEqual(prepare.inputSchema.required, ['model', 'messages']);
   assert.deepEqual(prepare.inputSchema.properties.mode.enum, ['count', 'prefill']);
@@ -72,10 +78,10 @@ test('contract 11: MCP catalog exposes the six async job and prepared-context to
   assert.equal(prepare.inputSchema.properties.resident_only.type, 'boolean');
 });
 
-test('contract 11: chat-job MCP tools mirror manager extensions and REST methods', async () => {
+test('contract 10: Response MCP tools mirror extensions and OpenAI-compatible REST methods', async () => {
   const argumentsBody = {
     model: 'voice-fast',
-    messages: [{ role: 'user', content: 'long request' }],
+    input: [{ role: 'user', content: 'long request' }],
     temperature: 0.3,
     max_tokens: 50_000,
     prepared_context_id: 'ctx_opaque',
@@ -83,26 +89,35 @@ test('contract 11: chat-job MCP tools mirror manager extensions and REST methods
     context_cache_strict: true,
     priority: 'background',
     routing: 'local_only',
+    stream: true,
   };
-  const submitted = await captureToolCall('llama_submit_chat_job', argumentsBody);
-  assert.equal(submitted.captured.url, 'http://localhost:5250/api/v1/chat/completions/jobs');
+  const submitted = await captureToolCall('submit_response', argumentsBody);
+  assert.equal(submitted.captured.url, 'http://localhost:5250/api/v1/responses');
   assert.equal(submitted.captured.method, 'POST');
   const { priority: _toolPriority, ...rest } = argumentsBody;
-  assert.deepEqual(submitted.captured.body, { ...rest, request_priority: 'background', stream: false });
+  assert.deepEqual(submitted.captured.body, { ...rest, request_priority: 'background', background: true });
   assert.equal(Object.hasOwn(submitted.captured.body, 'priority'), false, 'the inert tool-only name must not reach REST');
-  assert.equal(submitted.result.status, 202);
+  assert.equal(submitted.result.data.ok, true);
 
-  const polled = await captureToolCall('llama_get_chat_job', { id: 'job_opaque' });
-  assert.equal(polled.captured.url, 'http://localhost:5250/api/v1/chat/completions/jobs/job_opaque');
+  const polled = await captureToolCall('get_response', { id: 'resp_opaque' });
+  assert.equal(polled.captured.url, 'http://localhost:5250/api/v1/responses/resp_opaque');
   assert.equal(polled.captured.method, 'GET');
   assert.equal(polled.captured.body, undefined);
 
-  const cancelled = await captureToolCall('llama_cancel_chat_job', { id: 'job_opaque' });
-  assert.equal(cancelled.captured.url, 'http://localhost:5250/api/v1/chat/completions/jobs/job_opaque');
-  assert.equal(cancelled.captured.method, 'DELETE');
+  const resumed = await captureToolCall('get_response', {
+    id: 'resp_opaque', stream: true, starting_after: 17,
+  });
+  assert.equal(
+    resumed.captured.url,
+    'http://localhost:5250/api/v1/responses/resp_opaque?stream=true&starting_after=17',
+  );
+
+  const cancelled = await captureToolCall('cancel_response', { id: 'resp_opaque' });
+  assert.equal(cancelled.captured.url, 'http://localhost:5250/api/v1/responses/resp_opaque/cancel');
+  assert.equal(cancelled.captured.method, 'POST');
 });
 
-test('contract 11: context MCP tools map prepare, poll, and release without hidden waiting', async () => {
+test('contract 10: context MCP tools map prepare, poll, and release without hidden waiting', async () => {
   const prepareBody = {
     model: 'voice-fast',
     messages: [{ role: 'system', content: 'Retain this prefix.' }],

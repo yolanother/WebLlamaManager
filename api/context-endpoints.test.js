@@ -300,7 +300,7 @@ test('contract 9: append mode rejects multimodal and malformed suffix messages',
   }
 });
 
-test('contract 10: exact prepared-context hashing remains unchanged outside append mode', () => {
+test('contract 9: exact prepared-context hashing remains unchanged outside append mode', () => {
   const fullPrompt = {
     model: 'voice-fast',
     messages: [

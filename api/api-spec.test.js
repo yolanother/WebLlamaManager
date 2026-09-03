@@ -96,9 +96,6 @@ const CURRENT_ENDPOINT_KEYS = [
   'GET /api/analytics/crashes',
   'GET /api/v1/models',
   'POST /api/v1/chat/completions',
-  'POST /api/v1/chat/completions/jobs',
-  'GET /api/v1/chat/completions/jobs/{id}',
-  'DELETE /api/v1/chat/completions/jobs/{id}',
   'POST /api/v1/completions',
   'POST /api/v1/embeddings',
   'POST /api/embeddings',
@@ -107,6 +104,10 @@ const CURRENT_ENDPOINT_KEYS = [
   'POST /api/embed/model',
   'GET /api/v1/models/{model}',
   'POST /api/v1/responses',
+  'GET /api/v1/responses/{response_id}',
+  'POST /api/v1/responses/{response_id}/cancel',
+  'GET /v1/responses/{response_id}',
+  'POST /v1/responses/{response_id}/cancel',
   'POST /api/v1/messages',
   'POST /api/v1/messages/count_tokens',
   'POST /api/v1/rerank',
@@ -267,54 +268,64 @@ test('OpenAPI generator emits a structurally complete OpenAPI 3.1 document', () 
   assert.deepEqual(JSON.parse(JSON.stringify(document)), document);
 });
 
-test('contracts 1, 2, 4, 6, and 8: async job routes document lifecycle, ownership, limits, and Location polling', () => {
+test('contracts 1-8: Responses docs expose OpenAI background create, retrieve, cancel, and replay aliases', () => {
   const byKey = new Map(ENDPOINTS.map(endpoint => [`${endpoint.method} ${endpoint.path}`, endpoint]));
-  const submit = byKey.get('POST /api/v1/chat/completions/jobs');
-  const poll = byKey.get('GET /api/v1/chat/completions/jobs/{id}');
-  const cancel = byKey.get('DELETE /api/v1/chat/completions/jobs/{id}');
-  assert.ok(submit);
-  assert.ok(poll);
-  assert.ok(cancel);
+  for (const prefix of ['/api/v1', '/v1']) {
+    const create = byKey.get(`POST ${prefix}/responses`);
+    const retrieve = byKey.get(`GET ${prefix}/responses/{response_id}`);
+    const cancel = byKey.get(`POST ${prefix}/responses/{response_id}/cancel`);
+    assert.ok(create, `missing create alias ${prefix}`);
+    assert.ok(retrieve, `missing retrieve alias ${prefix}`);
+    assert.ok(cancel, `missing cancel alias ${prefix}`);
 
-  assert.ok(submit.requestSchema.required.includes('model'));
-  assert.ok(submit.requestSchema.required.includes('messages'));
-  assert.equal(submit.requestSchema.properties.stream.const, false);
-  for (const extension of [
-    'prepared_context_id', 'prepared_context_mode', 'context_cache_strict',
-    'request_priority', 'routing',
-  ]) {
-    assert.ok(submit.requestSchema.properties[extension], `submit must document ${extension}`);
+    assert.equal(create.requestSchema.properties.background.type, 'boolean');
+    assert.equal(create.requestSchema.properties.stream.type, 'boolean');
+    assert.equal(create.requestSchema.required.includes('background'), false);
+    assert.match(create.description, /background/i);
+    assert.match(create.description, /synchronous/i);
+    for (const extension of [
+      'prepared_context_id', 'prepared_context_mode', 'context_cache_strict',
+      'request_priority', 'routing',
+    ]) {
+      assert.ok(create.requestSchema.properties[extension], `${prefix} Responses must document ${extension}`);
+    }
+
+    const response = retrieve.responseSchema.properties;
+    assert.match(response.id.pattern, /resp_/);
+    assert.equal(response.object.const, 'response');
+    assert.deepEqual(
+      new Set(response.status.enum),
+      new Set(['queued', 'in_progress', 'completed', 'failed', 'cancelled', 'incomplete']),
+    );
+    assert.equal(response.created_at.type, 'integer');
+    assert.ok(response.completed_at);
+    assert.ok(response.output);
+    assert.ok(response.error);
+    const params = new Map(retrieve.params.map(param => [param.name, param]));
+    assert.equal(params.get('stream').in, 'query');
+    assert.equal(params.get('starting_after').in, 'query');
+    assert.equal(params.get('starting_after').schema.type, 'integer');
+    assert.match(retrieve.description, /sequence_number/);
+    assert.match(retrieve.description, /original|created/i);
+    assert.match(retrieve.description, /bounded|cap/i);
+    assert.match(retrieve.description, /10 minutes/i);
+    assert.match(retrieve.description, /scope/i);
+    assert.match(retrieve.description, /404/);
+    assert.match(retrieve.description, /not[- ]found/i);
+    assert.match(cancel.description, /idempotent/i);
+    assert.match(cancel.description, /background/i);
   }
-  assert.deepEqual(submit.requestSchema.properties.prepared_context_mode.enum, ['append']);
-  assert.match(submit.description, /202/);
-  assert.match(submit.description, /Location/i);
-  assert.match(submit.description, /4\s*MiB/i);
-  assert.match(submit.description, /429/);
-  assert.match(submit.description, /128/);
-  assert.match(submit.description, /32/);
-  assert.match(submit.description, /64\s*MiB/i);
-  assert.match(submit.description, /16\s*MiB/i);
-
-  const status = poll.responseSchema.properties.status;
-  assert.deepEqual(status.enum, ['queued', 'running', 'done', 'failed', 'cancelled']);
-  assert.equal(poll.responseSchema.properties.progress.properties.percent.const, null);
-  assert.match(poll.description, /scope/i);
-  assert.match(poll.description, /404/);
-  assert.match(poll.description, /60 minutes/i);
-  assert.match(poll.description, /restart/i);
-  assert.match(cancel.description, /idempotent/i);
-  assert.match(cancel.description, /late/i);
 });
 
-test('contracts 9 and 10: prepared-context docs distinguish exact reuse, append reuse, and unsupported DS4', () => {
+test('contracts 9 and 11: prepared-context docs distinguish exact reuse, append reuse, and unsupported DS4', () => {
   const prepare = ENDPOINTS.find(endpoint => endpoint.path === '/api/v1/context/prepare');
-  const chat = ENDPOINTS.find(endpoint => endpoint.path === '/api/v1/chat/completions');
+  const responses = ENDPOINTS.find(endpoint => endpoint.path === '/api/v1/responses');
   const context = ENDPOINTS.find(endpoint => endpoint.path === '/api/v1/context/{id}');
   assert.ok(prepare);
-  assert.ok(chat);
+  assert.ok(responses);
   assert.ok(context);
 
-  const reference = [prepare.description, chat.description, context.description, renderLlmsFullReference()].join('\n');
+  const reference = [prepare.description, responses.description, context.description, renderLlmsFullReference()].join('\n');
   assert.match(reference, /prepared_context_mode/);
   assert.match(reference, /append/);
   assert.match(reference, /text[- ]only/i);
@@ -329,9 +340,13 @@ test('contracts 9 and 10: prepared-context docs distinguish exact reuse, append 
   assert.match(reference, /alias/i);
 });
 
-test('contract 12: agent-facing API reference publishes measured timeout ceilings', () => {
+test('contracts 7 and 11: agent reference documents cursor-exclusive resumable background streaming', () => {
   const reference = renderLlmsFullReference();
-  assert.match(reference, /(?:90\s*(?:s|seconds).*gateway|gateway.*90\s*(?:s|seconds))/is);
-  assert.match(reference, /(?:600\s*(?:s|seconds).*backend|backend.*600\s*(?:s|seconds))/is);
-  assert.match(reference, /(?:180\s*(?:s|seconds).*model[- ]load|model[- ]load.*180\s*(?:s|seconds))/is);
+  assert.match(reference, /background/i);
+  assert.match(reference, /stream=true/);
+  assert.match(reference, /starting_after/);
+  assert.match(reference, /sequence_number/);
+  assert.match(reference, /response\.completed/);
+  assert.match(reference, /10 minutes/i);
+  assert.match(reference, /process[- ]local/i);
 });

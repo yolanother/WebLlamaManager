@@ -144,7 +144,7 @@ test('serves background after a bounded burst of interactive requests', async ()
   assert.deepEqual(order, ['interactive-1', 'interactive-2', 'background', 'interactive-3']);
 });
 
-test('contract 7: aborting a pending acquisition removes it and it never activates', async () => {
+test('contract 4: aborting a pending acquisition removes it and it never activates', async () => {
   const queue = new PriorityRequestQueue(1);
   const holder = await queue.acquire({ endpoint: 'chat', priority: 'interactive' });
   const controller = new AbortController();
@@ -171,7 +171,7 @@ test('contract 7: aborting a pending acquisition removes it and it never activat
   queue.release(next);
 });
 
-test('contract 7: an already-aborted acquisition is rejected without consuming capacity', async () => {
+test('contract 4: an already-aborted acquisition is rejected without consuming capacity', async () => {
   const queue = new PriorityRequestQueue(1);
   const controller = new AbortController();
   controller.abort('client_disconnect');
