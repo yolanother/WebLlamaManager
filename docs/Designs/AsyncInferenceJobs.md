@@ -11,6 +11,9 @@ GET    /api/v1/chat/completions/jobs/{id}  poll or collect
 DELETE /api/v1/chat/completions/jobs/{id}  cancel
 ```
 
+The consumer and operator workflow, including curl and MCP examples, is in
+[Using Async Inference and Prepared Contexts](../Guides/AsyncInference.md).
+
 Submission accepts the same JSON body as `POST /api/v1/chat/completions`, except
 that `stream: true` is rejected with HTTP 400 instead of being silently changed.
 The manager executes the retained request as a non-streaming completion because
@@ -175,6 +178,18 @@ prefix-handle operation; its `--kv-disk-dir` is memory offload, not caller-visib
 KV reuse. DS4 therefore advertises prepared-context support as false and rejects
 strict/append prepared-context use instead of claiming a cache hit.
 
+### Alias effective-context discovery
+
+An alias can route to targets with different context limits, so an alias row's
+`n_ctx: null` means "route-dependent or unknown," not the manager's global
+default. A local preparation response identifies both `requestedModel` and the
+concrete `resolvedModel`; callers look up the latter in `GET /api/v1/models` and
+use that concrete row's advertised `n_ctx`. If it is still absent, the limit is
+unknown and must not be inferred. An async job eligible for multiple local or
+remote targets has no single effective context before routing; callers that
+require a particular limit select an explicit routing policy and consult the
+selected backend's concrete catalog.
+
 ## MCP mapping
 
 The MCP server mirrors the REST contract with six tools:
@@ -196,6 +211,8 @@ exposes the manager extensions required for prepared reuse and policy selection,
 including `prepared_context_id`, `prepared_context_mode`, `context_cache_strict`,
 `priority`, and `routing`.
 
+The complete tool argument and lifecycle reference is in [MCP server](../mcp.md).
+
 ## Error and HTTP semantics
 
 | Operation | Success | Client/ownership error | Capacity | Upstream failure |
@@ -211,6 +228,39 @@ bounded and normalize non-JSON/plain-text upstream failures without including
 authorization values, prompt bodies, or backend API keys. Async execution avoids
 client and proxy socket lifetimes; it does not remove the manager's model-load or
 remote-backend attempt timeouts.
+
+## Measured connection and execution ceilings
+
+The deployment evidence that drove this design separates the connection cut
+from work that remains bounded inside a job:
+
+| Cut | Value | Owner |
+|---|---:|---|
+| OpenResty in front of `llama.lair.jaxns.net` | 90 seconds | Infrastructure gateway |
+| Remote backend, per attempt | 600 seconds | Llama Manager |
+| Chat model-load wait | 180 seconds | Llama Manager |
+
+On `drakemore` with DS4 at a 65,536-token context, a 36,636-token prompt took
+287 seconds, a 50,636-token prompt took 228 seconds, and a 73,252-token prompt
+was refused as over context. The first prompt returned HTTP 504 at 90 seconds
+through the gateway and HTTP 200 at 287 seconds when sent directly. These are
+observations for those inputs and that deployment, not general performance
+claims. Jobs remove the need for the caller/gateway response to remain open
+during inference; the 600- and 180-second manager ceilings still apply.
+
+## OpenAPI and documentation contract
+
+The checked-in OpenAPI document describes all six HTTP operations: job submit,
+poll, and cancel plus prepared-context create, get, and release. It includes the
+public lifecycle shapes, manager extension fields, 400/404/409/413/429 responses,
+and retained asynchronous failures. `api/openapi.json` is generated from the
+source API specification and must not be edited independently.
+
+The [consumer guide](../Guides/AsyncInference.md) records sync-versus-async
+selection, measured ceilings, scope and restart behavior, retention and limits,
+cancellation and failure handling, alias effective-context lookup, and prepared
+append invalidation. [MCP server](../mcp.md) maps the same contract to agent
+tools.
 
 ## Compatibility
 

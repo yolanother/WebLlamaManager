@@ -46,6 +46,7 @@ A comprehensive LLM management, debugging, and performance monitoring platform f
 
 ### Infrastructure
 - **OpenAI-compatible API**: Drop-in replacement proxy (`chat/completions`, `completions`, `embeddings`, `responses`, Anthropic-shaped `messages`, `rerank`) with automatic message sanitization for tool-call edge cases
+- **Async inference jobs**: Submit non-streaming chat work, disconnect, then poll or cancel an Authorization-scoped handle; compose a ready llama.cpp prepared prefix with new text messages without resending the prefix ([guide](docs/Guides/AsyncInference.md))
 - **MCP Server**: Integration with AI agents like Claude Desktop
 - **Full Chat Interface**: Multi-conversation chat with streaming, code highlighting, and image support
 - **systemd service**: Auto-start on boot, runs in background
@@ -175,6 +176,13 @@ On top of that:
   `request_priority: "realtime"` for latency-sensitive turns and
   `routing: "local_only"` when remote egress is forbidden. See
   [`docs/Designs/ConversationContextCache.md`](docs/Designs/ConversationContextCache.md).
+- **Async inference**: submit at `/api/v1/chat/completions/jobs`, retain the
+  opaque job id, and poll or cancel it later. Use this for work that may exceed a
+  client/proxy connection budget. A ready llama.cpp prepared handle plus
+  `prepared_context_mode: "append"` lets the caller send only new text messages;
+  DS4 rejects strict/append prepared reuse because it has no compatible reusable
+  slot primitive. See [Using Async Inference and Prepared
+  Contexts](docs/Guides/AsyncInference.md).
 
 See [`docs/features-overview.md`](docs/features-overview.md) for the full picture.
 
@@ -255,6 +263,8 @@ llama-server/
 | `/models/load` | POST | Load a model |
 | `/models/unload` | POST | Unload a model |
 | `/v1/chat/completions` | POST | Chat completions (OpenAI-compatible) |
+| `/api/v1/chat/completions/jobs` | POST | Submit a retained non-streaming chat job |
+| `/api/v1/chat/completions/jobs/:id` | GET / DELETE | Poll or cancel an owned chat job |
 | `/v1/completions` | POST | Text completions |
 | `/v1/chat/completions/input_tokens` | POST | Exact local chat-template input count |
 | `/v1/responses/input_tokens` | POST | Exact local Responses input count |
@@ -737,6 +747,19 @@ Replace `/path/to/llama-server` with the actual path to this repository.
 | `llama_get_processes` | List running llama-server processes |
 | `llama_get_logs` | Get recent server logs |
 | `llama_chat` | Send a chat completion request |
+| `llama_submit_chat_job` | Submit non-streaming chat work that may outlive the client/proxy budget |
+| `llama_get_chat_job` | Poll a retained chat job for terminal result or error |
+| `llama_cancel_chat_job` | Idempotently cancel a queued or running chat job |
+| `llama_prepare_context` | Count or prefill an Authorization-scoped llama.cpp context |
+| `llama_get_prepared_context` | Poll a prepared-context handle |
+| `llama_release_prepared_context` | Cancel or release a prepared-context handle |
+
+Use `llama_chat` only for work expected to finish within the client and proxy
+budget. For longer work, submit a job and poll explicitly so the MCP connection
+does not have to remain open during inference. See the [MCP tool
+reference](docs/mcp.md) for schemas, limits, append-mode examples, and the
+measured 90-second gateway, 600-second backend-attempt, and 180-second model-load
+ceilings.
 
 ### Environment Variables
 
@@ -753,4 +776,7 @@ Additional documentation is available in the [docs/](docs/) directory:
 - [Chat Page Design](docs/Designs/ChatPage.md) - Full chat interface design
 - [Docs Page Design](docs/Designs/DocsPage.md) - In-app documentation design
 - [API Docs Design](docs/Designs/ApiDocs.md) - API documentation enhancements
+- [Async Inference Guide](docs/Guides/AsyncInference.md) - Choosing sync versus async, jobs, prepared append, limits, and failure handling
+- [Async Inference Design](docs/Designs/AsyncInferenceJobs.md) - Retained job and prepared-context architecture
+- [MCP Tool Reference](docs/mcp.md) - MCP setup and async/context workflows
 - [OpenCode Integration](docs/Designs/OpenCode.md) - OpenCode AI setup and configuration

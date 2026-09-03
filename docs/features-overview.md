@@ -116,6 +116,48 @@ credentials. Clocks, units, lifecycle ordering, cache semantics, version
 compatibility, and privacy guarantees are defined in
 [ContextTimingEvidence.md](Designs/ContextTimingEvidence.md).
 
+### Async inference jobs and send-once prefixes
+
+`POST /api/v1/chat/completions/jobs` accepts a valid non-streaming chat body and
+returns HTTP 202 with an opaque Authorization-scoped job before model lookup,
+loading, admission, or inference. Clients poll or cancel at
+`/api/v1/chat/completions/jobs/{id}`. Active records intentionally expose only
+`queued`/`running`, a null percentage, and no partial output; `done` contains the
+complete OpenAI-shaped result. Upstream HTTP, transport, plain-text,
+oversized-result, and invalid-empty completion failures settle as bounded
+structured `failed` records.
+
+Jobs are process-local and disappear on manager restart. Terminal records expire
+60 minutes after settlement. Defaults bound the store to 128 jobs globally, 32
+per scope, 4 MiB per serialized request, 64/16 MiB of retained active request
+bytes globally/per scope, and 16 MiB per serialized result. Expired and oldest
+terminal records are reclaimed before admission returns HTTP 429; active jobs are
+never evicted. Cancellation is idempotent and immediately terminal to the caller,
+removes pending queue work or cooperatively aborts active local/remote/DS4 work,
+and remains capacity-accounted until execution settles.
+
+A ready llama.cpp prepared handle can be combined with
+`prepared_context_mode: "append"` so a later synchronous or async chat body
+contains only new text messages. The manager composes them with the private
+retained prefix and fails closed on conflicting input-affecting fields,
+multimodal suffixes, scope/model/revision mismatch, expiry/restart, or lost slot
+ownership. Omitting append mode preserves existing full-prompt exact validation.
+DS4 truthfully rejects strict/append prepared reuse because it exposes no
+compatible caller-visible slot primitive.
+
+Alias rows can have `n_ctx: null` because targets differ. For a local prepared
+request, use its concrete `resolvedModel` to find the effective model row and
+`n_ctx` in `GET /api/v1/models`; never interpret null as the global default. A
+multi-target local/remote job has no single effective context before routing.
+
+The measured deployment ceilings are 90 seconds at the OpenResty gateway, 600
+seconds per remote-backend attempt, and 180 seconds for chat model loading. Async
+jobs remove the long-lived caller/proxy response from the inference interval but
+do not remove the manager-owned ceilings. Usage, measured observations, curl and
+MCP examples, limits, scope, restart, error, and invalidation behavior are in
+[Using Async Inference and Prepared Contexts](Guides/AsyncInference.md); design
+rationale is in [Async Inference Jobs](Designs/AsyncInferenceJobs.md).
+
 ## 4. Model alias groups
 
 One global table, `config.aliases`, maps a client-facing **alias name** onto an
@@ -313,6 +355,9 @@ Turn the host into a full-screen dashboard appliance (gdm autologin → a Waylan
 - [`ds4-build.md`](ds4-build.md) / [`ds4-auto-update.md`](ds4-auto-update.md) — build + self-updater
 - [`Designs/EngineAbstraction.md`](Designs/EngineAbstraction.md) — engine-seam design
 - [`Designs/ModelManagement.md`](Designs/ModelManagement.md) — model lifecycle
+- [`Designs/AsyncInferenceJobs.md`](Designs/AsyncInferenceJobs.md) — retained chat-job and prepared append design
+- [`Guides/AsyncInference.md`](Guides/AsyncInference.md) — consumer/operator guide for sync, async, and prepared contexts
+- [`mcp.md`](mcp.md) — MCP tool setup and async/context workflow
 - [`Designs/PackageSafeRuntime.md`](Designs/PackageSafeRuntime.md) — FHS paths, ownership, and authorization
 - [`Utilities/package-installation.md`](Utilities/package-installation.md) — package operator guide
 - [`llama-cpp-rocm-build-and-deployment.md`](llama-cpp-rocm-build-and-deployment.md) — the llama.cpp engine build
