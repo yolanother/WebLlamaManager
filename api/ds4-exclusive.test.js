@@ -11,6 +11,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DS4_EXCLUSIVE_ERROR,
+  ds4InFlightCount,
+  ds4EvictionReadiness,
   ds4ModelMatches,
   ds4RequestTarget,
   reclaimTargetBytes,
@@ -264,4 +266,31 @@ test('ds4RequestTarget: an EMPTY ds4ModelIds misroutes the ds4 model to llama', 
     requestedModel: 'DeepSeek-V4-Flash.gguf', ds4ModelIds: [], llamaRunning: true,
   });
   assert.equal(r.target, 'local-llama', 'empty ids cannot match, so the ds4 model is misrouted');
+});
+
+test('ds4InFlightCount counts only requests being served by ds4', () => {
+  assert.equal(ds4InFlightCount([]), 0);
+  assert.equal(ds4InFlightCount(), 0);
+  assert.equal(ds4InFlightCount([{ backend: 'ds4' }, { backend: 'local' }, { backend: 'ds4' }]), 2);
+  assert.equal(ds4InFlightCount([{ backend: 'local' }, null, undefined]), 0);
+});
+
+test('ds4EvictionReadiness evicts immediately when ds4 is idle', () => {
+  const r = ds4EvictionReadiness({ inFlight: 0, waitedMs: 0, maxWaitMs: 300000 });
+  assert.equal(r.evict, true);
+});
+
+test('ds4EvictionReadiness waits while ds4 is answering', () => {
+  // The case this exists for: a competing request evicted DS4 87s into a long
+  // prefill, and the caller got "ds4-server request failed: fetch failed".
+  const r = ds4EvictionReadiness({ inFlight: 1, waitedMs: 87000, maxWaitMs: 300000 });
+  assert.equal(r.evict, false);
+  assert.match(r.reason, /waiting for 1 in-flight/);
+});
+
+test('ds4EvictionReadiness gives up at the deadline so the box is not pinned', () => {
+  // A wedged ds4 request must not starve the model waiting for its memory.
+  const r = ds4EvictionReadiness({ inFlight: 2, waitedMs: 300000, maxWaitMs: 300000 });
+  assert.equal(r.evict, true);
+  assert.match(r.reason, /evicting anyway/);
 });

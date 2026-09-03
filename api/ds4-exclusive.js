@@ -209,3 +209,46 @@ export function ds4Exclusive503Body(requestedModel, ds4ModelName) {
     },
   };
 }
+
+/**
+ * Count the requests currently being served by ds4-server.
+ *
+ * Eviction previously looked only at the memory budget, so a competing request
+ * for another model could SIGKILL ds4-server while it was mid-answer. The
+ * caller saw `ds4-server request failed: fetch failed` after having already
+ * waited out most of a long prefill — work thrown away, and a failure that
+ * looks like a backend fault rather than a scheduling decision.
+ *
+ * @param {Iterable<{backend?:string}>} requests Active request records.
+ * @returns {number} How many are being served by ds4.
+ */
+export function ds4InFlightCount(requests = []) {
+  let n = 0;
+  for (const r of requests) if (r && r.backend === 'ds4') n += 1;
+  return n;
+}
+
+/**
+ * Whether DS4 may be evicted right now, or the caller should wait.
+ *
+ * Waiting is bounded: a wedged request must not pin DS4 forever and starve the
+ * model that wants the memory, so past the deadline eviction proceeds and the
+ * in-flight request is lost — the previous behaviour, but only as a last resort
+ * rather than immediately.
+ *
+ * @param {{inFlight:number, waitedMs:number, maxWaitMs:number}} p
+ * @returns {{evict:boolean, reason:string}}
+ */
+export function ds4EvictionReadiness({ inFlight = 0, waitedMs = 0, maxWaitMs = 0 } = {}) {
+  if (inFlight <= 0) return { evict: true, reason: 'no ds4 requests in flight' };
+  if (waitedMs >= maxWaitMs) {
+    return {
+      evict: true,
+      reason: `${inFlight} ds4 request(s) still in flight after ${Math.round(waitedMs / 1000)}s — evicting anyway so the box is not pinned`,
+    };
+  }
+  return {
+    evict: false,
+    reason: `waiting for ${inFlight} in-flight ds4 request(s) to finish before evicting`,
+  };
+}

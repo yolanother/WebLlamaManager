@@ -163,7 +163,8 @@ import { resolveDs4ModelPath } from './engines.js';
 import { buildRepoRecommendations, computeCapacityBytes } from './repo-recommendations.js';
 import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
-  shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision
+  shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision,
+  ds4InFlightCount, ds4EvictionReadiness
 } from './ds4-exclusive.js';
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
@@ -6683,11 +6684,57 @@ async function activateDs4Exclusive(presetId, preset) {
  * requests wait. Best-effort reclaim wait — llama's own preflight guard re-checks
  * per-model on the next request.
  */
+/** How long to let in-flight ds4 requests finish before evicting anyway (ms). */
+const DS4_DRAIN_MAX_WAIT_MS = 300000;
+
+/**
+ * Wait for ds4-server to finish answering before it is stopped.
+ *
+ * Eviction used to consult only the memory budget, so a request for a model
+ * that did not fit beside DS4 would SIGKILL ds4-server mid-answer. Observed on
+ * hardware: a long-context request was 87 seconds into its prefill when a
+ * competing `default-small` request evicted DS4, and the caller received
+ * `ds4-server request failed: fetch failed`. The expensive work was discarded
+ * and the failure looked like a backend fault rather than a scheduling choice.
+ *
+ * The wait is bounded. A wedged request must not pin DS4 forever and starve the
+ * model waiting for its memory, so past DS4_DRAIN_MAX_WAIT_MS eviction proceeds
+ * regardless — the old behaviour, but as a last resort instead of the default.
+ *
+ * @returns {Promise<void>} Resolves once ds4 is idle or the deadline passes.
+ */
+async function drainDs4RequestsBeforeEviction() {
+  const startedAt = Date.now();
+  let announced = false;
+  for (;;) {
+    const inFlight = ds4InFlightCount(activeRequests.values());
+    const readiness = ds4EvictionReadiness({
+      inFlight,
+      waitedMs: Date.now() - startedAt,
+      maxWaitMs: DS4_DRAIN_MAX_WAIT_MS,
+    });
+    if (readiness.evict) {
+      if (announced) {
+        console.log(`[ds4] ${readiness.reason}`);
+        addLog('presets', `ds4: ${readiness.reason}`);
+      }
+      return;
+    }
+    if (!announced) {
+      announced = true;
+      console.log(`[ds4] ${readiness.reason}`);
+      addLog('presets', `ds4: ${readiness.reason}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
 async function deactivateDs4Exclusive() {
   let releaseGate;
   ds4SwapPromise = new Promise((resolve) => { releaseGate = resolve; });
   try {
     addLog('presets', 'ds4: deactivating exclusive mode — stopping ds4-server and verifying reclaim');
+    await drainDs4RequestsBeforeEviction();
     await stopDs4Server();
     ds4SettledRuntime = null; // no longer serving ds4 — clear the settled runtime state
     ds4ActivePresetId = null;  // ds4 is gone; stop claiming its model routes locally
