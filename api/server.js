@@ -1855,7 +1855,11 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
           externalSignal.addEventListener('abort', externalAbortHandler, { once: true });
         }
       }
-      const fetchOptions = { ...options, signal: controller.signal };
+      // dispatcher: llamaDispatcher disables undici's default 300s
+      // headersTimeout/bodyTimeout (see llamaDispatcher's definition above) —
+      // without it, a slow-but-healthy remote backend gets torn down by
+      // undici at ~300s regardless of attemptTimeoutMs/REMOTE_BACKEND_TIMEOUT_MS.
+      const fetchOptions = { ...options, dispatcher: llamaDispatcher, signal: controller.signal };
       try {
         const response = await fetch(url, fetchOptions);
         clearTimeout(timeout);
@@ -10259,6 +10263,11 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
+      // dispatcher: llamaDispatcher disables undici's default 300s
+      // headersTimeout/bodyTimeout — a large-context prompt can leave
+      // ds4-server silent well past 300s during prefill, which otherwise
+      // tears down this fetch regardless of the caller's own timeout/abort.
+      dispatcher: llamaDispatcher,
       signal: controller.signal
     });
 
@@ -10362,7 +10371,12 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
   try {
     const upstream = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body), signal: controller.signal,
+      body: JSON.stringify(req.body),
+      // See proxyChatToDs4 above: without this, undici's default 300s
+      // headersTimeout/bodyTimeout can abort a healthy but slow ds4-server
+      // response before it ever gets a chance to answer.
+      dispatcher: llamaDispatcher,
+      signal: controller.signal,
     });
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');
