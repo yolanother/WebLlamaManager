@@ -10438,8 +10438,11 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
   const url = ds4TargetUrl(ds4.port, '/v1/chat/completions');
   console.log(`[chat/completions] ds4 engine active — forwarding to ${url}`);
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: 'ds4', relayRequestId: readRelayRequestId(req.headers) });
-  const controller = new AbortController();
-  res.on('close', () => { try { controller.abort(); } catch { /* ignore */ } });
+  // Reuse the controller stored on activeRequests. The stall watchdog aborts
+  // that exact controller; a separate local controller would leave the DS4
+  // fetch and its single generation slot alive after the watchdog killed it.
+  const controller = activeRequests.get(activeReqId)?.abortController;
+  res.on('close', () => { try { controller?.abort(); } catch { /* ignore */ } });
 
   // Gate through ds4Queue before touching ds4-server — it serializes to one
   // concurrent generation on the shared GPU. Without this, concurrent requests
@@ -10448,7 +10451,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
   // explicit release() in the finally below.
   let ds4Slot;
   try {
-    ds4Slot = await acquireDs4Slot(res, { model: requestedModel, endpoint: 'chat/completions', activeReqId, signal: controller.signal });
+    ds4Slot = await acquireDs4Slot(res, { model: requestedModel, endpoint: 'chat/completions', activeReqId, signal: controller?.signal });
   } catch (err) {
     endActiveRequest(activeReqId, { status: 'error' });
     throw err;
@@ -10468,7 +10471,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
       // ds4-server silent well past 300s during prefill, which otherwise
       // tears down this fetch regardless of the caller's own timeout/abort.
       dispatcher: llamaDispatcher,
-      signal: controller.signal
+      signal: controller?.signal
     });
 
     if (!upstream.ok) {
@@ -10568,12 +10571,14 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
   const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const url = ds4TargetUrl(ds4.port, '/v1/completions');
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'completions', messages: null, backend: 'ds4', relayRequestId: readRelayRequestId(req.headers) });
-  const controller = new AbortController();
-  res.on('close', () => { try { controller.abort(); } catch { /* ignore */ } });
+  // Share the tracked controller for the same watchdog-to-fetch lifecycle used
+  // by chat/completions and responses.
+  const controller = activeRequests.get(activeReqId)?.abortController;
+  res.on('close', () => { try { controller?.abort(); } catch { /* ignore */ } });
   // See proxyChatToDs4 above: ds4Queue serializes the single generation slot.
   let ds4Slot;
   try {
-    ds4Slot = await acquireDs4Slot(res, { model: requestedModel, endpoint: 'completions', activeReqId, signal: controller.signal });
+    ds4Slot = await acquireDs4Slot(res, { model: requestedModel, endpoint: 'completions', activeReqId, signal: controller?.signal });
   } catch (err) {
     endActiveRequest(activeReqId, { status: 'error' });
     throw err;
@@ -10586,7 +10591,7 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
       // headersTimeout/bodyTimeout can abort a healthy but slow ds4-server
       // response before it ever gets a chance to answer.
       dispatcher: llamaDispatcher,
-      signal: controller.signal,
+      signal: controller?.signal,
     });
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');

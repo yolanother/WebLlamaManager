@@ -507,3 +507,32 @@ test('router watchdog: a forwarded request outlives its remote ceiling while the
   }
   assert.equal(ds4Queue.active, 0);
 });
+
+test('DS4 chat and completions share the tracked abort controller so watchdog kills release the slot', () => {
+  const source = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
+  const functions = [
+    ['proxyChatToDs4', 'proxyCompletionsToDs4'],
+    ['proxyCompletionsToDs4', 'app.post'],
+  ];
+
+  for (const [name, nextMarker] of functions) {
+    const start = source.indexOf(`async function ${name}`);
+    assert.ok(start >= 0, `${name} must exist`);
+    const end = source.indexOf(nextMarker === 'app.post' ? nextMarker : `async function ${nextMarker}`, start + 1);
+    assert.ok(end > start, `${name} must have a bounded source section`);
+    const body = source.slice(start, end);
+
+    assert.match(
+      body,
+      /const controller = activeRequests\.get\(activeReqId\)\?\.abortController;/,
+      `${name} must use the controller the stall watchdog aborts`,
+    );
+    assert.doesNotMatch(
+      body,
+      /const controller = new AbortController\(\);/,
+      `${name} must not create a disconnected controller`,
+    );
+    assert.match(body, /signal: controller\?\.signal/, `${name} must pass the tracked signal to DS4 work`);
+    assert.match(body, /finally \{\s*ds4Slot\.release\(\);\s*\}/, `${name} must release its slot after abort rejection`);
+  }
+});
