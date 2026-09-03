@@ -40,7 +40,8 @@ export class InferenceJobSubmissionError extends Error {
  * @returns {void}
  * @throws {InferenceJobSubmissionError} When a prepared-context field is present.
  */
-export function assertResponsesContextSupported(body = {}) {
+export function assertResponsesPreparedContextAbsent(body = {}) {
+  if (!body || typeof body !== 'object') return;
   const field = PREPARED_CONTEXT_FIELDS.find(name => Object.hasOwn(body, name));
   if (field) {
     throw new InferenceJobSubmissionError(
@@ -205,7 +206,7 @@ export class InferenceJobStore {
     if (!scopeId) throw new InferenceJobSubmissionError('scopeId is required', 400, 'INVALID_REQUEST');
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new InferenceJobSubmissionError('request body must be an object', 400, 'INVALID_REQUEST');
     if (body.background !== true) throw new InferenceJobSubmissionError('background must be true', 400, 'invalid_request');
-    assertResponsesContextSupported(body);
+    assertResponsesPreparedContextAbsent(body);
     if (body.model !== undefined && (typeof body.model !== 'string' || !body.model.trim())) throw new InferenceJobSubmissionError('model must be a non-empty string when supplied', 400, 'invalid_request');
     const executionBody = { ...body };
     delete executionBody.background;

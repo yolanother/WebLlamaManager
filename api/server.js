@@ -112,7 +112,7 @@ import {
   requestExactInputTokens,
   requestRenderedPrefix,
 } from './context-endpoints.js';
-import { InferenceJobStore, assertResponsesContextSupported } from './async-inference.js';
+import { InferenceJobStore, assertResponsesPreparedContextAbsent } from './async-inference.js';
 import {
   canonicalHash,
   compatibilityFingerprint,
@@ -12421,7 +12421,7 @@ function sendBackgroundResponseError(res, error, fallback = 'background Response
  * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
  */
 async function handleResponses(req, res) {
-  try { assertResponsesContextSupported(req.body); }
+  try { assertResponsesPreparedContextAbsent(req.body); }
   catch (error) { return sendBackgroundResponseError(res, error); }
   if (req.body?.background === true) {
     try {
