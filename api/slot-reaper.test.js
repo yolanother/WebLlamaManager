@@ -2,7 +2,7 @@
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findLeakedSlots } from './slot-reaper.js';
+import { findLeakedSlots, activeRequestHoldsSlot } from './slot-reaper.js';
 
 const GRACE = 10_000;
 const HARDCAP = 3_600_000;
@@ -62,4 +62,28 @@ test('falls back to enqueuedAt when startedAt missing', () => {
   const items = [{ id: 1, activeReqId: 'a', enqueuedAt: now - 20_000, endpoint: 'chat/completions' }];
   const r = findLeakedSlots({ items, liveReqIds: new Set(), now, graceMs: GRACE, hardCapMs: HARDCAP });
   assert.deepEqual(r, [1]);
+});
+
+// ── activeRequestHoldsSlot ──────────────────────────────────────────────────
+
+test('activeRequestHoldsSlot: local backend holds slot only when in localSlotHolders', () => {
+  assert.equal(activeRequestHoldsSlot({ backend: 'local' }, 5, new Set([5]), new Set()), true);
+  assert.equal(activeRequestHoldsSlot({ backend: 'local' }, 5, new Set(), new Set()), false);
+});
+
+test('activeRequestHoldsSlot: ds4 backend holds slot only when in ds4SlotHolders (the reported bug)', () => {
+  // Before the fix, ds4 requests were unconditionally reported active because
+  // "any non-local backend" was treated as already running. With a real ds4
+  // admission queue, a queued (not yet dispatched) ds4 request must show pending.
+  assert.equal(activeRequestHoldsSlot({ backend: 'ds4' }, 7, new Set(), new Set([7])), true);
+  assert.equal(activeRequestHoldsSlot({ backend: 'ds4' }, 7, new Set(), new Set()), false);
+});
+
+test('activeRequestHoldsSlot: other remote backends have no local gate, always active', () => {
+  assert.equal(activeRequestHoldsSlot({ backend: 'drakemore-mtj8prpy' }, 9, new Set(), new Set()), true);
+});
+
+test('activeRequestHoldsSlot: missing backend defaults to local semantics', () => {
+  assert.equal(activeRequestHoldsSlot({}, 1, new Set([1]), new Set()), true);
+  assert.equal(activeRequestHoldsSlot({}, 1, new Set(), new Set()), false);
 });

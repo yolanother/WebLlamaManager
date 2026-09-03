@@ -55,7 +55,8 @@ import { normalizeModelKey } from './model-identity.js';
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
-import { findLeakedSlots } from './slot-reaper.js';
+import { findLeakedSlots, activeRequestHoldsSlot } from './slot-reaper.js';
+import { ds4Queue, acquireDs4Slot } from './ds4-slot.js';
 import {
   resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries, expandGlob,
   BIG_ALIAS, SMALL_ALIAS, RESERVED_ALIAS_NAMES,
@@ -4954,6 +4955,14 @@ app.get('/api/queue', (req, res) => {
   for (const item of llamaQueue.activeItems.values()) {
     if (item.activeReqId != null) localSlotHolders.add(item.activeReqId);
   }
+  // Same idea for the local ds4-server engine: it also serializes to one
+  // concurrent generation (via ds4Queue), so only requests actually holding
+  // that slot are "active" — the rest are queued behind it, not simultaneously
+  // running. See activeRequestHoldsSlot for why plain isOffloaded is wrong here.
+  const ds4SlotHolders = new Set();
+  for (const item of ds4Queue.activeItems.values()) {
+    if (item.activeReqId != null) ds4SlotHolders.add(item.activeReqId);
+  }
 
   // Items from the activeRequests map (covers both local and remote). For local
   // requests we split into actively-streaming (holds a slot) vs queued (doesn't).
@@ -4962,7 +4971,7 @@ app.get('/api/queue', (req, res) => {
   for (const ar of activeRequests.values()) {
     const backendId = ar.backend || 'local';
     const isOffloaded = backendId !== 'local';
-    const holdsSlot = isOffloaded || localSlotHolders.has(ar.id);
+    const holdsSlot = activeRequestHoldsSlot(ar, ar.id, localSlotHolders, ds4SlotHolders);
     const status = holdsSlot ? 'active' : 'pending';
     const backendName = isOffloaded
       ? (backendNameMap[backendId] || backendId)
@@ -10319,6 +10328,19 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
   const controller = new AbortController();
   res.on('close', () => { try { controller.abort(); } catch { /* ignore */ } });
 
+  // Gate through ds4Queue before touching ds4-server — it serializes to one
+  // concurrent generation on the shared GPU. Without this, concurrent requests
+  // fire straight at it and starve each other (the reported pile-up). release()
+  // is guaranteed by acquireDs4Slot via res 'finish'/'close', on top of the
+  // explicit release() in the finally below.
+  let ds4Slot;
+  try {
+    ds4Slot = await acquireDs4Slot(res, { model: requestedModel, endpoint: 'chat/completions', activeReqId, signal: controller.signal });
+  } catch (err) {
+    endActiveRequest(activeReqId, { status: 'error' });
+    throw err;
+  }
+
   try {
     // LIVE VERIFICATION PENDING: exercises a real ds4-server round-trip, which needs
     // the 81GB DeepSeek V4 Flash model loaded in an operator memory window (ds4 and
@@ -10416,6 +10438,8 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
     // the 502 here would make a swap indistinguishable from a broken engine.
     if (!res.headersSent) throw err;
     try { res.end(); } catch { /* ignore */ }
+  } finally {
+    ds4Slot.release();
   }
 }
 
@@ -10433,6 +10457,14 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
   const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'completions', messages: null, backend: 'ds4' });
   const controller = new AbortController();
   res.on('close', () => { try { controller.abort(); } catch { /* ignore */ } });
+  // See proxyChatToDs4 above: ds4Queue serializes the single generation slot.
+  let ds4Slot;
+  try {
+    ds4Slot = await acquireDs4Slot(res, { model: requestedModel, endpoint: 'completions', activeReqId, signal: controller.signal });
+  } catch (err) {
+    endActiveRequest(activeReqId, { status: 'error' });
+    throw err;
+  }
   try {
     const upstream = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -10485,6 +10517,8 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
     addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error: err.message, backend: 'ds4', requestBody: req.body });
     if (!res.headersSent) return res.status(502).json({ error: { message: `ds4-server request failed: ${err.message}`, type: 'ds4_backend_error' } });
     try { res.end(); } catch { /* ignore */ }
+  } finally {
+    ds4Slot.release();
   }
 }
 
@@ -12533,6 +12567,16 @@ async function proxyResponsesToDs4(req, res, {
   const abort = () => { try { controller?.abort('client_disconnect'); } catch { /* best effort */ } };
   res.once('close', abort);
 
+  // See proxyChatToDs4 above: ds4Queue serializes the single generation slot.
+  let ds4Slot;
+  try {
+    ds4Slot = await acquireDs4Slot(res, { model: requestedModel, endpoint: 'responses', activeReqId, priority, signal: controller?.signal });
+  } catch (err) {
+    endActiveRequest(activeReqId, { status: 'error' });
+    res.off('close', abort);
+    throw err;
+  }
+
   try {
     const upstream = await fetch(url, {
       method: 'POST',
@@ -12618,6 +12662,7 @@ async function proxyResponsesToDs4(req, res, {
     if (!res.writableEnded) res.end();
   } finally {
     res.off('close', abort);
+    ds4Slot.release();
   }
 }
 

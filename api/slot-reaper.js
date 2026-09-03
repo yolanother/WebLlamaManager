@@ -7,6 +7,10 @@
 // blocking ALL local dispatch until the manager restarts. This module decides
 // which held slots are leaked and should be force-released. It is pure so the
 // stall watchdog can call it and unit tests can pin the policy.
+//
+// activeRequestHoldsSlot() below answers a related but distinct question for
+// the /api/queue display: given the queues a request's backend actually goes
+// through, is it really running right now, or just waiting its turn?
 
 /**
  * Decide which held queue slots are leaked and should be force-released.
@@ -45,4 +49,29 @@ export function findLeakedSlots({ items, liveReqIds, now, graceMs, hardCapMs }) 
     out.push(it.id);
   }
   return out;
+}
+
+/**
+ * Decide whether an activeRequests entry currently holds a real generation
+ * slot, for /api/queue's active-vs-pending display.
+ *
+ * A remote backend (another box) has no local admission gate to reflect, so
+ * every offloaded request to one is legitimately "active" the moment it's
+ * sent. The local ds4-server engine is different: it runs ON this box and
+ * serializes to one concurrent generation via ds4Queue, so a request queued
+ * behind another one is NOT active yet — treating it as active (as plain
+ * "isOffloaded" did) misreports queued ds4 work as simultaneously running,
+ * which is exactly the "concurrency: 1 but multiple active" bug report.
+ *
+ * @param {{backend?:string}} activeRequest The activeRequests map entry (only `backend` is read).
+ * @param {number} activeRequestId Its activeRequests key.
+ * @param {Set<number>} localSlotHolders IDs currently holding a llamaQueue slot.
+ * @param {Set<number>} ds4SlotHolders IDs currently holding a ds4Queue slot.
+ * @returns {boolean} True when the request is actually running, not just queued.
+ */
+export function activeRequestHoldsSlot(activeRequest, activeRequestId, localSlotHolders, ds4SlotHolders) {
+  const backendId = activeRequest?.backend || 'local';
+  if (backendId === 'ds4') return (ds4SlotHolders || new Set()).has(activeRequestId);
+  if (backendId === 'local') return (localSlotHolders || new Set()).has(activeRequestId);
+  return true; // other remote backends: no local admission gate to reflect
 }
