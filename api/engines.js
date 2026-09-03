@@ -826,3 +826,40 @@ export function validateDs4DownloadRequest(body = {}, ds4Config = {}) {
 
   return { ok: true, repo, includePatterns, downloadId, targetDir: ds4Config.ggufDir };
 }
+
+/**
+ * Measured prefill throughput used to size the remote stall window.
+ *
+ * ~250 tokens/sec on the Strix Halo boxes, from timed runs on drakemore at
+ * ctx 65536: a 36,636-token prompt took 158-287s and a 50,636-token prompt 228s.
+ * Deliberately conservative — underestimating the rate shortens the window and
+ * risks killing healthy work, which is the failure this replaces.
+ */
+export const PREFILL_TOKENS_PER_SEC = 250;
+
+/**
+ * How long a remote request may emit nothing before it is treated as stalled.
+ *
+ * A long prompt produces NO tokens during prefill, so a fixed threshold cannot
+ * distinguish a wedged backend from one legitimately working: at 65,536 tokens
+ * prefill alone is over four minutes. The previous flat 120s aborted healthy
+ * long-context work with "This operation was aborted", which surfaced to the
+ * caller as a backend failure and looked, from outside, like a proxy timeout.
+ *
+ * The window therefore scales with the context the box is configured for, since
+ * that bounds how much prefill any single request can owe. The floor preserves
+ * the old behaviour for ordinary contexts.
+ *
+ * The trade-off is explicit: on a box configured for a very large context, a
+ * genuinely wedged remote is detected later. That is the right way round —
+ * killing work that would have succeeded is worse than being slow to notice a
+ * backend that is already broken, and the caller's own timeout still bounds it.
+ *
+ * @param {{contextTokens?:number, floorMs?:number, safetyFactor?:number}} p
+ * @returns {number} Idle milliseconds to allow before declaring a remote stalled.
+ */
+export function remoteStallMs({ contextTokens = 0, floorMs = 120000, safetyFactor = 1.5 } = {}) {
+  const tokens = Number(contextTokens) > 0 ? Number(contextTokens) : 0;
+  const prefillMs = (tokens / PREFILL_TOKENS_PER_SEC) * 1000 * safetyFactor;
+  return Math.max(floorMs, Math.round(prefillMs));
+}

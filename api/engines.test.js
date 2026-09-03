@@ -17,6 +17,7 @@ import {
   ds4ArgIsShellSafe,
   llamaFitsBesideDs4,
   isProjectorModelId,
+  remoteStallMs,
   buildLocalServerRegistry,
   renderModelsPresetIni,
   gemmaMtpPresetSection,
@@ -820,4 +821,26 @@ test('isProjectorModelId leaves real models alone', () => {
   assert.equal(isProjectorModelId('mmprojector-chat-7B-Q4_K_M.gguf'), false);
   assert.equal(isProjectorModelId(''), false);
   assert.equal(isProjectorModelId(undefined), false);
+});
+
+test('remoteStallMs keeps the 120s floor for ordinary contexts', () => {
+  // Small contexts must behave exactly as before: a wedged remote is still
+  // torn down promptly.
+  assert.equal(remoteStallMs({ contextTokens: 8192 }), 120000);
+  assert.equal(remoteStallMs({ contextTokens: 0 }), 120000);
+  assert.equal(remoteStallMs(), 120000);
+});
+
+test('remoteStallMs scales past the floor for a large context', () => {
+  // The case that killed healthy work: at 65,536 tokens and ~250 tok/s, prefill
+  // alone is ~262s, so a flat 120s aborted a backend that was working.
+  const ms = remoteStallMs({ contextTokens: 65536 });
+  assert.ok(ms > 120000, 'must exceed the floor');
+  assert.ok(ms >= 262000, `must cover ~262s of prefill, got ${ms}`);
+});
+
+test('remoteStallMs is monotonic in context size', () => {
+  const a = remoteStallMs({ contextTokens: 65536 });
+  const b = remoteStallMs({ contextTokens: 131072 });
+  assert.ok(b > a, 'a bigger context must allow a longer silence');
 });

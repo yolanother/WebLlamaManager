@@ -152,7 +152,7 @@ import {
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
-  isProjectorModelId,
+  isProjectorModelId, remoteStallMs,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -12952,10 +12952,22 @@ const STALL_HARD_CAP_MULTIPLIER = 6; // e.g. 10min soft → 60min hard cap
 // Remote backends use a tighter threshold: a wedged Ollama/etc. that accepts
 // the request but never streams data has no GPU work to "extend" — we should
 // give up fairly quickly and let the caller fail/retry/route elsewhere.
-// Remote stall threshold. 120s rather than 60s gives a slow-but-not-stuck
-// Ollama backend a fair chance to deliver the first token under load. Truly
-// wedged remotes still get torn down — just after a longer grace window.
-const REMOTE_STALL_MS = 120_000;
+// Remote stall floor. 120s rather than 60s gives a slow-but-not-stuck Ollama
+// backend a fair chance to deliver the first token under load. The effective
+// window is remoteStallMs() below, which raises this floor in proportion to the
+// configured context: a long prompt emits NOTHING during prefill, so a flat
+// threshold cannot tell a wedged backend from one legitimately working. Truly
+// wedged remotes still get torn down, just after a window sized to the work
+// they were plausibly asked to do.
+const REMOTE_STALL_FLOOR_MS = 120_000;
+
+/** Effective remote stall window for the currently configured context. */
+function currentRemoteStallMs() {
+  return remoteStallMs({
+    contextTokens: config?.contextSize || 0,
+    floorMs: REMOTE_STALL_FLOOR_MS,
+  });
+}
 
 setInterval(async () => {
   const stallMs = config?.localStallMs ?? DEFAULT_LOCAL_STALL_MS;
@@ -13089,9 +13101,10 @@ setInterval(async () => {
       // ties up the request indefinitely. Abort propagates via the
       // activeRequest signal that we now pass to fetchRemoteBackend, which
       // tears down the fetch + body stream.
-      if (idle < REMOTE_STALL_MS) continue;
+      const remoteStallLimit = currentRemoteStallMs();
+      if (idle < remoteStallLimit) continue;
       entry._watchdogKilled = true;
-      const msg = `Stall watchdog: aborting remote request ${id} (backend: ${entry.backend}, model: ${entry.model}, ${entry.tokens} tokens, idle ${Math.round(idle / 1000)}s ≥ ${Math.round(REMOTE_STALL_MS / 1000)}s)`;
+      const msg = `Stall watchdog: aborting remote request ${id} (backend: ${entry.backend}, model: ${entry.model}, ${entry.tokens} tokens, idle ${Math.round(idle / 1000)}s ≥ ${Math.round(remoteStallLimit / 1000)}s)`;
       console.warn(`[watchdog] ${msg}`);
       addLog('system', msg);
       requestStatsAccum.watchdogKills++;
