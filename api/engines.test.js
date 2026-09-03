@@ -1,7 +1,8 @@
 // Llama Manager — unit tests for engine abstraction and router preset helpers.
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 // Verifies engine selection, process configuration, and pure generation of
-// independent Gemma and Qwen3.8 MTP/ngram model-router INI sections.
+// independent Gemma and Qwen3.8 MTP/ngram model-router INI sections, including
+// ownership-aware DS4 stall decisions and their server watchdog wiring.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readdirSync, statSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
@@ -20,6 +21,7 @@ import {
   remoteStallMs,
   DS4_ZERO_TOKEN_STALL_MS,
   remoteStallCeilingMs,
+  remoteStallVerdict,
   largestContextBesideDs4,
   buildLocalServerRegistry,
   renderModelsPresetIni,
@@ -873,20 +875,119 @@ test('remoteStallCeilingMs: missing backend falls back to the generic ceiling', 
   assert.equal(remoteStallCeilingMs(undefined, 120_000), 120_000);
 });
 
-test('stall watchdog wires remoteStallCeilingMs into its remote/ds4 branch', () => {
-  // Pure-function tests above only prove remoteStallCeilingMs itself is
-  // correct; they say nothing about whether server.js's watchdog actually
-  // calls it. Lock the wiring structurally so a future edit reverting to a
-  // bare currentRemoteStallMs() call — silently un-fixing this — fails a test
-  // instead of just quietly regressing.
+// ── remoteStallVerdict (ownership-aware ds4 ceiling) ────────────────────────
+
+test('remoteStallVerdict: a ds4 request queued behind another one is never a stall candidate', () => {
+  // The whole point: it has produced no tokens for far longer than the ceiling,
+  // but only because someone else owns the single ds4 generation slot.
+  const now = 1_000_000_000;
+  const verdict = remoteStallVerdict({
+    entry: { backend: 'ds4', startTime: now - (DS4_ZERO_TOKEN_STALL_MS * 3), lastActivityAt: now - (DS4_ZERO_TOKEN_STALL_MS * 3), slotAcquiredAt: null },
+    holdsDs4Slot: false,
+    queuedForDs4Slot: true,
+    now,
+    genericRemoteStallMs: 120_000,
+  });
+  assert.equal(verdict.action, 'skip');
+  assert.match(verdict.reason, /queued for the ds4 generation slot/);
+});
+
+test('remoteStallVerdict: a ds4 entry in neither state is an orphan and is still reaped', () => {
+  // The exemption is for a request genuinely waiting its turn. An entry that
+  // holds nothing and is queued for nothing has no such excuse — leaving it
+  // exempt would let a dead handler's entry sit in activeRequests forever.
+  const now = 1_000_000_000;
+  const verdict = remoteStallVerdict({
+    entry: { backend: 'ds4', startTime: now - 600_000, lastActivityAt: now - 600_000 },
+    holdsDs4Slot: false,
+    queuedForDs4Slot: false,
+    now,
+    genericRemoteStallMs: 120_000,
+  });
+  assert.equal(verdict.action, 'stalled');
+  assert.equal(verdict.limitMs, DS4_ZERO_TOKEN_STALL_MS);
+});
+
+test('remoteStallVerdict: the ds4 slot holder is still bounded, measured from slot acquisition', () => {
+  const now = 1_000_000_000;
+  const entry = {
+    backend: 'ds4',
+    startTime: now - 3_600_000,      // waited an hour in the queue
+    lastActivityAt: now - 3_600_000, // and produced nothing during that wait
+    slotAcquiredAt: now - 60_000,    // but has only held the slot a minute
+  };
+  const stillFine = remoteStallVerdict({ entry, holdsDs4Slot: true, queuedForDs4Slot: false, now, genericRemoteStallMs: 120_000 });
+  assert.equal(stillFine.action, 'skip', 'queue wait must not count toward the generation ceiling');
+  assert.ok(stillFine.idleMs < DS4_ZERO_TOKEN_STALL_MS);
+
+  const later = now + DS4_ZERO_TOKEN_STALL_MS;
+  const stalled = remoteStallVerdict({ entry, holdsDs4Slot: true, now: later, genericRemoteStallMs: 120_000 });
+  assert.equal(stalled.action, 'stalled', 'a zero-token slot holder must still be reaped so the slot frees');
+  assert.equal(stalled.limitMs, DS4_ZERO_TOKEN_STALL_MS);
+});
+
+test('remoteStallVerdict: a ds4 entry that never recorded slot acquisition falls back to its own activity clock', () => {
+  const now = 1_000_000_000;
+  const entry = { backend: 'ds4', startTime: now - 600_000, lastActivityAt: now - 600_000 };
+  const verdict = remoteStallVerdict({ entry, holdsDs4Slot: true, now, genericRemoteStallMs: 120_000 });
+  assert.equal(verdict.action, 'stalled');
+  assert.equal(verdict.limitMs, DS4_ZERO_TOKEN_STALL_MS);
+});
+
+test('remoteStallVerdict: a non-ds4 remote backend keeps the generic ceiling and the arrival-based clock', () => {
+  const now = 1_000_000_000;
+  const entry = { backend: 'drakemore-mtj8prpy', startTime: now - 200_000, lastActivityAt: now - 200_000 };
+  assert.equal(remoteStallVerdict({ entry, holdsDs4Slot: false, now, genericRemoteStallMs: 393_216 }).action, 'skip');
+  const stalled = remoteStallVerdict({ entry, holdsDs4Slot: false, now, genericRemoteStallMs: 120_000 });
+  assert.equal(stalled.action, 'stalled');
+  assert.equal(stalled.limitMs, 120_000);
+});
+
+test('remoteStallVerdict: ds4 slot ownership does not leak to other backends', () => {
+  // holdsDs4Slot is meaningless for a remote backend id; it must not exempt it.
+  const now = 1_000_000_000;
+  const entry = { backend: 'dahaka-ollama-mngx88pk', startTime: now - 500_000, lastActivityAt: now - 500_000 };
+  assert.equal(remoteStallVerdict({ entry, holdsDs4Slot: false, now, genericRemoteStallMs: 120_000 }).action, 'stalled');
+});
+
+test('stall watchdog wires remoteStallVerdict — with ds4 slot ownership — into its remote/ds4 branch', () => {
+  // Pure-function tests above only prove remoteStallVerdict itself is correct;
+  // they say nothing about whether server.js's watchdog actually calls it. Lock
+  // the wiring structurally so a future edit reverting to a bare
+  // currentRemoteStallMs() or an ownership-blind ceiling — silently un-fixing
+  // this — fails a test instead of just quietly regressing.
   const source = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
   const branchStart = source.indexOf('// Remote backend stall.');
   assert.ok(branchStart >= 0, 'watchdog remote-stall branch must exist');
-  const branch = source.slice(branchStart, branchStart + 1200);
+  const branch = source.slice(branchStart, branchStart + 3000);
   assert.match(
     branch,
-    /const remoteStallLimit = remoteStallCeilingMs\(entry, currentRemoteStallMs\(\)\);/,
-    'the remote-stall branch must route through remoteStallCeilingMs, not a bare currentRemoteStallMs()',
+    /const verdict = remoteStallVerdict\(\{[\s\S]*?holdsDs4Slot: ds4SlotHolders\.has\(id\),[\s\S]*?queuedForDs4Slot: ds4SlotWaiters\.has\(id\),[\s\S]*?genericRemoteStallMs: currentRemoteStallMs\(\),[\s\S]*?\}\);/,
+    'the remote-stall branch must route through remoteStallVerdict and pass real ds4 slot ownership and queue membership',
+  );
+  assert.match(
+    branch,
+    /if \(verdict\.action === 'skip'\) continue;/,
+    'a skip verdict must short-circuit before anything is aborted',
+  );
+  assert.match(
+    branch,
+    /forwardedRequestIsQueuedDownstream\(backendCfg, entry\.relayRequestId, entry\._downstreamWait, 'watchdog'\)/,
+    'the branch must ask the provider whether the request is merely queued before killing it',
+  );
+  // The ds4 ownership set has to be built from the real queue, not guessed.
+  const watchdogStart = source.indexOf('// Local: only candidates that hold a real queue slot are eligible.');
+  assert.ok(watchdogStart >= 0);
+  const preamble = source.slice(watchdogStart, branchStart);
+  assert.match(
+    preamble,
+    /for \(const item of ds4Queue\.activeItems\.values\(\)\) \{\s*if \(item\.activeReqId != null\) ds4SlotHolders\.add\(item\.activeReqId\);/,
+    'ds4SlotHolders must come from ds4Queue.activeItems',
+  );
+  assert.match(
+    preamble,
+    /for \(const item of ds4Queue\.queue\) \{\s*if \(item\.activeReqId != null\) ds4SlotWaiters\.add\(item\.activeReqId\);/,
+    'ds4SlotWaiters must come from the real ds4Queue backlog',
   );
 });
 

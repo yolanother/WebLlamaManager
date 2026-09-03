@@ -14,6 +14,9 @@
 // expanded into standard multimodal parts before chat inference.
 // Manager extensions provide bounded, replayable process-local background
 // Responses and scope-safe prepared-context append reuse through Chat Completions.
+// Fleet proxy requests carry a correlation id so a router can distinguish
+// downstream DS4 admission wait from active zero-token generation and renew
+// deadlines without re-enqueueing healthy work.
 // The same application is served on API_PORT and, best-effort, on the appliance
 // mirror port ALT_PORT (default 80) when the process is allowed to bind it.
 
@@ -56,7 +59,11 @@ import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference,
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots, activeRequestHoldsSlot } from './slot-reaper.js';
-import { ds4Queue, acquireDs4Slot } from './ds4-slot.js';
+import { ds4Queue, acquireDs4Slot, setDs4SlotGrantedObserver } from './ds4-slot.js';
+import {
+  RELAY_REQUEST_ID_HEADER, relayRequestIdFor, readRelayRequestId,
+  probeDownstreamQueue, downstreamWaitDecision, createExtendableDeadline,
+} from './downstream-wait.js';
 import {
   resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries, expandGlob,
   BIG_ALIAS, SMALL_ALIAS, RESERVED_ALIAS_NAMES,
@@ -157,7 +164,7 @@ import {
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
-  isProjectorModelId, remoteStallMs, remoteStallCeilingMs, largestContextBesideDs4,
+  isProjectorModelId, remoteStallMs, remoteStallCeilingMs, remoteStallVerdict, largestContextBesideDs4,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -1802,7 +1809,47 @@ function recordBackendFailure(backendId, backendName) {
   backendCircuitBreakers.set(backendId, cb);
 }
 
-async function fetchRemoteBackend(backend, url, options, { label = 'remote', model, externalSignal } = {}) {
+/** Fallback request counter for forwards that don't register an activeRequest. */
+let untrackedRelayCounter = 0;
+
+/**
+ * Ask a provider manager whether it is holding our forwarded request in its
+ * ADMISSION queue rather than actually working on it.
+ *
+ * Only a positive answer counts. An unreachable backend, a non-manager backend,
+ * a request the provider does not report, or one it reports as active all
+ * return false, leaving the caller's normal give-up behaviour intact. See
+ * downstream-wait.js for why silence alone must not be read as a wedge.
+ *
+ * @param {object} backend Backend directory entry (needs `url`, `name`, `id`).
+ * @param {string|null} relayRequestId Id we forwarded with the request.
+ * @param {{since:(number|null), lastLogAt?:number}} waitState Mutable per-request wait bookkeeping.
+ * @param {string} [label] Log label.
+ * @returns {Promise<boolean>} True only when the provider says it is still queued.
+ */
+async function forwardedRequestIsQueuedDownstream(backend, relayRequestId, waitState, label = 'remote') {
+  if (!backend?.url || !relayRequestId) return false;
+  const { item } = await probeDownstreamQueue({ backendUrl: backend.url, relayRequestId });
+  const now = Date.now();
+  const decision = downstreamWaitDecision({ item, waitingSince: waitState.since, now });
+  if (!decision.extend) {
+    waitState.since = null;
+    return false;
+  }
+  if (waitState.since == null) waitState.since = now;
+  // One line a minute: enough to see a long provider queue wait in the log
+  // without a line every watchdog tick for the whole wait.
+  if (!waitState.lastLogAt || now - waitState.lastLogAt > 60_000) {
+    waitState.lastLogAt = now;
+    const waitedS = Math.round((now - waitState.since) / 1000);
+    const msg = `Holding request ${relayRequestId} on ${backend.name || backend.id}: ${decision.reason} (queued ${waitedS}s)`;
+    console.log(`[${label}] ${msg}`);
+    addLog('backends', msg);
+  }
+  return true;
+}
+
+async function fetchRemoteBackend(backend, url, options, { label = 'remote', model, externalSignal, activeReqId = null } = {}) {
   const queue = backendQueues.get(backend.id);
   if (!queue) {
     throw new Error(`No queue for backend ${backend.id}`);
@@ -1822,6 +1869,25 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
 
   const stats = backendStats.get(backend.id);
   const startTime = Date.now();
+
+  // Carry a stable id for this request across the hop, and remember it on the
+  // activeRequests entry. It lets both give-up clocks on this side (the
+  // per-attempt deadline below and the stall watchdog) ask the provider whether
+  // our request is queued rather than wedged. A request we are relaying onward
+  // keeps the id it arrived with, so the whole chain stays correlated.
+  const entry = activeReqId != null ? activeRequests.get(activeReqId) : null;
+  // Endpoints that don't register an activeRequest (completions, embeddings,
+  // messages, the responses remote path) still get an id from the untracked
+  // counter: the per-attempt deadline below can use it even though the stall
+  // watchdog, which works off activeRequests, cannot.
+  const relayRequestId = entry?.relayRequestId
+    || relayRequestIdFor(
+      selfNodeId() || config?.nodeId || systemHostname(),
+      activeReqId != null ? activeReqId : `u${++untrackedRelayCounter}`,
+    );
+  if (entry) entry.relayRequestId = relayRequestId;
+  options = { ...options, headers: { ...(options?.headers || {}), [RELAY_REQUEST_ID_HEADER]: relayRequestId } };
+  const deadlineWait = { since: null };
 
   try {
     let lastError;
@@ -1843,7 +1909,17 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
         backend.timeoutMs || REMOTE_BACKEND_TIMEOUT_MS,
         currentRemoteStallMs(),
       );
-      const timeout = setTimeout(() => controller.abort(), attemptTimeoutMs);
+      // Not a plain setTimeout: the attempt window is renewed for as long as the
+      // provider positively reports this request as still QUEUED for its
+      // generation slot. Aborting there would not rescue anything — it would
+      // just make the caller resend and land at the back of that same queue,
+      // which is the retry churn this deadline was blamed for. A provider that
+      // is actually working, unreachable, or silent still times out on schedule.
+      const timeout = createExtendableDeadline({
+        timeoutMs: attemptTimeoutMs,
+        onExpire: () => forwardedRequestIsQueuedDownstream(backend, relayRequestId, deadlineWait, label),
+        onTimeout: () => controller.abort(),
+      });
       // Compose with the caller's externalSignal (e.g. activeRequest's
       // abortController) so the watchdog or a user-initiated kill can also
       // tear down a hung remote fetch — including after headers arrive but
@@ -1863,7 +1939,7 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
       const fetchOptions = { ...options, dispatcher: llamaDispatcher, signal: controller.signal };
       try {
         const response = await fetch(url, fetchOptions);
-        clearTimeout(timeout);
+        timeout.cancel();
         // Keep externalAbortHandler active — caller's signal may still need
         // to tear down a stalled body stream after headers arrive. We remove
         // it in the response-consumer (the proxy handler) via a `.finally`.
@@ -1896,7 +1972,7 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
 
         return { response, retries: attempt, backend };
       } catch (err) {
-        clearTimeout(timeout);
+        timeout.cancel();
         if (externalAbortHandler && externalSignal) {
           try { externalSignal.removeEventListener('abort', externalAbortHandler); } catch {}
         }
@@ -2389,7 +2465,7 @@ function broadcastActiveRequest(event, data) {
   }
 }
 
-function startActiveRequest({ model, endpoint, messages, prompt, backend, priority = 'interactive', routing = 'auto', aliasModel = null }) {
+function startActiveRequest({ model, endpoint, messages, prompt, backend, priority = 'interactive', routing = 'auto', aliasModel = null, relayRequestId = null }) {
   const id = ++activeRequestIdCounter;
   // Extract last user message for display
   let userMessage = '';
@@ -2420,7 +2496,11 @@ function startActiveRequest({ model, endpoint, messages, prompt, backend, priori
   // aliasModel keeps the ORIGINAL alias name when the request came in through one, so
   // the reroute scanner can re-resolve the alias group later — `model` by then holds the
   // concrete local target and no longer identifies the group.
-  const entry = { id, model, aliasModel, endpoint, userMessage, fullContext, responseText: '', startTime: now, lastActivityAt: now, slotAcquiredAt: null, upstreamProbe: null, status: 'processing', tokens: 0, backend: backend || 'local', priority, routing, abortController };
+  // relayRequestId identifies this request across manager hops. Inbound, it is
+  // the id our upstream router sent (echoed in /api/queue so that router can see
+  // whether we have it queued or generating); outbound, fetchRemoteBackend
+  // stamps the same field with the id it forwards. See downstream-wait.js.
+  const entry = { id, model, aliasModel, endpoint, userMessage, fullContext, responseText: '', startTime: now, lastActivityAt: now, slotAcquiredAt: null, upstreamProbe: null, status: 'processing', tokens: 0, backend: backend || 'local', priority, routing, relayRequestId: relayRequestId || null, abortController };
   activeRequests.set(id, entry);
   // Track which model is actively being processed on the local backend
   // This is used by the offload logic to detect model-switch conflicts while a model is still loading
@@ -2438,6 +2518,31 @@ function getActiveRequestSignal(id) {
   const entry = activeRequests.get(id);
   return entry?.abortController?.signal;
 }
+
+/**
+ * Start a request's "actively generating" clock.
+ *
+ * Called when a generation slot is granted — by acquireLocalSlot for the
+ * llama.cpp lane and, via setDs4SlotGrantedObserver below, for the ds4 lane.
+ * Queue-wait time before this point belongs to `startTime` (totalElapsed) and
+ * must never count toward a no-token stall ceiling.
+ *
+ * @param {number|string|null|undefined} activeReqId activeRequests key, if the caller tracks one.
+ */
+function markGenerationSlotAcquired(activeReqId) {
+  if (activeReqId == null) return;
+  const entry = activeRequests.get(activeReqId);
+  if (!entry) return;
+  const now = Date.now();
+  entry.lastActivityAt = now;
+  entry.slotAcquiredAt = now;
+}
+
+// ds4 serializes to a single generation slot; a request waiting for it is not
+// stalled, it is queued. Stamping the entry on grant is what lets /api/queue
+// report waiting time apart from generation time, and what anchors the ds4
+// zero-token ceiling (remoteStallVerdict) to the slot rather than to arrival.
+setDs4SlotGrantedObserver(({ activeReqId }) => markGenerationSlotAcquired(activeReqId));
 
 function updateActiveRequest(id, text) {
   const entry = activeRequests.get(id);
@@ -4989,7 +5094,12 @@ app.get('/api/queue', (req, res) => {
       activeRequestId: ar.id,
       backend: backendId,
       backendName,
-      offloaded: isOffloaded
+      offloaded: isOffloaded,
+      // Echo the id our upstream router forwarded (null for a request a client
+      // sent us directly). That router polls this endpoint to tell "queued
+      // behind another request" from "wedged" before it gives up on us — see
+      // downstream-wait.js.
+      relayRequestId: ar.relayRequestId || null
     };
     if (detail) {
       result.responseText = ar.responseText || '';
@@ -5010,9 +5120,12 @@ app.get('/api/queue', (req, res) => {
     result.totalElapsed = result.elapsed;
     if (ar.slotAcquiredAt) {
       result.activeElapsed = Date.now() - ar.slotAcquiredAt;
-    } else if (isOffloaded) {
-      // Remote routing has no separate "slot acquire" step on our side; the
-      // total elapsed is also the active elapsed.
+    } else if (isOffloaded && holdsSlot) {
+      // Routing to another box has no separate "slot acquire" step on our side;
+      // the total elapsed is also the active elapsed. A ds4 request that has NOT
+      // been granted the local generation slot yet is excluded by holdsSlot: it
+      // is waiting, not generating, and reporting its queue wait as active time
+      // is exactly what let a queued request look like a stalled one.
       result.activeElapsed = result.elapsed;
     } else {
       result.activeElapsed = null;
@@ -5066,11 +5179,18 @@ app.get('/api/queue', (req, res) => {
     if (item.activeReqId != null) positionByActiveReqId.set(item.activeReqId, idx);
     positionByQueueItemId.set(item.id, idx);
   });
+  // Same lookup for the ds4 lane — a ds4 request that doesn't hold the slot is
+  // waiting in ds4Queue, not llamaQueue, so its position must come from there.
+  const ds4PositionByActiveReqId = new Map();
+  ds4Queue.queue.forEach((item, idx) => {
+    if (item.activeReqId != null) ds4PositionByActiveReqId.set(item.activeReqId, idx);
+  });
   // Annotate pendingFromActive with their queue position (1-based for display).
   for (const p of pendingFromActive) {
-    const idx = positionByActiveReqId.get(p.activeRequestId);
+    const inDs4Lane = p.backend === 'ds4';
+    const idx = (inDs4Lane ? ds4PositionByActiveReqId : positionByActiveReqId).get(p.activeRequestId);
     if (idx != null) p.queuePosition = idx + 1;
-    p.queueLength = llamaQueue.queue.length;
+    p.queueLength = (inDs4Lane ? ds4Queue.queue : llamaQueue.queue).length;
   }
   const seenActiveReqIds = new Set(pendingFromActive.map(p => p.activeRequestId));
   const pendingItems = [
@@ -9970,14 +10090,7 @@ async function acquireLocalSlot(req, res, {
   // the upstream — queue-wait time shouldn't count toward the no-token timeout.
   // Also stamp slotAcquiredAt so the UI can show "active elapsed" separate from
   // "total elapsed" (which includes queue wait).
-  if (activeReqId != null) {
-    const ar = activeRequests.get(activeReqId);
-    if (ar) {
-      const now = Date.now();
-      ar.lastActivityAt = now;
-      ar.slotAcquiredAt = now;
-    }
-  }
+  markGenerationSlotAcquired(activeReqId);
   let released = false;
   let releasePending = false;
   const release = () => {
@@ -10324,7 +10437,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
   const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const url = ds4TargetUrl(ds4.port, '/v1/chat/completions');
   console.log(`[chat/completions] ds4 engine active — forwarding to ${url}`);
-  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: 'ds4' });
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: 'ds4', relayRequestId: readRelayRequestId(req.headers) });
   const controller = new AbortController();
   res.on('close', () => { try { controller.abort(); } catch { /* ignore */ } });
 
@@ -10454,7 +10567,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
 async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, startTime }) {
   const ds4 = resolveDs4Config(config, RUNTIME_ENV);
   const url = ds4TargetUrl(ds4.port, '/v1/completions');
-  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'completions', messages: null, backend: 'ds4' });
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'completions', messages: null, backend: 'ds4', relayRequestId: readRelayRequestId(req.headers) });
   const controller = new AbortController();
   res.on('close', () => { try { controller.abort(); } catch { /* ignore */ } });
   // See proxyChatToDs4 above: ds4Queue serializes the single generation slot.
@@ -10946,6 +11059,7 @@ async function handleChatCompletions(req, res) {
     backend: routing.remote ? routing.backend.id : 'local',
     priority: requestPolicy.priority,
     routing: requestPolicy.routing,
+    relayRequestId: readRelayRequestId(req.headers),
   });
   res.setHeader('x-llama-manager-priority', requestPolicy.priority);
   res.setHeader('x-llama-manager-routing', requestPolicy.routing);
@@ -11019,7 +11133,7 @@ async function handleChatCompletions(req, res) {
         method: 'POST',
         headers: { ...routing.headers },
         body: JSON.stringify(remoteBody)
-      }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId) });
+      }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId), activeReqId });
 
       if (!response.ok) {
         const error = await response.text();
@@ -12562,6 +12676,7 @@ async function proxyResponsesToDs4(req, res, {
     backend: 'ds4',
     priority,
     routing,
+    relayRequestId: readRelayRequestId(req.headers),
   });
   const controller = activeRequests.get(activeReqId)?.abortController;
   const abort = () => { try { controller?.abort('client_disconnect'); } catch { /* best effort */ } };
@@ -13704,6 +13819,20 @@ setInterval(async () => {
   for (const item of llamaQueue.activeItems.values()) {
     if (item.activeReqId != null) slotHolders.add(item.activeReqId);
   }
+  // Same rule for the ds4 lane: only the request that actually owns the single
+  // ds4 generation slot is a stall candidate. The ones behind it are waiting
+  // their turn, and their silence says nothing about whether they are stuck.
+  const ds4SlotHolders = new Set();
+  for (const item of ds4Queue.activeItems.values()) {
+    if (item.activeReqId != null) ds4SlotHolders.add(item.activeReqId);
+  }
+  // …and who is genuinely WAITING in that queue. The exemption above is granted
+  // for real queue membership, not merely for "isn't holding the slot", so an
+  // orphaned ds4 entry that is in neither state is still reaped normally.
+  const ds4SlotWaiters = new Set();
+  for (const item of ds4Queue.queue) {
+    if (item.activeReqId != null) ds4SlotWaiters.add(item.activeReqId);
+  }
   // Leaked-slot detector: a chat slot whose activeReqId no longer maps to a live
   // activeRequest is a DEFINITIVE leak (handler ended without firing release()).
   // Reap it on a short grace (LEAK_REAP_GRACE_MS) rather than the generous
@@ -13834,17 +13963,47 @@ setInterval(async () => {
       // just like any other request) blocks the box's single ds4 generation
       // slot for every request queued behind it. See DS4_ZERO_TOKEN_STALL_MS
       // for how that ceiling was derived.
-      const remoteStallLimit = remoteStallCeilingMs(entry, currentRemoteStallMs());
-      if (idle < remoteStallLimit) continue;
+      //
+      // That ceiling bounds a request HOLDING the slot. remoteStallVerdict
+      // applies it only to the holder, and measures it from slot acquisition:
+      // a ds4 request still queued behind another one is not a stall candidate,
+      // and killing it there only sends its caller back to the end of the same
+      // queue it was already waiting in.
+      const verdict = remoteStallVerdict({
+        entry,
+        holdsDs4Slot: ds4SlotHolders.has(id),
+        queuedForDs4Slot: ds4SlotWaiters.has(id),
+        now,
+        genericRemoteStallMs: currentRemoteStallMs(),
+      });
+      if (verdict.action === 'skip') continue;
+      // Silence from ANOTHER manager is ambiguous in exactly the same way, and
+      // unlike a wedge it can be checked: ask the provider before giving up.
+      // While it reports our request as queued for its own generation slot,
+      // hold the request open — aborting would not rescue it, it would resend
+      // it to the back of that same queue. An unreachable or unhelpful backend
+      // falls through to the kill, so a genuinely wedged remote still dies.
+      if (entry.relayRequestId) {
+        const backendCfg = (config?.backends?.directory || []).find(b => b.id === entry.backend);
+        entry._downstreamWait = entry._downstreamWait || { since: null };
+        if (await forwardedRequestIsQueuedDownstream(backendCfg, entry.relayRequestId, entry._downstreamWait, 'watchdog')) {
+          // Keep provider queue wait out of the idle clock: this ceiling is for
+          // time the far side is actually working on us.
+          entry.lastActivityAt = Date.now();
+          continue;
+        }
+      }
       entry._watchdogKilled = true;
-      const msg = `Stall watchdog: aborting remote request ${id} (backend: ${entry.backend}, model: ${entry.model}, ${entry.tokens} tokens, idle ${Math.round(idle / 1000)}s ≥ ${Math.round(remoteStallLimit / 1000)}s)`;
+      // verdict.idleMs, not the loop's `idle`: for a ds4 slot holder the clock
+      // starts at slot acquisition, so this is the silence we actually acted on.
+      const msg = `Stall watchdog: aborting remote request ${id} (backend: ${entry.backend}, model: ${entry.model}, ${entry.tokens} tokens, ${verdict.reason})`;
       console.warn(`[watchdog] ${msg}`);
       addLog('system', msg);
       requestStatsAccum.watchdogKills++;
       watchdogStats.totalKills++;
       watchdogStats.lastKillAt = now;
       watchdogStats.lastKillModel = entry.model;
-      watchdogStats.lastKillStallMs = idle;
+      watchdogStats.lastKillStallMs = verdict.idleMs;
       try { entry.abortController?.abort(); } catch { /* ignore */ }
     }
   }

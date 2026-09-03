@@ -11,8 +11,10 @@
 // healthPath, modelsShape }), validate ds4 preset fields, resolve a ds4 GGUF
 // model path under the dedicated ds4 gguf dir, shape the OpenAI `/v1/models`
 // entry/list for an active ds4 model, and build pure llama.cpp router preset
-// descriptors for model-specific speculative acceleration. Kept out of server.js
-// so it is unit-testable without booting the server.
+// descriptors for model-specific speculative acceleration. It also decides
+// whether silence is a true generation stall or legitimate DS4 admission wait.
+// Kept out of server.js so these policies are unit-testable without booting the
+// server.
 
 /** Canonical engine type identifiers. */
 export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4' };
@@ -906,6 +908,66 @@ export const DS4_ZERO_TOKEN_STALL_MS = 480_000;
  */
 export function remoteStallCeilingMs(entry, genericRemoteStallMs) {
   return entry?.backend === 'ds4' ? DS4_ZERO_TOKEN_STALL_MS : genericRemoteStallMs;
+}
+
+/**
+ * Decide whether the stall watchdog should act on a non-local activeRequests
+ * entry — and, for ds4, from WHEN its silence should be measured.
+ *
+ * The zero-token ceiling bounds a request that is *generating nothing while
+ * holding the generation slot*. It was previously applied to every ds4-backed
+ * entry from the moment the request arrived, which is a different quantity:
+ * ds4 serializes to one generation (ds4Queue), so a second request sits in the
+ * admission queue producing no tokens for a reason that has nothing to do with
+ * being stuck. Killing it there punishes a request for someone else's work and
+ * — when the request came from another manager — sends the caller back to the
+ * end of this same queue.
+ *
+ * So: a ds4 entry WAITING IN ds4Queue is not a stall candidate at all (its wait
+ * is bounded by the holder's own ceiling times the queue depth), and one that
+ * holds the slot is measured from slot acquisition, not from arrival.
+ * `slotAcquiredAt` is stamped when ds4Queue grants the slot; taking the max of
+ * the anchors keeps this correct even if a caller stamps only lastActivityAt.
+ *
+ * The exemption is deliberately tied to real queue membership, not to "isn't
+ * holding the slot": an entry that is neither holding nor queued has nothing
+ * legitimately keeping it silent (an orphaned entry whose handler died after
+ * the slot was released, say), and must still be reaped on the normal ceiling
+ * rather than sitting in activeRequests forever.
+ *
+ * @param {object} p
+ * @param {{backend?:string, startTime?:number, lastActivityAt?:number, slotAcquiredAt?:number}} p.entry activeRequests entry.
+ * @param {boolean} [p.holdsDs4Slot] Whether this entry currently owns the ds4Queue slot.
+ * @param {boolean} [p.queuedForDs4Slot] Whether it is waiting in ds4Queue for that slot.
+ * @param {number} p.now Epoch ms.
+ * @param {number} p.genericRemoteStallMs currentRemoteStallMs() — the ceiling for non-ds4 remotes.
+ * @returns {{action:'skip'|'stalled', idleMs:number, limitMs:number, reason:string}}
+ */
+export function remoteStallVerdict({ entry, holdsDs4Slot = false, queuedForDs4Slot = false, now, genericRemoteStallMs }) {
+  const limitMs = remoteStallCeilingMs(entry, genericRemoteStallMs);
+  const isDs4 = entry?.backend === 'ds4';
+  if (isDs4 && !holdsDs4Slot && queuedForDs4Slot) {
+    return {
+      action: 'skip',
+      idleMs: 0,
+      limitMs,
+      reason: 'queued for the ds4 generation slot — silence here is admission wait, not a stall',
+    };
+  }
+  const anchors = [entry?.lastActivityAt, entry?.startTime];
+  if (isDs4 && holdsDs4Slot) anchors.push(entry?.slotAcquiredAt);
+  const known = anchors.filter((t) => Number.isFinite(t));
+  const since = known.length ? Math.max(...known) : now;
+  const idleMs = Math.max(0, now - since);
+  if (idleMs < limitMs) {
+    return { action: 'skip', idleMs, limitMs, reason: 'within the idle ceiling' };
+  }
+  return {
+    action: 'stalled',
+    idleMs,
+    limitMs,
+    reason: `idle ${Math.round(idleMs / 1000)}s >= ${Math.round(limitMs / 1000)}s`,
+  };
 }
 
 /**

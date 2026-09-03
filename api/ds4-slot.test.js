@@ -1,10 +1,13 @@
 // Llama Manager — unit tests for api/ds4-slot.js.
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
+// Verifies single-generation admission, release on every response outcome,
+// cancellation while queued, and notification only when a request gains the
+// actual DS4 generation slot.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PriorityRequestQueue } from './request-queue.js';
-import { ds4Queue, acquireDs4Slot } from './ds4-slot.js';
+import { ds4Queue, acquireDs4Slot, setDs4SlotGrantedObserver } from './ds4-slot.js';
 
 /** Minimal stand-in for an Express Response: an EventEmitter with the two
  * flags acquireDs4Slot checks synchronously after acquiring. */
@@ -123,4 +126,45 @@ test('abort signal while queued rejects the wait and never holds the slot', asyn
 
   slot1.release();
   assert.equal(ds4Queue.active, 0);
+});
+
+test('the slot-granted observer fires on the grant, not when the request starts waiting', async () => {
+  const granted = [];
+  setDs4SlotGrantedObserver((info) => granted.push(info));
+  try {
+    const res1 = fakeRes();
+    const res2 = fakeRes();
+    const slot1 = await acquireDs4Slot(res1, { activeReqId: 11, model: 'ds4', endpoint: 'chat/completions' });
+    assert.deepEqual(granted.map(g => g.activeReqId), [11]);
+
+    const wait2 = acquireDs4Slot(res2, { activeReqId: 12 });
+    await Promise.resolve();
+    assert.deepEqual(
+      granted.map(g => g.activeReqId),
+      [11],
+      'a request still queued has not started generating — stamping it there is what made queue wait look like a stall',
+    );
+
+    slot1.release();
+    const slot2 = await wait2;
+    assert.deepEqual(granted.map(g => g.activeReqId), [11, 12]);
+    assert.equal(granted[0].model, 'ds4');
+    assert.equal(granted[0].endpoint, 'chat/completions');
+    slot2.release();
+  } finally {
+    setDs4SlotGrantedObserver(null);
+  }
+});
+
+test('a throwing observer can never break slot admission', async () => {
+  setDs4SlotGrantedObserver(() => { throw new Error('bookkeeping blew up'); });
+  try {
+    const res = fakeRes();
+    const slot = await acquireDs4Slot(res, { activeReqId: 13 });
+    assert.equal(ds4Queue.active, 1);
+    slot.release();
+    assert.equal(ds4Queue.active, 0);
+  } finally {
+    setDs4SlotGrantedObserver(null);
+  }
 });
