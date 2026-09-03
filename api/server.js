@@ -165,6 +165,7 @@ import {
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
   isProjectorModelId, remoteStallMs, remoteStallCeilingMs, remoteStallVerdict, largestContextBesideDs4,
+  ds4ChatDeltaText, ds4ResponsesEventText,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection
@@ -10519,7 +10520,10 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
           if (line.startsWith('data: ') && line !== 'data: [DONE]') {
             try {
               const d = JSON.parse(line.slice(6));
-              const t = d.choices?.[0]?.delta?.content || '';
+              // Count reasoning/thinking output as progress too — ds4 can spend
+              // thousands of tokens in delta.reasoning_content before any
+              // delta.content appears. See ds4ChatDeltaText's JSDoc.
+              const t = ds4ChatDeltaText(d.choices?.[0]?.delta);
               if (t) { completionTokens++; responseText += t; updateActiveRequest(activeReqId, t); }
               if (d.usage) { promptTokens = d.usage.prompt_tokens || promptTokens; completionTokens = d.usage.completion_tokens || completionTokens; }
             } catch { /* non-JSON keepalive line */ }
@@ -12746,9 +12750,13 @@ async function proxyResponsesToDs4(req, res, {
           if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
           try {
             const event = JSON.parse(line.slice(6));
-            if (event.type === 'response.output_text.delta' && event.delta) {
-              responseText += event.delta;
-              updateActiveRequest(activeReqId, event.delta);
+            // Count reasoning-summary deltas as progress too — ds4 reports its
+            // THINKING phase as its own event type, never folded into
+            // output_text.delta. See ds4ResponsesEventText's JSDoc.
+            const text = ds4ResponsesEventText(event);
+            if (text) {
+              responseText += text;
+              updateActiveRequest(activeReqId, text);
             }
             const usage = event.usage || event.response?.usage;
             if (usage) {

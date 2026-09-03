@@ -12,9 +12,10 @@
 // model path under the dedicated ds4 gguf dir, shape the OpenAI `/v1/models`
 // entry/list for an active ds4 model, and build pure llama.cpp router preset
 // descriptors for model-specific speculative acceleration. It also decides
-// whether silence is a true generation stall or legitimate DS4 admission wait.
-// Kept out of server.js so these policies are unit-testable without booting the
-// server.
+// whether silence is a true generation stall or legitimate DS4 admission wait,
+// and extracts the progress-bearing text (including reasoning/thinking output)
+// from ds4-server's streamed chat and Responses deltas. Kept out of server.js
+// so these policies are unit-testable without booting the server.
 
 /** Canonical engine type identifiers. */
 export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4' };
@@ -908,6 +909,45 @@ export const DS4_ZERO_TOKEN_STALL_MS = 480_000;
  */
 export function remoteStallCeilingMs(entry, genericRemoteStallMs) {
   return entry?.backend === 'ds4' ? DS4_ZERO_TOKEN_STALL_MS : genericRemoteStallMs;
+}
+
+/**
+ * Extract the progress-bearing text from one ds4-server chat/completions SSE
+ * delta, treating its THINKING-phase output as progress alongside its answer.
+ *
+ * ds4-server (see ds4_server.c's sse_chat_delta_n call sites) streams thinking
+ * text under `delta.reasoning_content` and only starts sending `delta.content`
+ * once thinking closes. A caller that reads only `delta.content` sees zero
+ * tokens for as long as ds4 is thinking — which DS4_ZERO_TOKEN_STALL_MS then
+ * mistakes for a genuine stall and kills, even though generation is healthy.
+ *
+ * @param {{content?:string, reasoning_content?:string}} [delta] One SSE chunk's `choices[0].delta`.
+ * @returns {string} The text to count as progress, or '' if the delta carries none.
+ */
+export function ds4ChatDeltaText(delta) {
+  return delta?.content || delta?.reasoning_content || '';
+}
+
+/**
+ * Extract the progress-bearing text from one ds4-server Responses-API SSE
+ * event, treating its reasoning-summary deltas as progress alongside its
+ * output-text deltas.
+ *
+ * ds4-server's Responses stream (see ds4_server.c's responses_sse_reasoning_delta
+ * and responses_sse_output_text_delta) reports THINKING-phase text as its own
+ * event type, `response.reasoning_summary_text.delta`, never folded into
+ * `response.output_text.delta`. A caller that reacts only to output-text deltas
+ * sees zero tokens for as long as ds4 is thinking.
+ *
+ * @param {{type?:string, delta?:string}} [event] One parsed SSE event.
+ * @returns {string} The text to count as progress, or '' if the event carries none.
+ */
+export function ds4ResponsesEventText(event) {
+  if (!event?.delta) return '';
+  if (event.type === 'response.output_text.delta' || event.type === 'response.reasoning_summary_text.delta') {
+    return event.delta;
+  }
+  return '';
 }
 
 /**

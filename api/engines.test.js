@@ -39,6 +39,8 @@ import {
   isDs4RepoAllowed,
   listDs4GgufFiles,
   validateDs4DownloadRequest,
+  ds4ChatDeltaText,
+  ds4ResponsesEventText,
 } from './engines.js';
 
 // ── isEngineProcessComm (heat/RSS attribution) ───────────────────────────────
@@ -1034,4 +1036,42 @@ test('largestContextBesideDs4 never admits an unknown model size', () => {
   });
   assert.equal(r.fits, false);
   assert.match(r.reason, /unknown/i);
+});
+
+// ── ds4ChatDeltaText / ds4ResponsesEventText (reasoning-as-progress) ───────
+
+test('ds4ChatDeltaText: content-only delta returns the content', () => {
+  assert.equal(ds4ChatDeltaText({ content: 'hi' }), 'hi');
+});
+
+test('ds4ChatDeltaText: a reasoning-only delta (ds4-server THINKING phase) is not dropped', () => {
+  // ds4-server emits reasoning text as delta.reasoning_content and only sends
+  // delta.content once thinking is done — see ds4_server.c sse_chat_delta_n
+  // call sites ("reasoning_content" vs "content"). A generation stuck in
+  // THINKING for minutes must still count as progress.
+  assert.equal(ds4ChatDeltaText({ reasoning_content: 'thinking...' }), 'thinking...');
+});
+
+test('ds4ChatDeltaText: content wins when a delta somehow carries both', () => {
+  assert.equal(ds4ChatDeltaText({ content: 'answer', reasoning_content: 'thought' }), 'answer');
+});
+
+test('ds4ChatDeltaText: a delta with neither field yields empty string', () => {
+  assert.equal(ds4ChatDeltaText({ tool_calls: [] }), '');
+  assert.equal(ds4ChatDeltaText(undefined), '');
+});
+
+test('ds4ResponsesEventText: an output_text delta is progress', () => {
+  assert.equal(ds4ResponsesEventText({ type: 'response.output_text.delta', delta: 'hi' }), 'hi');
+});
+
+test('ds4ResponsesEventText: a reasoning_summary_text delta (THINKING phase) is progress too', () => {
+  // ds4-server's Responses stream sends reasoning as its own event type —
+  // response.reasoning_summary_text.delta — never folded into output_text.
+  // See ds4_server.c responses_sse_reasoning_delta.
+  assert.equal(ds4ResponsesEventText({ type: 'response.reasoning_summary_text.delta', delta: 'thinking...' }), 'thinking...');
+});
+
+test('ds4ResponsesEventText: an unrelated event type yields empty string', () => {
+  assert.equal(ds4ResponsesEventText({ type: 'response.completed', delta: 'ignored' }), '');
 });
