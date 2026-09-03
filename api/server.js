@@ -1806,7 +1806,18 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
       // first cancellation), every subsequent retry immediately threw
       // "This operation was aborted" without actually contacting the backend.
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), backend.timeoutMs || REMOTE_BACKEND_TIMEOUT_MS);
+      // A per-backend timeoutMs is operator intent, but it was configured before
+      // large contexts existed and can be shorter than the minimum time any
+      // request could possibly take: Drakemore carried 120000 while a 36k-token
+      // prompt needs ~160s of prefill, so every attempt aborted, retried, and
+      // re-paid the prefill from scratch — four full prefills, then failure,
+      // reported as "Failed to reach remote backend". A ceiling below the
+      // floor is not a policy, so take whichever is larger.
+      const attemptTimeoutMs = Math.max(
+        backend.timeoutMs || REMOTE_BACKEND_TIMEOUT_MS,
+        currentRemoteStallMs(),
+      );
+      const timeout = setTimeout(() => controller.abort(), attemptTimeoutMs);
       // Compose with the caller's externalSignal (e.g. activeRequest's
       // abortController) so the watchdog or a user-initiated kill can also
       // tear down a hung remote fetch — including after headers arrive but
