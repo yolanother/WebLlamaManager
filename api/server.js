@@ -13,7 +13,7 @@
 // OpenAI routes support both /api/v1 and bare /v1 paths, with URL-based media
 // expanded into standard multimodal parts before chat inference.
 // Manager extensions provide bounded, replayable process-local background
-// Responses and scope-safe prepared-context append reuse through synchronous routes.
+// Responses and scope-safe prepared-context append reuse through Chat Completions.
 // The same application is served on API_PORT and, best-effort, on the appliance
 // mirror port ALT_PORT (default 80) when the process is allowed to bind it.
 
@@ -112,7 +112,7 @@ import {
   requestExactInputTokens,
   requestRenderedPrefix,
 } from './context-endpoints.js';
-import { InferenceJobStore } from './async-inference.js';
+import { InferenceJobStore, assertResponsesContextSupported } from './async-inference.js';
 import {
   canonicalHash,
   compatibilityFingerprint,
@@ -12343,7 +12343,7 @@ async function executeBackgroundResponse({ body, headers, signal, publish }) {
       if (!payload || payload === '[DONE]') continue;
       let event;
       try { event = JSON.parse(payload); } catch { continue; }
-      if (event?.response && ['response.completed', 'response.failed', 'response.cancelled'].includes(event.type)) {
+      if (event?.response && ['response.completed', 'response.failed', 'response.cancelled', 'response.incomplete'].includes(event.type)) {
         finalResponse = event.response;
       }
       if (publish(event) === false) return false;
@@ -12421,6 +12421,8 @@ function sendBackgroundResponseError(res, error, fallback = 'background Response
  * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
  */
 async function handleResponses(req, res) {
+  try { assertResponsesContextSupported(req.body); }
+  catch (error) { return sendBackgroundResponseError(res, error); }
   if (req.body?.background === true) {
     try {
       const response = inferenceJobs.submit({

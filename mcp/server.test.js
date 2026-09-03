@@ -54,16 +54,19 @@ test('contract 10: MCP catalog exposes OpenAI Response and prepared-context tool
 
   const submit = byName.get('submit_response');
   assert.deepEqual(submit.inputSchema.required, ['model', 'input']);
-  for (const field of [
-    'prepared_context_id', 'prepared_context_mode', 'context_cache_strict',
-    'priority', 'routing', 'stream',
-  ]) {
+  for (const field of ['priority', 'routing', 'stream']) {
     assert.ok(submit.inputSchema.properties[field], `submit tool omits ${field}`);
   }
-  assert.deepEqual(submit.inputSchema.properties.prepared_context_mode.enum, ['append']);
+  assert.equal(submit.inputSchema.properties.prepared_context_id, undefined);
+  assert.equal(submit.inputSchema.additionalProperties, false);
   assert.match(submit.description, /llama_chat/);
   assert.match(submit.description, /client|proxy/i);
   assert.match(submit.description, /budget/i);
+
+  const chat = byName.get('llama_chat');
+  assert.ok(chat.inputSchema.properties.prepared_context_id);
+  assert.deepEqual(chat.inputSchema.properties.prepared_context_mode.enum, ['append']);
+  assert.equal(chat.inputSchema.properties.context_cache_strict.type, 'boolean');
 
   const getResponse = byName.get('get_response');
   assert.deepEqual(getResponse.inputSchema.required, ['id']);
@@ -83,10 +86,7 @@ test('contract 10: Response MCP tools mirror extensions and OpenAI-compatible RE
     model: 'voice-fast',
     input: [{ role: 'user', content: 'long request' }],
     temperature: 0.3,
-    max_tokens: 50_000,
-    prepared_context_id: 'ctx_opaque',
-    prepared_context_mode: 'append',
-    context_cache_strict: true,
+    max_output_tokens: 50_000,
     priority: 'background',
     routing: 'local_only',
     stream: true,
@@ -98,6 +98,18 @@ test('contract 10: Response MCP tools mirror extensions and OpenAI-compatible RE
   assert.deepEqual(submitted.captured.body, { ...rest, request_priority: 'background', background: true });
   assert.equal(Object.hasOwn(submitted.captured.body, 'priority'), false, 'the inert tool-only name must not reach REST');
   assert.equal(submitted.result.data.ok, true);
+
+  const chatted = await captureToolCall('llama_chat', {
+    model: 'voice-fast',
+    messages: [{ role: 'user', content: 'suffix' }],
+    prepared_context_id: 'ctx_opaque',
+    prepared_context_mode: 'append',
+    context_cache_strict: true,
+  });
+  assert.equal(chatted.captured.url, 'http://localhost:5250/api/v1/chat/completions');
+  assert.equal(chatted.captured.body.prepared_context_id, 'ctx_opaque');
+  assert.equal(chatted.captured.body.prepared_context_mode, 'append');
+  assert.equal(chatted.captured.body.context_cache_strict, true);
 
   const polled = await captureToolCall('get_response', { id: 'resp_opaque' });
   assert.equal(polled.captured.url, 'http://localhost:5250/api/v1/responses/resp_opaque');

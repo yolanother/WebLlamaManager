@@ -4546,7 +4546,7 @@
       "post": {
         "operationId": "post_api_v1_chat_completions",
         "summary": "Create a chat completion",
-        "description": "Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side. Question-mark-only assistant output is rejected with upstream_output_error / QUESTION_MARK_ONLY_OUTPUT; streamed clients must honor the structured SSE error envelope because heartbeat headers may already be committed. Non-streaming responses carry a versioned `_llama_manager.timingEvidence` record; streamed responses publish the same record on the LLM capture log. Served completions report queue admission and first emitted content as manager-measured, while input tokenization and inference start are explicitly unsupported because llama.cpp folds tokenization into prompt processing and never reports decode start — use POST /api/v1/context/prepare for certifiable tokenization and prefill measurements.",
+        "description": "Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side. A ready llama.cpp prefill handle may be supplied with prepared_context_mode:\"append\" to combine manager-retained prefix messages with a new text-only suffix; conflicting input-affecting fields, multimodal suffixes, stale/wrong-scope/wrong-model handles, compatibility revision changes, and displaced slot ownership fail closed. Omitting append preserves exact full-prompt prepared-handle validation. DS4 rejects strict and append reuse because it has no compatible caller-visible slot primitive. Question-mark-only assistant output is rejected with upstream_output_error / QUESTION_MARK_ONLY_OUTPUT; streamed clients must honor the structured SSE error envelope because heartbeat headers may already be committed. Non-streaming responses carry a versioned `_llama_manager.timingEvidence` record; streamed responses publish the same record on the LLM capture log. Served completions report queue admission and first emitted content as manager-measured, while input tokenization and inference start are explicitly unsupported because llama.cpp folds tokenization into prompt processing and never reports decode start — use POST /api/v1/context/prepare for certifiable tokenization and prefill measurements.",
         "tags": [
           "openai"
         ],
@@ -4786,6 +4786,36 @@
                   "stream": {
                     "type": "boolean",
                     "default": false
+                  },
+                  "prepared_context_id": {
+                    "type": "string",
+                    "description": "Opaque handle returned by POST /api/v1/context/prepare."
+                  },
+                  "prepared_context_mode": {
+                    "type": "string",
+                    "enum": [
+                      "append"
+                    ],
+                    "description": "Compose text-only suffix messages with the manager-retained prepared prefix."
+                  },
+                  "context_cache_strict": {
+                    "type": "boolean",
+                    "description": "Reject unavailable exact prepared reuse instead of falling back cold."
+                  },
+                  "request_priority": {
+                    "type": "string",
+                    "enum": [
+                      "realtime",
+                      "interactive",
+                      "background"
+                    ]
+                  },
+                  "routing": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "local_only"
+                    ]
                   }
                 },
                 "additionalProperties": true
@@ -5225,7 +5255,7 @@
       "post": {
         "operationId": "post_api_v1_responses",
         "summary": "Create an OpenAI Responses API response",
-        "description": "Create an OpenAI Responses API response through the Llama Manager HTTP API.",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement. Prepared-context reuse remains a Chat Completions extension and is rejected on Responses so a suffix can never execute without its retained prefix.",
         "tags": [
           "openai"
         ],
@@ -5237,6 +5267,93 @@
               "application/json": {
                 "schema": {
                   "type": "object",
+                  "required": [
+                    "id",
+                    "object",
+                    "created_at",
+                    "completed_at",
+                    "status",
+                    "background",
+                    "output",
+                    "error"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^resp_",
+                      "description": "Process-local capability id scoped to caller authorization."
+                    },
+                    "object": {
+                      "const": "response"
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "description": "Creation time in Unix seconds."
+                    },
+                    "completed_at": {
+                      "oneOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Terminal transition time in Unix seconds."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "in_progress",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "incomplete"
+                      ]
+                    },
+                    "background": {
+                      "type": "boolean"
+                    },
+                    "output": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "description": "Empty while active; complete only when completed."
+                    },
+                    "error": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "code",
+                            "message"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string",
+                              "maxLength": 1000
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "OpenAI-shaped bounded error when failed."
+                    },
+                    "_llama_manager": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Optional additive manager diagnostics; never changes the OpenAI error shape."
+                    }
+                  },
                   "additionalProperties": true
                 }
               }
@@ -5246,15 +5363,357 @@
         "x-codeSamples": [
           {
             "lang": "cURL",
-            "source": "curl -s -X POST 'http://localhost:5250/api/v1/responses' -H 'Content-Type: application/json' -d '{}'"
+            "source": "curl -s -X POST 'http://localhost:5250/api/v1/responses' -H 'Content-Type: application/json' -d '{\"model\":\"default-big\",\"input\":\"Analyze this long document.\",\"background\":true,\"request_priority\":\"interactive\",\"routing\":\"auto\"}'"
           },
           {
             "lang": "Python",
-            "source": "import json\nimport requests\n\npayload = json.loads(r'''{}''')\nresponse = requests.post('http://localhost:5250/api/v1/responses', json=payload)\nprint(response.json())"
+            "source": "import json\nimport requests\n\npayload = json.loads(r'''{\"model\":\"default-big\",\"input\":\"Analyze this long document.\",\"background\":true,\"request_priority\":\"interactive\",\"routing\":\"auto\"}''')\nresponse = requests.post('http://localhost:5250/api/v1/responses', json=payload)\nprint(response.json())"
           },
           {
             "lang": "JavaScript",
-            "source": "const response = await fetch('http://localhost:5250/api/v1/responses', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({})\n});\nconsole.log(await response.json());"
+            "source": "const response = await fetch('http://localhost:5250/api/v1/responses', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({\"model\":\"default-big\",\"input\":\"Analyze this long document.\",\"background\":true,\"request_priority\":\"interactive\",\"routing\":\"auto\"})\n});\nconsole.log(await response.json());"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [],
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "input": {},
+                  "background": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "stream": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "request_priority": {
+                    "type": "string",
+                    "enum": [
+                      "realtime",
+                      "interactive",
+                      "background"
+                    ]
+                  },
+                  "routing": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "local_only"
+                    ]
+                  }
+                },
+                "additionalProperties": true
+              },
+              "examples": {
+                "example1": {
+                  "summary": "Create a background Response example",
+                  "value": {
+                    "model": "default-big",
+                    "input": "Analyze this long document.",
+                    "background": true,
+                    "request_priority": "interactive",
+                    "routing": "auto"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/responses/{response_id}": {
+      "get": {
+        "operationId": "get_api_v1_responses_response_id",
+        "summary": "Retrieve or stream a background Response",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Add stream=true and optional starting_after to resume a stream-origin Response.",
+        "tags": [
+          "openai"
+        ],
+        "parameters": [
+          {
+            "name": "response_id",
+            "in": "path",
+            "required": true,
+            "description": "response_id path identifier.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "required": false,
+            "description": "Set true to replay and follow a stream-origin background Response.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "starting_after",
+            "in": "query",
+            "required": false,
+            "description": "Exclusive Responses event sequence_number cursor.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "object",
+                    "created_at",
+                    "completed_at",
+                    "status",
+                    "background",
+                    "output",
+                    "error"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^resp_",
+                      "description": "Process-local capability id scoped to caller authorization."
+                    },
+                    "object": {
+                      "const": "response"
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "description": "Creation time in Unix seconds."
+                    },
+                    "completed_at": {
+                      "oneOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Terminal transition time in Unix seconds."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "in_progress",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "incomplete"
+                      ]
+                    },
+                    "background": {
+                      "type": "boolean"
+                    },
+                    "output": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "description": "Empty while active; complete only when completed."
+                    },
+                    "error": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "code",
+                            "message"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string",
+                              "maxLength": 1000
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "OpenAI-shaped bounded error when failed."
+                    },
+                    "_llama_manager": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Optional additive manager diagnostics; never changes the OpenAI error shape."
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X GET 'http://localhost:5250/api/v1/responses/resp_example'"
+          },
+          {
+            "lang": "Python",
+            "source": "import requests\n\nresponse = requests.get('http://localhost:5250/api/v1/responses/resp_example')\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/v1/responses/resp_example');\nconsole.log(await response.json());"
+          }
+        ]
+      }
+    },
+    "/api/v1/responses/{response_id}/cancel": {
+      "post": {
+        "operationId": "post_api_v1_responses_response_id_cancel",
+        "summary": "Cancel a background Response",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Repeating cancellation returns the terminal Response unchanged.",
+        "tags": [
+          "openai"
+        ],
+        "parameters": [
+          {
+            "name": "response_id",
+            "in": "path",
+            "required": true,
+            "description": "response_id path identifier.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "object",
+                    "created_at",
+                    "completed_at",
+                    "status",
+                    "background",
+                    "output",
+                    "error"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^resp_",
+                      "description": "Process-local capability id scoped to caller authorization."
+                    },
+                    "object": {
+                      "const": "response"
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "description": "Creation time in Unix seconds."
+                    },
+                    "completed_at": {
+                      "oneOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Terminal transition time in Unix seconds."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "in_progress",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "incomplete"
+                      ]
+                    },
+                    "background": {
+                      "type": "boolean"
+                    },
+                    "output": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "description": "Empty while active; complete only when completed."
+                    },
+                    "error": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "code",
+                            "message"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string",
+                              "maxLength": 1000
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "OpenAI-shaped bounded error when failed."
+                    },
+                    "_llama_manager": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Optional additive manager diagnostics; never changes the OpenAI error shape."
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X POST 'http://localhost:5250/api/v1/responses/resp_example/cancel' -H 'Content-Type: application/json' -d '{}'"
+          },
+          {
+            "lang": "Python",
+            "source": "import json\nimport requests\n\npayload = json.loads(r'''{}''')\nresponse = requests.post('http://localhost:5250/api/v1/responses/resp_example/cancel', json=payload)\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/v1/responses/resp_example/cancel', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({})\n});\nconsole.log(await response.json());"
           }
         ],
         "requestBody": {
@@ -5267,7 +5726,7 @@
               },
               "examples": {
                 "example1": {
-                  "summary": "Create an OpenAI Responses API response example",
+                  "summary": "Cancel a background Response example",
                   "value": {}
                 }
               }
@@ -5713,7 +6172,7 @@
       "post": {
         "operationId": "post_api_v1_context_prepare",
         "summary": "Prepare a reusable inference context",
-        "description": "Measures the exact production-template input token count for a conversation and optionally prewarms its KV state. Set resident_only: true for a fail-closed measurement that never loads, switches, or evicts a model: if the concrete resolved model is not resident the call returns HTTP 200 with status \"skipped\". Residency is re-verified after the local inference lane is acquired, so a model swap racing the request yields \"model_no_longer_resident\" instead of certifying the wrong model. priority: \"background\" is bounded, preemptible maintenance work implying resident_only; arriving realtime inference cancels it and the lease reports status \"cancelled\". realtime cannot be requested here. Every response carries contextCacheContract plus both requestedModel and resolvedModel so an alias can never silently certify a different model. allow_model_load remains supported for existing callers but is unsafe for realtime background prewarming. Every lease carries a versioned timingEvidence record separating admission wait, input tokenization, and KV prefill as independently measured monotonic dimensions; a dimension that cannot be measured carries a typed reason and is never reported as zero. A prefill lease publishes an incomplete record at creation (HTTP 202) and a finalized one once background preparation settles, so poll GET /api/v1/context/{id} for the final measurements.",
+        "description": "Measures the exact production-template input token count for a conversation and optionally prewarms its KV state. Set resident_only: true for a fail-closed measurement that never loads, switches, or evicts a model: if the concrete resolved model is not resident the call returns HTTP 200 with status \"skipped\". Residency is re-verified after the local inference lane is acquired, so a model swap racing the request yields \"model_no_longer_resident\" instead of certifying the wrong model. priority: \"background\" is bounded, preemptible maintenance work implying resident_only; arriving realtime inference cancels it and the lease reports status \"cancelled\". realtime cannot be requested here. Every response carries contextCacheContract plus both requestedModel and resolvedModel so an alias can never silently certify a different model. allow_model_load remains supported for existing callers but is unsafe for realtime background prewarming. Every lease carries a versioned timingEvidence record separating admission wait, input tokenization, and KV prefill as independently measured monotonic dimensions; a dimension that cannot be measured carries a typed reason and is never reported as zero. A prefill lease publishes an incomplete record at creation (HTTP 202) and a finalized one once background preparation settles, so poll GET /api/v1/context/{id} for the final measurements. Ready prefill leases retain a private immutable copy of input-affecting fields for prepared_context_mode:\"append\"; callers send only a new text-message suffix and may vary output controls. The retained prefix is erased on release, expiry after 15 minutes, eviction, invalidation, or manager restart. For aliases, requestedModel identifies the caller alias while resolvedModel and compatibilityHash identify the effective concrete context; validate the effective fields returned by GET /api/v1/context/{id} before reuse.",
         "tags": [
           "context"
         ],
@@ -8108,7 +8567,7 @@
       "post": {
         "operationId": "post_v1_chat_completions",
         "summary": "Create a chat completion",
-        "description": "Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side. Question-mark-only assistant output is rejected with upstream_output_error / QUESTION_MARK_ONLY_OUTPUT; streamed clients must honor the structured SSE error envelope because heartbeat headers may already be committed. Non-streaming responses carry a versioned `_llama_manager.timingEvidence` record; streamed responses publish the same record on the LLM capture log. Served completions report queue admission and first emitted content as manager-measured, while input tokenization and inference start are explicitly unsupported because llama.cpp folds tokenization into prompt processing and never reports decode start — use POST /api/v1/context/prepare for certifiable tokenization and prefill measurements.",
+        "description": "Creates an OpenAI-compatible chat completion. Standard text, image_url, and input_audio parts pass through unchanged; video_url and audio_url are Llama Manager extensions expanded server-side. A ready llama.cpp prefill handle may be supplied with prepared_context_mode:\"append\" to combine manager-retained prefix messages with a new text-only suffix; conflicting input-affecting fields, multimodal suffixes, stale/wrong-scope/wrong-model handles, compatibility revision changes, and displaced slot ownership fail closed. Omitting append preserves exact full-prompt prepared-handle validation. DS4 rejects strict and append reuse because it has no compatible caller-visible slot primitive. Question-mark-only assistant output is rejected with upstream_output_error / QUESTION_MARK_ONLY_OUTPUT; streamed clients must honor the structured SSE error envelope because heartbeat headers may already be committed. Non-streaming responses carry a versioned `_llama_manager.timingEvidence` record; streamed responses publish the same record on the LLM capture log. Served completions report queue admission and first emitted content as manager-measured, while input tokenization and inference start are explicitly unsupported because llama.cpp folds tokenization into prompt processing and never reports decode start — use POST /api/v1/context/prepare for certifiable tokenization and prefill measurements.",
         "tags": [
           "openai"
         ],
@@ -8348,6 +8807,36 @@
                   "stream": {
                     "type": "boolean",
                     "default": false
+                  },
+                  "prepared_context_id": {
+                    "type": "string",
+                    "description": "Opaque handle returned by POST /api/v1/context/prepare."
+                  },
+                  "prepared_context_mode": {
+                    "type": "string",
+                    "enum": [
+                      "append"
+                    ],
+                    "description": "Compose text-only suffix messages with the manager-retained prepared prefix."
+                  },
+                  "context_cache_strict": {
+                    "type": "boolean",
+                    "description": "Reject unavailable exact prepared reuse instead of falling back cold."
+                  },
+                  "request_priority": {
+                    "type": "string",
+                    "enum": [
+                      "realtime",
+                      "interactive",
+                      "background"
+                    ]
+                  },
+                  "routing": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "local_only"
+                    ]
                   }
                 },
                 "additionalProperties": true
@@ -8500,7 +8989,7 @@
       "post": {
         "operationId": "post_v1_responses",
         "summary": "Create an OpenAI Responses API response",
-        "description": "Create an OpenAI Responses API response through the Llama Manager HTTP API.",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement. Prepared-context reuse remains a Chat Completions extension and is rejected on Responses so a suffix can never execute without its retained prefix.",
         "tags": [
           "openai"
         ],
@@ -8512,6 +9001,93 @@
               "application/json": {
                 "schema": {
                   "type": "object",
+                  "required": [
+                    "id",
+                    "object",
+                    "created_at",
+                    "completed_at",
+                    "status",
+                    "background",
+                    "output",
+                    "error"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^resp_",
+                      "description": "Process-local capability id scoped to caller authorization."
+                    },
+                    "object": {
+                      "const": "response"
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "description": "Creation time in Unix seconds."
+                    },
+                    "completed_at": {
+                      "oneOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Terminal transition time in Unix seconds."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "in_progress",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "incomplete"
+                      ]
+                    },
+                    "background": {
+                      "type": "boolean"
+                    },
+                    "output": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "description": "Empty while active; complete only when completed."
+                    },
+                    "error": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "code",
+                            "message"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string",
+                              "maxLength": 1000
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "OpenAI-shaped bounded error when failed."
+                    },
+                    "_llama_manager": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Optional additive manager diagnostics; never changes the OpenAI error shape."
+                    }
+                  },
                   "additionalProperties": true
                 }
               }
@@ -8521,15 +9097,357 @@
         "x-codeSamples": [
           {
             "lang": "cURL",
-            "source": "curl -s -X POST 'http://localhost:5250/v1/responses' -H 'Content-Type: application/json' -d '{}'"
+            "source": "curl -s -X POST 'http://localhost:5250/api/v1/responses' -H 'Content-Type: application/json' -d '{\"model\":\"default-big\",\"input\":\"Analyze this long document.\",\"background\":true,\"request_priority\":\"interactive\",\"routing\":\"auto\"}'"
           },
           {
             "lang": "Python",
-            "source": "import json\nimport requests\n\npayload = json.loads(r'''{}''')\nresponse = requests.post('http://localhost:5250/v1/responses', json=payload)\nprint(response.json())"
+            "source": "import json\nimport requests\n\npayload = json.loads(r'''{\"model\":\"default-big\",\"input\":\"Analyze this long document.\",\"background\":true,\"request_priority\":\"interactive\",\"routing\":\"auto\"}''')\nresponse = requests.post('http://localhost:5250/api/v1/responses', json=payload)\nprint(response.json())"
           },
           {
             "lang": "JavaScript",
-            "source": "const response = await fetch('http://localhost:5250/v1/responses', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({})\n});\nconsole.log(await response.json());"
+            "source": "const response = await fetch('http://localhost:5250/api/v1/responses', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({\"model\":\"default-big\",\"input\":\"Analyze this long document.\",\"background\":true,\"request_priority\":\"interactive\",\"routing\":\"auto\"})\n});\nconsole.log(await response.json());"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [],
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "input": {},
+                  "background": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "stream": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "request_priority": {
+                    "type": "string",
+                    "enum": [
+                      "realtime",
+                      "interactive",
+                      "background"
+                    ]
+                  },
+                  "routing": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "local_only"
+                    ]
+                  }
+                },
+                "additionalProperties": true
+              },
+              "examples": {
+                "example1": {
+                  "summary": "Create a background Response example",
+                  "value": {
+                    "model": "default-big",
+                    "input": "Analyze this long document.",
+                    "background": true,
+                    "request_priority": "interactive",
+                    "routing": "auto"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/responses/{response_id}": {
+      "get": {
+        "operationId": "get_v1_responses_response_id",
+        "summary": "Retrieve or stream a background Response",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Add stream=true and optional starting_after to resume a stream-origin Response.",
+        "tags": [
+          "openai"
+        ],
+        "parameters": [
+          {
+            "name": "response_id",
+            "in": "path",
+            "required": true,
+            "description": "response_id path identifier.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "required": false,
+            "description": "Set true to replay and follow a stream-origin background Response.",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "starting_after",
+            "in": "query",
+            "required": false,
+            "description": "Exclusive Responses event sequence_number cursor.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "object",
+                    "created_at",
+                    "completed_at",
+                    "status",
+                    "background",
+                    "output",
+                    "error"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^resp_",
+                      "description": "Process-local capability id scoped to caller authorization."
+                    },
+                    "object": {
+                      "const": "response"
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "description": "Creation time in Unix seconds."
+                    },
+                    "completed_at": {
+                      "oneOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Terminal transition time in Unix seconds."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "in_progress",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "incomplete"
+                      ]
+                    },
+                    "background": {
+                      "type": "boolean"
+                    },
+                    "output": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "description": "Empty while active; complete only when completed."
+                    },
+                    "error": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "code",
+                            "message"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string",
+                              "maxLength": 1000
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "OpenAI-shaped bounded error when failed."
+                    },
+                    "_llama_manager": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Optional additive manager diagnostics; never changes the OpenAI error shape."
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X GET 'http://localhost:5250/v1/responses/resp_example'"
+          },
+          {
+            "lang": "Python",
+            "source": "import requests\n\nresponse = requests.get('http://localhost:5250/v1/responses/resp_example')\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/v1/responses/resp_example');\nconsole.log(await response.json());"
+          }
+        ]
+      }
+    },
+    "/v1/responses/{response_id}/cancel": {
+      "post": {
+        "operationId": "post_v1_responses_response_id_cancel",
+        "summary": "Cancel a background Response",
+        "description": "With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404. Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work. Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles. Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result. Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history. A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete. This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings. Repeating cancellation returns the terminal Response unchanged.",
+        "tags": [
+          "openai"
+        ],
+        "parameters": [
+          {
+            "name": "response_id",
+            "in": "path",
+            "required": true,
+            "description": "response_id path identifier.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "object",
+                    "created_at",
+                    "completed_at",
+                    "status",
+                    "background",
+                    "output",
+                    "error"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^resp_",
+                      "description": "Process-local capability id scoped to caller authorization."
+                    },
+                    "object": {
+                      "const": "response"
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "description": "Creation time in Unix seconds."
+                    },
+                    "completed_at": {
+                      "oneOf": [
+                        {
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Terminal transition time in Unix seconds."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "in_progress",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "incomplete"
+                      ]
+                    },
+                    "background": {
+                      "type": "boolean"
+                    },
+                    "output": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      },
+                      "description": "Empty while active; complete only when completed."
+                    },
+                    "error": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "code",
+                            "message"
+                          ],
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "message": {
+                              "type": "string",
+                              "maxLength": 1000
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "OpenAI-shaped bounded error when failed."
+                    },
+                    "_llama_manager": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Optional additive manager diagnostics; never changes the OpenAI error shape."
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X POST 'http://localhost:5250/v1/responses/resp_example/cancel' -H 'Content-Type: application/json' -d '{}'"
+          },
+          {
+            "lang": "Python",
+            "source": "import json\nimport requests\n\npayload = json.loads(r'''{}''')\nresponse = requests.post('http://localhost:5250/v1/responses/resp_example/cancel', json=payload)\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/v1/responses/resp_example/cancel', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({})\n});\nconsole.log(await response.json());"
           }
         ],
         "requestBody": {
@@ -8542,7 +9460,7 @@
               },
               "examples": {
                 "example1": {
-                  "summary": "Create an OpenAI Responses API response example",
+                  "summary": "Cancel a background Response example",
                   "value": {}
                 }
               }

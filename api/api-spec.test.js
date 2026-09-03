@@ -283,12 +283,13 @@ test('contracts 1-8: Responses docs expose OpenAI background create, retrieve, c
     assert.equal(create.requestSchema.required.includes('background'), false);
     assert.match(create.description, /background/i);
     assert.match(create.description, /synchronous/i);
-    for (const extension of [
-      'prepared_context_id', 'prepared_context_mode', 'context_cache_strict',
-      'request_priority', 'routing',
-    ]) {
+    for (const extension of ['request_priority', 'routing']) {
       assert.ok(create.requestSchema.properties[extension], `${prefix} Responses must document ${extension}`);
     }
+    for (const unsupported of ['prepared_context_id', 'prepared_context_mode', 'context_cache_strict']) {
+      assert.equal(create.requestSchema.properties[unsupported], undefined);
+    }
+    assert.match(create.description, /chat completions/i);
 
     const response = retrieve.responseSchema.properties;
     assert.match(response.id.pattern, /resp_/);

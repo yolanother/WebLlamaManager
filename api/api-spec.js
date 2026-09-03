@@ -181,8 +181,8 @@ const RESPONSE_SCHEMA = {
     object: { const: 'response' },
     created_at: { type: 'integer', description: 'Creation time in Unix seconds.' },
     completed_at: { oneOf: [{ type: 'integer' }, { type: 'null' }], description: 'Terminal transition time in Unix seconds.' },
-    status: { type: 'string', enum: ['queued', 'in_progress', 'completed', 'failed', 'cancelled'] },
-    background: { const: true },
+    status: { type: 'string', enum: ['queued', 'in_progress', 'completed', 'failed', 'cancelled', 'incomplete'] },
+    background: { type: 'boolean' },
     output: { type: 'array', items: GENERIC_OBJECT_SCHEMA, description: 'Empty while active; complete only when completed.' },
     error: {
       oneOf: [{
@@ -193,22 +193,24 @@ const RESPONSE_SCHEMA = {
       }, { type: 'null' }],
       description: 'OpenAI-shaped bounded error when failed.',
     },
+    _llama_manager: { type: 'object', additionalProperties: true, description: 'Optional additive manager diagnostics; never changes the OpenAI error shape.' },
   },
   additionalProperties: true,
 };
 
 const RESPONSE_BACKGROUND_LIFECYCLE = [
-  'With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return HTTP 404.',
+  'With background:true, creation returns an OpenAI Response resource whose resp_ id is process-local and authorization scoped; missing, expired, and differently scoped ids return the same not-found HTTP 404.',
   'Polling exposes queued or in_progress without partial output and returns the whole final Response for completed, failed, or cancelled work.',
   'Cancellation is idempotent and public immediately; queued work is removed and active work is cooperatively aborted, while capacity remains charged until execution settles.',
   'Terminal records are retained for about 10 minutes after settlement. Limits are 128 responses globally, 32 per scope, 4 MiB per request, 64 MiB of active request bodies globally, 16 MiB per scope, and 16 MiB per result.',
   'Background stream creation and GET with stream=true retain standard Responses events with monotonic sequence_number. starting_after is exclusive. Replay is available only when the original request used stream:true and event count/byte caps fail the Response instead of dropping history.',
+  'A retained stream ends with response.completed, response.failed, response.cancelled, or response.incomplete.',
   'This transport avoids the measured 90-second gateway connection ceiling. It does not change the manager’s 600-second backend-attempt or 180-second model-load ceilings.',
 ].join(' ');
 
 const RESPONSE_REQUEST_SCHEMA = {
   type: 'object',
-  required: ['model', 'input'],
+  required: [],
   properties: {
     model: { type: 'string' },
     input: {},
@@ -221,7 +223,7 @@ const RESPONSE_REQUEST_SCHEMA = {
 };
 
 const RESPONSE_CREATE_OPTIONS = {
-  description: `${RESPONSE_BACKGROUND_LIFECYCLE} Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement.`,
+  description: `${RESPONSE_BACKGROUND_LIFECYCLE} Background execution loops through this same synchronous Responses route with background stripped, preserving alias resolution, routing, priority, and admission. Private request bodies and retained Authorization/X-Llama policy headers are erased after settlement. Prepared-context reuse remains a Chat Completions extension and is rejected on Responses so a suffix can never execute without its retained prefix.`,
   requestSchema: RESPONSE_REQUEST_SCHEMA,
   responseSchema: RESPONSE_SCHEMA,
   examples: [makeExample('POST', '/api/v1/responses', 'Create a background Response', {
@@ -236,6 +238,10 @@ const RESPONSE_CREATE_OPTIONS = {
 const RESPONSE_GET_OPTIONS = {
   description: `${RESPONSE_BACKGROUND_LIFECYCLE} Add stream=true and optional starting_after to resume a stream-origin Response.`,
   responseSchema: RESPONSE_SCHEMA,
+  params: [
+    { name: 'stream', in: 'query', required: false, description: 'Set true to replay and follow a stream-origin background Response.', schema: { type: 'boolean' } },
+    { name: 'starting_after', in: 'query', required: false, description: 'Exclusive Responses event sequence_number cursor.', schema: { type: 'integer', minimum: 0 } },
+  ],
 };
 
 const RESPONSE_CANCEL_OPTIONS = {
@@ -259,7 +265,7 @@ function examplePath(path) {
     n: '0',
     pid: '1234',
     presetId: 'default',
-    responseId: 'resp_example',
+    response_id: 'resp_example',
   };
   return path.replace(/\{([^}]+)\}/g, (_match, name) => values[name] ?? 'example');
 }
@@ -706,7 +712,7 @@ const CONTEXT_PREPARE_OPTIONS = {
     'allow_model_load remains supported for existing callers but is unsafe for realtime background prewarming.',
     'Every lease carries a versioned timingEvidence record separating admission wait, input tokenization, and KV prefill as independently measured monotonic dimensions; a dimension that cannot be measured carries a typed reason and is never reported as zero.',
     'A prefill lease publishes an incomplete record at creation (HTTP 202) and a finalized one once background preparation settles, so poll GET /api/v1/context/{id} for the final measurements.',
-    'Ready prefill leases retain a private immutable copy of input-affecting fields for prepared_context_mode:"append"; callers send only a new text-message suffix and may vary output controls. The retained prefix is erased on release, 15-minute expiry, eviction, invalidation, or manager restart.',
+    'Ready prefill leases retain a private immutable copy of input-affecting fields for prepared_context_mode:"append"; callers send only a new text-message suffix and may vary output controls. The retained prefix is erased on release, expiry after 15 minutes, eviction, invalidation, or manager restart.',
     'For aliases, requestedModel identifies the caller alias while resolvedModel and compatibilityHash identify the effective concrete context; validate the effective fields returned by GET /api/v1/context/{id} before reuse.',
   ].join(' '),
   requestSchema: CONTEXT_PREPARE_REQUEST_SCHEMA,
@@ -1038,8 +1044,8 @@ const ROUTES = [
   ['POST', '/api/embed/model', 'models', 'Set the active embedding model'],
   ['GET', '/api/v1/models/{model}', 'openai', 'Get an OpenAI-compatible model'],
   ['POST', '/api/v1/responses', 'openai', 'Create an OpenAI Responses API response', RESPONSE_CREATE_OPTIONS],
-  ['GET', '/api/v1/responses/{responseId}', 'openai', 'Retrieve or stream a background Response', RESPONSE_GET_OPTIONS],
-  ['POST', '/api/v1/responses/{responseId}/cancel', 'openai', 'Cancel a background Response', RESPONSE_CANCEL_OPTIONS],
+  ['GET', '/api/v1/responses/{response_id}', 'openai', 'Retrieve or stream a background Response', RESPONSE_GET_OPTIONS],
+  ['POST', '/api/v1/responses/{response_id}/cancel', 'openai', 'Cancel a background Response', RESPONSE_CANCEL_OPTIONS],
   ['POST', '/api/v1/responses/input_tokens', 'openai', 'Count exact rendered Responses API input tokens'],
   ['POST', '/api/v1/messages', 'openai', 'Create an Anthropic-compatible message'],
   ['POST', '/api/v1/messages/count_tokens', 'openai', 'Count Anthropic message tokens'],
@@ -1061,8 +1067,8 @@ const ROUTES = [
   ['POST', '/v1/completions', 'openai', 'Create a legacy text completion'],
   ['POST', '/v1/embeddings', 'openai', 'Create vector embeddings'],
   ['POST', '/v1/responses', 'openai', 'Create an OpenAI Responses API response', RESPONSE_CREATE_OPTIONS],
-  ['GET', '/v1/responses/{responseId}', 'openai', 'Retrieve or stream a background Response', RESPONSE_GET_OPTIONS],
-  ['POST', '/v1/responses/{responseId}/cancel', 'openai', 'Cancel a background Response', RESPONSE_CANCEL_OPTIONS],
+  ['GET', '/v1/responses/{response_id}', 'openai', 'Retrieve or stream a background Response', RESPONSE_GET_OPTIONS],
+  ['POST', '/v1/responses/{response_id}/cancel', 'openai', 'Cancel a background Response', RESPONSE_CANCEL_OPTIONS],
   ['POST', '/v1/messages', 'openai', 'Create an Anthropic-compatible message'],
   ['POST', '/v1/messages/count_tokens', 'openai', 'Count Anthropic message tokens'],
   ['POST', '/v1/rerank', 'openai', 'Rerank documents'],

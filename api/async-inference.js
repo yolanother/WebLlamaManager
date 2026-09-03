@@ -9,8 +9,9 @@
 
 import { randomBytes } from 'node:crypto';
 
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'incomplete']);
 const RETAINED_HEADER_NAMES = new Set(['authorization', 'x-llama-priority', 'x-llama-routing']);
+const PREPARED_CONTEXT_FIELDS = ['prepared_context_id', 'prepared_context_mode', 'context_cache_strict'];
 
 /** Error carrying the HTTP status and stable code for rejected submission. */
 export class InferenceJobSubmissionError extends Error {
@@ -25,6 +26,28 @@ export class InferenceJobSubmissionError extends Error {
     this.statusCode = statusCode;
     this.status = statusCode;
     this.code = code;
+  }
+}
+
+/**
+ * Reject prepared-context extensions on the Responses surface.
+ *
+ * Prepared append is implemented by Chat Completions because it operates on
+ * retained chat-template messages and a llama.cpp slot. Accepting these fields
+ * on Responses would otherwise risk executing only the suffix.
+ *
+ * @param {Record<string, unknown>} body Responses request body.
+ * @returns {void}
+ * @throws {InferenceJobSubmissionError} When a prepared-context field is present.
+ */
+export function assertResponsesContextSupported(body = {}) {
+  const field = PREPARED_CONTEXT_FIELDS.find(name => Object.hasOwn(body, name));
+  if (field) {
+    throw new InferenceJobSubmissionError(
+      `${field} is supported by Chat Completions, not Responses`,
+      400,
+      'prepared_context_not_supported_for_responses',
+    );
   }
 }
 
@@ -54,7 +77,7 @@ function boundedError(error, defaults = {}) {
 
 /** Create the canonical safe Response skeleton for a retained record. */
 function responseSkeleton(record) {
-  return {
+  const response = {
     id: record.id,
     object: 'response',
     created_at: Math.floor(record.createdAt / 1000),
@@ -65,13 +88,15 @@ function responseSkeleton(record) {
     output: [],
     error: record.status === 'failed' ? record.error : null,
   };
+  if (record.managerDiagnostics) response._llama_manager = cloneJson(record.managerDiagnostics);
+  return response;
 }
 
 /** Return a defensive canonical Response projection. */
 function publicResponse(record) {
   if (!record) return null;
   if (!record.response) return responseSkeleton(record);
-  return cloneJson({
+  const response = {
     ...record.response,
     id: record.id,
     object: 'response',
@@ -79,7 +104,10 @@ function publicResponse(record) {
     completed_at: record.publicCompletedAt == null ? null : Math.floor(record.publicCompletedAt / 1000),
     status: record.status,
     background: true,
-  });
+    error: record.status === 'failed' ? record.error : (record.response.error ?? null),
+  };
+  if (record.managerDiagnostics) response._llama_manager = cloneJson(record.managerDiagnostics);
+  return cloneJson(response);
 }
 
 /** Extract a bounded structured upstream error. */
@@ -176,10 +204,9 @@ export class InferenceJobStore {
   submit({ scopeId, body, headers = {} } = {}) {
     if (!scopeId) throw new InferenceJobSubmissionError('scopeId is required', 400, 'INVALID_REQUEST');
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new InferenceJobSubmissionError('request body must be an object', 400, 'INVALID_REQUEST');
-    if (typeof body.model !== 'string' || !body.model.trim()) throw new InferenceJobSubmissionError('model must be a non-empty string', 400, 'INVALID_REQUEST');
-    if (body.input === undefined || body.input === null || body.input === '' || (Array.isArray(body.input) && body.input.length === 0)) {
-      throw new InferenceJobSubmissionError('input must not be empty', 400, 'INVALID_REQUEST');
-    }
+    if (body.background !== true) throw new InferenceJobSubmissionError('background must be true', 400, 'invalid_request');
+    assertResponsesContextSupported(body);
+    if (body.model !== undefined && (typeof body.model !== 'string' || !body.model.trim())) throw new InferenceJobSubmissionError('model must be a non-empty string when supplied', 400, 'invalid_request');
     const executionBody = { ...body };
     delete executionBody.background;
     let serialized;
@@ -198,11 +225,12 @@ export class InferenceJobStore {
     const id = this.createId();
     if (typeof id !== 'string' || !id.startsWith('resp_') || this.records.has(id)) throw new InferenceJobSubmissionError('could not allocate an opaque Response id', 500, 'RESPONSE_ID_ALLOCATION_FAILED');
     const record = {
-      id, scopeId, model: body.model, status: 'queued', createdAt, publicCompletedAt: null,
+      id, scopeId, model: body.model || 'default', status: 'queued', createdAt, publicCompletedAt: null,
       expiresAt: null, response: null, error: null, requestBytes,
       requestBody: cloneJson(null, serialized), requestHeaders: retainedHeaders(headers),
       abortController: new AbortController(), executionSettled: false,
-      streaming: body.stream === true, events: [], eventBytes: 0, nextSequence: 1, listeners: new Set(),
+      streaming: body.stream === true, events: [], eventBytes: 0, nextSequence: 1,
+      terminalEventPublished: false, streamClosed: false, listeners: new Set(), managerDiagnostics: null,
     };
     this.records.set(id, record);
     queueMicrotask(() => this.#run(record));
@@ -262,7 +290,8 @@ export class InferenceJobStore {
   replay(id, scopeId, { startingAfter = 0 } = {}) {
     this.prune();
     const record = this.records.get(id);
-    if (!record || record.scopeId !== scopeId || !record.streaming) return null;
+    if (!record || record.scopeId !== scopeId) return null;
+    if (!record.streaming) throw new InferenceJobSubmissionError('background stream was not enabled for this Response', 400, 'background_stream_not_enabled');
     const cursor = this.#cursor(startingAfter);
     return record.events.filter(event => event.sequence_number > cursor).map(event => cloneJson(event));
   }
@@ -277,7 +306,8 @@ export class InferenceJobStore {
   follow(id, scopeId, { startingAfter = 0, signal } = {}) {
     this.prune();
     const record = this.records.get(id);
-    if (!record || record.scopeId !== scopeId || !record.streaming) return null;
+    if (!record || record.scopeId !== scopeId) return null;
+    if (!record.streaming) throw new InferenceJobSubmissionError('background stream was not enabled for this Response', 400, 'background_stream_not_enabled');
     let cursor = this.#cursor(startingAfter);
     return (async function* iterate() {
       while (true) {
@@ -285,13 +315,17 @@ export class InferenceJobStore {
           cursor = event.sequence_number;
           yield cloneJson(event);
         }
-        if (TERMINAL_STATUSES.has(record.status) || signal?.aborted) return;
+        if (signal?.aborted) return;
+        if (record.streamClosed) {
+          if (record.events.some(candidate => candidate.sequence_number > cursor)) continue;
+          return;
+        }
         await new Promise(resolve => {
           const wake = () => { cleanup(); resolve(); };
           const cleanup = () => { record.listeners.delete(wake); signal?.removeEventListener('abort', wake); };
           record.listeners.add(wake);
           signal?.addEventListener('abort', wake, { once: true });
-          if (TERMINAL_STATUSES.has(record.status) || signal?.aborted) wake();
+          if (record.streamClosed || signal?.aborted) wake();
         });
       }
     })();
@@ -310,7 +344,10 @@ export class InferenceJobStore {
     if (TERMINAL_STATUSES.has(record.status)) return publicResponse(record);
     record.status = 'cancelled';
     record.publicCompletedAt = this.now();
-    if (record.streaming) this.#appendEvent(record, { type: 'response.cancelled', response: publicResponse(record) });
+    if (record.streaming) {
+      try { this.#appendEvent(record, { type: 'response.cancelled', response: publicResponse(record) }); } catch { /* cancellation remains terminal */ }
+      record.streamClosed = true;
+    }
     try { record.abortController.abort('cancelled'); } catch { /* best effort */ }
     this.#notify(record);
     return publicResponse(record);
@@ -353,19 +390,40 @@ export class InferenceJobStore {
       if (!Number.isInteger(status) || status < 200 || status >= 300) {
         record.status = 'failed';
         record.error = upstreamError(Number.isInteger(status) ? status : 502, result?.body);
+        const upstreamType = result?.body?.error?.type;
+        record.managerDiagnostics = {
+          background_response: {
+            upstream_status: Number.isInteger(status) ? status : 502,
+            ...(upstreamType ? { upstream_error_type: String(upstreamType).slice(0, 100) } : {}),
+          },
+        };
+      } else if (result?.body?.status === 'failed') {
+        record.status = 'failed';
+        record.error = boundedError(result.body.error, { code: 'response_failed' });
+        record.response = cloneJson(result.body);
+      } else if (result?.body?.status === 'incomplete' && Array.isArray(result.body.output)) {
+        const incomplete = { ...result.body, id: record.id, object: 'response', status: 'incomplete', background: true };
+        const serialized = JSON.stringify(incomplete);
+        if (Buffer.byteLength(serialized) > this.maxResultBytes) {
+          record.status = 'failed';
+          record.error = boundedError(`Response result exceeds ${this.maxResultBytes} bytes`, { code: 'result_too_large' });
+        } else {
+          record.status = 'incomplete';
+          record.response = cloneJson(null, serialized);
+        }
       } else if (!isCompleteResponse(result?.body)) {
         record.status = 'failed';
-        record.error = boundedError('Responses request returned no complete output', { status: 502, code: 'INVALID_RESPONSE' });
+        record.error = boundedError('Responses request returned no complete output', { code: 'invalid_upstream_response' });
       } else {
         const completed = { ...result.body, id: record.id, object: 'response', status: 'completed', background: true };
         let serialized;
         try { serialized = JSON.stringify(completed); } catch { serialized = null; }
         if (!serialized) {
           record.status = 'failed';
-          record.error = boundedError('Response result was not JSON serializable', { status: 502, code: 'INVALID_RESPONSE' });
+          record.error = boundedError('Response result was not JSON serializable', { code: 'invalid_upstream_response' });
         } else if (Buffer.byteLength(serialized) > this.maxResultBytes) {
           record.status = 'failed';
-          record.error = boundedError(`Response result exceeds ${this.maxResultBytes} bytes`, { status: 502, code: 'RESULT_TOO_LARGE' });
+          record.error = boundedError(`Response result exceeds ${this.maxResultBytes} bytes`, { code: 'result_too_large' });
         } else {
           record.status = 'completed';
           record.response = cloneJson(null, serialized);
@@ -374,13 +432,14 @@ export class InferenceJobStore {
     } catch (error) {
       if (record.status !== 'cancelled' && record.status !== 'failed') {
         record.status = 'failed';
-        record.error = boundedError(error, { status: 502, type: 'transport_error', code: 'RESPONSE_TRANSPORT_FAILED' });
+        record.error = boundedError(error, { code: 'response_transport_failed' });
       }
     } finally {
       if (!record.publicCompletedAt) record.publicCompletedAt = this.now();
-      if (record.streaming && record.status === 'failed') {
-        try { this.#appendEvent(record, { type: 'response.failed', response: publicResponse(record) }); } catch { /* state remains pollable */ }
+      if (record.streaming && TERMINAL_STATUSES.has(record.status) && !record.terminalEventPublished) {
+        try { this.#appendEvent(record, { type: `response.${record.status}`, response: publicResponse(record) }); } catch { /* state remains pollable */ }
       }
+      record.streamClosed = true;
       this.#settle(record);
     }
   }
@@ -392,10 +451,11 @@ export class InferenceJobStore {
     const bytes = Buffer.byteLength(JSON.stringify(normalized));
     this.#reclaimSettledEvents(bytes, record.id);
     if (record.events.length >= this.maxEventsPerResponse || record.eventBytes + bytes > this.maxEventBytesPerResponse || this.#eventBytes() + bytes > this.maxRetainedEventBytes) {
-      throw new InferenceJobSubmissionError('retained streaming event capacity exceeded', 502, 'EVENT_LOG_CAPACITY_EXCEEDED');
+      throw new InferenceJobSubmissionError('retained streaming event capacity exceeded', 502, 'event_retention_exceeded');
     }
     record.events.push(normalized);
     record.eventBytes += bytes;
+    if (/^response\.(?:completed|failed|cancelled|incomplete)$/.test(normalized.type)) record.terminalEventPublished = true;
     this.#notify(record);
     return cloneJson(normalized);
   }
@@ -404,8 +464,9 @@ export class InferenceJobStore {
   #failEventCapacity(record, error) {
     if (TERMINAL_STATUSES.has(record.status)) return;
     record.status = 'failed';
-    record.error = boundedError(error, { status: 502, code: 'EVENT_LOG_CAPACITY_EXCEEDED' });
+    record.error = boundedError(error, { code: 'event_retention_exceeded' });
     record.publicCompletedAt = this.now();
+    record.streamClosed = true;
     try { record.abortController.abort('event_capacity'); } catch { /* best effort */ }
     this.#notify(record);
   }

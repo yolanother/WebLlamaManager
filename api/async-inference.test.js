@@ -157,7 +157,7 @@ test('contract 6: a serialized background request over 4 MiB is rejected before 
   assert.equal(executions, 0);
 });
 
-test('contracts 8 and 9: execution strips background recursion while retaining policy and prepared context', async () => {
+test('contracts 8 and 9: execution strips background recursion, retains policy, and rejects unsupported prepared context', async () => {
   let captured;
   const store = new InferenceJobStore({
     execute: async input => {
@@ -167,9 +167,6 @@ test('contracts 8 and 9: execution strips background recursion while retaining p
   });
   const body = requestBody({
     temperature: 0.25,
-    prepared_context_id: 'ctx_private',
-    prepared_context_mode: 'append',
-    context_cache_strict: true,
     request_priority: 'background',
     routing: 'local_only',
   });
@@ -188,9 +185,6 @@ test('contracts 8 and 9: execution strips background recursion while retaining p
   await waitFor(() => captured);
   assert.equal(Object.hasOwn(captured.body, 'background'), false, 'loopback execution must not recurse');
   assert.deepEqual(captured.body.input, body.input);
-  assert.equal(captured.body.prepared_context_id, 'ctx_private');
-  assert.equal(captured.body.prepared_context_mode, 'append');
-  assert.equal(captured.body.context_cache_strict, true);
   assert.equal(captured.body.request_priority, 'background');
   assert.equal(captured.body.routing, 'local_only');
   assert.equal(headerValue(captured.headers, 'authorization'), 'Bearer tenant-secret');
@@ -202,12 +196,17 @@ test('contracts 8 and 9: execution strips background recursion while retaining p
   const completed = await waitFor(() => store.get(submitted.id, 'scope_a')?.status === 'completed'
     && store.get(submitted.id, 'scope_a'));
   const publicJson = JSON.stringify(completed);
-  for (const secret of ['tenant-secret', 'ctx_private', 'session=must-not-be-retained']) {
+  for (const secret of ['tenant-secret', 'session=must-not-be-retained']) {
     assert.equal(publicJson.includes(secret), false, `${secret} leaked through the Response resource`);
   }
   assert.equal(Object.hasOwn(completed, 'body'), false);
   assert.equal(Object.hasOwn(completed, 'headers'), false);
   assert.equal(Object.hasOwn(completed, 'scopeId'), false);
+
+  assertSubmitError(() => store.submit({
+    scopeId: 'scope_a',
+    body: requestBody({ prepared_context_id: 'ctx_private', prepared_context_mode: 'append' }),
+  }), 400);
 });
 
 test('contracts 5 and 6: ids are scope-bound and expire about 10 minutes after settlement', async () => {

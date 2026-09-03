@@ -67,11 +67,11 @@ export function composePreparedContextAppend({ preparedBody, suffixBody } = {}) 
     throw appendConflict('prepared context does not retain a reusable message prefix', 'PREPARED_CONTEXT_PREFIX_UNAVAILABLE');
   }
   if (!suffixBody || typeof suffixBody !== 'object' || !Array.isArray(suffixBody.messages) || suffixBody.messages.length === 0) {
-    throw appendConflict('append mode requires a non-empty messages suffix');
+    throw appendConflict('append mode requires a non-empty messages suffix', 'PREPARED_CONTEXT_APPEND_INVALID_SUFFIX');
   }
   for (const message of suffixBody.messages) {
     if (!message || typeof message !== 'object' || typeof message.role !== 'string' || typeof message.content !== 'string') {
-      throw appendConflict('append mode accepts text-only message suffixes', 'PREPARED_CONTEXT_MULTIMODAL_UNSUPPORTED');
+      throw appendConflict('append mode accepts text-only message suffixes', 'PREPARED_CONTEXT_APPEND_INVALID_SUFFIX');
     }
   }
 

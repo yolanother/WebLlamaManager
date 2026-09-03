@@ -338,14 +338,17 @@ export const tools = [
         max_tokens: {
           type: 'number',
           description: 'Maximum tokens to generate'
-        }
+        },
+        prepared_context_id: { type: 'string', description: 'Optional manager prepared-context handle.' },
+        prepared_context_mode: { type: 'string', enum: ['append'], description: 'Append these text messages to a retained prepared prefix.' },
+        context_cache_strict: { type: 'boolean', description: 'Fail closed if exact prepared reuse is unavailable.' }
       },
       required: ['model', 'messages']
     }
   },
   {
     name: 'submit_response',
-    description: 'Create an OpenAI background Response. Returns a resp_ id immediately for polling with get_response.',
+    description: 'Create an OpenAI background Response when work may exceed the client or proxy time budget. Returns a resp_ id for get_response; use llama_chat for simple blocking chat.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -355,14 +358,15 @@ export const tools = [
         max_output_tokens: { type: 'number', description: 'Maximum output tokens.' },
         priority: { type: 'string', enum: ['realtime', 'interactive', 'background'], description: 'Manager queue priority, mapped to request_priority.' },
         routing: { type: 'string', enum: ['auto', 'local_only'], description: 'Manager routing policy.' },
+        stream: { type: 'boolean', description: 'Stream now while retaining events for later resume.' },
       },
       required: ['model', 'input'],
-      additionalProperties: true,
+      additionalProperties: false,
     }
   },
   {
     name: 'get_response',
-    description: 'Retrieve a scope-owned OpenAI background Response by its resp_ id.',
+    description: 'Retrieve a scope-owned OpenAI background Response by its resp_ id, or resume retained events after a sequence_number cursor.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -501,11 +505,14 @@ export async function handleTool(name, args) {
       };
       if (args.temperature !== undefined) body.temperature = args.temperature;
       if (args.max_tokens !== undefined) body.max_tokens = args.max_tokens;
+      if (args.prepared_context_id !== undefined) body.prepared_context_id = args.prepared_context_id;
+      if (args.prepared_context_mode !== undefined) body.prepared_context_mode = args.prepared_context_mode;
+      if (args.context_cache_strict !== undefined) body.context_cache_strict = args.context_cache_strict;
       return apiCall('POST', '/api/v1/chat/completions', body);
     }
 
     case 'submit_response': {
-      const body = { ...args, background: true, stream: false };
+      const body = { ...args, background: true };
       if (args.priority !== undefined) {
         body.request_priority = args.priority;
         delete body.priority;
