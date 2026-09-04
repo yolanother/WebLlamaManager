@@ -47,12 +47,13 @@ export function classifyCard({ gttBytes, systemBytes } = {}) {
  * Builds the ordered GPU inventory, inference card first.
  *
  * @param {Array<object>} cards One entry per card as read from sysfs. Recognised
- *   keys: `card`, `name`, `driver`, `vramBytes`, `gttBytes`, `available`,
+ *   keys: `card`, `name`, `driver`, `vramBytes`, `vramSource`, `gttBytes`, `available`,
  *   `temperature`, `usage`, `power`, `coreClock`, `memClock`.
  * @param {?number} systemBytes Total system memory in bytes.
  * @returns {Array<object>} One entry per card, inference card first, each with
  *   `card`, `name`, `driver`, `kind`, `inference`, `available`, `reason`,
- *   `vramBytes`, `gttBytes`, `systemBytes` and the telemetry fields. An empty
+ *   `vramBytes`, `vramSource`, `gttBytes`, `systemBytes` and the telemetry
+ *   fields. An empty
  *   array when the machine has no GPU -- never a placeholder card.
  */
 export function buildInventory(cards, systemBytes) {
@@ -72,6 +73,10 @@ export function buildInventory(cards, systemBytes) {
       // Unknown is null, never 0. A confident zero and a silent omission are
       // both worse than an honest "unknown", and this readout has shipped both.
       vramBytes: raw.vramBytes ?? null,
+      // WHICH source answered for vramBytes, so a caller can say so. An
+      // aperture figure over-reports (a 24 GiB card shows a 32 GiB BAR) and
+      // must be presented as an estimate rather than a measurement.
+      vramSource: raw.vramSource ?? null,
       gttBytes: raw.gttBytes ?? null,
       systemBytes: systemBytes ?? null,
       temperature: raw.temperature ?? null,
@@ -138,4 +143,117 @@ export function parseRocmSmiCards(data) {
     };
   }
   return out;
+}
+
+/**
+ * PCI vendor ids to the vendor name a readout should show. Mirrors PCI_VENDORS
+ * in the kiosk agent -- the two must not drift, or the panel and the dashboard
+ * will name the same card differently.
+ * @type {Object<string,string>}
+ */
+export const PCI_VENDORS = {
+  '0x1002': 'AMD',
+  '0x10de': 'NVIDIA',
+  '0x8086': 'Intel',
+};
+
+/**
+ * PCI vendor id NVIDIA cards answer to. `nvidia-smi` is asked about those and
+ * only those, so a card from another vendor can never be handed an NVIDIA
+ * card's VRAM figure.
+ * @type {string}
+ */
+export const NVIDIA_VENDOR_ID = '0x10de';
+
+/**
+ * Smallest BAR that can plausibly BE a card's VRAM aperture. Below this the BAR
+ * is a window onto a fraction of VRAM -- a card without resizable BAR shows
+ * 256 MiB -- and reporting it would be confidently wrong, which is worse than
+ * saying nothing. Mirrors MIN_VRAM_BAR_BYTES in the kiosk agent.
+ * @type {number}
+ */
+export const MIN_VRAM_BAR_BYTES = 1024 ** 3;
+
+/** PCI resource flag: the BAR is memory. From include/linux/ioport.h. */
+const PCI_RESOURCE_MEM = 0x200;
+
+/** PCI resource flag: the BAR is prefetchable. From include/linux/ioport.h. */
+const PCI_RESOURCE_PREFETCH = 0x2000;
+
+/**
+ * Sizes a card's largest prefetchable memory BAR from its sysfs `resource` file.
+ *
+ * This is the vendor-neutral last resort for a discrete card's dedicated VRAM:
+ * it needs no driver-specific sysfs and no vendor tool, so it answers for a
+ * card on nouveau that publishes neither. It OVER-reports -- a 24 GiB RTX 3090
+ * exposes a 32 GiB BAR -- which is why the caller records `vramSource` and the
+ * dashboard labels an aperture figure an estimate rather than a measurement.
+ *
+ * @param {?string} resourceText Contents of the card's `device/resource` file,
+ *   one `start end flags` triplet of hex values per line. Null or empty when
+ *   the file is absent.
+ * @returns {?number} Aperture size in bytes, or null when there is no
+ *   prefetchable memory BAR of at least MIN_VRAM_BAR_BYTES.
+ */
+export function parsePciApertureBytes(resourceText) {
+  if (!resourceText || typeof resourceText !== 'string') return null;
+  let largest = 0;
+  for (const line of resourceText.split('\n')) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 3) continue;
+    const start = Number.parseInt(fields[0], 16);
+    const end = Number.parseInt(fields[1], 16);
+    const flags = Number.parseInt(fields[2], 16);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(flags)) continue;
+    if (end <= start) continue;
+    if (!(flags & PCI_RESOURCE_MEM) || !(flags & PCI_RESOURCE_PREFETCH)) continue;
+    largest = Math.max(largest, end - start + 1);
+  }
+  return largest >= MIN_VRAM_BAR_BYTES ? largest : null;
+}
+
+/**
+ * Maps PCI slot addresses to device names from `lspci -mm` output.
+ *
+ * Names are whatever the local PCI ID database resolves, which may be a bare
+ * `Device 1586` for silicon newer than that database. Mirrors
+ * lspci_device_names in the kiosk agent.
+ *
+ * @param {?string} stdout Raw `lspci -mm` stdout, or null when the tool is
+ *   absent -- an ordinary outcome on an appliance that never installs it.
+ * @returns {Object<string,string>} Slot-to-name mapping; empty when there is
+ *   nothing to read.
+ */
+export function parseLspciNames(stdout) {
+  if (!stdout || typeof stdout !== 'string') return {};
+  const names = {};
+  for (const line of stdout.split('\n')) {
+    const space = line.indexOf(' ');
+    if (space < 0) continue;
+    const slot = line.slice(0, space);
+    const fields = [...line.slice(space + 1).matchAll(/"([^"]*)"/g)].map((m) => m[1]);
+    if (fields.length >= 3) names[slot] = fields[2];
+  }
+  return names;
+}
+
+/**
+ * Names one card from its PCI identity and whatever label resolved for it.
+ *
+ * Mirrors describe_card's naming in the kiosk agent: the vendor as a readable
+ * word when it is one we know, then the lspci label, then the raw device id,
+ * and only when nothing at all is known a generic description. A raw id is
+ * shown rather than a guess -- silicon newer than the local PCI database is the
+ * normal case on this hardware, not an error.
+ *
+ * @param {{vendorId:?string, deviceId:?string, lspciName:?string}} identity
+ *   The card's `device/vendor` and `device/device` sysfs values (`0x`-prefixed)
+ *   and the name lspci resolved for its slot, if any.
+ * @returns {string} A display name, never empty.
+ */
+export function describeCardName({ vendorId, deviceId, lspciName } = {}) {
+  let label = lspciName || '';
+  if (!label && deviceId) label = `Device ${deviceId.replace(/^0x/, '')}`;
+  const vendor = vendorId ? (PCI_VENDORS[vendorId] || vendorId) : '';
+  return [vendor, label || 'Graphics adapter'].filter(Boolean).join(' ');
 }

@@ -15,6 +15,9 @@ import {
   classifyCard,
   buildInventory,
   parseRocmSmiCards,
+  parsePciApertureBytes,
+  parseLspciNames,
+  describeCardName,
 } from './gpu-inventory.js';
 
 const GIB = 1024 ** 3;
@@ -119,4 +122,88 @@ test('rocm-smi parsing covers every card, not just card0', () => {
 test('rocm-smi returning nothing is an empty map, not a throw', () => {
   assert.deepEqual(parseRocmSmiCards({}), {});
   assert.deepEqual(parseRocmSmiCards(null), {});
+});
+
+/*
+ * VENDOR-NEUTRAL ENUMERATION (A1).
+ *
+ * Drakemore's RTX 3090 sits on nouveau, which registers no hwmon and publishes
+ * no mem_info_vram_total, so every AMD-shaped reader drops it. These helpers are
+ * the vendor-neutral fallbacks, mirrored from the kiosk agent so the two
+ * readouts cannot disagree about what is in the machine.
+ */
+
+test('the aperture is the largest prefetchable memory BAR', () => {
+  // A 24 GiB RTX 3090 exposes a 32 GiB prefetchable BAR -- the figure is an
+  // over-report, which is why A3 labels it an estimate rather than hiding it.
+  const resource = [
+    '0x00000000a0000000 0x00000000a0ffffff 0x0000000000040200', // 16 MiB, not prefetchable
+    '0x0000008000000000 0x00000087ffffffff 0x000000000014220c', // 32 GiB, prefetchable
+    '0x0000000000000000 0x0000000000000000 0x0000000000000000',
+  ].join('\n');
+  assert.equal(parsePciApertureBytes(resource), 32 * GIB);
+});
+
+test('a BAR too small to be VRAM is discarded, not reported', () => {
+  // A card without resizable BAR shows a 256 MiB window onto a large pool.
+  // Printing that as the card's memory would be a confident lie.
+  const resource = '0x0000000090000000 0x000000009fffffff 0x000000000014220c';
+  assert.equal(parsePciApertureBytes(resource), null);
+  assert.equal(parsePciApertureBytes(''), null);
+  assert.equal(parsePciApertureBytes(null), null);
+});
+
+test('a non-prefetchable memory BAR is never mistaken for VRAM', () => {
+  const resource = '0x0000008000000000 0x00000087ffffffff 0x0000000000040200';
+  assert.equal(parsePciApertureBytes(resource), null);
+});
+
+test('lspci -mm output becomes a slot to name map', () => {
+  const stdout = [
+    'c6:00.0 "VGA compatible controller" "NVIDIA Corporation" "GA102 [GeForce RTX 3090]" -r a1 "NVIDIA Corporation" "Device 1467"',
+    'c8:00.0 "VGA compatible controller" "Advanced Micro Devices, Inc. [AMD/ATI]" "Strix Halo" -ra1 "AMD" "Device 1586"',
+  ].join('\n');
+  const names = parseLspciNames(stdout);
+  assert.equal(names['c6:00.0'], 'GA102 [GeForce RTX 3090]');
+  assert.equal(names['c8:00.0'], 'Strix Halo');
+});
+
+test('lspci being absent is an empty map, not a throw', () => {
+  assert.deepEqual(parseLspciNames(''), {});
+  assert.deepEqual(parseLspciNames(null), {});
+});
+
+test('a card is named from its vendor and whatever label resolves', () => {
+  assert.equal(
+    describeCardName({ vendorId: '0x10de', deviceId: '0x2204', lspciName: 'GA102 [GeForce RTX 3090]' }),
+    'NVIDIA GA102 [GeForce RTX 3090]',
+  );
+  // Silicon newer than the local PCI database: the raw device id, not a guess.
+  assert.equal(describeCardName({ vendorId: '0x1002', deviceId: '0x1586' }), 'AMD Device 1586');
+  // An unknown vendor id is shown as-is rather than dropped.
+  assert.equal(describeCardName({ vendorId: '0x1234', deviceId: '0x0001' }), '0x1234 Device 0001');
+  assert.equal(describeCardName({}), 'Graphics adapter');
+});
+
+/*
+ * A card with no hwmon must still produce an entry. nouveau registers none, so
+ * requiring one is exactly what made the 3090 invisible. Telemetry it cannot
+ * report is null -- a confident 0 W / 0 C would read as a broken card.
+ */
+test('a card with no telemetry is inventoried with nulls, not zeroes', () => {
+  const cards = [
+    { card: 'card1', name: 'NVIDIA GA102 [GeForce RTX 3090]', driver: 'nouveau', vramBytes: 32 * GIB, vramSource: 'aperture' },
+    { card: 'card2', name: 'AMD Device 1586', driver: 'amdgpu', gttBytes: 120 * GIB, vramBytes: 1 * GIB, temperature: 49, power: 38 },
+  ];
+  const [inference, discrete] = buildInventory(cards, SYSTEM);
+  assert.equal(inference.card, 'card2');
+  assert.equal(inference.kind, 'integrated');
+  assert.equal(discrete.card, 'card1');
+  assert.equal(discrete.driver, 'nouveau');
+  assert.equal(discrete.available, true);
+  assert.equal(discrete.temperature, null);
+  assert.equal(discrete.power, null);
+  assert.equal(discrete.vramBytes, 32 * GIB);
+  assert.equal(discrete.vramSource, 'aperture');
+  assert.equal(inference.vramSource, null);
 });
