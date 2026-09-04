@@ -72,9 +72,19 @@ wait_for_url() {
 # flags and an explicit Wayland environment; Chrome-family browsers retain the
 # appliance profile and app-mode flags. Tests may request one launch only.
 launch() {
-    local browser status
+    local browser status drm
     local -a cmd
     browser="$(kiosk_require_browser)" || return 1
+
+    # Pin the compositor to the APU when a second GPU is present, so the output
+    # it drives does not depend on kernel enumeration order. Empty on a
+    # single-GPU appliance, which is every appliance without a discrete card --
+    # nothing is exported there and the display path is untouched.
+    drm="$(kiosk_drm_devices)"
+    if [ -n "$drm" ]; then
+        export WLR_DRM_DEVICES="$drm"
+        kiosk_log "pinning compositor to $drm (multiple GPUs present)"
+    fi
     if [ "$browser" = "$KIOSK_SHELL_BIN" ]; then
         # The shell takes the URL and needs nothing else: it is fullscreen and
         # undecorated by construction, and it shows the appliance's own branded

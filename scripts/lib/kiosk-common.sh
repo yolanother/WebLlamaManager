@@ -41,6 +41,50 @@ kiosk_resolve_url() {
     printf 'http://localhost:%s/kiosk\n' "${api_port:-3001}"
 }
 
+# Resolve the DRM device the compositor should be pinned to, if any.
+#
+# Returns a /dev/dri/cardN path when the machine has MORE THAN ONE GPU and one
+# of them is driven by amdgpu; empty otherwise. Empty means "let wlroots
+# choose", which is exactly what a single-GPU appliance -- almost every
+# appliance -- has always done, so its display path is unchanged.
+#
+# WHY THIS EXISTS: with a second GPU present, wlroots picks a render device on
+# its own and may pick one it cannot allocate the other card's connected output
+# on. Measured on drakemore the moment the NVIDIA driver was installed: cage
+# logged "Failed to pick primary buffer format for output 'HDMI-A-2'" followed
+# by "Failed to create swapchain" in a hot loop -- 72 errors in two minutes --
+# and the APU's output went dark, where the previous boot on nouveau logged
+# none. Pinning makes the display path deterministic instead of dependent on
+# kernel enumeration order.
+#
+# The APU is preferred deliberately. It is the appliance's own GPU and the one
+# every appliance has, so the kiosk renders identically whether or not a
+# discrete card is fitted -- and it leaves the discrete card entirely free for
+# compute rather than holding a compositor.
+# Echo: the device path, or nothing.
+kiosk_drm_devices() {
+    local drm amd="" count=0 card driver
+    drm="$(kiosk_path /sys/class/drm)"
+    [ -d "$drm" ] || return 0
+    for card in "$drm"/card[0-9]*; do
+        # Only whole cards, never the per-connector nodes (card1-DP-3).
+        case "${card##*/}" in *-*) continue ;; esac
+        # -L, not -e: sysfs always makes this a symlink, and -e would follow
+        # it and reject a card whose driver target is not itself readable.
+        [ -L "$card/device/driver" ] || continue
+        count=$((count + 1))
+        # Last component of the link TEXT, not its resolved target: the name
+        # is all we need and this still works if the target is unreadable.
+        driver="$(basename "$(readlink "$card/device/driver" 2>/dev/null)" 2>/dev/null || true)"
+        if [ "$driver" = amdgpu ] && [ -z "$amd" ]; then amd="/dev/dri/${card##*/}"; fi
+    done
+    # One GPU needs no pin, and with no AMD card there is nothing to prefer --
+    # pinning to a card we have not reasoned about would be a guess.
+    [ "$count" -gt 1 ] || return 0
+    [ -n "$amd" ] || return 0
+    printf '%s\n' "$amd"
+}
+
 # Absolute path to the install manifest (records what install changed).
 kiosk_manifest_path() { kiosk_path /var/backups/llama-kiosk/manifest; }
 

@@ -811,8 +811,68 @@ test_uninstall_without_install_preserves_session_entry
 test_partial_install_without_completion_marker_is_cleaned
 test_session_symlink_target_is_never_overwritten
 test_dangling_session_symlink_is_restored_exactly
+# Build a fake /sys/class/drm tree. Args: sandbox, then "card:driver" pairs.
+make_drm_tree() {
+    local sb="$1"; shift
+    local pair card driver
+    for pair in "$@"; do
+        card="${pair%%:*}"; driver="${pair##*:}"
+        mkdir -p "$sb/sys/class/drm/$card/device"
+        mkdir -p "$sb/sys/bus/pci/drivers/$driver"
+        ln -sfn "../../../bus/pci/drivers/$driver" "$sb/sys/class/drm/$card/device/driver"
+    done
+}
+
+# The compositor must be pinned to the AMD GPU when a second card is present.
+#
+# THE REGRESSION THIS EXISTS FOR: installing the NVIDIA driver on a Strix Halo
+# box with an OCuLink card made wlroots pick a render device it could not
+# allocate the AMD-connected output's buffers on. cage then logged
+# "Failed to pick primary buffer format for output 'HDMI-A-2'" and
+# "Failed to create swapchain" in a hot loop -- 72 errors in two minutes,
+# measured on drakemore -- and that output went dark. The previous boot, on
+# nouveau, logged zero.
+test_drm_pinning() {
+    (
+      local sb; sb="$(new_sandbox)"; export KIOSK_ROOT="$sb"
+      source "$REPO_ROOT/scripts/lib/kiosk-common.sh"
+
+      # One AMD card only -- almost every appliance. Nothing is pinned, so the
+      # single-GPU display path is byte-for-byte what it always was.
+      make_drm_tree "$sb" "card0:amdgpu"
+      assert_eq "single amd card pins nothing" "" "$(kiosk_drm_devices)"
+
+      # Two cards, the discrete one enumerating FIRST as it does on drakemore.
+      local sb2; sb2="$(new_sandbox)"; export KIOSK_ROOT="$sb2"
+      make_drm_tree "$sb2" "card1:nvidia" "card2:amdgpu"
+      assert_eq "two cards pin the amd one" "/dev/dri/card2" "$(kiosk_drm_devices)"
+
+      # Still the AMD one when it enumerates first.
+      local sb3; sb3="$(new_sandbox)"; export KIOSK_ROOT="$sb3"
+      make_drm_tree "$sb3" "card0:amdgpu" "card1:nvidia"
+      assert_eq "amd first still pins amd" "/dev/dri/card0" "$(kiosk_drm_devices)"
+
+      # nouveau counts as a second GPU too: the pin must not depend on which
+      # NVIDIA driver happens to be bound.
+      local sb4; sb4="$(new_sandbox)"; export KIOSK_ROOT="$sb4"
+      make_drm_tree "$sb4" "card1:nouveau" "card2:amdgpu"
+      assert_eq "nouveau also triggers the pin" "/dev/dri/card2" "$(kiosk_drm_devices)"
+
+      # No AMD card at all -- there is nothing to prefer, so let wlroots decide
+      # rather than pinning it to a card we have not reasoned about.
+      local sb5; sb5="$(new_sandbox)"; export KIOSK_ROOT="$sb5"
+      make_drm_tree "$sb5" "card0:nvidia" "card1:nvidia"
+      assert_eq "no amd card pins nothing" "" "$(kiosk_drm_devices)"
+
+      # No DRM tree at all (a container, or a fixture): never fail, never pin.
+      local sb6; sb6="$(new_sandbox)"; export KIOSK_ROOT="$sb6"
+      assert_eq "absent drm tree pins nothing" "" "$(kiosk_drm_devices)"
+    )
+}
+
 test_launcher
 test_launcher_readiness_and_exit_report
+test_drm_pinning
 
 # Tally the file-based counters in the parent shell and exit nonzero on any fail.
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
