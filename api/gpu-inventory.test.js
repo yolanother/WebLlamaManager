@@ -207,3 +207,25 @@ test('a card with no telemetry is inventoried with nulls, not zeroes', () => {
   assert.equal(discrete.vramSource, 'aperture');
   assert.equal(inference.vramSource, null);
 });
+
+/*
+ * Per-card `usage` was structurally null on EVERY card ever built. The sysfs
+ * reader supplies the kernel's counter as `busyPercent`; this read `raw.usage`,
+ * a key nothing sets. The headline figure was fine, which is what hid it: the
+ * dashboard's rail showed real utilisation while the per-card panel beside it
+ * showed nothing, on the same machine, from the same poll.
+ */
+test('a card reports the utilisation the kernel measured for it', () => {
+  const [gpu] = buildInventory([{ card: 'card1', driver: 'amdgpu', gttBytes: 128 * GIB, busyPercent: 97 }], SYSTEM);
+  assert.equal(gpu.usage, 97);
+});
+
+test('a card with no utilisation counter reports null, not idle', () => {
+  // nouveau exposes no gpu_busy_percent. Reporting 0% would assert the card is
+  // idle; null says we cannot see it, which is the truth.
+  const [, dgpu] = buildInventory([
+    { card: 'card2', driver: 'amdgpu', gttBytes: 128 * GIB, busyPercent: 30 },
+    { card: 'card1', driver: 'nouveau' },
+  ], SYSTEM);
+  assert.equal(dgpu.usage, null);
+});

@@ -80,7 +80,9 @@ export function buildInventory(cards, systemBytes) {
       gttBytes: raw.gttBytes ?? null,
       systemBytes: systemBytes ?? null,
       temperature: raw.temperature ?? null,
-      usage: raw.usage ?? null,
+      // The kernel's busy counter reaches this reader as `busyPercent`.
+      // Reading only `usage` left this null on every card ever built.
+      usage: raw.usage ?? raw.busyPercent ?? null,
       power: raw.power ?? null,
       coreClock: raw.coreClock ?? null,
       memClock: raw.memClock ?? null,
