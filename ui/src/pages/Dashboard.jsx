@@ -37,6 +37,7 @@ import {
   HistoryTooltip,
   TimeRangeSelector,
   GpuLegendItems,
+  historyGpuAreas,
 } from '../components/util.jsx';
 
 // Keep Dashboard-owned Recharts series themeable. The shared chart helpers still
@@ -135,6 +136,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   const [analytics, setAnalytics] = useState(null);
   const [historyRange, setHistoryRange] = useState('1h');
   const [historyData, setHistoryData] = useState(null);
+  // Per-GPU series for the long-range charts. Empty on a single-GPU machine,
+  // which therefore keeps its original single-line history charts.
+  const historyGpuSeries = historyData?.gpuSeries || [];
   const [crashData, setCrashData] = useState(null);
   const [modelBreakdown, setModelBreakdown] = useState(null);
   const [requestStats, setRequestStats] = useState(null);
@@ -794,7 +798,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                       <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                       <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit="W" range={historyRange} />} />
-                      <Area type="monotone" dataKey="pwr" name="Power" stroke={DASHBOARD_CHART_COLORS.power} fill="url(#gradFsPwr)" strokeWidth={2} dot={false} animationDuration={500} />
+                      {historyGpuSeries.length > 0
+                        ? historyGpuAreas(historyGpuSeries, 'pwr', DASHBOARD_CHART_COLORS.power)
+                        : <Area type="monotone" dataKey="pwr" name="Power" stroke={DASHBOARD_CHART_COLORS.power} fill="url(#gradFsPwr)" strokeWidth={2} dot={false} animationDuration={500} />}
                     </AreaChart>
                   </ResponsiveContainer>
                 ) : <div className="chart-empty">No historical data yet</div>}
@@ -811,7 +817,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                       <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                       <YAxis domain={[0, 100]} tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                       <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
-                      <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={DASHBOARD_CHART_COLORS.memory} fill="url(#gradFsMem)" strokeWidth={2} dot={false} animationDuration={500} />
+                      {historyGpuSeries.length > 0
+                        ? historyGpuAreas(historyGpuSeries, 'mg', DASHBOARD_CHART_COLORS.memory)
+                        : <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={DASHBOARD_CHART_COLORS.memory} fill="url(#gradFsMem)" strokeWidth={2} dot={false} animationDuration={500} />}
                       <Area type="monotone" dataKey="ms" name="System" stroke={DASHBOARD_CHART_COLORS.memorySecondary} fill="url(#gradFsSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
                     </AreaChart>
                   </ResponsiveContainer>
@@ -1778,7 +1786,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                     <YAxis tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<HistoryTooltip unit="W" range={historyRange} />} />
-                    <Area type="monotone" dataKey="pwr" name="Power" stroke={DASHBOARD_CHART_COLORS.power} fill="url(#gradHistPower)" strokeWidth={2} dot={false} animationDuration={500} />
+                    {historyGpuSeries.length > 0
+                      ? historyGpuAreas(historyGpuSeries, 'pwr', DASHBOARD_CHART_COLORS.power)
+                      : <Area type="monotone" dataKey="pwr" name="Power" stroke={DASHBOARD_CHART_COLORS.power} fill="url(#gradHistPower)" strokeWidth={2} dot={false} animationDuration={500} />}
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet. Data is aggregated every minute.</div>}
@@ -1806,7 +1816,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     <XAxis dataKey="time" tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} interval="preserveStartEnd" />
                     <YAxis domain={[0, 100]} tick={{ fill: 'var(--text-secondary)', fontSize: 10 }} tickLine={false} axisLine={false} />
                     <Tooltip content={<HistoryTooltip unit="%" range={historyRange} />} />
-                    <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={DASHBOARD_CHART_COLORS.memory} fill="url(#gradHistMem)" strokeWidth={2} dot={false} animationDuration={500} />
+                    {historyGpuSeries.length > 0
+                      ? historyGpuAreas(historyGpuSeries, 'mg', DASHBOARD_CHART_COLORS.memory)
+                      : <Area type="monotone" dataKey="mg" name="GTT/VRAM" stroke={DASHBOARD_CHART_COLORS.memory} fill="url(#gradHistMem)" strokeWidth={2} dot={false} animationDuration={500} />}
                     <Area type="monotone" dataKey="ms" name="System" stroke={DASHBOARD_CHART_COLORS.memorySecondary} fill="url(#gradHistSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" animationDuration={500} />
                   </AreaChart>
                 </ResponsiveContainer>

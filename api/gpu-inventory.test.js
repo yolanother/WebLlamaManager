@@ -21,6 +21,8 @@ import {
   parseNvidiaSmi,
   resolveGpuSeries,
   gpuMemoryUsagePercent,
+  perCardKeys,
+  historyCardKeys,
 } from './gpu-inventory.js';
 
 const GIB = 1024 ** 3;
@@ -389,4 +391,47 @@ test('a discrete card reports no GTT usage either, not just no GTT size', () => 
   ], SYSTEM);
   assert.equal(dgpu.gttBytes, null);
   assert.equal(dgpu.gttUsedBytes, null);
+});
+
+/*
+ * PER-GPU LONG-RANGE HISTORY.
+ *
+ * The persisted minute records held one scalar per metric, so the 1h/1d/1w
+ * charts showed a single line however many cards the machine had. These find
+ * the per-card fields without a hardcoded card list -- card ids differ per
+ * machine, and the persisted file is append-only, so records written before a
+ * card was fitted simply lack its keys.
+ */
+
+test('per-card sample keys are discovered from the samples themselves', () => {
+  const points = [
+    { timestamp: 1, gpu: 40, cpu: 30, gpu_card2: 40, gpu_card1: 55 },
+    { timestamp: 2, gpu: 41, cpu: 31, gpu_card2: 41 },
+  ];
+  assert.deepEqual(perCardKeys(points).sort(), ['gpu_card1', 'gpu_card2']);
+});
+
+test('samples with no per-card fields yield no keys', () => {
+  assert.deepEqual(perCardKeys([{ timestamp: 1, gpu: 40, cpu: 30 }]), []);
+  assert.deepEqual(perCardKeys([]), []);
+  assert.deepEqual(perCardKeys(null), []);
+});
+
+test('history records expose their per-card keys per metric prefix', () => {
+  // A record written before the second card was fitted lacks its keys entirely;
+  // the union across the range is what the chart must draw.
+  const records = [
+    { ts: 1, pwr: 10, tg: 40, pwr_card2: 10, tg_card2: 40 },
+    { ts: 2, pwr: 12, tg: 42, pwr_card2: 11, tg_card2: 41, pwr_card1: 30, tg_card1: 55 },
+  ];
+  assert.deepEqual(historyCardKeys(records, 'pwr').sort(), ['pwr_card1', 'pwr_card2']);
+  assert.deepEqual(historyCardKeys(records, 'tg').sort(), ['tg_card1', 'tg_card2']);
+  assert.deepEqual(historyCardKeys(records, 'mg'), []);
+});
+
+test('a metric prefix never captures another metric that starts the same way', () => {
+  // "ms" (system memory) must not be harvested as a per-card "m" series.
+  const records = [{ ts: 1, ms: 20, mg: 30, mg_card1: 5 }];
+  assert.deepEqual(historyCardKeys(records, 'mg'), ['mg_card1']);
+  assert.deepEqual(historyCardKeys(records, 'ms'), []);
 });

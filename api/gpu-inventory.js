@@ -390,3 +390,47 @@ export function gpuMemoryUsagePercent(gpu) {
   if (!total || total <= 0 || used === null || used === undefined) return null;
   return Math.max(0, Math.min(100, Math.round((used / total) * 1000) / 10));
 }
+
+/**
+ * The per-card field names present in a set of analytics samples.
+ *
+ * Card ids differ per machine and a card can be fitted or removed at any time,
+ * so the key set is discovered from the data rather than hardcoded.
+ *
+ * @param {?Array<object>} points Samples from one analytics buffer.
+ * @returns {Array<string>} Every `gpu_<card>` key seen, deduplicated.
+ */
+export function perCardKeys(points) {
+  if (!Array.isArray(points)) return [];
+  const keys = new Set();
+  for (const point of points) {
+    for (const key of Object.keys(point || {})) {
+      if (key.startsWith('gpu_')) keys.add(key);
+    }
+  }
+  return [...keys];
+}
+
+/**
+ * The per-card field names one metric contributes to a set of history records.
+ *
+ * The persisted history is append-only, so records written before a card was
+ * fitted simply lack its keys; the union across the range is what a chart must
+ * be prepared to draw, with gaps where a record had nothing.
+ *
+ * @param {?Array<object>} records Minute records in range.
+ * @param {string} prefix The metric's record key, e.g. `pwr`, `tg`, `mg`.
+ * @returns {Array<string>} Keys shaped `<prefix>_<card>`. The underscore is
+ *   required, so asking for `ms` can never harvest `mg_card1` -- or `mv`.
+ */
+export function historyCardKeys(records, prefix) {
+  if (!Array.isArray(records) || !prefix) return [];
+  const lead = `${prefix}_`;
+  const keys = new Set();
+  for (const record of records) {
+    for (const key of Object.keys(record || {})) {
+      if (key.startsWith(lead)) keys.add(key);
+    }
+  }
+  return [...keys];
+}

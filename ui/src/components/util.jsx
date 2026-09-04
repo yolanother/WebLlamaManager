@@ -399,6 +399,41 @@ export function GpuLegendItems({ gpuSeries, baseColor }) {
   ));
 }
 
+
+/**
+ * One Recharts <Area> per GPU for a LONG-RANGE history chart.
+ *
+ * Same idea as gpuSeriesAreas, but the history records name their fields
+ * `<metric>_<card>` because one record carries every metric, where a live
+ * sample buffer holds only one.
+ *
+ * @param {Array<{card:string, label:string, name:string}>} series gpuSeries
+ *   from the history payload.
+ * @param {string} prefix The metric's record key -- `pwr`, `tg` or `mg`.
+ * @param {string} baseColor The chart's own colour, kept for the first card so
+ *   its line is the one that was always there.
+ * @returns {Array<object>} Area elements, or empty for a single-GPU machine.
+ */
+export function historyGpuAreas(series, prefix, baseColor) {
+  if (!Array.isArray(series) || series.length === 0) return [];
+  return series.map((entry, i) => (
+    <Area
+      key={`${prefix}_${entry.card}`}
+      type="monotone"
+      dataKey={`${prefix}_${entry.card}`}
+      name={entry.name ? `${entry.label} — ${entry.name}` : entry.label}
+      stroke={i === 0 ? baseColor : GPU_SERIES_COLORS[(i - 1) % GPU_SERIES_COLORS.length]}
+      fill="none"
+      strokeWidth={2}
+      dot={false}
+      // Records written before a card was fitted lack its key entirely, so the
+      // line must break there rather than dive to zero.
+      connectNulls={false}
+      animationDuration={500}
+    />
+  ));
+}
+
 function TemperatureChart({ data, height = 140, gpuSeries = [] }) {
   if (!data || data.length < 2) {
     return (

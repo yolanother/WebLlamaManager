@@ -206,6 +206,8 @@ import {
   parseNvidiaSmi,
   resolveGpuSeries,
   gpuMemoryUsagePercent,
+  perCardKeys,
+  historyCardKeys,
 } from './gpu-inventory.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
@@ -2231,6 +2233,19 @@ const watchdogStats = {
 };
 
 // Flush minute-level aggregate to persistent storage
+// One record field per GPU for a metric, averaged over only the samples that
+// carried a value for that card. A card with nothing to report in the whole
+// minute contributes no field at all, so the chart draws a gap rather than a
+// zero that would read as idle or stone cold.
+function perCardRecordFields(prefix, points, avgPresent) {
+  const out = {};
+  for (const key of perCardKeys(points)) {
+    const value = avgPresent(points, key);
+    if (value !== null) out[`${prefix}_${key.slice(4)}`] = Math.round(value * 10) / 10;
+  }
+  return out;
+}
+
 function flushAnalyticsMinute() {
   const now = Date.now();
   const cutoff = now - 60000;
@@ -2244,6 +2259,15 @@ function flushAnalyticsMinute() {
   const queuePoints = analyticsData.queue.filter(p => p.timestamp > cutoff);
 
   const avg = (arr, key) => arr.length > 0 ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
+  // Same, but over only the samples that HAVE the key. A per-card field is
+  // absent whenever that card could not measure the metric, and zero-filling
+  // those would drag the card's average toward zero -- reporting a GPU as
+  // cooler or idler than it was, which is the failure this whole readout
+  // exists to avoid.
+  const avgPresent = (arr, key) => {
+    const values = arr.map((p) => p[key]).filter((v) => typeof v === 'number');
+    return values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : null;
+  };
   const max = (arr, key) => arr.length > 0 ? Math.max(...arr.map(p => p[key] || 0)) : 0;
 
   const record = {
@@ -2254,6 +2278,14 @@ function flushAnalyticsMinute() {
     ms: Math.round(avg(memPoints, 'system') * 10) / 10,
     tg: Math.round(avg(tempPoints, 'gpu') * 10) / 10,
     tc: Math.round(avg(tempPoints, 'cpu') * 10) / 10,
+    // One field per GPU per metric, so the long-range charts can draw a line
+    // per card instead of one line for the inference card. The keys are
+    // discovered from the samples, because card ids differ per machine -- and
+    // this file is append-only, so records written before a card was fitted
+    // simply lack its keys and the chart shows a gap rather than a zero.
+    ...perCardRecordFields('pwr', powerPoints, avgPresent),
+    ...perCardRecordFields('tg', tempPoints, avgPresent),
+    ...perCardRecordFields('mg', memPoints, avgPresent),
     tps: Math.round(avg(tokenPoints, 'tokensPerSecond') * 10) / 10,
     tpsMax: Math.round(max(tokenPoints, 'tokensPerSecond') * 10) / 10,
     // Per-model average tok/s (only from actual generation points, not zero-fill)
@@ -9187,6 +9219,12 @@ app.get('/api/analytics/history', (req, res) => {
     points = [];
     for (const [ts, items] of buckets) {
       const avg = (key) => items.reduce((s, p) => s + (p[key] || 0), 0) / items.length;
+      // Per-card fields are missing from every record written before that card
+      // was fitted, so they are averaged over the records that carry them.
+      const avgPresent = (key) => {
+        const values = items.map((p) => p[key]).filter((v) => typeof v === 'number');
+        return values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : null;
+      };
       const sum = (key) => items.reduce((s, p) => s + (p[key] || 0), 0);
       const maxVal = (key) => Math.max(...items.map(p => p[key] || 0));
 
@@ -9211,8 +9249,20 @@ app.get('/api/analytics/history', (req, res) => {
         mergedMtps[model] = Math.round(mergedMtps[model] / mtpsCounts[model] * 10) / 10;
       }
 
+      // Average each per-card field the same way as its scalar counterpart.
+      // Discovered per bucket, so a card that appears partway through the range
+      // starts contributing exactly where its records start.
+      const perCard = {};
+      for (const prefix of ['pwr', 'tg', 'mg']) {
+        for (const key of historyCardKeys(items, prefix)) {
+          const value = avgPresent(key);
+          if (value !== null) perCard[key] = Math.round(value * 10) / 10;
+        }
+      }
+
       points.push({
         ts: ts + bucketMs / 2, // midpoint
+        ...perCard,
         pwr: Math.round(avg('pwr') * 10) / 10,
         mv: Math.round(avg('mv') * 10) / 10,
         mg: Math.round(avg('mg') * 10) / 10,
@@ -9273,6 +9323,9 @@ app.get('/api/analytics/history', (req, res) => {
 
   res.json({
     points,
+    // Same descriptor the live charts use, so the long-range charts label and
+    // colour their per-card lines identically. Empty on a single-GPU machine.
+    gpuSeries: analyticsGpuSeries,
     summary: {
       totalRequests,
       totalErrors,
