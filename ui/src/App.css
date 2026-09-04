@@ -259,7 +259,12 @@ input::placeholder {
 
 .stats-header-items {
   display: flex;
-  align-items: center;
+  /* Stretch, not center: the tiles carry different content (a 36px ring plus a
+     label, versus two or three stacked sensor rows) and centering them left the
+     thermal tile visibly shorter than its neighbours. Stretching makes every
+     tile as tall as the tallest, so adding a sensor row cannot desynchronise
+     the row again. */
+  align-items: stretch;
   gap: 16px;
 }
 
@@ -267,6 +272,8 @@ input::placeholder {
   display: flex;
   flex-direction: column;
   align-items: center;
+  /* Content stays optically centred now that the box is taller than it. */
+  justify-content: center;
   gap: 2px;
 }
 
@@ -281,20 +288,25 @@ input::placeholder {
   letter-spacing: 0.5px;
 }
 
+/* No fixed height. This tile was pinned to 36px while its own stack asked for
+   52px, so the second sensor row rendered OUTSIDE the tile's rounded
+   background -- the reading sat on the header, below the card it belonged to.
+   The tile now sizes to its rows and the container stretches its siblings to
+   match. */
 .stats-header-item.temp {
   justify-content: center;
   min-width: 36px;
-  height: 36px;
 }
 
-/* Combined GPU/CPU thermal tile: two stacked sensor rows filling the same
-   overall footprint as the 36px-ring + label sibling tiles. */
+/* Combined GPU/CPU thermal tile: one stacked row per sensor -- a row for each
+   GPU that reports a temperature, then the CPU. The height comes from the rows
+   themselves and the sibling tiles stretch to match, rather than from a magic
+   number that had to be re-tuned every time a row was added. */
 .stats-header-temp-stack {
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 3px;
-  min-height: 52px;
 }
 
 .stats-header-temp-row {

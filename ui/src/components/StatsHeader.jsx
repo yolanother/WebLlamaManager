@@ -7,7 +7,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { copyTextToClipboard } from '../api.js';
-import { resolveGpuRings } from '../gpu-panel.js';
+import { resolveGpuRings, resolveGpuTempRows } from '../gpu-panel.js';
 import { ProgressRing, ConcentricRings, guardSeverity, sensorSeverity, severityColor } from './util.jsx';
 
 // Compact Stats Header
@@ -137,10 +137,16 @@ function StatsHeader({ stats }) {
               // mask a hot CPU. Each tile carries its own severity color; the
               // CPU tile only renders when the guard reports a CPU reading.
               const guard = stats.guard;
-              const gpuC = guard?.gpuC ?? stats.gpu.temperature;
               const cpuC = guard?.cpuC ?? null;
+              // One row per GPU that actually reports a sensor, inference card
+              // first. A single GPU still reads plain "GPU"; a card with no
+              // sensor contributes no row rather than a zero beside real ones.
               const rows = [
-                gpuC > 0 ? { label: 'GPU', value: gpuC, sev: sensorSeverity(gpuC, guard) } : null,
+                ...resolveGpuTempRows(stats).map((row) => ({
+                  label: row.label,
+                  value: row.value,
+                  sev: sensorSeverity(row.value, guard),
+                })),
                 cpuC != null && cpuC > 0 ? { label: 'CPU', value: cpuC, sev: sensorSeverity(cpuC, guard) } : null,
               ].filter(Boolean);
               if (!rows.length) return null;

@@ -203,3 +203,54 @@ export function resolveGpuRings(stats) {
     title: rings.map((r) => r.title).join('\n'),
   };
 }
+
+/**
+ * Builds the GPU rows of the stats-rail thermal tile.
+ *
+ * The tile used to carry exactly one GPU row, which on a multi-card machine
+ * silently meant "the card inference runs on" -- so a discrete card cooking at
+ * 90 C appeared nowhere on the rail. Every card that actually reports a
+ * temperature now gets its own row.
+ *
+ * A card only earns a row when it HAS a sensor. Inventing a row for a card
+ * whose driver publishes none (nouveau reports no temperature for an NVIDIA
+ * card) would sit a zero or blank reading beside two real ones, in a tile
+ * whose entire subject is heat. Absent is honest there; zero is not.
+ *
+ * @param {?object} stats The /api/system payload.
+ * @returns {Array<{card:string, label:string, value:number}>} Inference card
+ *   first, matching the ring order. Labels are numbered only when more than
+ *   one card reports, so the common single-GPU tile still reads "GPU". Empty
+ *   when nothing reports a temperature -- never a zero row.
+ */
+export function resolveGpuTempRows(stats) {
+  const gpus = Array.isArray(stats?.gpus) ? stats.gpus : [];
+  // The thermal governor's own reading is what it throttles on, so it wins for
+  // the inference card: the rail must not show a different number from the
+  // thing actually taking action.
+  const guardC = stats?.guard?.gpuC ?? null;
+
+  if (gpus.length === 0) {
+    // An appliance whose manager predates gpus[]: the headline figure is the
+    // only GPU temperature there is.
+    const value = guardC ?? stats?.gpu?.temperature ?? null;
+    return value > 0 ? [{ card: '', label: 'GPU', value }] : [];
+  }
+
+  const inference = gpus.find((g) => g.inference) || gpus[0];
+  const ordered = [inference, ...gpus.filter((g) => g !== inference)];
+
+  const rows = ordered
+    .map((gpu) => {
+      const own = gpu === inference ? (guardC ?? gpu.temperature) : gpu.temperature;
+      return { card: gpu.card || '', value: own ?? null };
+    })
+    .filter((row) => row.value > 0);
+
+  return rows.map((row, i) => ({
+    ...row,
+    // Numbered only when there is something to disambiguate from. A lone
+    // "GPU 1" on a single-card appliance would imply a missing second card.
+    label: rows.length > 1 ? `GPU ${i + 1}` : 'GPU',
+  }));
+}

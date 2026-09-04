@@ -9,7 +9,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveGpuPanel, formatGpuMemory, resolveGpuRings } from './gpu-panel.js';
+import { resolveGpuPanel, formatGpuMemory, resolveGpuRings, resolveGpuTempRows } from './gpu-panel.js';
 
 const GIB = 1024 ** 3;
 
@@ -245,4 +245,74 @@ test('an unavailable card still gets a ring, so a dead card is not invisible', (
   assert.equal(view.rings.length, 2);
   assert.equal(view.rings[1].value, null);
   assert.match(view.rings[1].title, /no kernel driver/);
+});
+
+/*
+ * THE THERMAL TILE'S GPU ROWS.
+ *
+ * The tile showed one GPU row and one CPU row. On a two-card machine that
+ * silently means "the inference card", so a discrete card cooking at 90 C is
+ * not on the rail at all. A card only earns a row when it actually reports a
+ * temperature: inventing a row for a card whose driver publishes no sensor
+ * would put an empty or zero reading next to two real ones, which is worse
+ * than the card being absent from a tile that is explicitly about heat.
+ */
+
+test('one GPU with a temperature gets a single unnumbered row', () => {
+  const rows = resolveGpuTempRows({ gpus: [{ ...RINGS_APU, temperature: 73 }] });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].label, 'GPU');
+  assert.equal(rows[0].value, 73);
+});
+
+test('the guard reading wins for the inference card', () => {
+  // The thermal governor's own figure is what it throttles on, so the rail
+  // must not show a different number than the thing taking action.
+  const rows = resolveGpuTempRows({
+    gpus: [{ ...RINGS_APU, temperature: 73 }],
+    guard: { gpuC: 78 },
+  });
+  assert.equal(rows[0].value, 78);
+});
+
+test('a second card with a temperature gets its own numbered row', () => {
+  const rows = resolveGpuTempRows({
+    gpus: [{ ...RINGS_3090, temperature: 64 }, { ...RINGS_APU, temperature: 73 }],
+  });
+  assert.equal(rows.length, 2);
+  // Inference card first, matching the ring order -- not DRM order.
+  assert.deepEqual(rows.map((r) => r.label), ['GPU 1', 'GPU 2']);
+  assert.equal(rows[0].value, 73);
+  assert.equal(rows[1].value, 64);
+  assert.equal(rows[1].card, 'card1');
+});
+
+test('a card that reports no temperature gets NO row', () => {
+  // Drakemore today: nouveau publishes no thermal sensor for the 3090. The
+  // tile is about heat, so a card with no sensor stays out of it rather than
+  // showing 0 C beside two real readings.
+  const rows = resolveGpuTempRows({ gpus: [RINGS_3090, { ...RINGS_APU, temperature: 73 }] });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].label, 'GPU');
+  assert.equal(rows[0].value, 73);
+});
+
+test('a zero reading is treated as no sensor, not as a cold card', () => {
+  const rows = resolveGpuTempRows({
+    gpus: [{ ...RINGS_3090, temperature: 0 }, { ...RINGS_APU, temperature: 73 }],
+  });
+  assert.equal(rows.length, 1);
+});
+
+test('an older API with no gpus[] still yields the headline GPU row', () => {
+  const rows = resolveGpuTempRows({ gpu: { temperature: 70 } });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].label, 'GPU');
+  assert.equal(rows[0].value, 70);
+});
+
+test('no GPU temperature anywhere yields no rows rather than a zero row', () => {
+  assert.deepEqual(resolveGpuTempRows({}), []);
+  assert.deepEqual(resolveGpuTempRows({ gpu: { temperature: 0 } }), []);
+  assert.deepEqual(resolveGpuTempRows({ gpus: [RINGS_3090] }), []);
 });
