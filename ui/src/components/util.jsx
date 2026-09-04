@@ -420,7 +420,15 @@ export function historyGpuAreas(series, prefix, baseColor) {
     <Area
       key={`${prefix}_${entry.card}`}
       type="monotone"
-      dataKey={`${prefix}_${entry.card}`}
+      // The INFERENCE card falls back to the plain scalar field, because that
+      // is the same measurement under its old name. Without this, switching a
+      // machine to per-card series would blank a year of history the moment a
+      // second GPU was fitted: every record written before the change carries
+      // `pwr` but no `pwr_cardN`, and the chart would draw one lonely point.
+      // Other cards have no such history and simply start where they start.
+      dataKey={entry.inference
+        ? (point) => point?.[`${prefix}_${entry.card}`] ?? point?.[prefix]
+        : `${prefix}_${entry.card}`}
       name={entry.name ? `${entry.label} — ${entry.name}` : entry.label}
       stroke={i === 0 ? baseColor : GPU_SERIES_COLORS[(i - 1) % GPU_SERIES_COLORS.length]}
       fill="none"
@@ -429,7 +437,10 @@ export function historyGpuAreas(series, prefix, baseColor) {
       // Records written before a card was fitted lack its key entirely, so the
       // line must break there rather than dive to zero.
       connectNulls={false}
-      animationDuration={500}
+      // No entry animation. These charts refetch every 60s, and re-animating
+      // every line from the baseline on each poll is noise -- it also makes the
+      // chart read as empty for the first half second after every refresh.
+      isAnimationActive={false}
     />
   ));
 }

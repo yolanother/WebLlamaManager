@@ -1793,6 +1793,11 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 </ResponsiveContainer>
               ) : <div className="chart-empty">No historical data yet. Data is aggregated every minute.</div>}
             </div>
+            {historyGpuSeries.length > 0 ? (
+              <div className="chart-legend">
+                <GpuLegendItems gpuSeries={historyGpuSeries} baseColor={DASHBOARD_CHART_COLORS.power} />
+              </div>
+            ) : null}
           </div>
 
           {/* Memory History */}
@@ -1825,7 +1830,9 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               ) : <div className="chart-empty">No historical data yet</div>}
             </div>
             <div className="chart-legend">
-              <div className="chart-legend-item"><span className="chart-legend-dot vram"></span>GTT/VRAM</div>
+              {historyGpuSeries.length > 0
+                ? <GpuLegendItems gpuSeries={historyGpuSeries} baseColor={DASHBOARD_CHART_COLORS.memory} />
+                : <div className="chart-legend-item"><span className="chart-legend-dot vram"></span>GTT/VRAM</div>}
               <div className="chart-legend-item"><span className="chart-legend-dot system"></span>System</div>
             </div>
           </div>
