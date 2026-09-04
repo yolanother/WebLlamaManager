@@ -19,6 +19,8 @@ import {
   parseLspciNames,
   describeCardName,
   parseNvidiaSmi,
+  resolveGpuSeries,
+  gpuMemoryUsagePercent,
 } from './gpu-inventory.js';
 
 const GIB = 1024 ** 3;
@@ -305,4 +307,86 @@ test('a card carries how much of its own memory is in use', () => {
 test('unmeasured memory-in-use is null, not zero', () => {
   const [gpu] = buildInventory([{ card: 'card1', driver: 'amdgpu', gttBytes: 128 * GIB }], SYSTEM);
   assert.equal(gpu.vramUsedBytes, null);
+});
+
+/*
+ * PER-GPU CHART SERIES.
+ *
+ * Every analytics sample recorded one scalar per metric, taken from the
+ * inference card, so a second GPU's temperature, power, utilisation and memory
+ * were absent from every graph on the dashboard. These describe the extra
+ * series a multi-card machine adds; a single-GPU machine adds none, so its
+ * charts keep drawing exactly the lines they always drew.
+ */
+
+test('a single-GPU machine adds no extra series', () => {
+  assert.deepEqual(resolveGpuSeries([{ card: 'card1', inference: true }]), []);
+  assert.deepEqual(resolveGpuSeries([]), []);
+  assert.deepEqual(resolveGpuSeries(null), []);
+});
+
+test('a multi-GPU machine gets one series per card, inference card first', () => {
+  // Drakemore: the discrete card enumerates FIRST, so ordering by the array
+  // would label the card that is not running the model "GPU 1".
+  const series = resolveGpuSeries([
+    { card: 'card1', name: 'NVIDIA GA102 [GeForce RTX 3090]', inference: false },
+    { card: 'card2', name: 'AMD Device 1586', inference: true },
+  ]);
+  assert.equal(series.length, 2);
+  assert.deepEqual(series.map((s) => s.card), ['card2', 'card1']);
+  assert.deepEqual(series.map((s) => s.label), ['GPU 1', 'GPU 2']);
+  // The key is what a chart uses as its dataKey and what the sample carries.
+  assert.deepEqual(series.map((s) => s.key), ['gpu_card2', 'gpu_card1']);
+  assert.equal(series[0].inference, true);
+  assert.equal(series[1].name, 'NVIDIA GA102 [GeForce RTX 3090]');
+});
+
+test('a card memory percentage uses the pool that card actually has', () => {
+  const GB = GIB;
+  // An APU's usable pool is its GTT window, not the token 1 GiB VRAM carve-out;
+  // reporting VRAM for it would understate the machine by two orders of
+  // magnitude, exactly as the panel's formatter already avoids.
+  assert.equal(gpuMemoryUsagePercent({
+    kind: 'integrated', gttBytes: 100 * GB, gttUsedBytes: 25 * GB,
+    vramBytes: 1 * GB, vramUsedBytes: 1 * GB,
+  }), 25);
+  // A discrete card has no GTT and its VRAM is the answer.
+  assert.equal(gpuMemoryUsagePercent({
+    kind: 'discrete', vramBytes: 24 * GB, vramUsedBytes: 6 * GB,
+  }), 25);
+});
+
+test('a card nothing can measure reports null, not zero usage', () => {
+  // 0% would claim the card is empty; null says we cannot see it.
+  assert.equal(gpuMemoryUsagePercent({ kind: 'discrete', vramBytes: 24 * GIB }), null);
+  assert.equal(gpuMemoryUsagePercent({ kind: 'discrete', vramUsedBytes: 1 * GIB }), null);
+  assert.equal(gpuMemoryUsagePercent({}), null);
+  assert.equal(gpuMemoryUsagePercent(null), null);
+});
+
+test('a memory percentage never exceeds 100 or goes negative', () => {
+  assert.equal(gpuMemoryUsagePercent({ kind: 'discrete', vramBytes: 10, vramUsedBytes: 40 }), 100);
+  assert.equal(gpuMemoryUsagePercent({ kind: 'discrete', vramBytes: 10, vramUsedBytes: -5 }), 0);
+});
+
+test('the inference card carries how much of its GTT window is in use', () => {
+  // Without this the integrated card contributed NO point to the per-GPU
+  // memory chart -- gpuMemoryUsagePercent reads gttUsedBytes for an APU, and
+  // the field was being dropped here while gttBytes survived.
+  const [apu] = buildInventory([
+    { card: 'card1', driver: 'amdgpu', gttBytes: 128 * GIB, gttUsedBytes: 32 * GIB },
+  ], SYSTEM);
+  assert.equal(apu.gttUsedBytes, 32 * GIB);
+  assert.equal(gpuMemoryUsagePercent(apu), 25);
+});
+
+test('a discrete card reports no GTT usage either, not just no GTT size', () => {
+  // Leaving gttUsedBytes set while nulling gttBytes would leave a discrete card
+  // claiming to consume a host-memory window it cannot address.
+  const [, dgpu] = buildInventory([
+    { card: 'card1', driver: 'nvidia', vramBytes: 24 * GIB, gttBytes: 256 * 1024 * 1024, gttUsedBytes: 64 * 1024 * 1024 },
+    { card: 'card2', driver: 'amdgpu', gttBytes: 128 * GIB, gttUsedBytes: 8 * GIB },
+  ], SYSTEM);
+  assert.equal(dgpu.gttBytes, null);
+  assert.equal(dgpu.gttUsedBytes, null);
 });

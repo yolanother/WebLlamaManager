@@ -330,7 +330,76 @@ function ChartTooltip({ active, payload, label, unit = '' }) {
 }
 
 // Temperature Chart Component
-function TemperatureChart({ data, height = 140 }) {
+// Colours for the SECOND and later GPUs on a multi-card machine. The first GPU
+// keeps its chart's own metric colour (red for temperature, amber for power),
+// so a one-GPU dashboard -- almost every appliance -- looks exactly as it
+// always did and the extra cards are what stand out as new.
+const GPU_SERIES_COLORS = ['var(--info)', 'var(--series-2)', 'var(--series-4-alt)', 'var(--series-6)'];
+
+/**
+ * One Recharts <Area> per GPU, for a chart that would otherwise draw a single
+ * line for whichever card inference runs on.
+ *
+ * Stroke only, no gradient fill: several filled areas stacked over each other
+ * are unreadable, and the gradient ids these charts use are document-global,
+ * so a fill per card would need id plumbing for a worse-looking result.
+ *
+ * @param {Array<{key:string, label:string, name:string}>} series From the
+ *   analytics payload's gpuSeries. Empty for a single-GPU machine.
+ * @param {string} baseColor The chart's own metric colour, used for the first
+ *   card so its line is the one that was always there.
+ * @returns {Array<object>} Area elements, or empty when there is one GPU.
+ */
+function gpuSeriesAreas(series, baseColor) {
+  if (!Array.isArray(series) || series.length === 0) return [];
+  return series.map((entry, i) => (
+    <Area
+      key={entry.key}
+      type="monotone"
+      dataKey={entry.key}
+      // The card's real name in the tooltip, its short label on the axis
+      // legend: "GPU 2" is what the thermal tile calls it, and the full name
+      // is what tells an operator which physical card that is.
+      name={entry.name ? `${entry.label} — ${entry.name}` : entry.label}
+      stroke={i === 0 ? baseColor : GPU_SERIES_COLORS[(i - 1) % GPU_SERIES_COLORS.length]}
+      fill="none"
+      strokeWidth={2}
+      dot={false}
+      // A card that cannot measure this metric records no field at all, so the
+      // line breaks rather than diving to zero and reading as idle or cold.
+      connectNulls={false}
+      isAnimationActive={false}
+    />
+  ));
+}
+
+
+/**
+ * Legend entries naming each GPU's line, coloured to match gpuSeriesAreas.
+ *
+ * The static "GPU" legend was accurate while a chart drew one GPU line. With a
+ * line per card it becomes a lie by omission -- two lines, one label, and no
+ * way to tell which card is which. Renders nothing on a single-GPU machine so
+ * the caller can fall back to its original markup.
+ *
+ * @param {{gpuSeries:Array<object>, baseColor:string}} props `baseColor` must
+ *   be the same colour passed to gpuSeriesAreas, or the dots will disagree
+ *   with the lines they label.
+ */
+export function GpuLegendItems({ gpuSeries, baseColor }) {
+  if (!Array.isArray(gpuSeries) || gpuSeries.length === 0) return null;
+  return gpuSeries.map((entry, i) => (
+    <div key={entry.key} className="chart-legend-item" title={entry.name || undefined}>
+      <span
+        className="chart-legend-dot"
+        style={{ background: i === 0 ? baseColor : GPU_SERIES_COLORS[(i - 1) % GPU_SERIES_COLORS.length] }}
+      ></span>
+      {entry.label}
+    </div>
+  ));
+}
+
+function TemperatureChart({ data, height = 140, gpuSeries = [] }) {
   if (!data || data.length < 2) {
     return (
       <div className="chart-container" style={{ height }}>
@@ -357,7 +426,9 @@ function TemperatureChart({ data, height = 140 }) {
           <XAxis dataKey="timestamp" hide />
           <YAxis domain={[0, 100]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit="°C" />} />
-          <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpu)" strokeWidth={2} dot={false} />
+          {gpuSeries.length > 0
+            ? gpuSeriesAreas(gpuSeries, CHART_COLORS.temperature)
+            : <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpu)" strokeWidth={2} dot={false} />}
           <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpu)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
         </AreaChart>
       </ResponsiveContainer>
@@ -918,7 +989,7 @@ function ModelPerformanceHistory({ requestSeries, loading = false, error = '' })
 // GPU/CPU compute-usage chart. Mirrors TemperatureChart but plots
 // utilization % so users can see when the iGPU is actually loaded
 // (and how that correlates with CPU spikes during prompt processing).
-function UsageChart({ data, height = 140 }) {
+function UsageChart({ data, height = 140, gpuSeries = [] }) {
   if (!data || data.length < 2) {
     return (
       <div className="chart-container" style={{ height }}>
@@ -948,7 +1019,9 @@ function UsageChart({ data, height = 140 }) {
           <XAxis dataKey="timestamp" hide />
           <YAxis domain={[0, 100]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit="%" />} />
-          <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpuUse)" strokeWidth={2} dot={false} />
+          {gpuSeries.length > 0
+            ? gpuSeriesAreas(gpuSeries, CHART_COLORS.temperature)
+            : <Area type="monotone" dataKey="gpu" name="GPU" stroke={CHART_COLORS.temperature} fill="url(#gradGpuUse)" strokeWidth={2} dot={false} />}
           <Area type="monotone" dataKey="cpu" name="CPU" stroke={CHART_COLORS.temperatureCpu} fill="url(#gradCpuUse)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
           <Area type="monotone" dataKey="appCpu" name="App CPU" stroke={CHART_COLORS.appUsage} fill="url(#gradAppUse)" strokeWidth={2} dot={false} strokeDasharray="2 2" />
         </AreaChart>
@@ -958,7 +1031,7 @@ function UsageChart({ data, height = 140 }) {
 }
 
 // Power Chart Component
-function PowerChart({ data, height = 140 }) {
+function PowerChart({ data, height = 140, gpuSeries = [] }) {
   if (!data || data.length < 2) {
     return (
       <div className="chart-container" style={{ height }}>
@@ -983,7 +1056,9 @@ function PowerChart({ data, height = 140 }) {
           <XAxis dataKey="timestamp" hide />
           <YAxis domain={[0, Math.ceil(maxPower / 10) * 10]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit="W" />} />
-          <Area type="monotone" dataKey="watts" name="Power" stroke={CHART_COLORS.power} fill="url(#gradPower)" strokeWidth={2} dot={false} />
+          {gpuSeries.length > 0
+            ? gpuSeriesAreas(gpuSeries, CHART_COLORS.power)
+            : <Area type="monotone" dataKey="watts" name="Power" stroke={CHART_COLORS.power} fill="url(#gradPower)" strokeWidth={2} dot={false} />}
         </AreaChart>
       </ResponsiveContainer>
     </div>
@@ -991,7 +1066,7 @@ function PowerChart({ data, height = 140 }) {
 }
 
 // Memory Chart Component
-function MemoryChart({ data, primaryKey = 'vram', height = 140 }) {
+function MemoryChart({ data, primaryKey = 'vram', height = 140, gpuSeries = [] }) {
   if (!data || data.length < 2) {
     return (
       <div className="chart-container" style={{ height }}>
@@ -1022,7 +1097,9 @@ function MemoryChart({ data, primaryKey = 'vram', height = 140 }) {
           <XAxis dataKey="timestamp" hide />
           <YAxis domain={[0, 100]} tick={{ fill: 'var(--chart-axis-text)', fontSize: 10 }} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTooltip unit="%" />} />
-          <Area type="monotone" dataKey={primaryKey} name={primaryKey.toUpperCase()} stroke={CHART_COLORS.memory} fill="url(#gradMem)" strokeWidth={2} dot={false} />
+          {gpuSeries.length > 0
+            ? gpuSeriesAreas(gpuSeries, CHART_COLORS.memory)
+            : <Area type="monotone" dataKey={primaryKey} name={primaryKey.toUpperCase()} stroke={CHART_COLORS.memory} fill="url(#gradMem)" strokeWidth={2} dot={false} />}
           <Area type="monotone" dataKey="system" name="System" stroke={CHART_COLORS.memorySecondary} fill="url(#gradSys)" strokeWidth={2} dot={false} strokeDasharray="4 2" />
           <Area type="monotone" dataKey="app" name="App" stroke={CHART_COLORS.appUsage} fill="url(#gradAppMem)" strokeWidth={2} dot={false} strokeDasharray="2 2" />
         </AreaChart>

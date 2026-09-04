@@ -36,6 +36,7 @@ import {
   formatHistoryTime,
   HistoryTooltip,
   TimeRangeSelector,
+  GpuLegendItems,
 } from '../components/util.jsx';
 
 // Keep Dashboard-owned Recharts series themeable. The shared chart helpers still
@@ -715,19 +716,19 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 <span style={{ color: severityColor(sensorSeverity(stats?.gpu?.temperature, stats?.guard)) }}>GPU: {stats?.gpu?.temperature?.toFixed(0) || 0}°C</span>
                 {stats?.cpu?.temperature ? <> / <span style={{ color: severityColor(sensorSeverity(stats.cpu.temperature, stats?.guard)) }}>CPU: {stats.cpu.temperature}°C</span></> : ''}
               </span></h4>
-              <MemoTemperatureChart data={analytics?.temperature || []} height={200} />
+              <MemoTemperatureChart data={analytics?.temperature || []} height={200} gpuSeries={analytics?.gpuSeries || []} />
             </div>
             <div className="chart-card glass-panel">
               <h4>GPU / CPU Usage <span className="chart-value">GPU: {stats?.gpu?.usage?.toFixed(0) || 0}%{stats?.cpu?.usage != null ? ` / CPU: ${stats.cpu.usage.toFixed(0)}%` : ''}</span></h4>
-              <MemoUsageChart data={analytics?.usage || []} height={200} />
+              <MemoUsageChart data={analytics?.usage || []} height={200} gpuSeries={analytics?.gpuSeries || []} />
             </div>
             <div className="chart-card glass-panel">
               <h4>Power <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span></h4>
-              <MemoPowerChart data={analytics?.power || []} height={200} />
+              <MemoPowerChart data={analytics?.power || []} height={200} gpuSeries={analytics?.gpuSeries || []} />
             </div>
             <div className="chart-card glass-panel">
               <h4>Memory <span className="chart-value">{stats?.gpu?.isAPU ? `GTT: ${stats?.gpu?.gtt?.usage?.toFixed(0) || 0}%` : `VRAM: ${stats?.gpu?.vram?.usage?.toFixed(0) || 0}%`}</span></h4>
-              <MemoMemoryChart data={analytics?.memory || []} primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'} height={200} />
+              <MemoMemoryChart data={analytics?.memory || []} primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'} height={200} gpuSeries={analytics?.gpuSeries || []} />
             </div>
             <div className="chart-card glass-panel">
               <h4>Generation Speed <span className="chart-value">{analytics?.tokenStats?.averageTokensPerSecond?.toFixed(1) || 0} tok/s</span></h4>
@@ -1459,12 +1460,16 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 {stats?.cpu?.temperature ? <> / <span style={{ color: severityColor(sensorSeverity(stats.cpu.temperature, stats?.guard)) }}>CPU: {stats.cpu.temperature}°C</span></> : ''}
               </span>
             </h4>
-            <MemoTemperatureChart data={analytics?.temperature || []} />
+            <MemoTemperatureChart data={analytics?.temperature || []} gpuSeries={analytics?.gpuSeries || []} />
             <div className="chart-legend">
-              <div className="chart-legend-item">
-                <span className="chart-legend-dot gpu"></span>
-                GPU
-              </div>
+              {analytics?.gpuSeries?.length
+                ? <GpuLegendItems gpuSeries={analytics.gpuSeries} baseColor={DASHBOARD_CHART_COLORS.temperature} />
+                : (
+                  <div className="chart-legend-item">
+                    <span className="chart-legend-dot gpu"></span>
+                    GPU
+                  </div>
+                )}
               <div className="chart-legend-item">
                 <span className="chart-legend-dot cpu"></span>
                 CPU
@@ -1481,12 +1486,16 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 {stats?.cpu?.usage != null && ` / CPU: ${stats.cpu.usage.toFixed(0)}%`}
               </span>
             </h4>
-            <MemoUsageChart data={analytics?.usage || []} />
+            <MemoUsageChart data={analytics?.usage || []} gpuSeries={analytics?.gpuSeries || []} />
             <div className="chart-legend">
-              <div className="chart-legend-item">
-                <span className="chart-legend-dot gpu"></span>
-                GPU
-              </div>
+              {analytics?.gpuSeries?.length
+                ? <GpuLegendItems gpuSeries={analytics.gpuSeries} baseColor={DASHBOARD_CHART_COLORS.temperature} />
+                : (
+                  <div className="chart-legend-item">
+                    <span className="chart-legend-dot gpu"></span>
+                    GPU
+                  </div>
+                )}
               <div className="chart-legend-item">
                 <span className="chart-legend-dot cpu"></span>
                 CPU
@@ -1504,7 +1513,14 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
               Power Consumption
               <span className="chart-value">{stats?.gpu?.power?.toFixed(0) || 0} W</span>
             </h4>
-            <MemoPowerChart data={analytics?.power || []} />
+            <MemoPowerChart data={analytics?.power || []} gpuSeries={analytics?.gpuSeries || []} />
+            {analytics?.gpuSeries?.length ? (
+              // A single-GPU power chart draws one line and needs no legend --
+              // the heading already says what it is. Two lines do.
+              <div className="chart-legend">
+                <GpuLegendItems gpuSeries={analytics.gpuSeries} baseColor={DASHBOARD_CHART_COLORS.power} />
+              </div>
+            ) : null}
           </div>
 
           {/* Memory Chart */}
@@ -1521,12 +1537,17 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             <MemoMemoryChart
               data={analytics?.memory || []}
               primaryKey={stats?.gpu?.isAPU ? 'gtt' : 'vram'}
+              gpuSeries={analytics?.gpuSeries || []}
             />
             <div className="chart-legend">
-              <div className="chart-legend-item">
-                <span className="chart-legend-dot vram"></span>
-                {stats?.gpu?.isAPU ? 'GTT' : 'VRAM'}
-              </div>
+              {analytics?.gpuSeries?.length
+                ? <GpuLegendItems gpuSeries={analytics.gpuSeries} baseColor={DASHBOARD_CHART_COLORS.memory} />
+                : (
+                  <div className="chart-legend-item">
+                    <span className="chart-legend-dot vram"></span>
+                    {stats?.gpu?.isAPU ? 'GTT' : 'VRAM'}
+                  </div>
+                )}
               <div className="chart-legend-item">
                 <span className="chart-legend-dot system"></span>
                 System

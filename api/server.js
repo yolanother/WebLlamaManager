@@ -204,6 +204,8 @@ import {
   NVIDIA_VENDOR_ID,
   NVIDIA_SMI_QUERY,
   parseNvidiaSmi,
+  resolveGpuSeries,
+  gpuMemoryUsagePercent,
 } from './gpu-inventory.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
@@ -2044,6 +2046,12 @@ function updateBackendTokenStats(backendId, promptTokens, completionTokens, dura
 
 // Analytics data storage (circular buffers for time-series data)
 const MAX_ANALYTICS_POINTS = 300; // 5 minutes at 1 second intervals
+// Describes the per-GPU fields the analytics samples carry, so a chart can
+// label and colour them without inferring anything from key names. Empty on a
+// single-GPU machine, which records no per-card fields at all. Rebuilt on every
+// broadcast, so adding or removing a card is picked up without a restart.
+let analyticsGpuSeries = [];
+
 const analyticsData = {
   temperature: [],   // { timestamp, gpu, cpu }
   power: [],         // { timestamp, watts }
@@ -4081,24 +4089,50 @@ async function broadcastStats() {
 
     // Record analytics data points
     if (stats.gpu) {
+      // One extra field per GPU on a multi-card machine, so every graph can
+      // draw a line for each card instead of one line for whichever card
+      // inference happens to run on. Empty on a single-GPU appliance, which
+      // therefore records exactly the fields it always did.
+      //
+      // A card that cannot measure a metric contributes NO field rather than a
+      // zero: Recharts leaves a gap for a missing value, where a 0 would draw
+      // the card flat along the axis and read as "idle" or "stone cold".
+      const series = resolveGpuSeries(stats.gpus);
+      const perCard = (pick) => {
+        const out = {};
+        for (const entry of series) {
+          const gpu = stats.gpus.find((g) => g.card === entry.card);
+          const value = gpu ? pick(gpu) : null;
+          if (value !== null && value !== undefined) out[entry.key] = value;
+        }
+        return out;
+      };
+
       addAnalyticsPoint('temperature', {
         gpu: stats.gpu.temperature || 0,
-        cpu: stats.cpu?.temperature || 0
+        cpu: stats.cpu?.temperature || 0,
+        ...perCard((g) => g.temperature),
       });
       addAnalyticsPoint('power', {
-        watts: stats.gpu.power || 0
+        watts: stats.gpu.power || 0,
+        ...perCard((g) => g.power),
       });
       addAnalyticsPoint('memory', {
         vram: stats.gpu.vram?.usage || 0,
         gtt: stats.gpu.gtt?.usage || 0,
         system: stats.memory?.usage || 0,
-        app: stats.memory?.appUsage || 0
+        app: stats.memory?.appUsage || 0,
+        ...perCard(gpuMemoryUsagePercent),
       });
       addAnalyticsPoint('usage', {
         gpu: stats.gpu.usage || 0,
         cpu: stats.cpu?.usage || 0,
-        appCpu: stats.cpu?.appUsage || 0
+        appCpu: stats.cpu?.appUsage || 0,
+        ...perCard((g) => g.usage),
       });
+      // The descriptor the charts need to label and colour those fields. Kept
+      // beside the buffers rather than repeated in every sample.
+      analyticsGpuSeries = series;
     } else if (stats.cpu?.temperature) {
       addAnalyticsPoint('temperature', {
         gpu: 0,
@@ -9086,6 +9120,9 @@ app.get('/api/analytics', (req, res) => {
     context: analyticsData.context.filter(p => p.timestamp > cutoff),
     queue: analyticsData.queue.filter(p => p.timestamp > cutoff),
     usage: analyticsData.usage.filter(p => p.timestamp > cutoff),
+    // One entry per GPU when the machine has more than one; empty otherwise, so
+    // a single-GPU dashboard renders precisely the chart it always has.
+    gpuSeries: analyticsGpuSeries,
     tokenStats: {
       totalPromptTokens: tokenStats.totalPromptTokens,
       totalCompletionTokens: tokenStats.totalCompletionTokens,

@@ -81,6 +81,9 @@ export function buildInventory(cards, systemBytes) {
       // must be presented as an estimate rather than a measurement.
       vramSource: raw.vramSource ?? null,
       gttBytes: raw.gttBytes ?? null,
+      // How much of that window is in use. Dropped here originally, which left
+      // the APU with no point on the per-card memory chart.
+      gttUsedBytes: raw.gttUsedBytes ?? null,
       systemBytes: systemBytes ?? null,
       temperature: raw.temperature ?? null,
       // The kernel's busy counter reaches this reader as `busyPercent`.
@@ -105,6 +108,7 @@ export function buildInventory(cards, systemBytes) {
     // system pools stay null: absent, never a share of host RAM.
     if (entry !== inference) {
       entry.gttBytes = null;
+      entry.gttUsedBytes = null;
       entry.systemBytes = null;
     }
     if (!entry.available) {
@@ -325,4 +329,64 @@ export function parseNvidiaSmi(stdout) {
     };
   }
   return out;
+}
+
+/**
+ * Describes the extra chart series a multi-GPU machine needs.
+ *
+ * Every analytics sample used to record one scalar per metric, taken from the
+ * inference card, so a second GPU's temperature, power, utilisation and memory
+ * appeared on no graph at all. This names one series per card so each metric
+ * can carry a value for every GPU.
+ *
+ * Returns EMPTY for a single-GPU machine -- almost every appliance -- so its
+ * samples gain no keys and its charts keep drawing exactly the lines they
+ * always drew. The multi-card case is additive, never a rewrite of the common
+ * one.
+ *
+ * @param {?Array<object>} gpus The `gpus[]` inventory.
+ * @returns {Array<{key:string, card:string, label:string, name:string,
+ *   inference:boolean}>} Inference card first -- DRM order is not meaningful to
+ *   a reader, and on this appliance the discrete card enumerates ahead of the
+ *   APU, so ordering by the array would label the wrong card "GPU 1". `key` is
+ *   both the sample field and the chart's dataKey.
+ */
+export function resolveGpuSeries(gpus) {
+  const list = Array.isArray(gpus) ? gpus : [];
+  if (list.length <= 1) return [];
+  const inference = list.find((g) => g.inference) || list[0];
+  const ordered = [inference, ...list.filter((g) => g !== inference)];
+  return ordered.map((gpu, i) => ({
+    key: `gpu_${gpu.card || i}`,
+    card: gpu.card || '',
+    // "GPU 1"/"GPU 2" matches the thermal tile's rows, so one machine speaks
+    // one language about its cards across the whole dashboard.
+    label: `GPU ${i + 1}`,
+    name: gpu.name || '',
+    inference: Boolean(gpu.inference),
+  }));
+}
+
+/**
+ * How full one card's own memory pool is, as a percentage.
+ *
+ * An APU's usable pool is its GTT window, not the token VRAM carve-out (1 GiB
+ * on Strix Halo), so reporting VRAM for it would understate the machine by two
+ * orders of magnitude. A discrete card has no GTT and its VRAM is the answer.
+ * This mirrors the panel's own formatter so the chart and the card cannot
+ * disagree about which pool a GPU has.
+ *
+ * @param {?{kind:string, gttBytes:?number, gttUsedBytes:?number,
+ *   vramBytes:?number, vramUsedBytes:?number}} gpu One entry from `gpus[]`.
+ * @returns {?number} 0-100, or null when either half of the ratio is unknown --
+ *   never 0, which would claim the card's memory is empty rather than
+ *   unmeasured.
+ */
+export function gpuMemoryUsagePercent(gpu) {
+  if (!gpu) return null;
+  const integrated = gpu.kind === 'integrated';
+  const total = integrated ? gpu.gttBytes : gpu.vramBytes;
+  const used = integrated ? gpu.gttUsedBytes : gpu.vramUsedBytes;
+  if (!total || total <= 0 || used === null || used === undefined) return null;
+  return Math.max(0, Math.min(100, Math.round((used / total) * 1000) / 10));
 }
