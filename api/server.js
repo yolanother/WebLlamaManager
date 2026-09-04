@@ -3296,7 +3296,9 @@ let lspciNamesCache = null;
 function lspciNames() {
   if (lspciNamesCache) return lspciNamesCache;
   try {
-    lspciNamesCache = parseLspciNames(execSync('lspci -mm', { encoding: 'utf-8', timeout: 5000 }));
+    // stderr is discarded: on a box without lspci the shell's "not found" would
+    // otherwise land in the appliance log as if something had gone wrong.
+    lspciNamesCache = parseLspciNames(execSync('lspci -mm', { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }));
   } catch {
     lspciNamesCache = {}; // not installed, or it failed -- either way, stop asking
   }
@@ -3314,7 +3316,9 @@ function nvidiaSmiMemoryBytes(slot) {
     try {
       const out = execSync(
         'nvidia-smi --query-gpu=pci.bus_id,memory.total --format=csv,noheader,nounits',
-        { encoding: 'utf-8', timeout: 5000 },
+        // stderr discarded: the tool is absent on every AMD-only appliance, and
+        // "nvidia-smi: not found" in the log reads as a fault rather than normal.
+        { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] },
       );
       for (const line of out.split('\n')) {
         const fields = line.split(',').map((f) => f.trim());
