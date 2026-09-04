@@ -23,7 +23,7 @@
 import express from 'express';
 import cors from 'cors';
 import { spawn, exec, execSync } from 'child_process';
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync, unlinkSync, realpathSync, readlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, basename, isAbsolute, relative, resolve } from 'path';
 import { createServer } from 'http';
@@ -199,7 +199,10 @@ import { shouldIdleShutdown } from './idle-shutdown.js';
 import { resolveIdleMinutes } from './idle-policy.js';
 import { resolveNamingModel } from './naming-model.js';
 import { seedDefaultAliases } from './seed-aliases.js';
-import { buildInventory } from './gpu-inventory.js';
+import {
+  buildInventory, parsePciApertureBytes, parseLspciNames, describeCardName,
+  NVIDIA_VENDOR_ID,
+} from './gpu-inventory.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -3283,48 +3286,143 @@ function getCpuTemperature() {
   return null;
 }
 
-// Read AMD GPU stats directly from amdgpu sysfs (host-side). On Strix Halo, rocm-smi
-// returns NO data at all on recent kernels (6.18+), so these sysfs reads are the reliable
-// source for the dashboard + thermal governor: edge temperature, package power, core
-// clock, and busy %. Without them the dashboard shows 0 °C / 0 W / 0 MHz / 0 % and the
-// governor never throttles a hot APU. Each field is 0 if its sensor is unavailable.
-// Returns { temperature(°C), power(W), coreClock(MHz), busyPercent(%) }.
+// lspci's slot -> name map, resolved AT MOST ONCE for the life of the process.
+// /api/system is polled continuously and every card is described on every poll,
+// so spawning lspci per card per poll would be a real regression. The PCI bus
+// does not change under a running kernel, so one read is also the correct one.
+// null means "not attempted yet"; an empty map means lspci is absent, which is
+// an ordinary outcome and not retried.
+let lspciNamesCache = null;
+function lspciNames() {
+  if (lspciNamesCache) return lspciNamesCache;
+  try {
+    lspciNamesCache = parseLspciNames(execSync('lspci -mm', { encoding: 'utf-8', timeout: 5000 }));
+  } catch {
+    lspciNamesCache = {}; // not installed, or it failed -- either way, stop asking
+  }
+  return lspciNamesCache;
+}
+
+// nvidia-smi's slot -> VRAM map, memoised for the same reason. The tool is
+// OPTIONAL and usually absent (this appliance ships an AMD stack), so its
+// absence yields an empty map rather than an error. A2 layers live telemetry on
+// top; this call exists only to size a card sysfs could not size.
+let nvidiaSmiMemoryCache = null;
+function nvidiaSmiMemoryBytes(slot) {
+  if (!nvidiaSmiMemoryCache) {
+    nvidiaSmiMemoryCache = {};
+    try {
+      const out = execSync(
+        'nvidia-smi --query-gpu=pci.bus_id,memory.total --format=csv,noheader,nounits',
+        { encoding: 'utf-8', timeout: 5000 },
+      );
+      for (const line of out.split('\n')) {
+        const fields = line.split(',').map((f) => f.trim());
+        if (fields.length < 2) continue;
+        const mib = parseInt(fields[fields.length - 1], 10);
+        if (!Number.isFinite(mib)) continue;
+        // nvidia-smi zero-pads the domain (00000000:c6:00.0) where sysfs does
+        // not (0000:c6:00.0), so the bus:device.function tail is what matches.
+        nvidiaSmiMemoryCache[fields[0].toLowerCase().split(':').slice(-2).join(':')] = mib * 1024 * 1024;
+      }
+    } catch {
+      // absent or failed -- an ordinary outcome, cached so we stop asking
+    }
+  }
+  const tail = String(slot || '').toLowerCase().split(':').slice(-2).join(':');
+  return nvidiaSmiMemoryCache[tail] ?? null;
+}
+
+// Describe ONE DRM card from sysfs, whatever vendor and driver it has.
+//
+// This used to require an hwmon named exactly `amdgpu` and return null without
+// one. nouveau on a GA102 registers NO hwmon at all, so an OCuLink-attached RTX
+// 3090 was discarded here -- before the (correct) multi-GPU inventory ever saw
+// it -- and the machine reported hardware it does not have missing. Vendor
+// identity, driver, and memory are therefore all read vendor-neutrally, and the
+// card is described even when nothing on it reports telemetry.
+//
+// Telemetry a card cannot report is null, NEVER 0: a confident 0 W / 0 °C on a
+// working 3090 reads as a broken card, which is worse than an honest unknown.
+// Returns { card, name, driver, available, temperature, power, coreClock,
+// busyPercent, vramBytes, vramSource, gttBytes, gttUsedBytes }.
 function readCardSysfs(card) {
   const dev = `/sys/class/drm/${card}/device`;
+  const readOpt = (p) => { try { const v = parseInt(readFileSync(p, 'utf-8').trim()); return Number.isFinite(v) ? v : null; } catch { return null; } };
+  const readText = (p) => { try { return readFileSync(p, 'utf-8').trim(); } catch { return null; } };
+
+  // Any hwmon the card publishes, preferring amdgpu when several are present so
+  // an AMD card reads exactly as it always has. No hwmon is not a disqualifier.
   let hwmon = null;
   try {
     for (const hw of readdirSync(`${dev}/hwmon`)) {
-      if (readFileSync(`${dev}/hwmon/${hw}/name`, 'utf-8').trim() === 'amdgpu') { hwmon = `${dev}/hwmon/${hw}`; break; }
+      const path = `${dev}/hwmon/${hw}`;
+      if (!hwmon) hwmon = path;
+      if (readText(`${path}/name`) === 'amdgpu') { hwmon = path; break; }
     }
-  } catch { /* no hwmon on this card */ }
-  if (!hwmon) return null; // not the GPU card (e.g. a display-only node)
-  const readInt = (p) => { try { return parseInt(readFileSync(p, 'utf-8').trim()) || 0; } catch { return 0; } };
-  const readOpt = (p) => { try { const v = parseInt(readFileSync(p, 'utf-8').trim()); return Number.isFinite(v) ? v : null; } catch { return null; } };
-  let name = '';
-  try { name = readFileSync(`${dev}/product_name`, 'utf-8').trim(); } catch { /* not published */ }
+  } catch { /* no hwmon on this card -- normal for nouveau */ }
+
+  let slot = '';
+  try { slot = basename(realpathSync(dev)); } catch { /* fixture tree, or gone */ }
+  let driver = '';
+  try { driver = basename(readlinkSync(`${dev}/driver`)); } catch { /* nothing bound */ }
+  const vendorId = readText(`${dev}/vendor`);
+  const deviceId = readText(`${dev}/device`);
+
+  // Dedicated VRAM, most trustworthy source first: the driver's own figure,
+  // then nvidia-smi for NVIDIA cards only, then the PCI aperture. Which one
+  // answered is recorded, because the aperture OVER-reports (a 24 GiB card can
+  // expose a 32 GiB BAR) and must be presented as an estimate.
+  let vramSource = null;
+  let vramBytes = readOpt(`${dev}/mem_info_vram_total`);
+  if (vramBytes !== null) {
+    vramSource = 'sysfs';
+  } else {
+    if (vendorId === NVIDIA_VENDOR_ID) {
+      vramBytes = nvidiaSmiMemoryBytes(slot);
+      if (vramBytes !== null) vramSource = 'nvidia-smi';
+    }
+    if (vramBytes === null) {
+      vramBytes = parsePciApertureBytes(readText(`${dev}/resource`));
+      if (vramBytes !== null) vramSource = 'aperture';
+    }
+  }
+
+  const names = lspciNames();
+  const lspciName = names[slot] || names[slot.slice(5)] || null;
+  const temp = hwmon ? readOpt(`${hwmon}/temp1_input`) : null;
+  const power = hwmon ? readOpt(`${hwmon}/power1_average`) : null;
+  const clock = hwmon ? readOpt(`${hwmon}/freq1_input`) : null;
+
   return {
     card,
-    name,
-    driver: 'amdgpu',
-    available: true,
-    temperature: Math.round(readInt(`${hwmon}/temp1_input`) / 100) / 10, // m°C -> °C
-    power: Math.round(readInt(`${hwmon}/power1_average`) / 1000000),     // µW -> W
-    coreClock: Math.round(readInt(`${hwmon}/freq1_input`) / 1000000),    // Hz -> MHz
-    busyPercent: readInt(`${dev}/gpu_busy_percent`),
-    vramBytes: readOpt(`${dev}/mem_info_vram_total`),
+    // sysfs product_name when the driver publishes one (it is empty on Strix
+    // Halo), otherwise the vendor-neutral name the kiosk panel shows.
+    name: readText(`${dev}/product_name`) || describeCardName({ vendorId, deviceId, lspciName }),
+    driver,
+    // A card the running kernel has not bound cannot be used. Say so WITH the
+    // reason rather than dropping it: hardware that is physically present and
+    // silently missing from the readout is the hardest kind of fault to chase.
+    available: Boolean(driver),
+    temperature: temp === null ? null : Math.round(temp / 100) / 10, // m°C -> °C
+    power: power === null ? null : Math.round(power / 1000000),      // µW -> W
+    coreClock: clock === null ? null : Math.round(clock / 1000000),  // Hz -> MHz
+    busyPercent: readOpt(`${dev}/gpu_busy_percent`),
+    vramBytes,
+    vramSource,
     gttBytes: readOpt(`${dev}/mem_info_gtt_total`),
     gttUsedBytes: readOpt(`${dev}/mem_info_gtt_used`),
   };
 }
 
-// Read EVERY amdgpu card from sysfs, in DRM enumeration order.
+// Read EVERY DRM card from sysfs, in DRM enumeration order.
 //
 // This used to return on the first card it found. DRM cards enumerate in kernel
 // order, so an OCuLink-attached discrete card can sort AHEAD of the APU -- and
 // the dashboard then showed the discrete card's temperature, power and memory
 // under the iGPU's label while the thermal governor throttled on the same
 // numbers. Wrong values, not missing ones.
-// Returns [] when the machine has no amdgpu card.
+// Returns [] when the machine has no DRM card at all.
 function getAllGpuSysfsStats() {
   const cards = [];
   try {
@@ -3350,10 +3448,15 @@ function getGpuSysfsStats() {
   const systemBytes = memTotalBytes();
   const inference = buildInventory(cards, systemBytes)[0];
   const chosen = cards.find((c) => c.card === inference.card) || cards[0];
-  out.temperature = chosen.temperature;
-  out.power = chosen.power;
-  out.coreClock = chosen.coreClock;
-  out.busyPercent = chosen.busyPercent;
+  // This readout's contract is NUMBERS -- the thermal governor compares them and
+  // the dashboard's headline cells render them. Per-card telemetry is now null
+  // when a sensor cannot answer, so coerce here rather than making every caller
+  // of the governor handle a null. The per-card gpus[] readout keeps the honest
+  // null; this is the one place a 0 is the established meaning of "no reading".
+  out.temperature = chosen.temperature ?? 0;
+  out.power = chosen.power ?? 0;
+  out.coreClock = chosen.coreClock ?? 0;
+  out.busyPercent = chosen.busyPercent ?? 0;
   return out;
 }
 
