@@ -95,3 +95,82 @@ test('an unnamed inference card gets a meaningful heading, not just its node', (
   assert.match(view.label, /Integrated GPU/);
   assert.notEqual(view.label, 'card1');
 });
+
+/*
+ * AN APERTURE FIGURE IS AN ESTIMATE, AND MUST SAY SO (A3).
+ *
+ * When no vendor tool can size a discrete card, A1 falls back to the largest
+ * prefetchable PCI BAR. Drakemore's 24 GiB RTX 3090 exposes a 32 GiB resizable
+ * BAR, so an unqualified "32 GB" is a number an operator would size a model
+ * against and be wrong by 8 GiB. Every other source is a real measurement and
+ * must NOT be hedged -- a qualifier on a figure that is exact is its own kind of
+ * lie.
+ */
+const NVIDIA_APERTURE = {
+  card: 'card1', name: 'NVIDIA GA102 [GeForce RTX 3090]', driver: 'nouveau',
+  kind: 'discrete', inference: false, available: true, reason: '',
+  vramBytes: 32 * GIB, vramSource: 'aperture', gttBytes: null, systemBytes: null,
+  temperature: null, usage: null, power: null,
+};
+
+test('an aperture-derived size is rendered as an estimate, not a measurement', () => {
+  const detail = formatGpuMemory(NVIDIA_APERTURE);
+  assert.match(detail, /32 GB/);
+  assert.match(detail, /estimate/i, 'the figure must carry its own qualifier');
+  assert.match(detail, /^~/, 'and read as approximate at a glance');
+});
+
+test('a size a vendor tool measured is NOT hedged', () => {
+  const measured = { ...NVIDIA_APERTURE, vramSource: 'nvidia-smi', vramBytes: 24 * GIB };
+  assert.equal(formatGpuMemory(measured), '24 GB');
+  const sysfs = { ...NVIDIA_APERTURE, vramSource: 'sysfs', vramBytes: 24 * GIB };
+  assert.equal(formatGpuMemory(sysfs), '24 GB');
+  // A pre-A1 payload has no vramSource at all and must not suddenly read as an estimate.
+  const legacy = { ...NVIDIA_APERTURE, vramSource: undefined, vramBytes: 24 * GIB };
+  assert.equal(formatGpuMemory(legacy), '24 GB');
+});
+
+test("the APU's GTT pool is never labelled an estimate by a stray vramSource", () => {
+  // vramSource describes vramBytes. The integrated card reports its usable pool
+  // from GTT, so an 'aperture' tag on its unused VRAM carve-out must not leak in.
+  const apu = { ...IGPU, vramSource: 'aperture' };
+  assert.equal(formatGpuMemory(apu), '120 GB');
+});
+
+test('a vendor-named card keeps the name the backend resolved', () => {
+  const view = resolveGpuPanel({ gpus: [IGPU, NVIDIA_APERTURE] });
+  assert.equal(view.additional.length, 1);
+  // Identical to what the kiosk panel shows -- A4 locks the two together, so
+  // this must not be prettified here.
+  assert.equal(view.additional[0].title, 'NVIDIA GA102 [GeForce RTX 3090]');
+});
+
+test('the bound driver is on the card, because nouveau vs nvidia is the whole question', () => {
+  const view = resolveGpuPanel({ gpus: [IGPU, NVIDIA_APERTURE] });
+  assert.equal(view.additional[0].driver, 'nouveau');
+});
+
+test('an estimate carries an explanation for the reader who hovers it', () => {
+  const view = resolveGpuPanel({ gpus: [IGPU, NVIDIA_APERTURE] });
+  const card = view.additional[0];
+  assert.match(card.detail, /estimate/i);
+  assert.ok(card.detailTitle, 'an estimate must explain itself');
+  assert.match(card.detailTitle, /aperture|no vendor tool/i);
+});
+
+test('a measured card carries no explanation, because there is nothing to explain', () => {
+  const view = resolveGpuPanel({ gpus: [IGPU, { ...DGPU, vramSource: 'sysfs' }] });
+  assert.equal(view.additional[0].detail, '24 GB');
+  assert.equal(view.additional[0].detailTitle, null);
+});
+
+/*
+ * The unavailable-reason > size > reason precedence A1's panel established is
+ * extended here, not replaced: a card the kernel never bound has nothing useful
+ * to say about its memory, estimate or not.
+ */
+test('an unusable card still leads with its reason, not with an estimate', () => {
+  const unbound = { ...NVIDIA_APERTURE, available: false, driver: '', reason: 'no kernel driver is bound to it' };
+  const view = resolveGpuPanel({ gpus: [IGPU, unbound] });
+  assert.equal(view.additional[0].detail, 'no kernel driver is bound to it');
+});

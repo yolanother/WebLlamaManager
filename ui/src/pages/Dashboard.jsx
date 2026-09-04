@@ -1359,11 +1359,15 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 <span className="resource-label">
                   {gpu.title}
                   <span style={{ fontSize: '0.7em', opacity: 0.7, marginLeft: '0.4em' }}>
-                    {gpu.kind}
+                    {gpu.driver ? `${gpu.kind} \u00b7 ${gpu.driver}` : gpu.kind}
                   </span>
                 </span>
-                {/* Never a bare 0: an unmeasurable card says why. */}
-                <span className="resource-detail">{gpu.detail}</span>
+                {/* Never a bare 0: an unmeasurable card says why. An estimated
+                    size carries its explanation as a tooltip, so the qualifier
+                    in the text stays short enough to read at a glance. */}
+                <span className="resource-detail" title={gpu.detailTitle || undefined}>
+                  {gpu.detail}
+                </span>
                 {gpu.available && gpu.temperature > 0 && (
                   <span
                     className="resource-detail"

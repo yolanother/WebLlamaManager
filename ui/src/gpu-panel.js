@@ -20,18 +20,45 @@
  * on Strix Halo), so reporting VRAM for it would understate the machine by two
  * orders of magnitude. A discrete card has no GTT and its VRAM is the answer.
  *
- * @param {{vramBytes:?number, gttBytes:?number}} gpu One entry from `gpus[]`.
+ * A figure derived from the PCI aperture is an OVER-estimate and says so: a
+ * 24 GiB RTX 3090 exposes a 32 GiB resizable BAR, and an unqualified "32 GB" is
+ * a number an operator would size a model against and be wrong by 8 GiB. Every
+ * other source is a real measurement and is left unhedged, because qualifying a
+ * figure that is exact is its own kind of lie.
+ *
+ * @param {{vramBytes:?number, gttBytes:?number, vramSource:?string}} gpu One
+ *   entry from `gpus[]`. `vramSource` describes vramBytes only.
  * @returns {?string} Human-readable size, or null when nothing on this machine
  *   can measure it — never "0 B", which reads as "this card has no memory".
  */
 export function formatGpuMemory(gpu) {
-  const bytes = gpu?.gttBytes || gpu?.vramBytes || null;
+  const gtt = gpu?.gttBytes || null;
+  const bytes = gtt || gpu?.vramBytes || null;
   if (!bytes || bytes <= 0) return null;
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes;
   let unit = 0;
   while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
-  return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+  const size = `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+  // Only when the figure SHOWN is the aperture one. An integrated card reports
+  // its usable pool from GTT, so a stray vramSource on its unused VRAM
+  // carve-out must not make the APU's honest number read as a guess.
+  return !gtt && gpu?.vramSource === 'aperture' ? `~${size} (aperture estimate)` : size;
+}
+
+/**
+ * Explains an estimated memory figure to whoever hovers it.
+ *
+ * @param {{vramBytes:?number, gttBytes:?number, vramSource:?string}} gpu One
+ *   entry from `gpus[]`.
+ * @returns {?string} Tooltip text, or null when the figure is a measurement and
+ *   there is therefore nothing to explain.
+ */
+export function gpuMemoryTitle(gpu) {
+  if (gpu?.gttBytes || gpu?.vramSource !== 'aperture') return null;
+  return 'No vendor tool on this machine reports this card\u2019s memory size, so this is the '
+    + 'largest prefetchable PCI aperture instead. It is an upper bound: a card can expose a '
+    + 'window larger than the memory behind it.';
 }
 
 /**
@@ -61,8 +88,9 @@ export function describeGpu(gpu) {
  *   `gpus` — an appliance whose manager predates this field must not render as
  *   broken, so a missing or empty list is simply "one GPU, nothing to add".
  * @returns {{showAdditional:boolean, count:number, label:?string,
- *   additional:Array<{card:string, title:string, detail:string, kind:string,
- *   available:boolean, inference:boolean, temperature:?number, power:?number}>}}
+ *   additional:Array<{card:string, title:string, detail:string,
+ *   detailTitle:?string, driver:string, kind:string, available:boolean,
+ *   inference:boolean, temperature:?number, power:?number}>}}
  *   `label` is the inference card's name, for use as a heading, and is null
  *   when there is nothing to disambiguate it from.
  */
@@ -87,6 +115,13 @@ export function resolveGpuPanel(stats) {
       // empty heading would make it look like a UI fault rather than a card.
       title: describeGpu(gpu),
       detail,
+      // Null unless `detail` is an estimate. Only an estimate owes the reader
+      // an explanation; attaching one to a measured figure invites doubt about
+      // a number that deserves none.
+      detailTitle: gpu.available && size ? gpuMemoryTitle(gpu) : null,
+      // The bound driver, because nouveau vs nvidia is exactly the distinction
+      // an operator asking "why is there no CUDA on this card" needs to see.
+      driver: gpu.driver || '',
       kind: gpu.kind || 'discrete',
       available: gpu.available !== false,
       inference: false,
