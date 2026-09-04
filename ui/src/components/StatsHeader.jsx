@@ -7,7 +7,8 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { copyTextToClipboard } from '../api.js';
-import { ProgressRing, guardSeverity, sensorSeverity, severityColor } from './util.jsx';
+import { resolveGpuRings } from '../gpu-panel.js';
+import { ProgressRing, ConcentricRings, guardSeverity, sensorSeverity, severityColor } from './util.jsx';
 
 // Compact Stats Header
 function StatsHeader({ stats }) {
@@ -115,25 +116,21 @@ function StatsHeader({ stats }) {
               <span className="stats-header-label">{stats.gpu.isAPU ? 'GTT' : 'VRAM'}</span>
             </div>
 
-            <div
-              className="stats-header-item"
-              title={(stats.gpus?.length || 1) > 1
-                ? `GPU usage \u2014 inference card of ${stats.gpus.length}`
-                : 'GPU Usage'}
-            >
-              <ProgressRing
-                value={stats.gpu.usage || 0}
-                size={36}
-                strokeWidth={4}
-                color="var(--accent)"
-              />
-              {/* The rail is a one-line summary of the card the model runs on;
-                  it is not multiplied per card. The count only tells the
-                  operator another card exists so a missing one is noticeable. */}
-              <span className="stats-header-label">
-                GPU{(stats.gpus?.length || 1) > 1 ? ` 1/${stats.gpus.length}` : ''}
-              </span>
-            </div>
+            {(() => {
+              // One concentric ring per GPU, outermost = the card inference
+              // runs on. This replaced a single ring labelled "1/2", which was
+              // accurate and useless: it named the card being shown while the
+              // other card's load appeared nowhere on the rail, so a discrete
+              // card pinned at 100% stayed invisible until someone opened the
+              // dashboard.
+              const gauge = resolveGpuRings(stats);
+              return (
+                <div className="stats-header-item" title={gauge.title}>
+                  <ConcentricRings rings={gauge.rings} size={36} strokeWidth={4} />
+                  <span className="stats-header-label">{gauge.label}</span>
+                </div>
+              );
+            })()}
 
             {(stats.guard || stats.gpu.temperature > 0) && (() => {
               // One compact tile per sensor (GPU + CPU) so a cool GPU can't

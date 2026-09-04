@@ -7499,3 +7499,14 @@ html[data-effects="simple"] .searchable-select-search {
     transition: none;
   }
 }
+
+/* A GPU present in the machine whose driver publishes no utilisation counter
+   (nouveau on an NVIDIA card, for one). Drawn instead of a fill, never as 0%:
+   an empty solid ring would assert the card is idle, when the truth is that we
+   cannot see it. Dashed so it is legible as "no data" rather than a level, and
+   muted so it never competes with a card that IS reporting. */
+.concentric-ring-unknown {
+  stroke: var(--text-secondary);
+  stroke-dasharray: 2 3;
+  opacity: 0.45;
+}

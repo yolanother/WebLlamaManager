@@ -137,3 +137,69 @@ export function resolveGpuPanel(stats) {
     additional,
   };
 }
+
+/**
+ * Builds the stats-rail GPU gauge: one concentric ring per GPU.
+ *
+ * The rail used to draw a single ring for the inference card and label it
+ * "1/2". That label was accurate and useless -- it said "you are looking at
+ * card 1 of 2" while the second card's load appeared nowhere on the rail, so a
+ * discrete card pinned at 100% was invisible until someone opened the
+ * dashboard. One ring per card shows all of them in the same space.
+ *
+ * Rings are ordered outermost first, starting with the card inference runs on,
+ * because DRM enumeration order is not meaningful to a reader: on this
+ * appliance the OCuLink card enumerates ahead of the APU, so ordering by the
+ * array would put the card that is NOT running the model on the outside.
+ *
+ * @param {?object} stats The /api/system payload. A payload with no `gpus`
+ *   (an appliance whose manager predates the field) falls back to the headline
+ *   `gpu` figure, so the tile keeps working rather than rendering empty.
+ * @returns {{rings:Array<{card:string, value:?number, title:string}>,
+ *   label:string, title:string}} `value` is null for a card nothing can
+ *   measure -- the caller draws its track and no fill. `label` sits under the
+ *   gauge; `title` is the hover text naming every card.
+ */
+export function resolveGpuRings(stats) {
+  const gpus = Array.isArray(stats?.gpus) ? stats.gpus : [];
+
+  if (gpus.length <= 1) {
+    // One card, or an API that predates gpus[]. Either way this must render
+    // exactly as the single ring always did: almost every appliance is here.
+    const only = gpus[0] || null;
+    const value = only ? (only.usage ?? null) : (stats?.gpu?.usage ?? 0);
+    return {
+      rings: [{ card: only?.card || '', value, title: only ? describeGpu(only) : 'GPU usage' }],
+      label: 'GPU',
+      title: 'GPU Usage',
+    };
+  }
+
+  const inference = gpus.find((g) => g.inference) || gpus[0];
+  const ordered = [inference, ...gpus.filter((g) => g !== inference)];
+
+  const rings = ordered.map((gpu) => {
+    const name = describeGpu(gpu);
+    const usage = gpu.usage ?? null;
+    let detail;
+    // An unusable card's reason outranks its missing number, and a card that
+    // simply has no counter is explained rather than shown as 0% -- which
+    // would assert it is idle when the truth is that we cannot see it.
+    if (gpu.available === false) detail = gpu.reason || 'unavailable';
+    else if (usage === null) detail = 'no utilisation counter on this driver';
+    else detail = `${Math.round(usage)}%`;
+    return {
+      card: gpu.card || '',
+      value: usage,
+      title: `${name} — ${detail}${gpu.inference ? ' (inference)' : ''}`,
+    };
+  });
+
+  return {
+    rings,
+    // Not "1/N": that claimed to be showing one card of several, which stopped
+    // being true the moment every card got its own ring.
+    label: `GPU ×${gpus.length}`,
+    title: rings.map((r) => r.title).join('\n'),
+  };
+}

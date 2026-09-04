@@ -9,7 +9,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveGpuPanel, formatGpuMemory } from './gpu-panel.js';
+import { resolveGpuPanel, formatGpuMemory, resolveGpuRings } from './gpu-panel.js';
 
 const GIB = 1024 ** 3;
 
@@ -173,4 +173,76 @@ test('an unusable card still leads with its reason, not with an estimate', () =>
   const unbound = { ...NVIDIA_APERTURE, available: false, driver: '', reason: 'no kernel driver is bound to it' };
   const view = resolveGpuPanel({ gpus: [IGPU, unbound] });
   assert.equal(view.additional[0].detail, 'no kernel driver is bound to it');
+});
+
+/*
+ * THE STATS-RAIL GAUGE.
+ *
+ * The rail used to show one ring for the inference card and label it "1/2",
+ * which said "you are looking at card 1 of 2" -- true, and useless: the second
+ * card's load was nowhere on the rail. One concentric ring per GPU shows every
+ * card at once, outermost first, so a busy second card is visible without
+ * opening the dashboard.
+ */
+
+// Drakemore's real shape: the discrete card enumerates FIRST, and nouveau
+// publishes no utilisation counter for it.
+const RINGS_APU = {
+  card: 'card2', name: 'AMD Device 1586', kind: 'integrated', inference: true,
+  available: true, driver: 'amdgpu', usage: 99,
+};
+const RINGS_3090 = {
+  card: 'card1', name: 'NVIDIA GA102 [GeForce RTX 3090]', kind: 'discrete',
+  inference: false, available: true, driver: 'nouveau', usage: null,
+};
+
+test('a single-GPU machine gets exactly one ring and no count in the label', () => {
+  const view = resolveGpuRings({ gpus: [IGPU] });
+  assert.equal(view.rings.length, 1);
+  assert.equal(view.rings[0].value, 22);
+  assert.equal(view.label, 'GPU');
+});
+
+test('an older API with no gpus[] still gets one ring from the headline figure', () => {
+  // An appliance whose manager predates gpus[] must not render a bare tile.
+  for (const stats of [{}, { gpus: [] }, { gpus: null }]) {
+    const view = resolveGpuRings({ ...stats, gpu: { usage: 41 } });
+    assert.equal(view.rings.length, 1);
+    assert.equal(view.rings[0].value, 41);
+    assert.equal(view.label, 'GPU');
+  }
+});
+
+test('every GPU gets its own ring, inference card outermost', () => {
+  const view = resolveGpuRings({ gpus: [RINGS_3090, RINGS_APU] });
+  assert.equal(view.rings.length, 2);
+  // Outermost is the card inference runs on, NOT the first in DRM order.
+  assert.equal(view.rings[0].card, 'card2');
+  assert.equal(view.rings[0].value, 99);
+  assert.equal(view.rings[1].card, 'card1');
+});
+
+test('a card with no utilisation counter draws a track but no fill', () => {
+  // nouveau reports nothing. A 0% fill would assert the 3090 is idle; a null
+  // value renders the track alone, which reads as "present, unmeasured".
+  const view = resolveGpuRings({ gpus: [RINGS_3090, RINGS_APU] });
+  assert.equal(view.rings[1].value, null);
+  assert.match(view.rings[1].title, /RTX 3090/);
+  assert.match(view.rings[1].title, /no utilisation/i);
+});
+
+test('the label counts the cards rather than claiming to show one of them', () => {
+  const view = resolveGpuRings({ gpus: [RINGS_3090, RINGS_APU] });
+  // "1/2" said "card 1 of 2", which stopped being true once both are drawn.
+  assert.equal(view.label, 'GPU ×2');
+  assert.match(view.title, /AMD Device 1586/);
+  assert.match(view.title, /RTX 3090/);
+});
+
+test('an unavailable card still gets a ring, so a dead card is not invisible', () => {
+  const dead = { ...RINGS_3090, available: false, usage: null, reason: 'no kernel driver is bound to it' };
+  const view = resolveGpuRings({ gpus: [dead, RINGS_APU] });
+  assert.equal(view.rings.length, 2);
+  assert.equal(view.rings[1].value, null);
+  assert.match(view.rings[1].title, /no kernel driver/);
 });

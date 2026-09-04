@@ -43,6 +43,97 @@ function ringSeverity(value) {
   return 'normal';
 }
 
+/**
+ * One concentric ring per GPU, outermost first.
+ *
+ * Distinct from ProgressRing's `segments` mode, which stacks arcs on a SINGLE
+ * ring to split one quantity into parts. These are independent quantities --
+ * separate cards -- so they get separate radii rather than shares of one
+ * circle, and each keeps the theme's own severity coloring so a card pinned
+ * at 100% reads red wherever it sits in the stack.
+ *
+ * A ring whose value is null draws its track and no fill: that is a card
+ * present in the machine whose driver publishes no utilisation counter, and
+ * filling it to 0% would assert the card is idle when the truth is that we
+ * cannot see it.
+ *
+ * @param {{rings: Array<{card:string, value:?number, title:string}>,
+ *   size:number, strokeWidth:number, gap:number}} props `rings` outermost
+ *   first; `gap` is the clear space between adjacent rings in px.
+ */
+function ConcentricRings({ rings, size = 36, strokeWidth = 4, gap = 1.5 }) {
+  // The outermost ring keeps ProgressRing's geometry exactly, so a one-ring
+  // gauge is pixel-identical to the single ring it replaces.
+  const outer = (size - strokeWidth) / 2;
+  const step = strokeWidth + gap;
+  // The centre figure is the outermost card -- the one inference runs on.
+  const lead = rings[0]?.value ?? null;
+
+  return (
+    <svg width={size} height={size} className="progress-ring">
+      {rings.map((ring, i) => {
+        const radius = outer - i * step;
+        if (radius <= strokeWidth / 2) return null; // no room left for this card
+        const circumference = radius * 2 * Math.PI;
+        const measured = ring.value != null;
+        const value = measured ? Math.max(0, Math.min(100, ring.value)) : 0;
+        return (
+          <g key={ring.card || i}>
+            <circle
+              className="progress-ring-bg"
+              strokeWidth={strokeWidth}
+              fill="transparent"
+              r={radius}
+              cx={size / 2}
+              cy={size / 2}
+            />
+            {measured ? (
+              <circle
+                className="progress-ring-fill"
+                data-severity={ringSeverity(value)}
+                strokeWidth={strokeWidth}
+                fill="transparent"
+                r={radius}
+                cx={size / 2}
+                cy={size / 2}
+                style={{
+                  strokeDasharray: circumference,
+                  strokeDashoffset: circumference - (value / 100) * circumference,
+                  stroke: 'var(--accent)',
+                }}
+              />
+            ) : (
+              // A bare track is the same colour as the tile behind it, so an
+              // unmeasured card read as empty space rather than as a card. A
+              // dashed ring is visibly present AND visibly not a level, which
+              // is exactly the claim: this GPU is here, its driver publishes
+              // no utilisation counter.
+              <circle
+                className="concentric-ring-unknown"
+                strokeWidth={strokeWidth}
+                fill="transparent"
+                r={radius}
+                cx={size / 2}
+                cy={size / 2}
+              />
+            )}
+            <title>{ring.title}</title>
+          </g>
+        );
+      })}
+      {/* Only a single ring leaves room for a readable centre figure. With a
+          second ring the text collides with it, and the per-card numbers are
+          already in the hover text -- a gauge that cannot be read at a glance
+          is worse than one that shows levels and defers the digits. */}
+      {rings.length === 1 && lead != null && (
+        <text x="50%" y="50%" textAnchor="middle" dy=".3em" className="progress-ring-text">
+          {Math.round(lead)}%
+        </text>
+      )}
+    </svg>
+  );
+}
+
 function ProgressRing({ value, size = 80, strokeWidth = 8, color = 'var(--accent)', segments = null, centerValue = null }) {
   const radius = (size - strokeWidth) / 2;
   const circumference = radius * 2 * Math.PI;
@@ -1157,6 +1248,7 @@ function TimeRangeSelector({ value, onChange }) {
 export {
   StatCard,
   ProgressRing,
+  ConcentricRings,
   CHART_COLORS,
   guardSeverity,
   sensorSeverity,
