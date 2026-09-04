@@ -73,6 +73,9 @@ export function buildInventory(cards, systemBytes) {
       // Unknown is null, never 0. A confident zero and a silent omission are
       // both worse than an honest "unknown", and this readout has shipped both.
       vramBytes: raw.vramBytes ?? null,
+      // How much of the card's OWN memory is in use, so a per-card memory
+      // chart has a series per GPU rather than one for the inference card.
+      vramUsedBytes: raw.vramUsedBytes ?? null,
       // WHICH source answered for vramBytes, so a caller can say so. An
       // aperture figure over-reports (a 24 GiB card shows a 32 GiB BAR) and
       // must be presented as an estimate rather than a measurement.
@@ -258,4 +261,68 @@ export function describeCardName({ vendorId, deviceId, lspciName } = {}) {
   if (!label && deviceId) label = `Device ${deviceId.replace(/^0x/, '')}`;
   const vendor = vendorId ? (PCI_VENDORS[vendorId] || vendorId) : '';
   return [vendor, label || 'Graphics adapter'].filter(Boolean).join(' ');
+}
+
+/**
+ * Field order this module expects from nvidia-smi, and the query that produces
+ * it. Exported so the caller cannot drift from the parser: one edited without
+ * the other silently shifts every column.
+ *
+ * `name` is deliberately NOT queried. The card is already named from sysfs or
+ * lspci, and a vendor string arriving inside comma-separated output is a
+ * parsing hazard for no gain.
+ * @type {string}
+ */
+export const NVIDIA_SMI_QUERY =
+  'pci.bus_id,temperature.gpu,power.draw,utilization.gpu,memory.total,memory.used,'
+  + 'clocks.current.graphics,clocks.current.memory';
+
+/**
+ * Parses `nvidia-smi --format=csv,noheader,nounits` output into per-card
+ * telemetry.
+ *
+ * This is the ONLY source of these numbers for an NVIDIA card: the open driver
+ * registers no hwmon, verified on the appliance after installing 610, so the
+ * sysfs path that serves every AMD card reports nothing here.
+ *
+ * @param {?string} stdout Raw output, one card per line, fields in
+ *   NVIDIA_SMI_QUERY order.
+ * @returns {Object<string,{temperature:?number, power:?number, usage:?number,
+ *   vramBytes:?number, vramUsedBytes:?number, coreClock:?number,
+ *   memClock:?number}>} Keyed by the card's `bus:device.function` tail --
+ *   nvidia-smi zero-pads the PCI domain to eight digits where sysfs uses four,
+ *   so the tail is the only part that matches a sysfs slot. Empty when the tool
+ *   is absent or said nothing, which is the normal case on an AMD appliance.
+ */
+export function parseNvidiaSmi(stdout) {
+  if (!stdout || typeof stdout !== 'string') return {};
+  const out = {};
+  // "[N/A]" is what nvidia-smi prints for a sensor the board does not have.
+  // It must read as null: zero would claim the card draws no power or is at 0 C.
+  const num = (value) => {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const mib = (value) => {
+    const parsed = num(value);
+    return parsed === null ? null : Math.round(parsed) * 1024 * 1024;
+  };
+  for (const line of stdout.split('\n')) {
+    const f = line.split(',').map((v) => v.trim());
+    // Eight fields or it is not a row we understand. A short row is skipped
+    // rather than half-parsed into columns that have shifted.
+    if (f.length < 8 || !f[0]) continue;
+    const tail = f[0].toLowerCase().split(':').slice(-2).join(':');
+    if (!tail) continue;
+    out[tail] = {
+      temperature: num(f[1]),
+      power: num(f[2]),
+      usage: num(f[3]),
+      vramBytes: mib(f[4]),
+      vramUsedBytes: mib(f[5]),
+      coreClock: num(f[6]),
+      memClock: num(f[7]),
+    };
+  }
+  return out;
 }

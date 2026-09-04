@@ -18,6 +18,7 @@ import {
   parsePciApertureBytes,
   parseLspciNames,
   describeCardName,
+  parseNvidiaSmi,
 } from './gpu-inventory.js';
 
 const GIB = 1024 ** 3;
@@ -228,4 +229,80 @@ test('a card with no utilisation counter reports null, not idle', () => {
     { card: 'card1', driver: 'nouveau' },
   ], SYSTEM);
   assert.equal(dgpu.usage, null);
+});
+
+/*
+ * NVIDIA LIVE TELEMETRY.
+ *
+ * nvidia-smi is the ONLY source for these numbers: the 610 open driver
+ * registers no hwmon at all, verified on the appliance after installing it, so
+ * the sysfs path that serves every AMD card reports nothing for an NVIDIA one.
+ *
+ * The fixture below is real output captured from the appliance, not invented:
+ *   nvidia-smi --query-gpu=pci.bus_id,temperature.gpu,power.draw,\
+ *     utilization.gpu,memory.total,memory.used,clocks.current.graphics,\
+ *     clocks.current.memory --format=csv,noheader,nounits
+ */
+
+test('nvidia-smi output becomes per-card telemetry keyed by bus tail', () => {
+  const parsed = parseNvidiaSmi('00000000:65:00.0, 54, 21.19, 0, 24576, 10, 210, 405');
+  // nvidia-smi zero-pads the domain to 8 digits where sysfs uses 4, so the
+  // bus:device.function tail is the only part that can be matched.
+  const card = parsed['65:00.0'];
+  assert.ok(card, 'card should be keyed by its bus tail');
+  assert.equal(card.temperature, 54);
+  assert.equal(card.power, 21.19);
+  assert.equal(card.usage, 0);
+  assert.equal(card.vramBytes, 24576 * 1024 * 1024);
+  assert.equal(card.vramUsedBytes, 10 * 1024 * 1024);
+  assert.equal(card.coreClock, 210);
+  assert.equal(card.memClock, 405);
+});
+
+test('every card in a multi-GPU box is parsed, not just the first', () => {
+  const parsed = parseNvidiaSmi([
+    '00000000:65:00.0, 54, 21.19, 0, 24576, 10, 210, 405',
+    '00000000:01:00.0, 71, 240.50, 97, 24576, 23000, 1900, 9500',
+  ].join('\n'));
+  assert.deepEqual(Object.keys(parsed).sort(), ['01:00.0', '65:00.0']);
+  assert.equal(parsed['01:00.0'].usage, 97);
+  assert.equal(parsed['01:00.0'].power, 240.5);
+});
+
+test('an [N/A] field is null, never zero', () => {
+  // nvidia-smi prints [N/A] for sensors a given board does not have. Zero
+  // would claim the card draws no power or sits at 0 C.
+  const card = parseNvidiaSmi('00000000:65:00.0, [N/A], [N/A], 0, 24576, 10, [N/A], 405')['65:00.0'];
+  assert.equal(card.temperature, null);
+  assert.equal(card.power, null);
+  assert.equal(card.coreClock, null);
+  // The fields that DID report are still trusted.
+  assert.equal(card.usage, 0);
+  assert.equal(card.memClock, 405);
+});
+
+test('absent nvidia-smi is an empty map, not a throw', () => {
+  assert.deepEqual(parseNvidiaSmi(''), {});
+  assert.deepEqual(parseNvidiaSmi(null), {});
+  assert.deepEqual(parseNvidiaSmi('\n\n'), {});
+});
+
+test('a short or malformed row is skipped rather than half-parsed', () => {
+  assert.deepEqual(parseNvidiaSmi('00000000:65:00.0, 54'), {});
+});
+
+test('a card carries how much of its own memory is in use', () => {
+  // Needed per-card so the memory chart can draw a line for each GPU rather
+  // than only for the card inference runs on.
+  const [apu, dgpu] = buildInventory([
+    { card: 'card1', driver: 'nvidia', vramBytes: 24 * GIB, vramUsedBytes: 2 * GIB },
+    { card: 'card2', driver: 'amdgpu', gttBytes: 128 * GIB, vramBytes: 1 * GIB, vramUsedBytes: 512 * 1024 * 1024 },
+  ], SYSTEM);
+  assert.equal(apu.vramUsedBytes, 512 * 1024 * 1024);
+  assert.equal(dgpu.vramUsedBytes, 2 * GIB);
+});
+
+test('unmeasured memory-in-use is null, not zero', () => {
+  const [gpu] = buildInventory([{ card: 'card1', driver: 'amdgpu', gttBytes: 128 * GIB }], SYSTEM);
+  assert.equal(gpu.vramUsedBytes, null);
 });

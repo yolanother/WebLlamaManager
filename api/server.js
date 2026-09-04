@@ -202,6 +202,8 @@ import { seedDefaultAliases } from './seed-aliases.js';
 import {
   buildInventory, parsePciApertureBytes, parseLspciNames, describeCardName,
   NVIDIA_VENDOR_ID,
+  NVIDIA_SMI_QUERY,
+  parseNvidiaSmi,
 } from './gpu-inventory.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
@@ -3305,36 +3307,68 @@ function lspciNames() {
   return lspciNamesCache;
 }
 
-// nvidia-smi's slot -> VRAM map, memoised for the same reason. The tool is
-// OPTIONAL and usually absent (this appliance ships an AMD stack), so its
-// absence yields an empty map rather than an error. A2 layers live telemetry on
-// top; this call exists only to size a card sysfs could not size.
-let nvidiaSmiMemoryCache = null;
-function nvidiaSmiMemoryBytes(slot) {
-  if (!nvidiaSmiMemoryCache) {
-    nvidiaSmiMemoryCache = {};
+// Live telemetry for every NVIDIA card, refreshed off the request path.
+//
+// nvidia-smi is the ONLY source of an NVIDIA card's temperature, power,
+// utilisation, memory-in-use and clocks: the 610 open driver registers no
+// hwmon at all (verified on the appliance after installing it), so the sysfs
+// reads that serve every AMD card return nothing here.
+//
+// The FIRST call is synchronous, so the very first /api/stats already carries
+// the exact VRAM figure instead of briefly showing the PCI-aperture estimate
+// and then correcting itself. Every refresh after that is asynchronous: this
+// runs once per stats broadcast (1s by default), and a synchronous spawn on
+// that cadence would block the event loop for tens of milliseconds each time.
+// Callers get the last good sample while a refresh is in flight.
+//
+// One spawn covers ALL cards, never one per card.
+let nvidiaSmiCards = {};
+let nvidiaSmiFetchedAt = 0;
+let nvidiaSmiInflight = false;
+// Absent nvidia-smi is the normal case on an AMD appliance. After the first
+// failure we stop asking entirely rather than spawning a doomed process every
+// second for the life of the box.
+let nvidiaSmiUsable = true;
+const NVIDIA_SMI_CMD = `nvidia-smi --query-gpu=${NVIDIA_SMI_QUERY} --format=csv,noheader,nounits`;
+
+function nvidiaSmiTelemetry() {
+  if (!nvidiaSmiUsable) return nvidiaSmiCards;
+
+  if (nvidiaSmiFetchedAt === 0) {
+    // First use only: pay one blocking call to get VRAM right immediately.
     try {
-      const out = execSync(
-        'nvidia-smi --query-gpu=pci.bus_id,memory.total --format=csv,noheader,nounits',
-        // stderr discarded: the tool is absent on every AMD-only appliance, and
-        // "nvidia-smi: not found" in the log reads as a fault rather than normal.
-        { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] },
-      );
-      for (const line of out.split('\n')) {
-        const fields = line.split(',').map((f) => f.trim());
-        if (fields.length < 2) continue;
-        const mib = parseInt(fields[fields.length - 1], 10);
-        if (!Number.isFinite(mib)) continue;
-        // nvidia-smi zero-pads the domain (00000000:c6:00.0) where sysfs does
-        // not (0000:c6:00.0), so the bus:device.function tail is what matches.
-        nvidiaSmiMemoryCache[fields[0].toLowerCase().split(':').slice(-2).join(':')] = mib * 1024 * 1024;
-      }
+      nvidiaSmiCards = parseNvidiaSmi(execSync(NVIDIA_SMI_CMD, {
+        encoding: 'utf-8',
+        timeout: 5000,
+        // stderr discarded: "nvidia-smi: not found" in the log of an AMD-only
+        // appliance reads as a fault rather than as the normal case.
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }));
     } catch {
-      // absent or failed -- an ordinary outcome, cached so we stop asking
+      nvidiaSmiUsable = false;
     }
+    nvidiaSmiFetchedAt = Date.now();
+    return nvidiaSmiCards;
   }
+
+  if (!nvidiaSmiInflight && Date.now() - nvidiaSmiFetchedAt >= STATS_INTERVAL) {
+    nvidiaSmiInflight = true;
+    exec(NVIDIA_SMI_CMD, { encoding: 'utf-8', timeout: 5000 }, (err, stdout) => {
+      nvidiaSmiInflight = false;
+      nvidiaSmiFetchedAt = Date.now();
+      // A transient failure keeps the last sample rather than blanking the
+      // card; only the very first call decides the tool is absent.
+      if (!err) nvidiaSmiCards = parseNvidiaSmi(stdout);
+    });
+  }
+  return nvidiaSmiCards;
+}
+
+// One card's telemetry, matched on the bus:device.function tail because
+// nvidia-smi zero-pads the PCI domain to eight digits where sysfs uses four.
+function nvidiaSmiCard(slot) {
   const tail = String(slot || '').toLowerCase().split(':').slice(-2).join(':');
-  return nvidiaSmiMemoryCache[tail] ?? null;
+  return nvidiaSmiTelemetry()[tail] || null;
 }
 
 // Describe ONE DRM card from sysfs, whatever vendor and driver it has.
@@ -3383,7 +3417,7 @@ function readCardSysfs(card) {
     vramSource = 'sysfs';
   } else {
     if (vendorId === NVIDIA_VENDOR_ID) {
-      vramBytes = nvidiaSmiMemoryBytes(slot);
+      vramBytes = nvidiaSmiCard(slot)?.vramBytes ?? null;
       if (vramBytes !== null) vramSource = 'nvidia-smi';
     }
     if (vramBytes === null) {
@@ -3398,6 +3432,12 @@ function readCardSysfs(card) {
   const power = hwmon ? readOpt(`${hwmon}/power1_average`) : null;
   const clock = hwmon ? readOpt(`${hwmon}/freq1_input`) : null;
 
+  // An NVIDIA card has NO hwmon -- verified on the appliance with the 610 open
+  // driver loaded -- so every reading above is null for it and nvidia-smi is
+  // the only source. Consulted for NVIDIA cards only, so no other vendor can
+  // ever be handed an NVIDIA card's numbers.
+  const smi = vendorId === NVIDIA_VENDOR_ID ? nvidiaSmiCard(slot) : null;
+
   return {
     card,
     // sysfs product_name when the driver publishes one (it is empty on Strix
@@ -3408,12 +3448,20 @@ function readCardSysfs(card) {
     // reason rather than dropping it: hardware that is physically present and
     // silently missing from the readout is the hardest kind of fault to chase.
     available: Boolean(driver),
-    temperature: temp === null ? null : Math.round(temp / 100) / 10, // m°C -> °C
-    power: power === null ? null : Math.round(power / 1000000),      // µW -> W
-    coreClock: clock === null ? null : Math.round(clock / 1000000),  // Hz -> MHz
-    busyPercent: readOpt(`${dev}/gpu_busy_percent`),
+    // hwmon first so an AMD card reads exactly as it always has; nvidia-smi
+    // fills in only where sysfs published nothing.
+    temperature: temp === null ? (smi?.temperature ?? null) : Math.round(temp / 100) / 10, // m°C -> °C
+    power: power === null ? (smi?.power ?? null) : Math.round(power / 1000000),            // µW -> W
+    coreClock: clock === null ? (smi?.coreClock ?? null) : Math.round(clock / 1000000),    // Hz -> MHz
+    // Only amdgpu publishes a memory clock in sysfs; for an NVIDIA card this is
+    // the first source there has ever been for it.
+    memClock: smi?.memClock ?? null,
+    busyPercent: readOpt(`${dev}/gpu_busy_percent`) ?? smi?.usage ?? null,
     vramBytes,
     vramSource,
+    // How much of the card's own VRAM is in use. sysfs publishes this for
+    // amdgpu; nvidia-smi is the only source for an NVIDIA card.
+    vramUsedBytes: readOpt(`${dev}/mem_info_vram_used`) ?? smi?.vramUsedBytes ?? null,
     gttBytes: readOpt(`${dev}/mem_info_gtt_total`),
     gttUsedBytes: readOpt(`${dev}/mem_info_gtt_used`),
   };
