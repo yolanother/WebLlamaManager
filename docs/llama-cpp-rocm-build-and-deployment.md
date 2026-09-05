@@ -235,3 +235,6 @@ is self-contained.)
 - `.llama-cpp-version` — the pinned commit (b10752 as of 2026-09-01).
 - Skills: `build-llama-cpp` (custom build/update the engine), `deploy-llama-manager`
   (deploy/restart), `system-health-monitor` (don't compile while the box is redlining).
+- [`strix-halo-gpu-stability.md`](strix-halo-gpu-stability.md) — the two distinct
+  gfx1151 failure modes (illegal-opcode vs. MES suspend wedge), the known-good
+  kernel/ROCm/firmware stack, and why prevention (not the watchdog) is the safety model.
