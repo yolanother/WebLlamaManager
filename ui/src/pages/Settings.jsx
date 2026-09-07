@@ -727,7 +727,12 @@ function DuoSection({ setMessage }) {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${API_BASE}/api/hardware-profile`)
+    // API_BASE is already '/api' (see ui/src/api.js), so prefixing another '/api'
+    // requested /api/api/hardware-profile. That does NOT 404: it falls through to the
+    // SPA catch-all and returns index.html as 200 text/html, so .json() throws and the
+    // panel rendered "Hardware profile unavailable" while the endpoint was perfectly
+    // healthy. A wrong API path here fails as a parse error, never as a status code.
+    fetch(`${API_BASE}/hardware-profile`)
       .then(r => r.json())
       .then(p => {
         if (cancelled) return;
