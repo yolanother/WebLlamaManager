@@ -13377,6 +13377,21 @@ async function proxyResponsesToDs4(req, res, {
  * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
  */
 async function handleResponses(req, res) {
+  // Duo is a chat-completions workflow: it runs three chat turns across two models and
+  // has no single-turn Responses envelope. Say so explicitly rather than letting the
+  // request fall through to "model 'duo' not found", which is true but useless — and
+  // which an operator would hit simply by leaving default-big pointed at the chain.
+  if (isDuoChainRequest(resolveRequestModel(req.body?.model).requestedModel)) {
+    return res.status(400).json({
+      error: {
+        message: `duo is a plan/execute/review chain and is only available on /v1/chat/completions. `
+          + `Use POST /v1/chat/completions with model "${DUO_CHAIN_ID}", or address one half `
+          + `directly (${DUO_PLANNER_ID} or ${DUO_WORKER_ID}) on this endpoint.`,
+        type: 'invalid_request_error',
+        code: 'duo_responses_unsupported',
+      },
+    });
+  }
   try { assertResponsesPreparedContextAbsent(req.body); }
   catch (error) { return sendBackgroundResponseError(res, error); }
   if (req.body?.background === true) {
