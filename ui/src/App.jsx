@@ -89,6 +89,9 @@ function AppLayout() {
           <Route path="/queue" element={<QueuePage stats={stats} activeRequestsMap={activeRequestsMap} />} />
           <Route path="/processes" element={<ProcessesPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          {/* Tab in the URL so a refresh or a shared link returns to the same tab,
+              mirroring /logs/:tab. */}
+          <Route path="/settings/:tab" element={<SettingsPage />} />
           <Route path="/docs" element={<DocsPage />} />
           <Route path="/api-docs" element={<ApiDocsPage />} />
         </Routes>

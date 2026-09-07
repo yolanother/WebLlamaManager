@@ -333,19 +333,19 @@ function LogsPage({ logs, clearLogs, requestLogs, clearRequestLogs, llmLogs, cle
         <h2>Logs</h2>
         <div className="logs-tabs">
           <button
-            className={`tab-btn glass-btn ${activeTab === 'server' ? 'active' : ''}`}
+            className={`tab-btn ${activeTab === 'server' ? 'active' : ''}`}
             onClick={() => setActiveTab('server')}
           >
             Server Logs
           </button>
           <button
-            className={`tab-btn glass-btn ${activeTab === 'requests' ? 'active' : ''}`}
+            className={`tab-btn ${activeTab === 'requests' ? 'active' : ''}`}
             onClick={() => setActiveTab('requests')}
           >
             Request Logs
           </button>
           <button
-            className={`tab-btn glass-btn ${activeTab === 'llm' ? 'active' : ''}`}
+            className={`tab-btn ${activeTab === 'llm' ? 'active' : ''}`}
             onClick={() => setActiveTab('llm')}
           >
             LLM Log

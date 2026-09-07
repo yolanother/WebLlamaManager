@@ -6,10 +6,14 @@
 // backends, and llama.cpp update controls in glass-aligned settings panels.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+
+/** Settings tabs addressable as /settings/<tab>; 'general' is the bare /settings path. */
+const SETTINGS_TABS = ['general', 'hosts', 'aliases', 'duo'];
 import { API_BASE } from '../api.js';
 import { aliasesToRows, rowsToAliases, diffAliases, validateRows } from './alias-editor.js';
 import {
-  duoConfigSections, defaultDuoSettings, validateDuoSettings, acceleratorAvailability,
+  duoConfigSections, defaultDuoSettings, validateDuoSettings,
 } from './duo-config.js';
 import { resolveLlamaUpdateView } from '../llama-update-policy.js';
 import { DEFAULT_THEME_ID } from '../theme/manifest.js';
@@ -237,7 +241,12 @@ function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
-  const [activeTab, setActiveTab] = useState('general'); // 'general' | 'hosts' | 'aliases' | 'duo'
+  // Tab lives in the URL so a refresh or a shared link lands on the same tab,
+  // mirroring the /logs/:tab pattern. 'general' is the bare /settings path.
+  const { tab: urlTab } = useParams();
+  const navigate = useNavigate();
+  const activeTab = SETTINGS_TABS.includes(urlTab) ? urlTab : 'general';
+  const setActiveTab = (next) => navigate(next === 'general' ? '/settings' : `/settings/${next}`);
   // Real model ids for the default-big/default-small target dropdowns (the synthetic
   // alias entries are excluded so an alias can't be pointed at itself).
   const [modelOptions, setModelOptions] = useState([]);
@@ -342,10 +351,10 @@ function SettingsPage() {
       )}
 
       <div className="settings-tabs">
-        <button className={`tab-btn glass-btn ${activeTab === 'general' ? 'active' : ''}`} onClick={() => setActiveTab('general')}>General</button>
-        <button className={`tab-btn glass-btn ${activeTab === 'hosts' ? 'active' : ''}`} onClick={() => setActiveTab('hosts')}>Remote Hosts</button>
-        <button className={`tab-btn glass-btn ${activeTab === 'aliases' ? 'active' : ''}`} onClick={() => setActiveTab('aliases')}>Aliases</button>
-        <button className={`tab-btn glass-btn ${activeTab === 'duo' ? 'active' : ''}`} onClick={() => setActiveTab('duo')}>Duo</button>
+        <button className={`tab-btn ${activeTab === 'general' ? 'active' : ''}`} onClick={() => setActiveTab('general')}>General</button>
+        <button className={`tab-btn ${activeTab === 'hosts' ? 'active' : ''}`} onClick={() => setActiveTab('hosts')}>Remote Hosts</button>
+        <button className={`tab-btn ${activeTab === 'aliases' ? 'active' : ''}`} onClick={() => setActiveTab('aliases')}>Aliases</button>
+        <button className={`tab-btn ${activeTab === 'duo' ? 'active' : ''}`} onClick={() => setActiveTab('duo')}>Duo</button>
       </div>
 
       {activeTab === 'general' && (
@@ -744,88 +753,135 @@ function DuoSection({ setMessage }) {
     return () => { cancelled = true; };
   }, [setMessage]);
 
-  if (loading) return <div className="settings-section glass-panel">Reading hardware profile…</div>;
-  if (!profile || !settings) return <div className="settings-section glass-panel">Hardware profile unavailable.</div>;
+  if (loading) {
+    return (
+      <section className="page-section glass-panel">
+        <h3>Duo mode</h3>
+        <p className="setting-hint">Reading this machine's hardware profile…</p>
+      </section>
+    );
+  }
+  if (!profile || !settings) {
+    return (
+      <section className="page-section glass-panel">
+        <h3>Duo mode</h3>
+        <p className="setting-hint">Hardware profile unavailable.</p>
+      </section>
+    );
+  }
 
   const sections = duoConfigSections(profile);
-  const accel = acceleratorAvailability(profile);
   const check = validateDuoSettings(settings, profile);
   const duo = profile.duo || {};
 
   const update = (patch) => setSettings(s => ({ ...s, ...patch }));
 
   return (
-    <div className="settings-section glass-panel">
-      <h3>Duo mode</h3>
-      <p className="settings-hint">
-        A slow planner and a fast worker held in memory at the same time, so a
-        plan → execute → review handoff costs a request instead of a model reload.
-      </p>
-
+    <>
       {sections.some(s => s.id === 'models') && (
-        <div className="settings-row">
-          <label>Models</label>
-          <div>
-            <div>Planner: {duo.plannerId} {duo.plannerPresent ? '✓' : '— not downloaded'}</div>
-            <div>Worker: {duo.workerId} {duo.workerPresent ? '✓' : '— not downloaded'}</div>
-            {!duo.available && (
-              <div className="settings-hint">
-                Both models must be present before duo can be selected.
-              </div>
-            )}
+        <section className="page-section glass-panel">
+          <h3>Duo Models</h3>
+          <div className="settings-grid">
+            <div className="setting-item">
+              <label>Planner</label>
+              <p className="setting-hint">
+                The slow model that reads the problem and writes an exact plan, then reviews
+                the result. <code>{duo.plannerId}</code>
+                {duo.plannerPresent ? ' — downloaded.' : ' — not downloaded.'}
+              </p>
+            </div>
+
+            <div className="setting-item">
+              <label>Worker</label>
+              <p className="setting-hint">
+                The fast model that carries the plan out, deciding nothing.{' '}
+                <code>{duo.workerId}</code>
+                {duo.workerPresent ? ' — downloaded.' : ' — not downloaded.'}
+              </p>
+            </div>
+
+            <div className="setting-item">
+              <label>Availability</label>
+              <p className="setting-hint">
+                {duo.available
+                  ? `Both models are present, so "${duo.chainId}" is selectable in the model picker.`
+                  : 'Both models must be downloaded before duo appears in the model picker.'}
+              </p>
+            </div>
           </div>
-        </div>
+        </section>
       )}
 
       {sections.some(s => s.id === 'threads') && (
-        <div className="settings-row">
-          <label htmlFor="duo-threads">CPU threads</label>
-          <div>
-            <input
-              id="duo-threads"
-              type="number"
-              min="1"
-              max={profile.logicalCores || undefined}
-              value={settings.threads}
-              onChange={e => update({ threads: Number(e.target.value) })}
-            />
-            <div className="settings-hint">
-              {profile.physicalCores} physical / {profile.logicalCores} logical cores detected.
-              One thread per physical core is the measured optimum.
+        <section className="page-section glass-panel">
+          <h3>CPU Threads</h3>
+          <div className="settings-grid">
+            <div className="setting-item">
+              <label htmlFor="duo-threads">Generation Threads</label>
+              <p className="setting-hint">
+                {profile.physicalCores} physical / {profile.logicalCores} logical cores detected.
+                One thread per physical core is the measured optimum — using all logical cores
+                collapses large-model throughput.
+              </p>
+              <input
+                id="duo-threads"
+                type="number"
+                className="glass-input"
+                min="1"
+                max={profile.logicalCores || undefined}
+                value={settings.threads}
+                onChange={e => update({ threads: Number(e.target.value) })}
+              />
+              {check.warning && <p className="setting-hint">⚠ {check.warning}</p>}
+              {!check.ok && <p className="setting-hint">⚠ {check.error}</p>}
             </div>
-            {check.warning && <div className="settings-warning">{check.warning}</div>}
-            {!check.ok && <div className="settings-error">{check.error}</div>}
           </div>
-        </div>
+        </section>
       )}
 
       {sections.some(s => s.id === 'exclusivity') && (
-        <div className="settings-row">
-          <label>Exclusivity</label>
-          <div className="settings-hint">
-            Duo and DS4 evict each other — selecting duo stops DS4, and selecting DS4
-            stops duo. Together they do not fit in this machine's memory.
+        <section className="page-section glass-panel">
+          <h3>Exclusivity</h3>
+          <div className="settings-grid">
+            <div className="setting-item">
+              <label>Duo and DS4</label>
+              <p className="setting-hint">
+                Duo and DS4 evict each other — selecting duo stops DS4, and selecting DS4
+                stops duo. Together they do not fit in this machine's memory.
+              </p>
+            </div>
           </div>
-        </div>
+        </section>
       )}
 
       {sections.some(s => s.id === 'accelerator') && (
-        <div className="settings-row">
-          <label htmlFor="duo-accel">GPU acceleration</label>
-          <div>
-            <label>
-              <input
-                id="duo-accel"
-                type="checkbox"
-                checked={settings.useAccelerator}
-                onChange={e => update({ useAccelerator: e.target.checked })}
-              />
-              {' '}Use the discrete NVIDIA GPU
-            </label>
-            <div>
-              <label htmlFor="duo-accel-priority">Priority</label>{' '}
+        <section className="page-section glass-panel">
+          <h3>GPU Acceleration</h3>
+          <div className="settings-grid">
+            <div className="setting-item checkbox">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={settings.useAccelerator}
+                  onChange={e => update({ useAccelerator: e.target.checked })}
+                />
+                <span>Use the discrete NVIDIA GPU</span>
+              </label>
+              <p className="setting-hint">
+                Lets duo borrow the discrete card through a separate RPC server. Off by
+                default; the card's usual work belongs to the pods agent.
+              </p>
+            </div>
+
+            <div className="setting-item">
+              <label htmlFor="duo-accel-priority">Priority</label>
+              <p className="setting-hint">
+                Who gets the card when both want it. Agent first means duo only takes it
+                while asset generation and TTS are demonstrably not using it.
+              </p>
               <select
                 id="duo-accel-priority"
+                className="glass-input"
                 value={settings.acceleratorPriority}
                 disabled={!settings.useAccelerator}
                 onChange={e => update({ acceleratorPriority: e.target.value })}
@@ -835,13 +891,9 @@ function DuoSection({ setMessage }) {
               </select>
             </div>
           </div>
-        </div>
+        </section>
       )}
-
-      {!accel.available && (
-        <div className="settings-hint">GPU acceleration is not offered here: {accel.reason}.</div>
-      )}
-    </div>
+    </>
   );
 }
 
