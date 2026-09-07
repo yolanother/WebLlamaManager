@@ -325,6 +325,7 @@ function QueryPanel({ stats }) {
               placeholder={models.length === 0 ? "No models available" : "Select model..."}
               disabled={!isHealthy || models.length === 0}
               storageKey="queryPanelModel"
+              groupByFamily
             />
             <button className="btn-ghost btn-small glass-btn" onClick={clearChat} title="Clear chat">
               🗑️

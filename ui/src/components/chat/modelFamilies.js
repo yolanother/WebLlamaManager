@@ -70,9 +70,16 @@ function baseName(name) {
 export function modelFamily(name) {
   const base = baseName(name);
   if (!base) return '';
-  // A path names a build inside a repo; the repo is the family.
-  const slash = base.lastIndexOf('/');
-  const scope = slash > 0 ? base.slice(0, slash) : base;
+  // A path names a build inside a repo, so the family lives in a directory --
+  // never in the filename, and never in a directory that is itself a build
+  // (unsloth ships the big models one quantization per subdirectory). Take the
+  // innermost directory that carries no quantization marker, which also skips
+  // past `/home/yolan/models/` in an absolute path.
+  const segments = base.split('/').filter(Boolean);
+  const directories = segments.slice(0, -1);
+  const scope = directories.length
+    ? (directories.filter((dir) => dir.search(QUANT_AT) < 0).pop() || directories[directories.length - 1])
+    : segments[segments.length - 1] || base;
   const quant = scope.search(QUANT_AT);
   const cut = quant > 0 ? scope.slice(0, quant) : scope;
   const family = cut

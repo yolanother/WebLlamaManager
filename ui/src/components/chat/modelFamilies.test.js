@@ -139,3 +139,23 @@ test('a quant marker in the repo directory does not leak into the family', () =>
   // google_gemma-4-12B-it-qat-q4_0-gguf/ — the quant lives in the directory name.
   assert.equal(modelFamily('google_gemma-4-12B-it-qat-q4_0-gguf/gemma-4-12b-it-qat-q4_0.gguf'), 'gemma-4-12B-it-qat');
 });
+
+test('a quantization directory between the repo and the file is not the family', () => {
+  // unsloth publishes the big builds one quant per subdirectory.
+  assert.equal(
+    modelFamily('unsloth_gemma-4-31B-it-GGUF/UD-Q8_K_XL/gemma-4-31B-it-UD-Q8_K_XL.gguf'),
+    'gemma-4-31B-it',
+  );
+});
+
+test('an absolute path resolves to the repo directory, not the mount point', () => {
+  assert.equal(
+    modelFamily('/home/yolan/models/Qwen_Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf'),
+    'Qwen3-Embedding-0.6B',
+  );
+  // ...and therefore shares a family with the plain repo id.
+  assert.equal(
+    modelFamily('/home/yolan/models/Qwen_Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf'),
+    modelFamily('Qwen_Qwen3-Embedding-0.6B-GGUF'),
+  );
+});

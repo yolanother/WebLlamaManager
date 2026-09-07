@@ -26,6 +26,34 @@
 - Streaming: SSE with Stop→Regenerate, scroll-lock with "Jump to latest", `aria-live="polite"`, routed-model badge from the `x-llama-router-choice` response header.
 - Video attachments can use the media API directly or the server-side `video_url` chat extension. Each video becomes a `[video: name, duration]` marker plus per-frame `[frame n/N @ MM:SS]` text markers followed by `image_url` frame parts and, when requested and available, normalized `input_audio` parts. This enables timestamp-referenced Q&A informed by both visuals and sound.
 
+## Model pickers: family grouping
+
+`ui/src/components/chat/modelFamilies.js` collapses a flat model list into one
+row per family, and every picker in the app renders that shape: the in-composer
+`ModelPicker`, and `SearchableSelect` wherever it is given `groupByFamily`
+(Query Panel, Presets — both the llama.cpp and ds4 selects — and the API Docs
+request builder).
+
+- A family row selects the family's **highest-fidelity build** by default, and
+  carries a `<count> ▾` toggle that folds out every build so a specific
+  quantization can still be chosen deliberately. Single-build families show no
+  toggle. Typing in the search box flattens the families, because a query is how
+  you reach a specific build.
+- The family is derived from the name alone — no server-side metadata, nothing
+  curated to fall out of date. For a `repo/build.gguf` path it comes from the
+  innermost directory that is not itself a build (so unsloth's
+  `…-GGUF/UD-Q8_K_XL/…` layout and an absolute `/home/yolan/models/…` path both
+  resolve to the repo); for a bare name it is everything before the first
+  quantization marker. The publisher prefix (`unsloth_`, `nomic-ai_`) and a
+  trailing `-GGUF` are then dropped.
+- Builds rank by bits per weight, then by variant (XL > L > M > S > XS > XXS),
+  reading the marker from the last path segment. Markers may be separated by
+  `-`, `_` or `.`.
+
+In practice this took the dev box's 57 ids down to 22 rows, with a single repo
+such as `nomic-ai_nomic-embed-text-v1.5-GGUF/` contributing one row instead of
+fifteen. Covered by `modelFamilies.test.js`.
+
 ## Server: media pipeline (`api/media.js`, PR #16)
 
 Mounted at `/api/media` (2-line hook in `server.js`, storage under the runtime data dir), this is now the common lower-level ingestion pipeline for both the UI and external API clients:

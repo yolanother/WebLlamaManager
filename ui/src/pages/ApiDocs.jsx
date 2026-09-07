@@ -734,6 +734,7 @@ function ApiDocsPage() {
                               }))}
                               placeholder="Select a model"
                               storageKey="lastApiDocsModel"
+                              groupByFamily
                             />
                           </div>
                         )}

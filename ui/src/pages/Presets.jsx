@@ -222,6 +222,7 @@ function PresetsPage({ stats }) {
                   options={ds4Models.map(m => ({ value: m.name, label: `${m.name}${m.sizeBytes ? ` — ${formatBytes(m.sizeBytes)}` : ''}` }))}
                   placeholder={ds4Models.length ? 'Select a ds4 GGUF...' : 'No ds4 GGUFs found — download one from the Download tab'}
                   storageKey="lastDs4PresetModel"
+                  groupByFamily
                 />
               ) : (
                 <SearchableSelect
@@ -230,6 +231,7 @@ function PresetsPage({ stats }) {
                   options={localModels.map(m => ({ value: m.name, label: formatModelName(m) }))}
                   placeholder="Select a local model..."
                   storageKey="lastPresetModel"
+                  groupByFamily
                 />
               )}
             </div>
