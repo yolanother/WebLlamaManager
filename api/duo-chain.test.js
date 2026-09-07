@@ -21,6 +21,8 @@ import {
   duoResponsesEnvelope,
   duoResponsesStreamEvents,
   duoStepText,
+  duoStepBudget,
+  DUO_REASONING_HEADROOM,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 
@@ -361,4 +363,25 @@ test('an entirely empty step is rejected whatever stopped it', () => {
   assert.match(duoStepText({ message: { content: '' }, finish_reason: 'stop' }).error, /produced no text/);
   assert.match(duoStepText({ message: {}, finish_reason: 'length' }).error, /token budget exhausted/);
   assert.match(duoStepText(undefined).error, /produced no text/);
+});
+
+// --- Room to think ------------------------------------------------------------------
+// The guard above turns an unfinished step into a loud failure. This is what stops that
+// failure being the normal outcome: on the box the same planner prompt took 520 tokens
+// one run and blew past 2500 the next, because reasoning tokens are not answer tokens.
+
+test('a step gets the caller\'s answer allowance plus room to reason', () => {
+  assert.equal(duoStepBudget(1200), 1200 + DUO_REASONING_HEADROOM);
+  assert.equal(duoStepBudget('2500'), 2500 + DUO_REASONING_HEADROOM);
+});
+
+test('no max_tokens still yields a budget with headroom, never zero', () => {
+  assert.equal(duoStepBudget(undefined), 2048 + DUO_REASONING_HEADROOM);
+  assert.equal(duoStepBudget(0), 2048 + DUO_REASONING_HEADROOM);
+  assert.equal(duoStepBudget(-5), 2048 + DUO_REASONING_HEADROOM);
+  assert.equal(duoStepBudget('nonsense'), 2048 + DUO_REASONING_HEADROOM);
+});
+
+test('the headroom is real, not a token or two', () => {
+  assert.ok(DUO_REASONING_HEADROOM >= 2048, 'a reasoning model needs room to think, not a rounding allowance');
 });

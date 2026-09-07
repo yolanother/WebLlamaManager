@@ -486,3 +486,31 @@ export function duoStepText(choice) {
   }
   return { text, error: null };
 }
+
+/**
+ * Tokens allowed for a chain step's thinking, on top of whatever the caller allowed for
+ * the answer.
+ *
+ * Both duo models are reasoning models: most of what they generate is thought that never
+ * reaches the reply. Measured on the box, a planner asked for three bicycle brake parts
+ * spent 520-626 tokens on one run and blew past 2500 on another for the same prompt.
+ */
+export const DUO_REASONING_HEADROOM = 4096;
+
+/**
+ * The per-step token budget for a caller's `max_tokens`.
+ *
+ * `max_tokens` from a caller is an allowance for the ANSWER. Handing that same number
+ * straight to a reasoning model makes it a budget for thinking-plus-answer, and the model
+ * routinely spends it all before writing a word — which duoStepText now correctly rejects
+ * as an unfinished step rather than passing an unfinished plan to the worker. Giving each
+ * step the caller's allowance PLUS room to think keeps the answer the size the caller
+ * asked for while letting the model actually arrive at one.
+ *
+ * @param {number|string|null|undefined} maxTokens The caller's `max_tokens`, if any.
+ * @returns {number} Tokens to request for one step.
+ */
+export function duoStepBudget(maxTokens) {
+  const requested = Number(maxTokens) > 0 ? Math.floor(Number(maxTokens)) : 2048;
+  return requested + DUO_REASONING_HEADROOM;
+}

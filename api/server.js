@@ -176,7 +176,7 @@ import { buildHardwareProfile } from './hardware-profile.js';
 import {
   duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID,
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
-  duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText,
+  duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText, duoStepBudget,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
@@ -11357,7 +11357,7 @@ async function runDuoChain(req, res) {
       error: { message: 'duo requires at least one user message', type: 'invalid_request_error' },
     });
   }
-  const maxTokens = Number(req.body?.max_tokens) > 0 ? Number(req.body.max_tokens) : 2048;
+  const maxTokens = duoStepBudget(req.body?.max_tokens);
   const started = Date.now();
 
   // The chat UI always streams, so refusing to stream would make duo unusable from the
@@ -11488,8 +11488,7 @@ async function runDuoChainResponses(req, res) {
       error: { message: 'duo requires at least one user message in `input`', type: 'invalid_request_error' },
     });
   }
-  const requestedMax = Number(req.body?.max_output_tokens ?? req.body?.max_tokens);
-  const maxTokens = requestedMax > 0 ? requestedMax : 2048;
+  const maxTokens = duoStepBudget(req.body?.max_output_tokens ?? req.body?.max_tokens);
   try {
     const { review, duo } = await runDuoChainSteps(history, request, maxTokens);
     const response = duoResponsesEnvelope({
