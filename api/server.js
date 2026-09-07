@@ -11276,8 +11276,23 @@ async function duoChainStepRequest(model, prompt, maxTokens) {
     throw new Error(`duo step '${model}' failed with HTTP ${response.status}`);
   }
   const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content;
-  if (typeof text !== 'string') throw new Error(`duo step '${model}' returned no message content`);
+  const message = data?.choices?.[0]?.message ?? {};
+  // Both duo models are reasoning models: when the token budget runs out mid-thought they
+  // return an EMPTY `content` with the actual text in `reasoning_content`. Reading only
+  // `content` chained an empty string to the next step and reported success — the chain
+  // "completed" in 43s having produced nothing. Prefer content, fall back to reasoning.
+  const text = (typeof message.content === 'string' && message.content.trim())
+    ? message.content
+    : (typeof message.reasoning_content === 'string' ? message.reasoning_content : '');
+  if (!text.trim()) {
+    // An empty step is a failure, not a result to pass on. Silently forwarding it makes
+    // the next step answer a question it was never given.
+    const reason = data?.choices?.[0]?.finish_reason;
+    throw new Error(
+      `duo step '${model}' produced no text` +
+      (reason === 'length' ? ' (token budget exhausted before it finished — raise max_tokens)' : '')
+    );
+  }
   return text;
 }
 
@@ -12256,7 +12271,20 @@ async function handleChatCompletions(req, res) {
       slotAssignment.compatibilityHash ||= await modelCompatibilityHash(requestedModel);
       slotAssignment.prefixHash ||= canonicalHash(managerControlledContextBody(req.body, requestedModel));
     }
-    if (slotAssignment && slotAssignment.slotId != null && !slotAssignment.hit) {
+    // Erase stale KV before a cold lineage reuses the slot — but ONLY once the model
+    // actually has a child. This erase is itself what triggers the router's lazy child
+    // load, so on a model that loads slowly it races that startup and returns 500; a
+    // model that loads in seconds always wins the race, which is why this only ever bit
+    // the large ones. The 82GB Qwen3.8-Flash-Next planner needs ~90-100s and lost it
+    // every time, failing the whole request with a 502 even though the router loads it
+    // perfectly well when simply asked for a completion.
+    //
+    // Skipping is SAFE here and not a weakening of the guarantee: a model with no child
+    // has no slots and therefore no stale KV from a prior lineage or auth scope to leak.
+    // A model that IS resident still erases, and still fails closed if that erase fails.
+    // Mirrors the residency guard the background sweep already uses on this same call.
+    if (slotAssignment && slotAssignment.slotId != null && !slotAssignment.hit
+        && await isLocalModelResident(requestedModel)) {
       await eraseSlotForColdAssignment({
         baseUrl: `http://localhost:${LLAMA_PORT}`,
         model: requestedModel,

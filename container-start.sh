@@ -44,12 +44,23 @@ export ROCM_LLVM_PRE_VEGA=1
 
 # Strix Halo / unified-memory GPU: tell the HIP backend it can place buffers
 # in GTT (system RAM) instead of the tiny BIOS-reserved VRAM partition.
-# Without these flags, llama.cpp tries to fit the whole model in VRAM (~1GB
-# on Strix Halo by default) and silently falls back to CPU for any model
-# that doesn't fit. Both flag names are set because the canonical name has
-# changed between llama.cpp releases.
+# Without this, llama.cpp tries to fit the whole model in VRAM (~1GB on Strix
+# Halo by default) and silently falls back to CPU for any model that doesn't fit.
+#
+# GGML_CUDA_ENABLE_UNIFIED_MEMORY was also set here, on the assumption that it
+# was merely the older name for the same setting. On b10752 that is FALSE, and
+# the two are not interchangeable: with it set, any sufficiently large model
+# fails to load outright. Measured on drakemore with the 82GB
+# Qwen3.8-Flash-Next planner, same binary and args, only the environment varying:
+#   GGML_HIP_UMA=1 alone                     -> loads and serves
+#   GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 alone  -> "failed to load", instantly,
+#                                               without the child even allocating
+#   both together                            -> fails
+# The failure is immediate and memory never moves, so it is a rejected fit
+# calculation rather than an exhausted allocation. Only the HIP-native name is
+# set now. Do not reinstate the CUDA one as a compatibility alias without
+# re-measuring against a large model — a small model hides this completely.
 export GGML_HIP_UMA=1
-export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 
 export IP_ADDRESS=$(ip addr show | grep "inet " | grep -v 127.0.0.1 | awk 'NR==1 {print $2}' | cut -d'/' -f1)
 
