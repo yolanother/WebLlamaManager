@@ -15,8 +15,11 @@
 // request rather than a model reload. That is the entire reason the mode exists: the
 // technique this reproduces pays ~25 s per handoff for want of the memory to hold both.
 //
-// This module is pure: it decides the steps and builds the prompts. The caller performs
-// the three requests. Unit-tested in duo-chain.test.js.
+// This module is pure: it decides the steps, resolves which turn of a conversation is
+// actually the request, builds each step's prompts and messages, turns each step's engine
+// timings into honest throughput stats, and shapes the finished chain into an OpenAI
+// Responses resource and its SSE event sequence. The caller performs the three requests.
+// Unit-tested in duo-chain.test.js.
 
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 
@@ -167,4 +170,269 @@ export function duoAliasTargets() {
     'default-big': [{ host: 'local', model: DUO_CHAIN_ID }],
     'default-small': [{ host: 'local', model: DUO_WORKER_ID }],
   };
+}
+
+/**
+ * The plain text of one message's `content`.
+ *
+ * Chat `content` is a string in the simple case and an array of typed parts in the
+ * multimodal case (`{type:'text', text}` / `{type:'input_text', text}`). Coercing an
+ * array with String() yields "[object Object]", which silently feeds the chain garbage,
+ * so array and object shapes are unwrapped to their text parts and everything else
+ * becomes an empty string.
+ *
+ * @param {string|Array<Object|string>|Object|null|undefined} content A message's content field.
+ * @returns {string} The concatenated text, or '' when there is none.
+ */
+export function duoMessageText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(part => (typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')))
+      .filter(text => text !== '')
+      .join('\n');
+  }
+  if (typeof content?.text === 'string') return content.text;
+  return '';
+}
+
+/**
+ * Split a conversation into the request the chain must satisfy and the turns that came
+ * before it.
+ *
+ * The LAST user message is the request; everything before it — including the assistant's
+ * replies — is context. Flattening every user turn into one blob instead (the original
+ * implementation) let each step latch onto a different question: in a real session the
+ * planner and reviewer worked on the operator's newest turn while the worker answered a
+ * question from several turns earlier, and the reviewer then correctly failed work that
+ * had answered nothing asked.
+ *
+ * Content is normalized to text here because the chain talks to the engine directly and
+ * therefore never passes through the multimodal expansion the chat endpoint performs.
+ *
+ * @param {Array<{role?:string, content?:*}>} messages The inbound conversation, oldest first.
+ * @returns {{history: Array<{role:string, content:string}>, request: string}} Prior turns and the request text.
+ */
+export function duoConversation(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  let lastUser = -1;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i]?.role === 'user' && duoMessageText(list[i]?.content).trim()) { lastUser = i; break; }
+  }
+  const request = lastUser >= 0 ? duoMessageText(list[lastUser].content).trim() : '';
+  // ponytail: the whole prior thread is carried as context; add windowing if a long
+  // session starts overflowing the planner's context.
+  const history = (lastUser >= 0 ? list.slice(0, lastUser) : list)
+    .map(message => ({ role: String(message?.role ?? 'user'), content: duoMessageText(message?.content).trim() }))
+    .filter(message => message.content !== '');
+  return { history, request };
+}
+
+/**
+ * The message array for one chain step: the conversation so far, then this step's
+ * instruction as a fresh user turn.
+ *
+ * Keeping the history as real turns rather than folding it into the instruction is what
+ * stops a step from mistaking an earlier question for the current one — the request it
+ * must act on is the only thing in the final turn.
+ *
+ * @param {Array<{role:string, content:string}>} history Prior conversation turns.
+ * @param {string} instruction The fully-built prompt for this step.
+ * @returns {Array<{role:string, content:string}>} Messages to send for this step.
+ */
+export function duoStepMessages(history, instruction) {
+  return [...(Array.isArray(history) ? history : []), { role: 'user', content: String(instruction ?? '') }];
+}
+
+/**
+ * Round to one decimal place, so a reported rate reads as 16.4 rather than
+ * 16.436893203883496.
+ * @param {number} value Any number.
+ * @returns {number} The value to one decimal place, or 0 when it is not finite.
+ */
+function round1(value) {
+  return Number.isFinite(value) ? Math.round(value * 10) / 10 : 0;
+}
+
+/**
+ * Honest throughput for one completed chain step.
+ *
+ * The rate an operator saw before this existed was the final answer's VISIBLE tokens
+ * divided by all three steps' wall time — roughly a fifth of the truth, because these are
+ * reasoning models that put most of their output in `reasoning_content` and because two
+ * of the three steps' tokens are never displayed at all. The engine reports what it
+ * actually achieved in `timings.predicted_per_second`, so that is preferred;
+ * `predicted_ms` and then wall time are the fallbacks, and the source is reported so a
+ * fallback number is never mistaken for a measured one.
+ *
+ * @param {Object} params Step outcome.
+ * @param {string} params.role Chain role ('plan' | 'execute' | 'review').
+ * @param {string} params.model Model id that ran the step.
+ * @param {number} params.elapsedMs Wall time for the step, including queueing.
+ * @param {Object|null} [params.body] The upstream chat-completion body, for `usage` and `timings`.
+ * @returns {{role:string, model:string, elapsedMs:number, completionTokens:number, generationMs:number, tokensPerSecond:number, tokensPerSecondSource:string}} Per-step stats.
+ */
+export function duoStepStats({ role, model, elapsedMs, body = null }) {
+  const timings = body?.timings ?? null;
+  const completionTokens = Number(body?.usage?.completion_tokens ?? timings?.predicted_n ?? 0) || 0;
+  const generationMs = Number(timings?.predicted_ms ?? 0) || 0;
+  const engineRate = Number(timings?.predicted_per_second ?? 0) || 0;
+  const wallMs = Math.max(0, Math.round(Number(elapsedMs) || 0));
+  let tokensPerSecond = engineRate;
+  let tokensPerSecondSource = 'engine';
+  if (!(tokensPerSecond > 0)) {
+    if (generationMs > 0) {
+      tokensPerSecond = completionTokens / (generationMs / 1000);
+      tokensPerSecondSource = 'engine_ms';
+    } else {
+      tokensPerSecond = wallMs > 0 ? completionTokens / (wallMs / 1000) : 0;
+      tokensPerSecondSource = 'wall_clock';
+    }
+  }
+  return {
+    role: String(role ?? ''),
+    model: String(model ?? ''),
+    elapsedMs: wallMs,
+    completionTokens,
+    generationMs: Math.round(generationMs),
+    tokensPerSecond: round1(tokensPerSecond),
+    tokensPerSecondSource,
+  };
+}
+
+/**
+ * Aggregate per-step stats into the two numbers that are both true and mean different
+ * things.
+ *
+ * `tokensPerSecond` is what the hardware achieved: every token the chain generated over
+ * the time the engine spent generating them. `effectiveTokensPerSecond` is what the
+ * operator waited through: the same tokens over the chain's whole wall time, which is
+ * lower because it includes queueing and the two handoffs. Reporting only the second
+ * number — over only the visible tokens — is what made two healthy models look like they
+ * were running at 2.7 tok/s.
+ *
+ * @param {Array<Object>} steps Per-step stats from duoStepStats().
+ * @returns {{steps:Array<Object>, completionTokens:number, elapsedMs:number, generationMs:number, tokensPerSecond:number, effectiveTokensPerSecond:number}} Aggregate plus the steps it came from.
+ */
+export function duoChainStats(steps) {
+  const list = Array.isArray(steps) ? steps : [];
+  const total = key => list.reduce((sum, step) => sum + (Number(step?.[key]) || 0), 0);
+  const completionTokens = total('completionTokens');
+  const elapsedMs = total('elapsedMs');
+  const generationMs = total('generationMs');
+  return {
+    steps: list,
+    completionTokens,
+    elapsedMs,
+    generationMs,
+    tokensPerSecond: generationMs > 0 ? round1(completionTokens / (generationMs / 1000)) : 0,
+    effectiveTokensPerSecond: elapsedMs > 0 ? round1(completionTokens / (elapsedMs / 1000)) : 0,
+  };
+}
+
+/**
+ * Normalize a Responses-API `input` into a chat-style message array.
+ *
+ * The Responses envelope accepts either a bare string or an array of message-shaped
+ * items, so both are flattened to the one shape the chain understands. Passing `input`
+ * straight through would leave a plain-string prompt roleless and therefore unmatched by
+ * the last-user-turn rule.
+ *
+ * @param {string|Array<Object>|null|undefined} input The Responses request's `input` field.
+ * @returns {Array<{role:string, content:*}>} Chat-style messages.
+ */
+export function duoResponsesInputMessages(input) {
+  if (typeof input === 'string') return [{ role: 'user', content: input }];
+  if (Array.isArray(input)) {
+    return input.map(item => (
+      typeof item === 'string'
+        ? { role: 'user', content: item }
+        : { role: item?.role ?? 'user', content: item?.content }
+    ));
+  }
+  return [];
+}
+
+/**
+ * Build the Responses-API resource for a finished chain.
+ *
+ * The chain's answer is the reviewer's report, presented as a single assistant message
+ * item exactly as a one-shot model reply would be, so a Responses client cannot tell it
+ * took three turns to produce. The chain's internals stay on the non-standard `duo`
+ * field, which clients ignore.
+ *
+ * @param {Object} params Envelope inputs.
+ * @param {string} params.id Response id (`resp_…`).
+ * @param {string} params.model Model id to report (the chain, not the model that spoke last).
+ * @param {string} params.text The reviewer's report.
+ * @param {number} [params.promptTokens=0] Input tokens across the chain.
+ * @param {number} [params.completionTokens=0] Output tokens across the chain.
+ * @param {Object|null} [params.duo=null] The `duo` envelope (plan, work, elapsedMs, stats).
+ * @param {number} [params.createdAt] Unix seconds; defaults to now.
+ * @returns {Object} An OpenAI Responses resource with `status: 'completed'`.
+ */
+export function duoResponsesEnvelope({
+  id,
+  model,
+  text,
+  promptTokens = 0,
+  completionTokens = 0,
+  duo = null,
+  createdAt = Math.floor(Date.now() / 1000),
+}) {
+  const outputText = String(text ?? '');
+  return {
+    id,
+    object: 'response',
+    created_at: createdAt,
+    status: 'completed',
+    model,
+    output: [{
+      id: `msg-${id}`,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: outputText, annotations: [] }],
+    }],
+    output_text: outputText,
+    usage: {
+      input_tokens: promptTokens,
+      output_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
+    duo,
+  };
+}
+
+/**
+ * The SSE event sequence that replays a finished Responses resource to a streaming
+ * client.
+ *
+ * The chain has no single token stream to forward — the first two steps produce text the
+ * client must never see — so the completed answer is replayed as a well-formed event
+ * sequence instead. The full lifecycle is emitted rather than a lone delta because SDK
+ * stream helpers and this server's own background follower key off the item/part
+ * lifecycle and off the terminal `response.completed` carrying the whole resource.
+ *
+ * @param {Object} response A completed Responses resource from duoResponsesEnvelope().
+ * @returns {Array<Object>} Events in emission order, each with a 1-based `sequence_number`.
+ */
+export function duoResponsesStreamEvents(response) {
+  const item = response?.output?.[0] ?? null;
+  const itemId = item?.id;
+  const text = String(response?.output_text ?? '');
+  const inProgress = { ...response, status: 'in_progress', output: [], output_text: '' };
+  const part = { type: 'output_text', text, annotations: [] };
+  const events = [
+    { type: 'response.created', response: inProgress },
+    { type: 'response.in_progress', response: inProgress },
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, status: 'in_progress', content: [] } },
+    { type: 'response.content_part.added', item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+    { type: 'response.output_text.delta', item_id: itemId, output_index: 0, content_index: 0, delta: text },
+    { type: 'response.output_text.done', item_id: itemId, output_index: 0, content_index: 0, text },
+    { type: 'response.content_part.done', item_id: itemId, output_index: 0, content_index: 0, part },
+    { type: 'response.output_item.done', output_index: 0, item },
+    { type: 'response.completed', response },
+  ];
+  return events.map((event, index) => ({ ...event, sequence_number: index + 1 }));
 }

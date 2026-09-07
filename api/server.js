@@ -176,6 +176,8 @@ import { buildHardwareProfile } from './hardware-profile.js';
 import {
   duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID,
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
+  duoConversation, duoStepMessages, duoStepStats, duoChainStats,
+  duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
@@ -11258,23 +11260,26 @@ function finalizeChatTiming(recorder, {
  * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
  */
 /**
- * Ask one duo model a single question through the local router.
+ * Ask one duo model a single conversation through the local router.
  *
  * Goes back through the router over HTTP rather than calling the engine directly, so the
  * chain reuses the existing routing, residency and queueing machinery instead of
  * duplicating it. Both models duo names are resident, so this costs a request, not a load.
  *
+ * The whole upstream body is returned alongside the text because the engine's own
+ * `timings` are the only honest source for what the step actually ran at.
+ *
  * @param {string} model Model id to ask (planner or worker).
- * @param {string} prompt Fully-built prompt for this step.
+ * @param {Array<{role:string, content:string}>} messages Conversation for this step, instruction last.
  * @param {number} maxTokens Upper bound on the reply.
- * @returns {Promise<string>} The assistant text.
+ * @returns {Promise<{text:string, body:Object}>} The assistant text and the upstream body.
  * @throws {Error} When the step returns a non-OK status or an unusable body.
  */
-async function duoChainStepRequest(model, prompt, maxTokens) {
+async function duoChainStepRequest(model, messages, maxTokens) {
   const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens }),
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
   });
   if (!response.ok) {
     throw new Error(`duo step '${model}' failed with HTTP ${response.status}`);
@@ -11297,26 +11302,63 @@ async function duoChainStepRequest(model, prompt, maxTokens) {
       (reason === 'length' ? ' (token budget exhausted before it finished — raise max_tokens)' : '')
     );
   }
+  return { text, body: data };
+}
+
+/**
+ * Run one chain step and record its throughput alongside the others.
+ * @param {'plan'|'execute'|'review'} role Which step this is.
+ * @param {string} model Model id to ask.
+ * @param {Array<{role:string, content:string}>} messages Conversation for this step.
+ * @param {number} maxTokens Upper bound on the reply.
+ * @param {Array<Object>} collected Mutable list the step's stats are appended to.
+ * @returns {Promise<string>} The step's text.
+ * @throws {Error} When the step fails or produces nothing.
+ */
+async function duoChainStep(role, model, messages, maxTokens, collected) {
+  const startedAt = Date.now();
+  const { text, body } = await duoChainStepRequest(model, messages, maxTokens);
+  collected.push(duoStepStats({ role, model, elapsedMs: Date.now() - startedAt, body }));
   return text;
+}
+
+/**
+ * Run all three steps buffered and return the reviewer's report with the chain's
+ * internals.
+ *
+ * Every step is sent the conversation's earlier turns followed by its own instruction, so
+ * no step can mistake an earlier question for the current request — the failure that let
+ * the worker implement a question from three turns back while the reviewer judged the
+ * newest one.
+ *
+ * @param {Array<{role:string, content:string}>} history Conversation turns before the request.
+ * @param {string} request The operator's current request.
+ * @param {number} maxTokens Per-step token budget.
+ * @returns {Promise<{plan:string, work:string, review:string, duo:Object}>} Step texts and the `duo` envelope.
+ * @throws {Error} When any step fails or produces nothing.
+ */
+async function runDuoChainSteps(history, request, maxTokens) {
+  const started = Date.now();
+  const stepStats = [];
+  const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats);
+  const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats);
+  const review = await duoChainStep('review', DUO_PLANNER_ID, duoStepMessages(history, buildReviewPrompt(request, plan, work)), maxTokens, stepStats);
+  return { plan, work, review, duo: { plan, work, elapsedMs: Date.now() - started, stats: duoChainStats(stepStats) } };
 }
 
 /**
  * Run the duo chain: the planner writes exact steps, the worker carries them out, the
  * planner reviews the result. Returns the reviewer's report as an ordinary chat
- * completion, with the intermediate plan and work attached under `duo` so an operator can
- * see what each half actually did.
- *
- * Streaming is not supported: a three-step chain has no single token stream, and pretending
- * otherwise would emit the planner's tokens as though they were the answer.
+ * completion, with the intermediate plan, work and per-step throughput attached under
+ * `duo` so an operator can see what each half actually did and how fast it did it.
  *
  * @param {import('express').Request} req Inbound request.
  * @param {import('express').Response} res Response to write.
  * @returns {Promise<void>}
  */
 async function runDuoChain(req, res) {
-  const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-  const userPrompt = messages.filter(m => m?.role === 'user').map(m => m?.content).join('\n\n').trim();
-  if (!userPrompt) {
+  const { history, request } = duoConversation(req.body?.messages);
+  if (!request) {
     return res.status(400).json({
       error: { message: 'duo requires at least one user message', type: 'invalid_request_error' },
     });
@@ -11330,15 +11372,17 @@ async function runDuoChain(req, res) {
   // REVIEW — the actual answer — is streamed through as it arrives.
   if (req.body?.stream === true) {
     try {
-      const plan = await duoChainStepRequest(DUO_PLANNER_ID, buildPlanPrompt(userPrompt), maxTokens);
-      const work = await duoChainStepRequest(DUO_WORKER_ID, buildExecutePrompt(userPrompt, plan), maxTokens);
+      const stepStats = [];
+      const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats);
+      const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats);
 
+      const reviewStartedAt = Date.now();
       const upstream = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: DUO_PLANNER_ID,
-          messages: [{ role: 'user', content: buildReviewPrompt(userPrompt, plan, work) }],
+          messages: duoStepMessages(history, buildReviewPrompt(request, plan, work)),
           max_tokens: maxTokens,
           stream: true,
         }),
@@ -11350,11 +11394,51 @@ async function runDuoChain(req, res) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      // Rewrite the upstream model id so the client sees the chain it asked for, not the
-      // planner that happened to produce the final turn.
+
+      // Forward line by line rather than byte by byte for two reasons: the engine reports
+      // the review's `timings` on its final chunk, and `[DONE]` has to be held back so the
+      // duo envelope can be appended after the answer but before the stream terminates.
+      // A client that stops at `[DONE]` would otherwise never see the stats.
+      let pending = '';
+      let reviewBody = null;
+      const forward = line => {
+        const trimmed = line.trim();
+        if (trimmed === 'data: [DONE]') return;
+        if (trimmed.startsWith('data: ')) {
+          try {
+            const chunk = JSON.parse(trimmed.slice(6));
+            if (chunk?.timings || chunk?.usage) {
+              reviewBody = { timings: chunk.timings ?? reviewBody?.timings, usage: chunk.usage ?? reviewBody?.usage };
+            }
+          } catch { /* keepalive or partial payload */ }
+        }
+        // Rewrite the upstream model id so the client sees the chain it asked for, not the
+        // planner that happened to produce the final turn.
+        res.write(`${line.split(DUO_PLANNER_ID).join(DUO_CHAIN_ID)}\n`);
+      };
       for await (const chunk of upstream.body) {
-        res.write(Buffer.from(chunk).toString('utf8').split(DUO_PLANNER_ID).join(DUO_CHAIN_ID));
+        pending += Buffer.from(chunk).toString('utf8');
+        let newline;
+        while ((newline = pending.indexOf('\n')) >= 0) {
+          forward(pending.slice(0, newline));
+          pending = pending.slice(newline + 1);
+        }
       }
+      if (pending) forward(pending);
+
+      stepStats.push(duoStepStats({
+        role: 'review', model: DUO_PLANNER_ID, elapsedMs: Date.now() - reviewStartedAt, body: reviewBody,
+      }));
+      const duo = { plan, work, elapsedMs: Date.now() - started, stats: duoChainStats(stepStats) };
+      res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-duo-${started}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: DUO_CHAIN_ID,
+        choices: [{ index: 0, delta: {}, finish_reason: null }],
+        duo,
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
       return res.end();
     } catch (error) {
       console.warn(`[duo] streaming chain failed: ${error.message}`);
@@ -11366,20 +11450,71 @@ async function runDuoChain(req, res) {
   }
 
   try {
-    const plan = await duoChainStepRequest(DUO_PLANNER_ID, buildPlanPrompt(userPrompt), maxTokens);
-    const work = await duoChainStepRequest(DUO_WORKER_ID, buildExecutePrompt(userPrompt, plan), maxTokens);
-    const review = await duoChainStepRequest(DUO_PLANNER_ID, buildReviewPrompt(userPrompt, plan, work), maxTokens);
-
+    const { review, duo } = await runDuoChainSteps(history, request, maxTokens);
     return res.json({
       id: `chatcmpl-duo-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: DUO_CHAIN_ID,
       choices: [{ index: 0, message: { role: 'assistant', content: review }, finish_reason: 'stop' }],
-      duo: { plan, work, elapsedMs: Date.now() - started },
+      duo,
     });
   } catch (error) {
     console.warn(`[duo] chain failed: ${error.message}`);
+    return res.status(502).json({
+      error: { message: `duo chain failed: ${error.message}`, type: 'upstream_error', code: 'duo_chain_failed' },
+    });
+  }
+}
+
+/**
+ * Run the duo chain for a Responses-API request and reply in the Responses envelope.
+ *
+ * The chain itself is endpoint-agnostic — it is three chat turns either way — so only the
+ * input normalization and the reply shape differ. Streaming replays the finished answer as
+ * a well-formed Responses event sequence rather than forwarding a token stream: the first
+ * two steps produce text the client must never see, and the review is the only step whose
+ * output is the answer.
+ *
+ * Background (`background: true`) requests never reach here: they are queued first and the
+ * job runner re-posts the same body without that flag, which lands on this path.
+ *
+ * @param {import('express').Request} req Inbound request.
+ * @param {import('express').Response} res Response to write.
+ * @returns {Promise<void>}
+ */
+async function runDuoChainResponses(req, res) {
+  const { history, request } = duoConversation(duoResponsesInputMessages(req.body?.input));
+  if (!request) {
+    return res.status(400).json({
+      error: { message: 'duo requires at least one user message in `input`', type: 'invalid_request_error' },
+    });
+  }
+  const requestedMax = Number(req.body?.max_output_tokens ?? req.body?.max_tokens);
+  const maxTokens = requestedMax > 0 ? requestedMax : 2048;
+  try {
+    const { review, duo } = await runDuoChainSteps(history, request, maxTokens);
+    const response = duoResponsesEnvelope({
+      id: `resp_duo_${Date.now()}`,
+      model: DUO_CHAIN_ID,
+      text: review,
+      completionTokens: duo.stats.completionTokens,
+      duo,
+    });
+    if (req.body?.stream === true) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      for (const event of duoResponsesStreamEvents(response)) {
+        res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
+    return res.json(response);
+  } catch (error) {
+    console.warn(`[duo] responses chain failed: ${error.message}`);
+    if (res.headersSent) return res.end();
     return res.status(502).json({
       error: { message: `duo chain failed: ${error.message}`, type: 'upstream_error', code: 'duo_chain_failed' },
     });
@@ -13467,21 +13602,6 @@ async function proxyResponsesToDs4(req, res, {
  * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
  */
 async function handleResponses(req, res) {
-  // Duo is a chat-completions workflow: it runs three chat turns across two models and
-  // has no single-turn Responses envelope. Say so explicitly rather than letting the
-  // request fall through to "model 'duo' not found", which is true but useless — and
-  // which an operator would hit simply by leaving default-big pointed at the chain.
-  if (isDuoChainRequest(resolveRequestModel(req.body?.model).requestedModel)) {
-    return res.status(400).json({
-      error: {
-        message: `duo is a plan/execute/review chain and is only available on /v1/chat/completions. `
-          + `Use POST /v1/chat/completions with model "${DUO_CHAIN_ID}", or address one half `
-          + `directly (${DUO_PLANNER_ID} or ${DUO_WORKER_ID}) on this endpoint.`,
-        type: 'invalid_request_error',
-        code: 'duo_responses_unsupported',
-      },
-    });
-  }
   try { assertResponsesPreparedContextAbsent(req.body); }
   catch (error) { return sendBackgroundResponseError(res, error); }
   if (req.body?.background === true) {
@@ -13504,6 +13624,17 @@ async function handleResponses(req, res) {
     } catch (error) {
       return sendBackgroundResponseError(res, error);
     }
+  }
+  // Duo is a workflow across two resident models, not a model the router can serve, so it
+  // must be intercepted before any of the single-model machinery below runs. Resolve
+  // through the alias table first: `default-big` points at the chain, and checking the RAW
+  // name would let that request fall through and 400 as an unknown model.
+  //
+  // This sits AFTER the background branch on purpose. A background request is queued
+  // first and re-posted by the job runner with `background` stripped, so the chain runs on
+  // that second pass and background/queued duo requests keep working unchanged.
+  if (isDuoChainRequest(resolveRequestModel(req.body?.model).requestedModel)) {
+    return runDuoChainResponses(req, res);
   }
   const requestAbort = new AbortController();
   const abortRequest = () => requestAbort.abort('client_disconnect');
