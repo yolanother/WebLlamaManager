@@ -11496,6 +11496,7 @@ async function runDuoChainResponses(req, res) {
       id: `resp_duo_${Date.now()}`,
       model: DUO_CHAIN_ID,
       text: review,
+      promptTokens: duo.stats.promptTokens,
       completionTokens: duo.stats.completionTokens,
       duo,
     });

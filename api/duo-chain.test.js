@@ -203,12 +203,26 @@ test('a step reports the engine\'s own rate, not visible tokens over wall time',
     role: 'plan',
     model: DUO_PLANNER_ID,
     elapsedMs: 30_000,
-    body: { usage: { completion_tokens: 243 }, timings: { predicted_ms: 14_817, predicted_n: 243, predicted_per_second: 16.4 } },
+    body: {
+      usage: { prompt_tokens: 194, completion_tokens: 243 },
+      timings: { prompt_n: 194, predicted_ms: 14_817, predicted_n: 243, predicted_per_second: 16.4 },
+    },
   });
   assert.equal(stats.tokensPerSecond, 16.4);
   assert.equal(stats.tokensPerSecondSource, 'engine');
   assert.equal(stats.completionTokens, 243);
+  assert.equal(stats.promptTokens, 194);
   assert.equal(stats.elapsedMs, 30_000);
+});
+
+test('input tokens are summed across the chain, so the envelope never reports zero', () => {
+  const stats = duoChainStats([
+    duoStepStats({ role: 'plan', model: 'p', elapsedMs: 1, body: { usage: { prompt_tokens: 200, completion_tokens: 10 } } }),
+    duoStepStats({ role: 'execute', model: 'w', elapsedMs: 1, body: { usage: { prompt_tokens: 500, completion_tokens: 20 } } }),
+    duoStepStats({ role: 'review', model: 'p', elapsedMs: 1, body: { timings: { prompt_n: 900, predicted_n: 30 } } }),
+  ]);
+  assert.equal(stats.promptTokens, 1600, 'every step is prompt the operator paid for');
+  assert.equal(stats.completionTokens, 60);
 });
 
 test('a step without engine timings falls back to wall clock and says so', () => {

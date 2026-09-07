@@ -16,9 +16,11 @@
 // technique this reproduces pays ~25 s per handoff for want of the memory to hold both.
 //
 // This module is pure: it decides the steps, resolves which turn of a conversation is
-// actually the request, builds each step's prompts and messages, turns each step's engine
-// timings into honest throughput stats, and shapes the finished chain into an OpenAI
-// Responses resource and its SSE event sequence. The caller performs the three requests.
+// actually the request, builds each step's prompts and messages, decides whether a step's
+// reply is a usable result or an unfinished one that must not be passed on, turns each
+// step's engine timings into honest throughput stats, and shapes the finished chain into
+// an OpenAI Responses resource and its SSE event sequence. The caller performs the three
+// requests.
 // Unit-tested in duo-chain.test.js.
 
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
@@ -270,10 +272,11 @@ function round1(value) {
  * @param {string} params.model Model id that ran the step.
  * @param {number} params.elapsedMs Wall time for the step, including queueing.
  * @param {Object|null} [params.body] The upstream chat-completion body, for `usage` and `timings`.
- * @returns {{role:string, model:string, elapsedMs:number, completionTokens:number, generationMs:number, tokensPerSecond:number, tokensPerSecondSource:string}} Per-step stats.
+ * @returns {{role:string, model:string, elapsedMs:number, promptTokens:number, completionTokens:number, generationMs:number, tokensPerSecond:number, tokensPerSecondSource:string}} Per-step stats.
  */
 export function duoStepStats({ role, model, elapsedMs, body = null }) {
   const timings = body?.timings ?? null;
+  const promptTokens = Number(body?.usage?.prompt_tokens ?? timings?.prompt_n ?? 0) || 0;
   const completionTokens = Number(body?.usage?.completion_tokens ?? timings?.predicted_n ?? 0) || 0;
   const generationMs = Number(timings?.predicted_ms ?? 0) || 0;
   const engineRate = Number(timings?.predicted_per_second ?? 0) || 0;
@@ -293,6 +296,7 @@ export function duoStepStats({ role, model, elapsedMs, body = null }) {
     role: String(role ?? ''),
     model: String(model ?? ''),
     elapsedMs: wallMs,
+    promptTokens,
     completionTokens,
     generationMs: Math.round(generationMs),
     tokensPerSecond: round1(tokensPerSecond),
@@ -312,16 +316,18 @@ export function duoStepStats({ role, model, elapsedMs, body = null }) {
  * were running at 2.7 tok/s.
  *
  * @param {Array<Object>} steps Per-step stats from duoStepStats().
- * @returns {{steps:Array<Object>, completionTokens:number, elapsedMs:number, generationMs:number, tokensPerSecond:number, effectiveTokensPerSecond:number}} Aggregate plus the steps it came from.
+ * @returns {{steps:Array<Object>, promptTokens:number, completionTokens:number, elapsedMs:number, generationMs:number, tokensPerSecond:number, effectiveTokensPerSecond:number}} Aggregate plus the steps it came from.
  */
 export function duoChainStats(steps) {
   const list = Array.isArray(steps) ? steps : [];
   const total = key => list.reduce((sum, step) => sum + (Number(step?.[key]) || 0), 0);
+  const promptTokens = total('promptTokens');
   const completionTokens = total('completionTokens');
   const elapsedMs = total('elapsedMs');
   const generationMs = total('generationMs');
   return {
     steps: list,
+    promptTokens,
     completionTokens,
     elapsedMs,
     generationMs,
