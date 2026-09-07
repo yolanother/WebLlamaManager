@@ -168,8 +168,11 @@ import {
   ds4ChatDeltaText, ds4ResponsesEventText, shouldLogDs4Verdict,
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
-  museGlimmerDflashPresetSection
+  museGlimmerDflashPresetSection,
+  qwen38FlashNextPresetSection,
+  qwen36WorkerPresetSection
 } from './engines.js';
+import { buildHardwareProfile } from './hardware-profile.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
@@ -6486,12 +6489,76 @@ async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
  * (caller then omits MODELS_PRESET so the router behaves exactly as before).
  * @returns {string}
  */
+let hardwareProfileCache = null;
+
+/**
+ * Resolve this machine's hardware profile, cached for the process lifetime because
+ * none of it changes at runtime. Performs the side effects (running `lscpu`, reading
+ * sysfs, querying the OS) that hardware-profile.js deliberately does not.
+ *
+ * The value that matters most is `threads`: the PHYSICAL core count, which is what a
+ * large MoE with CPU-side experts must use. Running one thread per LOGICAL core makes
+ * hyperthread siblings spin-wait on each other instead of computing — roughly a 50%
+ * throughput loss. `nproc`/`cpus().length` report logical cores and are the wrong
+ * number, so the profile parses `lscpu` and only falls back to logical when that fails.
+ *
+ * @returns {{physicalCores:number|null, logicalCores:number, threads:number,
+ *            threadsDerived:boolean, memTotalBytes:number, modelsFreeBytes:number,
+ *            hasNvidia:boolean}} The cached profile.
+ */
+function resolveHardwareProfile() {
+  if (hardwareProfileCache) return hardwareProfileCache;
+
+  let lscpuText = '';
+  try {
+    lscpuText = execSync('lscpu', { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    // lscpu absent or failed; the profile falls back to logical cores and says so.
+  }
+
+  const vendors = [];
+  try {
+    for (const card of readdirSync('/sys/class/drm')) {
+      if (!/^card\d+$/.test(card)) continue;
+      try {
+        vendors.push(readFileSync(`/sys/class/drm/${card}/device/vendor`, 'utf-8'));
+      } catch {
+        // A card without a readable vendor id simply does not vote.
+      }
+    }
+  } catch {
+    // No sysfs (container without /sys, non-Linux): treated as "no NVIDIA card".
+  }
+
+  hardwareProfileCache = buildHardwareProfile({
+    lscpuText,
+    logicalCores: cpus().length,
+    memTotalBytes: totalmem(),
+    vendors,
+  });
+
+  if (!hardwareProfileCache.threadsDerived) {
+    console.warn(
+      `[hardware] could not derive physical core count from lscpu; falling back to ${hardwareProfileCache.threads} logical threads. ` +
+      'Large-MoE decode may be materially slower than it should be.'
+    );
+  }
+  return hardwareProfileCache;
+}
+
 function writeModelsPresetFile() {
   try {
+    const profile = resolveHardwareProfile();
     const gemmaDraftPath = join(MODELS_DIR, 'google_gemma-4-E2B-it-assistant', 'gemma-4-E2B-it-assistant-BF16.gguf');
     const qwenDir = join(MODELS_DIR, 'unsloth_Qwen3.8-27B-GGUF');
     const qwenDraftPath = join(qwenDir, 'mtp-Qwen3.8-27B-Q4_0.gguf');
     const museDraftPath = join(MODELS_DIR, 'unsloth_Muse-Glimmer-30B-GGUF', 'dflash-kquant.gguf');
+    // Duo mode: the Qwen3.8-Flash-Next planner and its Qwen3.6-35B-A3B worker. Both
+    // are keyed on a shard/file that only exists once the weights are downloaded, so
+    // an absent model simply contributes no section.
+    const flashNextDir = join(MODELS_DIR, 'unsloth_Qwen3.8-Flash-Next-GGUF');
+    const flashNextShard = join(flashNextDir, 'Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf');
+    const workerPath = join(MODELS_DIR, 'unsloth_Qwen3.6-35B-A3B-GGUF', 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf');
     const sections = [
       gemmaMtpPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(gemmaDraftPath) }),
       qwen38MtpPresetSection({
@@ -6499,6 +6566,16 @@ function writeModelsPresetFile() {
         draftExists: existsSync(qwenDir) && existsSync(qwenDraftPath),
       }),
       museGlimmerDflashPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(museDraftPath) }),
+      qwen38FlashNextPresetSection({
+        modelsDir: MODELS_DIR,
+        weightsExist: existsSync(flashNextShard),
+        threads: profile.threads,
+      }),
+      qwen36WorkerPresetSection({
+        modelsDir: MODELS_DIR,
+        weightsExist: existsSync(workerPath),
+        threads: profile.threads,
+      }),
     ].filter(Boolean);
     const ini = renderModelsPresetIni(sections);
     if (!ini) return '';

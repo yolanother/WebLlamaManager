@@ -434,6 +434,78 @@ export function museGlimmerDflashPresetSection({ modelsDir, draftExists } = {}) 
 }
 
 /**
+ * Build the models-preset section for the Qwen3.8-Flash-Next planner — the large
+ * half of duo mode.
+ *
+ * This model (arch `qwen4_exp`) is 177B on disk but only 125B of it is a network.
+ * The remaining 51B is `per_layer_token_embd`, an n-gram lookup table carried over
+ * from Gemma's tensor naming: a pure GET_ROWS read with no matmul, prefetchable
+ * because the model knows the previous tokens before it starts the next one. Most of
+ * it is never touched at all on a given request.
+ *
+ * `lazy-mode on` is llama.cpp's purpose-built handling for exactly this — its own
+ * documentation names per-layer embeddings as the use case, and it reads the rows of
+ * such tensors from disk on demand rather than keeping them resident. It REQUIRES
+ * mmap, which is why `load-mode mmap` is set alongside it and why any mmap-disabling
+ * flag on the router command line silently defeats the whole arrangement (the router
+ * merges its own CLI args over every per-model preset). Together these are what make
+ * an 82GB file runnable on a box that cannot hold it.
+ *
+ * `cpu-moe` sends the 512-expert MoE weights (10 active per token) to the CPU side,
+ * leaving the GPU holding only the tensors that run on every token. `fit off` stops
+ * the auto-fitter from second-guessing these placements.
+ *
+ * Deliberately absent: `mtp` (measured at under +1 tok/s while taking memory better
+ * spent on experts) and any mmap-disabling flag.
+ *
+ * No filesystem access; the caller owns the weights-existence check.
+ *
+ * @param {{modelsDir:string, weightsExist:boolean, threads:number}} params Model root,
+ *   caller-verified weight availability, and the PHYSICAL core count from the hardware
+ *   profile (never the logical count — see hardware-profile.js).
+ * @returns {{name:string, options:Object<string,string>}|null} Section descriptor, or
+ *   null when the weights are absent so the router serves its other models normally.
+ */
+export function qwen38FlashNextPresetSection({ modelsDir, weightsExist, threads } = {}) {
+  if (!weightsExist) return null;
+  return {
+    name: 'unsloth_Qwen3.8-Flash-Next-GGUF',
+    options: {
+      'load-mode': 'mmap',
+      'lazy-mode': 'on',
+      'cpu-moe': '1',
+      'threads': String(threads),
+      'fit': 'off',
+      'parallel': '1',
+    },
+  };
+}
+
+/**
+ * Build the models-preset section for the Qwen3.6-35B-A3B worker — the fast half of
+ * duo mode, which executes the planner's steps at roughly three times its speed.
+ *
+ * It needs far less special handling than the planner: it is a conventional MoE that
+ * fits comfortably. The one thing it must not inherit is a logical-core thread count,
+ * which is why the profile's physical figure is passed explicitly.
+ *
+ * No filesystem access; the caller owns the weights-existence check.
+ *
+ * @param {{modelsDir:string, weightsExist:boolean, threads:number}} params Model root,
+ *   caller-verified weight availability, and the physical core count.
+ * @returns {{name:string, options:Object<string,string>}|null} Section descriptor, or null.
+ */
+export function qwen36WorkerPresetSection({ modelsDir, weightsExist, threads } = {}) {
+  if (!weightsExist) return null;
+  return {
+    name: 'unsloth_Qwen3.6-35B-A3B-GGUF',
+    options: {
+      'threads': String(threads),
+    },
+  };
+}
+
+/**
  * Validate the engine-related fields of a preset create/update request body.
  * Returns the normalized engine and (for ds4) a validated ds4 field block, or a
  * human-readable error. Does NOT touch the filesystem — existence checks stay in

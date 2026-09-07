@@ -21,6 +21,17 @@ set -euo pipefail
 : "${NO_WARMUP:=}"
 : "${FLASH_ATTN:=}"
 : "${GPU_LAYERS:=99}"
+# How the router loads model weights. This MUST stay overridable, because the router
+# merges its own CLI args on top of every per-model preset section, so any load-mode
+# flag set here silently overrides what an individual model asked for.
+#   none      -> --no-mmap. The long-standing default; preserved so nothing regresses.
+#   per-model -> emit NO global flag, letting each [model] section in --models-preset
+#                decide. Models without a section fall back to llama.cpp's own default
+#                (auto: mmap unless a device cannot). Required by duo mode, whose
+#                Qwen3.8-Flash-Next planner keeps its 51GB n-gram table on disk via
+#                --lazy-mode, and --lazy-mode does nothing without mmap.
+#   mmap|auto|mlock|mmap+mlock|dio -> passed straight through as --load-mode.
+: "${LOAD_MODE:=none}"
 # Where the router (and the per-model children it spawns) persist slot KV caches.
 # The manager (api/server.js) saves/restores conversation contexts here so a model
 # reload doesn't force a cold re-prefill. distrobox shares $HOME, so this same path
@@ -89,11 +100,17 @@ CMD=(
     --models-max "$MODELS_MAX"
     --ctx-size "$CONTEXT"
     -ngl "$GPU_LAYERS"
-    --no-mmap
     --jinja
     --host 0.0.0.0
     --port "$PORT"
 )
+# Load mode. "per-model" deliberately emits nothing so that a [model] section in
+# --models-preset can choose its own; anything else is applied to every child.
+case "$LOAD_MODE" in
+    per-model) ;;
+    none)      CMD+=(--no-mmap) ;;
+    *)         CMD+=(--load-mode "$LOAD_MODE") ;;
+esac
 [ -n "$NO_WARMUP" ] && CMD+=(--no-warmup)
 [ -n "$FLASH_ATTN" ] && CMD+=(--flash-attn on)
 # --slot-save-path is propagated by the router to every per-model child server,

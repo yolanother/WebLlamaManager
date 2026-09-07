@@ -28,6 +28,8 @@ import {
   gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection,
+  qwen38FlashNextPresetSection,
+  qwen36WorkerPresetSection,
   validatePresetEngineFields,
   resolveDs4ModelPath,
   ds4ModelEntry,
@@ -1103,4 +1105,74 @@ test('shouldLogDs4Verdict: an unchanged verdict re-logs once the heartbeat elaps
   const lastLogged = { action: 'skip', reason: 'x' };
   const now = 1000 + 60_000;
   assert.equal(shouldLogDs4Verdict({ action: 'skip', reason: 'x' }, lastLogged, 1000, now, 60_000), true);
+});
+
+// ---------------------------------------------------------------------------
+// Duo mode — Qwen3.8-Flash-Next planner + Qwen3.6 worker preset sections.
+//
+// The planner is a 177B qwen4_exp model whose extra 51B is an n-gram lookup
+// table (`per_layer_token_embd`), not a network. It is a pure GET_ROWS op, so it
+// belongs on the CPU side where mmap can leave most of it unread on the SSD.
+// These tests pin the three things that make an 82GB model runnable, and the two
+// flags that must never appear.
+// ---------------------------------------------------------------------------
+
+test('qwen38FlashNextPresetSection: pins the n-gram table to CPU and experts to CPU', () => {
+  const s = qwen38FlashNextPresetSection({ modelsDir: '/home/u/models', weightsExist: true, threads: 16 });
+  assert.equal(s.name, 'unsloth_Qwen3.8-Flash-Next-GGUF');
+  // The 51B phrase book stays ON DISK and is read a row at a time. llama.cpp's
+  // --lazy-mode names per-layer embeddings as its use case and requires mmap.
+  assert.equal(s.options['load-mode'], 'mmap');
+  assert.equal(s.options['lazy-mode'], 'on');
+  // 512 experts, 10 active per token — the GPU holds only the always-on tensors.
+  assert.equal(s.options['cpu-moe'], '1');
+  assert.equal(s.options['threads'], '16');
+  assert.equal(s.options['fit'], 'off');
+  assert.equal(s.options['parallel'], '1');
+});
+
+test('qwen38FlashNextPresetSection: NEVER enables MTP or disables mmap', () => {
+  const s = qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16 });
+  // MTP measured at +<1 tok/s and steals VRAM from experts.
+  assert.equal(s.options['mtp'], undefined);
+  assert.equal(s.options['model-draft'], undefined);
+  assert.equal(s.options['spec-type'], undefined);
+  // mmap is the entire mechanism keeping the 51B table on SSD, and --lazy-mode
+  // silently does nothing without it.
+  assert.equal(s.options['no-mmap'], undefined);
+  assert.equal(s.options['load-mode'], 'mmap');
+});
+
+test('qwen38FlashNextPresetSection: threads follow the hardware profile, not a constant', () => {
+  const strix = qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16 });
+  const video = qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: true, threads: 6 });
+  assert.equal(strix.options['threads'], '16');
+  assert.equal(video.options['threads'], '6');
+});
+
+test('qwen38FlashNextPresetSection: absent weights → null (router serves whatever else it has)', () => {
+  assert.equal(qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: false, threads: 16 }), null);
+});
+
+test('qwen36WorkerPresetSection: worker gets the same physical-core thread count', () => {
+  const s = qwen36WorkerPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16 });
+  assert.equal(s.name, 'unsloth_Qwen3.6-35B-A3B-GGUF');
+  assert.equal(s.options['threads'], '16');
+});
+
+test('qwen36WorkerPresetSection: absent weights → null', () => {
+  assert.equal(qwen36WorkerPresetSection({ modelsDir: '/m', weightsExist: false, threads: 16 }), null);
+});
+
+test('duo sections render into a valid two-section INI', () => {
+  const ini = renderModelsPresetIni([
+    qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16 }),
+    qwen36WorkerPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16 }),
+  ].filter(Boolean));
+  assert.match(ini, /^\[unsloth_Qwen3\.8-Flash-Next-GGUF\]/m);
+  assert.match(ini, /^\[unsloth_Qwen3\.6-35B-A3B-GGUF\]/m);
+  assert.match(ini, /^lazy-mode = on$/m);
+  assert.match(ini, /^load-mode = mmap$/m);
+  assert.match(ini, /^threads = 16$/m);
+  assert.doesNotMatch(ini, /no-mmap/);
 });
