@@ -3,14 +3,66 @@
 // LICENSE file in the repository root.
 //
 // Renders messenger bubbles with sanitized Markdown, multimodal previews,
-// compact artifact cards, attached metadata, and per-message actions.
+// compact artifact cards, attached metadata, and per-message actions. While an
+// assistant turn is streaming but has yet to emit visible content, it renders
+// a "Thinking…" indicator with elapsed time and a muted excerpt of the model's
+// live reasoning text so long reasoning-model turns visibly progress.
 
-import { Fragment, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 
 import { copyTextToClipboard, formatModelName } from '../../api.js';
 import { CodeBlock } from '../CodeBlock.jsx';
 import { countLines, getArtifactVersion } from './artifacts.js';
 import { formatMediaTime } from './attachments.js';
+import { reasoningTail } from './useChatStream.js';
+
+/** Seconds an assistant turn must run before the elapsed counter appears. */
+const ELAPSED_VISIBLE_AFTER_SECONDS = 3;
+
+/**
+ * Placeholder shown while an assistant turn is running but has produced no
+ * visible content yet. Reasoning models emit their chain of thought before any
+ * answer text, so this surfaces a "Thinking…" label, the elapsed seconds once
+ * the turn is clearly slow, and a quiet single-line excerpt of the newest
+ * reasoning text as proof that tokens really are arriving.
+ *
+ * @param {object} props
+ * @param {string} [props.reasoning] Accumulated live reasoning text.
+ * @param {number} [props.startedAt] `Date.now()` when the turn started; `0`
+ *   suppresses the elapsed counter.
+ * @returns {JSX.Element} The thinking indicator.
+ */
+function ThinkingIndicator({ reasoning = '', startedAt = 0 }) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!startedAt) return undefined;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [startedAt]);
+
+  const seconds = startedAt ? Math.max(0, Math.round((now - startedAt) / 1000)) : 0;
+  const tail = reasoningTail(reasoning);
+
+  return (
+    <div className="chat-thinking-block">
+      <div className="chat-thinking-line">
+        <span className="chat-thinking" aria-hidden="true">
+          <i /><i /><i />
+        </span>
+        <span className="chat-thinking-label">Thinking…</span>
+        {seconds >= ELAPSED_VISIBLE_AFTER_SECONDS && (
+          <span className="chat-thinking-elapsed" aria-hidden="true">{seconds}s</span>
+        )}
+      </div>
+      {tail && (
+        <div className="chat-reasoning-tail" aria-hidden="true">
+          <bdi>{tail}</bdi>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function safeHref(value) {
   try {
@@ -369,6 +421,8 @@ function Message({
   onOpenArtifact,
   onRegenerate,
   spacing = 'role-change',
+  streamReasoning = '',
+  streamStartedAt = 0,
 }) {
   const [copied, setCopied] = useState(false);
   const isUser = message.role === 'user';
@@ -414,9 +468,10 @@ function Message({
               <div className="chat-assistant-content">
                 {displayText ? <Markdown content={displayText} /> : (
                   isStreaming ? (
-                    <span className="chat-thinking" aria-label="Assistant is thinking">
-                      <i /><i /><i />
-                    </span>
+                    <ThinkingIndicator
+                      reasoning={streamReasoning}
+                      startedAt={streamStartedAt}
+                    />
                   ) : !hasArtifacts && (
                     <div className="chat-empty-response">
                       <span>Empty response.</span>

@@ -8,6 +8,10 @@
 // persistence live there now, shared with the chat-first shell's sidebar).
 // The `embedded` prop drops the page's own conversation rail, hamburger, and
 // new-conversation button when the chat-first shell already provides them.
+// The in-flight generation itself is owned by the module-scoped store in
+// `useChatStream.js` (including which conversation it belongs to), so leaving
+// and returning to the chat route rejoins a running generation instead of
+// cancelling it.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
@@ -98,10 +102,12 @@ function ChatPage({ stats, embedded = false }) {
   const [artifactContextEnabled, setArtifactContextEnabled] = useState(false);
   const [pageError, setPageError] = useState('');
   const [pageNotice, setPageNotice] = useState('');
-  const [streamConversationId, setStreamConversationId] = useState(null);
   const {
+    conversationId: streamConversationId,
     isStreaming,
+    reasoning,
     routedModel,
+    startedAt: streamStartedAt,
     stop,
     streamChat,
     streamingMessage,
@@ -313,13 +319,13 @@ function ChatPage({ stats, embedded = false }) {
     model,
     artifactEdit = null,
   ) => {
-    setStreamConversationId(conversationId);
     try {
       const requestMessages = baseMessages.map((message) => ({
         role: message.role,
         content: message.requestContent ?? message.content,
       }));
       const result = await streamChat({
+        conversationId,
         model: model || 'auto',
         messages: artifactEdit
           ? assembleArtifactEditMessages(requestMessages, artifactEdit)
@@ -393,10 +399,6 @@ function ChatPage({ stats, embedded = false }) {
           timestamp: new Date().toISOString(),
         }],
       });
-    } finally {
-      setStreamConversationId((current) => (
-        current === conversationId ? null : current
-      ));
     }
   }, [streamChat, updateConversation]);
 
@@ -586,6 +588,8 @@ function ChatPage({ stats, embedded = false }) {
             artifacts={activeConversation.artifacts || []}
             messages={activeConversation.messages}
             streamingMessage={streamingMessage}
+            streamReasoning={reasoning}
+            streamStartedAt={streamStartedAt}
             routedModel={routedModel}
             isStreaming={isStreaming && streamConversationId === activeConversation.id}
             onEdit={editMessage}
