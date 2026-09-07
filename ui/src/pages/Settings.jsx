@@ -8,6 +8,9 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { API_BASE } from '../api.js';
 import { aliasesToRows, rowsToAliases, diffAliases, validateRows } from './alias-editor.js';
+import {
+  duoConfigSections, defaultDuoSettings, validateDuoSettings, acceleratorAvailability,
+} from './duo-config.js';
 import { resolveLlamaUpdateView } from '../llama-update-policy.js';
 import { DEFAULT_THEME_ID } from '../theme/manifest.js';
 import {
@@ -234,7 +237,7 @@ function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
-  const [activeTab, setActiveTab] = useState('general'); // 'general' | 'hosts' | 'aliases'
+  const [activeTab, setActiveTab] = useState('general'); // 'general' | 'hosts' | 'aliases' | 'duo'
   // Real model ids for the default-big/default-small target dropdowns (the synthetic
   // alias entries are excluded so an alias can't be pointed at itself).
   const [modelOptions, setModelOptions] = useState([]);
@@ -342,6 +345,7 @@ function SettingsPage() {
         <button className={`tab-btn glass-btn ${activeTab === 'general' ? 'active' : ''}`} onClick={() => setActiveTab('general')}>General</button>
         <button className={`tab-btn glass-btn ${activeTab === 'hosts' ? 'active' : ''}`} onClick={() => setActiveTab('hosts')}>Remote Hosts</button>
         <button className={`tab-btn glass-btn ${activeTab === 'aliases' ? 'active' : ''}`} onClick={() => setActiveTab('aliases')}>Aliases</button>
+        <button className={`tab-btn glass-btn ${activeTab === 'duo' ? 'active' : ''}`} onClick={() => setActiveTab('duo')}>Duo</button>
       </div>
 
       {activeTab === 'general' && (
@@ -701,6 +705,136 @@ function SettingsPage() {
 
       {activeTab === 'aliases' && (
         <AliasesSection setMessage={setMessage} />
+      )}
+
+      {activeTab === 'duo' && (
+        <DuoSection setMessage={setMessage} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Duo mode panel. Renders only the sections this machine can actually act on: where no
+ * NVIDIA card is present the GPU-acceleration controls are omitted entirely rather than
+ * shown disabled, so the operator is never offered a switch that cannot do anything.
+ * All layout and validation decisions come from duo-config.js, which is unit-tested.
+ */
+function DuoSection({ setMessage }) {
+  const [profile, setProfile] = useState(null);
+  const [settings, setSettings] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/api/hardware-profile`)
+      .then(r => r.json())
+      .then(p => {
+        if (cancelled) return;
+        setProfile(p);
+        setSettings(defaultDuoSettings(p));
+      })
+      .catch(e => !cancelled && setMessage?.(`Could not read hardware profile: ${e.message}`))
+      .finally(() => !cancelled && setLoading(false));
+    return () => { cancelled = true; };
+  }, [setMessage]);
+
+  if (loading) return <div className="settings-section glass-panel">Reading hardware profile…</div>;
+  if (!profile || !settings) return <div className="settings-section glass-panel">Hardware profile unavailable.</div>;
+
+  const sections = duoConfigSections(profile);
+  const accel = acceleratorAvailability(profile);
+  const check = validateDuoSettings(settings, profile);
+  const duo = profile.duo || {};
+
+  const update = (patch) => setSettings(s => ({ ...s, ...patch }));
+
+  return (
+    <div className="settings-section glass-panel">
+      <h3>Duo mode</h3>
+      <p className="settings-hint">
+        A slow planner and a fast worker held in memory at the same time, so a
+        plan → execute → review handoff costs a request instead of a model reload.
+      </p>
+
+      {sections.some(s => s.id === 'models') && (
+        <div className="settings-row">
+          <label>Models</label>
+          <div>
+            <div>Planner: {duo.plannerId} {duo.plannerPresent ? '✓' : '— not downloaded'}</div>
+            <div>Worker: {duo.workerId} {duo.workerPresent ? '✓' : '— not downloaded'}</div>
+            {!duo.available && (
+              <div className="settings-hint">
+                Both models must be present before duo can be selected.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {sections.some(s => s.id === 'threads') && (
+        <div className="settings-row">
+          <label htmlFor="duo-threads">CPU threads</label>
+          <div>
+            <input
+              id="duo-threads"
+              type="number"
+              min="1"
+              max={profile.logicalCores || undefined}
+              value={settings.threads}
+              onChange={e => update({ threads: Number(e.target.value) })}
+            />
+            <div className="settings-hint">
+              {profile.physicalCores} physical / {profile.logicalCores} logical cores detected.
+              One thread per physical core is the measured optimum.
+            </div>
+            {check.warning && <div className="settings-warning">{check.warning}</div>}
+            {!check.ok && <div className="settings-error">{check.error}</div>}
+          </div>
+        </div>
+      )}
+
+      {sections.some(s => s.id === 'exclusivity') && (
+        <div className="settings-row">
+          <label>Exclusivity</label>
+          <div className="settings-hint">
+            Duo and DS4 evict each other — selecting duo stops DS4, and selecting DS4
+            stops duo. Together they do not fit in this machine's memory.
+          </div>
+        </div>
+      )}
+
+      {sections.some(s => s.id === 'accelerator') && (
+        <div className="settings-row">
+          <label htmlFor="duo-accel">GPU acceleration</label>
+          <div>
+            <label>
+              <input
+                id="duo-accel"
+                type="checkbox"
+                checked={settings.useAccelerator}
+                onChange={e => update({ useAccelerator: e.target.checked })}
+              />
+              {' '}Use the discrete NVIDIA GPU
+            </label>
+            <div>
+              <label htmlFor="duo-accel-priority">Priority</label>{' '}
+              <select
+                id="duo-accel-priority"
+                value={settings.acceleratorPriority}
+                disabled={!settings.useAccelerator}
+                onChange={e => update({ acceleratorPriority: e.target.value })}
+              >
+                <option value="agent-first">Agent first (asset generation / TTS keep the card)</option>
+                <option value="llama-first">Llama first</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {!accel.available && (
+        <div className="settings-hint">GPU acceleration is not offered here: {accel.reason}.</div>
       )}
     </div>
   );

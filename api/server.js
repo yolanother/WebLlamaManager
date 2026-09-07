@@ -5610,6 +5610,30 @@ app.delete('/api/models/aliases/:modelName(*)', (req, res) => {
   res.json({ success: true, aliases: config.modelAliases || {} });
 });
 
+// This machine's hardware profile. The duo config panel reads it to decide what to
+// render: where `hasNvidia` is false the GPU-acceleration controls are omitted entirely
+// rather than shown disabled, and `threads` supplies the physical-core default so the UI
+// never hardcodes a number that is only right on one box.
+app.get('/api/hardware-profile', (req, res) => {
+  try {
+    const profile = resolveHardwareProfile();
+    const duo = duoWeightPaths();
+    res.json({
+      ...profile,
+      duo: {
+        plannerPresent: duo.plannerExists,
+        workerPresent: duo.workerExists,
+        available: duo.plannerExists && duo.workerExists,
+        chainId: DUO_CHAIN_ID,
+        plannerId: DUO_PLANNER_ID,
+        workerId: DUO_WORKER_ID,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get models from llama-server (loaded/available)
 app.get('/api/models', async (req, res) => {
   try {
