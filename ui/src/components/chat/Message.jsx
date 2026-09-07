@@ -6,7 +6,10 @@
 // compact artifact cards, attached metadata, and per-message actions. While an
 // assistant turn is streaming but has yet to emit visible content, it renders
 // a "Thinking…" indicator with elapsed time and a muted excerpt of the model's
-// live reasoning text so long reasoning-model turns visibly progress.
+// live reasoning text so long reasoning-model turns visibly progress. Before
+// any reasoning arrives, it shows the manager's own queue/keepalive status
+// (e.g. "Queued — 2 of 3, 15s") in place of the generic label, so a user
+// waiting behind other requests can tell that apart from the model thinking.
 
 import { Fragment, useEffect, useState } from 'react';
 
@@ -14,7 +17,7 @@ import { copyTextToClipboard, formatModelName } from '../../api.js';
 import { CodeBlock } from '../CodeBlock.jsx';
 import { countLines, getArtifactVersion } from './artifacts.js';
 import { formatMediaTime } from './attachments.js';
-import { reasoningTail } from './useChatStream.js';
+import { reasoningTail, thinkingLabel } from './useChatStream.js';
 
 /** Seconds an assistant turn must run before the elapsed counter appears. */
 const ELAPSED_VISIBLE_AFTER_SECONDS = 3;
@@ -22,17 +25,21 @@ const ELAPSED_VISIBLE_AFTER_SECONDS = 3;
 /**
  * Placeholder shown while an assistant turn is running but has produced no
  * visible content yet. Reasoning models emit their chain of thought before any
- * answer text, so this surfaces a "Thinking…" label, the elapsed seconds once
- * the turn is clearly slow, and a quiet single-line excerpt of the newest
- * reasoning text as proof that tokens really are arriving.
+ * answer text, so this surfaces a "Thinking…" label (or the live queue/keepalive
+ * `status`, before reasoning starts), the elapsed seconds once the turn is
+ * clearly slow, and a quiet single-line excerpt of the newest reasoning text as
+ * proof that tokens really are arriving.
  *
  * @param {object} props
  * @param {string} [props.reasoning] Accumulated live reasoning text.
  * @param {number} [props.startedAt] `Date.now()` when the turn started; `0`
  *   suppresses the elapsed counter.
+ * @param {string} [props.status] Live queue/keepalive status string; see
+ *   `thinkingLabel`. Suppresses the generic elapsed counter, since the status
+ *   string already carries its own wait time.
  * @returns {JSX.Element} The thinking indicator.
  */
-function ThinkingIndicator({ reasoning = '', startedAt = 0 }) {
+function ThinkingIndicator({ reasoning = '', startedAt = 0, status = '' }) {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -50,8 +57,8 @@ function ThinkingIndicator({ reasoning = '', startedAt = 0 }) {
         <span className="chat-thinking" aria-hidden="true">
           <i /><i /><i />
         </span>
-        <span className="chat-thinking-label">Thinking…</span>
-        {seconds >= ELAPSED_VISIBLE_AFTER_SECONDS && (
+        <span className="chat-thinking-label">{thinkingLabel(status)}</span>
+        {!status && seconds >= ELAPSED_VISIBLE_AFTER_SECONDS && (
           <span className="chat-thinking-elapsed" aria-hidden="true">{seconds}s</span>
         )}
       </div>
@@ -423,6 +430,7 @@ function Message({
   spacing = 'role-change',
   streamReasoning = '',
   streamStartedAt = 0,
+  streamStatus = '',
 }) {
   const [copied, setCopied] = useState(false);
   const isUser = message.role === 'user';
@@ -471,6 +479,7 @@ function Message({
                     <ThinkingIndicator
                       reasoning={streamReasoning}
                       startedAt={streamStartedAt}
+                      status={streamStatus}
                     />
                   ) : !hasArtifacts && (
                     <div className="chat-empty-response">

@@ -4,9 +4,10 @@
 //
 // Maintains near-bottom auto-scroll behavior, a jump-to-latest affordance,
 // streaming status, day-group rhythm, empty-state suggestions, artifact
-// launchers, and drag-and-drop feedback. Forwards the live reasoning text and
-// generation start time of an in-flight completion to the streaming bubble so
-// it can show a "Thinking…" state with elapsed time and a reasoning excerpt.
+// launchers, and drag-and-drop feedback. Forwards the live reasoning text,
+// generation start time, and queue/keepalive status string of an in-flight
+// completion to the streaming bubble so it can show a "Thinking…" state with
+// elapsed time and a reasoning excerpt.
 
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -42,6 +43,7 @@ function MessageList({
   streamingMessage,
   streamReasoning = '',
   streamStartedAt = 0,
+  streamStatus = '',
   routedModel,
   isStreaming,
   onEdit,
@@ -156,6 +158,7 @@ function MessageList({
             isStreaming
             streamReasoning={streamReasoning}
             streamStartedAt={streamStartedAt}
+            streamStatus={streamStatus}
             message={{
               id: 'streaming',
               role: 'assistant',

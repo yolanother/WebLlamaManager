@@ -97,6 +97,20 @@ function reasoningTail(text, limit = REASONING_TAIL_CHARS) {
   return flat.length > limit ? flat.slice(flat.length - limit) : flat;
 }
 
+/**
+ * The label the "Thinking…" indicator shows in place of its default text.
+ * While `status` is set, no reasoning or content has arrived yet, so the
+ * live queue/keepalive status ("Queued — 2 of 3, 15s" / "Working — 42s") is
+ * more honest than a generic "Thinking…"; `status` clears the instant either
+ * arrives (see `streamChat`'s `consumeLine`).
+ *
+ * @param {string} [status] The live status string, or '' when none.
+ * @returns {string} `status` when present, otherwise the default label.
+ */
+function thinkingLabel(status = '') {
+  return status || 'Thinking…';
+}
+
 /** Mutable stream state; published to subscribers via {@link emit}. */
 const state = {
   conversationId: null,
@@ -336,5 +350,6 @@ export {
   reasoningDelta,
   reasoningTail,
   streamChat,
+  thinkingLabel,
   useChatStream,
 };

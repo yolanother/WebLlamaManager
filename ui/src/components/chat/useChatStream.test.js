@@ -13,7 +13,13 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { parseChatSseEvent, parseStatusComment, reasoningDelta, reasoningTail } from './useChatStream.js';
+import {
+  parseChatSseEvent,
+  parseStatusComment,
+  reasoningDelta,
+  reasoningTail,
+  thinkingLabel,
+} from './useChatStream.js';
 
 test('ordinary content, usage, and model SSE payloads remain available to Chat', () => {
   const event = {
@@ -113,6 +119,16 @@ test('non-status comments and data lines are not treated as a status', () => {
 test('the streaming hook surfaces status and clears it once real output arrives', () => {
   const source = readFileSync(fileURLToPath(new URL('./useChatStream.js', import.meta.url)), 'utf8');
   assert.match(source, /parseStatusComment\s*\(line\)/);
+});
+
+test('thinkingLabel prefers a live status string over the generic label', () => {
+  assert.equal(thinkingLabel('Queued — 2 of 3, 15s'), 'Queued — 2 of 3, 15s');
+  assert.equal(thinkingLabel('Working — 42s'), 'Working — 42s');
+});
+
+test('thinkingLabel falls back to "Thinking…" when there is no status', () => {
+  assert.equal(thinkingLabel(''), 'Thinking…');
+  assert.equal(thinkingLabel(undefined), 'Thinking…');
 });
 
 test('stream state lives at module scope so navigating away cannot abort it', () => {

@@ -108,6 +108,7 @@ function ChatPage({ stats, embedded = false }) {
     reasoning,
     routedModel,
     startedAt: streamStartedAt,
+    status: streamStatus,
     stop,
     streamChat,
     streamingMessage,
@@ -590,6 +591,7 @@ function ChatPage({ stats, embedded = false }) {
             streamingMessage={streamingMessage}
             streamReasoning={reasoning}
             streamStartedAt={streamStartedAt}
+            streamStatus={streamStatus}
             routedModel={routedModel}
             isStreaming={isStreaming && streamConversationId === activeConversation.id}
             onEdit={editMessage}
