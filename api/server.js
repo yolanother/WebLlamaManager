@@ -6534,8 +6534,10 @@ async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
 }
 
 /**
- * Write the router's `--models-preset` INI (into the cache dir, shared into the
- * distrobox via $HOME) enabling model-specific speculative decode when a known
+ * Write the router's `--models-preset` INI (into the DATA dir, which is the
+ * service account's $HOME when packaged and so is mounted into the distrobox
+ * where the engine runs — the cache dir is NOT, see below) enabling
+ * model-specific speculative decode when a known
  * draft GGUF is present. The router auto-detects primary models and --mmproj but
  * cannot infer separate draft models, so this file adds Gemma MTP, Qwen3.8
  * MTP/n-gram and Muse Glimmer DFlash (+ its published sampling) profiles without
@@ -6673,8 +6675,18 @@ function writeModelsPresetFile() {
     ].filter(Boolean);
     const ini = renderModelsPresetIni(sections);
     if (!ini) return '';
-    const path = join(RUNTIME_PATHS.cacheDir, 'models-preset.ini');
-    mkdirSync(RUNTIME_PATHS.cacheDir, { recursive: true });
+    // MUST live under a path the ENGINE can see. The engine runs inside the
+    // distrobox, which mounts only $HOME and /run/host. On a packaged appliance
+    // cacheDir is /var/cache/llama-manager -- neither of those -- so a file
+    // written there exists on the host and is invisible to the engine, and
+    // container-start.sh's `[ -f "$MODELS_PRESET" ]` guard then drops
+    // --models-preset without a word. That silently disabled EVERY section
+    // (Gemma MTP, Qwen3.8 MTP, Muse Glimmer DFlash) on every appliance, while
+    // continuing to work on a dev box where cacheDir happens to sit under $HOME.
+    // dataDir is /var/lib/llama-manager when packaged, which IS the service
+    // account's $HOME, and is under the project root on dev: visible in both.
+    const path = join(RUNTIME_PATHS.dataDir, 'models-preset.ini');
+    mkdirSync(RUNTIME_PATHS.dataDir, { recursive: true });
     writeFileSync(path, ini);
     return path;
   } catch (e) {
