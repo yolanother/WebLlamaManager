@@ -6566,6 +6566,25 @@ function duoWeightPaths() {
   };
 }
 
+/**
+ * The router's LOAD_MODE (see container-start.sh).
+ *
+ * Returns 'per-model' only when duo's weights are on the box. The duo planner keeps its
+ * 51GB n-gram table on disk via `--lazy-mode`, which REQUIRES mmap, and the router merges
+ * its own CLI args over every per-model preset section — so a global `--no-mmap` would
+ * silently defeat it. 'per-model' emits no global load flag at all, letting each [model]
+ * section choose and leaving unsectioned models on llama.cpp's own default.
+ *
+ * Everywhere else this stays 'none', which is the long-standing `--no-mmap` behaviour, so
+ * a box without duo sees no change whatsoever.
+ *
+ * @returns {string} Value for the router's LOAD_MODE environment variable.
+ */
+function resolveLoadMode() {
+  const duo = duoWeightPaths();
+  return (duo.plannerExists && duo.workerExists) ? 'per-model' : 'none';
+}
+
 let hardwareProfileCache = null;
 
 /**
@@ -6764,6 +6783,7 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
         FLASH_ATTN: config.flashAttn ? '1' : '',
         GPU_LAYERS: String(config.gpuLayers || 99),
         MODELS_PRESET: writeModelsPresetFile(),
+        LOAD_MODE: resolveLoadMode(),
         HF_TOKEN: resolveHfToken(config, process.env)
       };
 
@@ -7476,6 +7496,7 @@ app.post('/api/server/start', async (req, res) => {
       FLASH_ATTN: config.flashAttn ? '1' : '',
       GPU_LAYERS: String(config.gpuLayers || 99),
       MODELS_PRESET: writeModelsPresetFile(),
+      LOAD_MODE: resolveLoadMode(),
       HF_TOKEN: resolveHfToken(config, process.env)
     };
 
