@@ -88,3 +88,54 @@ test('an empty list groups to nothing', () => {
   assert.deepEqual(groupModelsByFamily([]), []);
   assert.deepEqual(groupModelsByFamily(), []);
 });
+
+// --- Repo-prefixed and path-shaped ids -------------------------------------
+// The pickers outside the composer are fed ids straight off /v1/models and the
+// local models scan, which carry a `publisher_` prefix, a `-GGUF` suffix, and
+// often a `repo/file.gguf` path. Without these the flat list the operator sees
+// on drakemore stays flat: the repo entry and each of its files land in their
+// own one-member "family".
+
+test('drops the publisher prefix and the GGUF suffix from the family name', () => {
+  assert.equal(modelFamily('unsloth_Muse-Glimmer-30B-GGUF'), 'Muse-Glimmer-30B');
+  assert.equal(modelFamily('Qwen_Qwen3-8B-GGUF'), 'Qwen3-8B');
+  assert.equal(modelFamily('nomic-ai_nomic-embed-text-v1.5-GGUF'), 'nomic-embed-text-v1.5');
+});
+
+test('a repo entry and the files inside it share one family', () => {
+  const repo = modelFamily('unsloth_Muse-Glimmer-30B-GGUF');
+  assert.equal(modelFamily('unsloth_Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-UD-Q4_K_XL'), repo);
+  // A build whose name carries no quant marker at all still belongs to its repo.
+  assert.equal(modelFamily('unsloth_Muse-Glimmer-30B-GGUF/dflash-kquant'), repo);
+});
+
+test('the aliased repo id and a bare build name meet in one family', () => {
+  assert.equal(modelFamily('Qwen3-8B-Q4_K_M'), modelFamily('Qwen_Qwen3-8B-GGUF'));
+});
+
+test('every quantization under one repo collapses into a single family', () => {
+  const names = [
+    'nomic-ai_nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q2_K.gguf',
+    'nomic-ai_nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q3_K_L.gguf',
+    'nomic-ai_nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q4_K_M.gguf',
+    'nomic-ai_nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q5_K_S.gguf',
+    'nomic-ai_nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q6_K.gguf',
+    'nomic-ai_nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q8_0.gguf',
+  ];
+  const groups = groupModelsByFamily(names.map((id) => ({ id })));
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].family, 'nomic-embed-text-v1.5');
+  assert.equal(groups[0].members.length, 6);
+  // Best member first: Q8_0 outranks every other build here.
+  assert.match(groups[0].best.id, /Q8_0/);
+});
+
+test('reads a dot-separated quantization marker', () => {
+  assert.ok(modelQuality('nomic-embed-text-v1.5.Q8_0.gguf') > modelQuality('nomic-embed-text-v1.5.Q4_K_M.gguf'));
+  assert.ok(modelQuality('nomic-embed-text-v1.5.Q4_K_M.gguf') > modelQuality('nomic-embed-text-v1.5.Q2_K.gguf'));
+});
+
+test('a quant marker in the repo directory does not leak into the family', () => {
+  // google_gemma-4-12B-it-qat-q4_0-gguf/ — the quant lives in the directory name.
+  assert.equal(modelFamily('google_gemma-4-12B-it-qat-q4_0-gguf/gemma-4-12b-it-qat-q4_0.gguf'), 'gemma-4-12B-it-qat');
+});

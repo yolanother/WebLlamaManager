@@ -3,20 +3,33 @@
 // LICENSE file in the repository root.
 //
 // Collapses a flat model list into one row per family (DeepSeek-V4-Flash,
-// Qwen3-8B, ...) with the highest-fidelity available member as the family's
-// default, so the picker shows a handful of choices instead of every
-// quantization of every model. Derives the family purely from the model name —
-// no server-side metadata, no curated mapping to fall out of date — and exposes
-// the full member list so a specific quantization can still be chosen
+// nomic-embed-text-v1.5, ...) with the highest-fidelity available member as the
+// family's default, so every picker in the app shows a handful of choices
+// instead of every quantization of every model. Derives the family purely from
+// the model name — no server-side metadata, no curated mapping to fall out of
+// date — handling the shapes this project actually serves: bare build names,
+// `publisher_repo-GGUF` ids, and `publisher_repo-GGUF/build.gguf` paths. Also
+// exposes the full member list so a specific quantization can still be chosen
 // deliberately.
 
-// Quantization markers, matched against a single '-'/'.' separated name token.
-//
-// This is the cut point for the family name: everything BEFORE the first quant
-// token is the family, everything from it on describes the build. Covers the
-// forms this project actually serves — Q4_K_M, Q8_0, IQ2_XXS, the run-together
-// IQ2XXS, and the float builds.
-const QUANT_TOKEN = /^(?:UD[-_])?(?:I?Q\d|F16|BF16|FP16|FP8|MXFP4)/i;
+// Quantization marker, matched after a `-`, `_` or `.` separator so a model
+// whose name merely begins with `q` is left alone. Covers the forms this
+// project serves — Q4_K_M, Q8_0, IQ2_XXS, the run-together IQ2XXS, Unsloth's
+// two-token UD-Q4_K_XL, and the float builds.
+const QUANT_AT = /[-_.](?:UD[-_])?(?:I?Q\d|F16|BF16|FP16|FP8|MXFP4)/i;
+
+// The same marker plus everything that trails it (`_K_M`, `XXS`, `_0`), which
+// is what the fidelity ranking reads.
+const QUANT_FULL = /[-_.]((?:UD[-_])?(?:I?Q\d|F16|BF16|FP16|FP8|MXFP4)[A-Za-z0-9_]*)/i;
+
+// HuggingFace publisher prefix as the repo directories are written on disk:
+// `unsloth_`, `Qwen_`, `nomic-ai_`, `google_`. Non-greedy, so a name that also
+// uses `_` as a separator only ever loses the publisher. Applied AFTER the
+// quantization cut, because a quant token contains underscores of its own.
+const PUBLISHER = /^[A-Za-z0-9][A-Za-z0-9.-]*?_(?=[A-Za-z0-9])/;
+
+// Trailing repo-format marker. Describes the container format, never the model.
+const FORMAT_SUFFIX = /[-_.]GGUF$/i;
 
 // Multi-part GGUF suffix, e.g. `-00001-of-00004`. Not a quantization, but it
 // must not survive into a family name or every split model becomes N families.
@@ -43,41 +56,47 @@ function baseName(name) {
 }
 
 /**
- * Derive a family name from a model name.
+ * Derive a family name from a model id, filename, or repo path.
  *
- * The family is the leading run of tokens before the first quantization marker,
- * so `Qwen3-8B-Q4_K_M` and `Qwen3-8B-Q8_0` share the family `Qwen3-8B` while
- * `Qwen3-Coder-Next` stays distinct from `Qwen3-8B`.
+ * For a `repo/build.gguf` path the family comes from the repo directory, so a
+ * repo entry and every build inside it land together — including builds whose
+ * own name carries no quantization marker at all. For a bare name the family is
+ * everything before the first quantization marker, so `Qwen3-8B-Q4_K_M` and
+ * `Qwen_Qwen3-8B-GGUF` both resolve to `Qwen3-8B`.
  *
- * @param {string} name Raw model id or filename.
- * @returns {string} The family name; the whole (extension-stripped) name when it carries no quant marker.
+ * @param {string} name Raw model id, filename, or `repo/file` path.
+ * @returns {string} The family name; the whole cleaned name when nothing can be stripped from it.
  */
 export function modelFamily(name) {
   const base = baseName(name);
   if (!base) return '';
-  const parts = base.split('-');
-  let cut = parts.findIndex((part) => QUANT_TOKEN.test(part));
-  if (cut <= 0) return base;
-  // Unsloth's dynamic builds write the marker as two tokens, `UD-Q4_K_XL`, so
-  // splitting on '-' leaves a bare `UD` in front of the quant token. It
-  // describes the build, not the model, and must not survive into the family.
-  if (/^UD$/i.test(parts[cut - 1])) cut -= 1;
-  if (cut <= 0) return base;
-  return parts.slice(0, cut).join('-');
+  // A path names a build inside a repo; the repo is the family.
+  const slash = base.lastIndexOf('/');
+  const scope = slash > 0 ? base.slice(0, slash) : base;
+  const quant = scope.search(QUANT_AT);
+  const cut = quant > 0 ? scope.slice(0, quant) : scope;
+  const family = cut
+    .replace(PUBLISHER, '')
+    .replace(FORMAT_SUFFIX, '')
+    .replace(/[-_.]+$/, '');
+  return family || cut || base;
 }
 
 /**
  * Score a model by the fidelity of its quantization.
  *
- * Used only to order members WITHIN a family, so the absolute value carries no
- * meaning beyond "higher is a better build of the same model".
+ * Reads the LAST path segment, because it is the file — not the repo directory
+ * — that names the build being ranked. Used only to order members WITHIN a
+ * family, so the absolute value carries no meaning beyond "higher is a better
+ * build of the same model".
  *
- * @param {string} name Raw model id or filename.
+ * @param {string} name Raw model id, filename, or `repo/file` path.
  * @returns {number} Fidelity score; 0 when no quantization can be read from the name.
  */
 export function modelQuality(name) {
   const base = baseName(name);
-  const token = base.split('-').find((part) => QUANT_TOKEN.test(part));
+  const build = base.slice(base.lastIndexOf('/') + 1);
+  const token = (build.match(QUANT_FULL) || [])[1];
   if (!token) return 0;
   const cleaned = token.replace(/^UD[-_]/i, '');
   const bitsKey = (cleaned.match(/^(i?q\d|f16|bf16|fp16|fp8|mxfp4)/i) || [''])[0].toLowerCase();
