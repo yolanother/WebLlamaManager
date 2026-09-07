@@ -9781,6 +9781,32 @@ async function handleModels(req, res) {
     } catch { /* ds4 not configured on this host — leave the list as-is */ }
 
     const data = { object: 'list', data: [...byId.values()] };
+
+    // Duo is a workflow across two resident models, so the router does not know it and
+    // no disk scan can find it — it has to be advertised explicitly. It MUST appear here
+    // and not only on /api/models: the chat picker reads /v1/models (ui/src/pages/Chat.jsx),
+    // so a duo listed only on the manager's own endpoint is invisible in the UI.
+    const duoEntry = duoChainModelEntry(duoWeightPaths());
+    if (duoEntry) {
+      data.data.push({
+        id: duoEntry.name,
+        object: 'model',
+        created: Math.floor(Date.now() / 1000),
+        owned_by: 'llama-manager',
+        meta: null,
+        n_ctx: null,
+        displayName: duoEntry.displayName,
+        status: 'available',
+        alias: null,
+        size: 0,
+        engine: ENGINE_TYPES.LLAMA,
+        context_management: contextCapabilities(ENGINE_TYPES.LLAMA, {
+          slotCacheEnabled: false,
+          slotOperationsSupported: false,
+        }),
+      });
+    }
+
     // Advertise the configured default-big/default-small aliases so clients can
     // discover them (only those with a configured target are listed).
     for (const entry of aliasListEntries(config, Math.floor(Date.now() / 1000))) {
