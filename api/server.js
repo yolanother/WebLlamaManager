@@ -11279,7 +11279,14 @@ async function duoChainStepRequest(model, messages, maxTokens) {
   const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
+    // `timings_per_token` is what makes the engine report `timings` on the reply. Without
+    // it the only rate available is tokens over wall clock, which includes queueing and
+    // model load and is the reason duo appeared to run at a fraction of its real speed.
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens, timings_per_token: true }),
+    // dispatcher: llamaDispatcher disables undici's default 300s headersTimeout. A chain
+    // step is a whole generation from a large model, so 300s is routinely too short — a
+    // healthy planner step was aborted at exactly 300.9s as "fetch failed" without it.
+    dispatcher: llamaDispatcher,
   });
   if (!response.ok) {
     throw new Error(`duo step '${model}' failed with HTTP ${response.status}`);
@@ -11385,7 +11392,11 @@ async function runDuoChain(req, res) {
           messages: duoStepMessages(history, buildReviewPrompt(request, plan, work)),
           max_tokens: maxTokens,
           stream: true,
+          timings_per_token: true,
         }),
+        // See duoChainStepRequest: without this the review is aborted at undici's default
+        // 300s, mid-stream, after the first two steps have already been paid for.
+        dispatcher: llamaDispatcher,
       });
       if (!upstream.ok || !upstream.body) {
         throw new Error(`duo review step failed with HTTP ${upstream.status}`);
