@@ -176,7 +176,7 @@ import { buildHardwareProfile } from './hardware-profile.js';
 import {
   duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID,
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
-  duoConversation, duoStepMessages, duoStepStats, duoChainStats,
+  duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
@@ -11292,23 +11292,10 @@ async function duoChainStepRequest(model, messages, maxTokens) {
     throw new Error(`duo step '${model}' failed with HTTP ${response.status}`);
   }
   const data = await response.json();
-  const message = data?.choices?.[0]?.message ?? {};
-  // Both duo models are reasoning models: when the token budget runs out mid-thought they
-  // return an EMPTY `content` with the actual text in `reasoning_content`. Reading only
-  // `content` chained an empty string to the next step and reported success — the chain
-  // "completed" in 43s having produced nothing. Prefer content, fall back to reasoning.
-  const text = (typeof message.content === 'string' && message.content.trim())
-    ? message.content
-    : (typeof message.reasoning_content === 'string' ? message.reasoning_content : '');
-  if (!text.trim()) {
-    // An empty step is a failure, not a result to pass on. Silently forwarding it makes
-    // the next step answer a question it was never given.
-    const reason = data?.choices?.[0]?.finish_reason;
-    throw new Error(
-      `duo step '${model}' produced no text` +
-      (reason === 'length' ? ' (token budget exhausted before it finished — raise max_tokens)' : '')
-    );
-  }
+  // Both duo models are reasoning models, and a step that never reached an answer must not
+  // be passed down the chain — see duoStepText for the two ways that goes wrong.
+  const { text, error } = duoStepText(data?.choices?.[0]);
+  if (error) throw new Error(`duo step '${model}' ${error}`);
   return { text, body: data };
 }
 

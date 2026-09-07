@@ -20,6 +20,7 @@ import {
   duoResponsesInputMessages,
   duoResponsesEnvelope,
   duoResponsesStreamEvents,
+  duoStepText,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 
@@ -310,4 +311,40 @@ test('nothing is emitted as answer text before the chain has finished', () => {
   const created = duoResponsesStreamEvents(response).find(e => e.type === 'response.created');
   assert.equal(created.response.status, 'in_progress');
   assert.deepEqual(created.response.output, [], 'the planner and worker text must never reach the client');
+});
+
+// --- A step that never finished is a failure, not a result ---------------------------
+
+test('an ordinary reply is used as-is', () => {
+  const { text, error } = duoStepText({ message: { content: 'the plan' }, finish_reason: 'stop' });
+  assert.equal(text, 'the plan');
+  assert.equal(error, null);
+});
+
+test('a reasoning model that finished but answered in reasoning_content is still usable', () => {
+  const { text, error } = duoStepText({ message: { content: '', reasoning_content: 'the plan' }, finish_reason: 'stop' });
+  assert.equal(text, 'the plan');
+  assert.equal(error, null);
+});
+
+test('a step still reasoning when the budget ran out is rejected, not passed on', () => {
+  const { text, error } = duoStepText({
+    message: { content: '', reasoning_content: 'I should first consider whether the user' },
+    finish_reason: 'length',
+  });
+  assert.equal(text, '');
+  assert.match(error, /still reasoning/);
+  assert.match(error, /max_tokens/);
+});
+
+test('an answer truncated by the budget is kept — partial work is still on topic', () => {
+  const { text, error } = duoStepText({ message: { content: '1. Remove the wheel' }, finish_reason: 'length' });
+  assert.equal(text, '1. Remove the wheel');
+  assert.equal(error, null);
+});
+
+test('an entirely empty step is rejected whatever stopped it', () => {
+  assert.match(duoStepText({ message: { content: '' }, finish_reason: 'stop' }).error, /produced no text/);
+  assert.match(duoStepText({ message: {}, finish_reason: 'length' }).error, /token budget exhausted/);
+  assert.match(duoStepText(undefined).error, /produced no text/);
 });

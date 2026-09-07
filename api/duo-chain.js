@@ -436,3 +436,47 @@ export function duoResponsesStreamEvents(response) {
   ];
   return events.map((event, index) => ({ ...event, sequence_number: index + 1 }));
 }
+
+/**
+ * The usable text of one chain step's reply, or the reason there is none.
+ *
+ * Two failure modes, both of which used to pass silently down the chain:
+ *
+ * Both duo models are reasoning models, and when a step's budget runs out mid-thought the
+ * reply carries an EMPTY `content` with the text in `reasoning_content`. Reading only
+ * `content` handed the next step an empty string and reported success — a chain that
+ * "completed" in 43s having produced nothing. So `reasoning_content` is the fallback.
+ *
+ * But that fallback must not swallow the case it looks like. When the model never reached
+ * an answer AND the budget is what stopped it, `reasoning_content` is an unfinished train
+ * of thought, not a result — and a planner's half-formed reasoning reads to the worker as
+ * a plan. On the box that produced a chain whose reviewer correctly demanded three bicycle
+ * brake parts while the worker, handed 1200 tokens of unfinished thinking, had answered an
+ * unrelated earlier turn with "Yellow." A step that never finished is a failure.
+ *
+ * @param {{message?:{content?:*, reasoning_content?:*}, finish_reason?:string}|null|undefined} choice One choice from a chat completion.
+ * @returns {{text:string, error:string|null}} The step's text, or a reason suffix describing why there is none.
+ */
+export function duoStepText(choice) {
+  const message = choice?.message ?? {};
+  const finishReason = choice?.finish_reason;
+  const answered = typeof message.content === 'string' && message.content.trim() !== '';
+  const text = answered
+    ? message.content
+    : (typeof message.reasoning_content === 'string' ? message.reasoning_content : '');
+  if (!text.trim()) {
+    return {
+      text: '',
+      error: 'produced no text'
+        + (finishReason === 'length' ? ' (token budget exhausted before it finished — raise max_tokens)' : ''),
+    };
+  }
+  if (!answered && finishReason === 'length') {
+    return {
+      text: '',
+      error: 'ran out of tokens while still reasoning and never produced an answer — '
+        + 'raise max_tokens rather than acting on an unfinished plan',
+    };
+  }
+  return { text, error: null };
+}
