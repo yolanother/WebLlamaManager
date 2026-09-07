@@ -5343,6 +5343,10 @@ app.get('/api/queue', (req, res) => {
       status,
       elapsed: Date.now() - ar.startTime,
       userMessage: detail ? (ar.userMessage || '') : ((ar.userMessage || '').slice(0, 200)),
+      // Not a liveness signal: entry.tokens is only ever incremented inside the
+      // SSE delta-parsing loop (updateActiveRequest), so a non-streaming
+      // request legitimately reports 0 here for its entire lifetime even while
+      // the engine is actively decoding.
       tokens: ar.tokens || 0,
       activeRequestId: ar.id,
       backend: backendId,

@@ -5,9 +5,11 @@
 // Owns the in-flight chat completion for the whole app: cancellation,
 // incremental SSE parsing, 50 ms render batching, usage accounting,
 // structured upstream-error surfacing, capture of the router-selected model
-// response header, and accumulation of reasoning-model `reasoning_content`
-// deltas so the UI can show a "Thinking…" state with a live excerpt of the
-// model's thoughts. State lives at module scope (read through
+// response header, accumulation of reasoning-model `reasoning_content` deltas
+// so the UI can show a "Thinking…" state with a live excerpt of the model's
+// thoughts, and a human status string parsed from the manager's `:` keepalive
+// comments (queue position, or "still working") for the stretch before any
+// delta has arrived at all. State lives at module scope (read through
 // `useSyncExternalStore`) rather than in component state so a generation
 // survives navigating away from the chat page and back.
 
@@ -57,6 +59,31 @@ function reasoningDelta(delta) {
 }
 
 /**
+ * Parse one non-`data:` SSE line into a human status string. api/server.js
+ * ships two repeating keepalive comment shapes while a request produces no
+ * deltas yet: `: queued position=N/M waited=Ws` every 5s while queued, and
+ * `: processing waited=Ws` (optionally with a ` backend=...` suffix for
+ * offloaded requests) every 10s once admitted but the upstream has been
+ * silent past 20s. Both used to be discarded outright, so a browser showed
+ * nothing at all during a long queue wait or a slow-starting generation.
+ *
+ * @param {string} line One decoded SSE line (comment or otherwise).
+ * @returns {string} A short status string, or '' when the line isn't one of
+ *   the two recognized keepalive shapes.
+ */
+function parseStatusComment(line) {
+  if (!line.startsWith(':')) return '';
+  const queued = line.match(/queued position=(\d+)\/(\d+) waited=(\d+)s/);
+  if (queued) {
+    const [, position, pending, waited] = queued;
+    return `Queued — ${position} of ${pending}, ${waited}s`;
+  }
+  const processing = line.match(/processing waited=(\d+)s/);
+  if (processing) return `Working — ${processing[1]}s`;
+  return '';
+}
+
+/**
  * Condense accumulated reasoning text into a single-line progress hint: the
  * tail of the thoughts with all whitespace collapsed, capped so the hint can
  * never grow the layout.
@@ -78,6 +105,7 @@ const state = {
   reasoning: '',
   routedModel: '',
   startedAt: 0,
+  status: '',
   streamingMessage: '',
 };
 
@@ -87,9 +115,10 @@ let snapshot = { ...state };
 /** Set of store subscribers. */
 const listeners = new Set();
 
-/** Buffered content and reasoning between repaints. */
+/** Buffered content, reasoning, and keepalive status between repaints. */
 let latestContent = '';
 let latestReasoning = '';
+let latestStatus = '';
 let paintTimer = null;
 let controller = null;
 
@@ -123,9 +152,11 @@ function flushPaint() {
     clearTimeout(paintTimer);
     paintTimer = null;
   }
-  if (state.streamingMessage === latestContent && state.reasoning === latestReasoning) return;
+  if (state.streamingMessage === latestContent && state.reasoning === latestReasoning
+      && state.status === latestStatus) return;
   state.streamingMessage = latestContent;
   state.reasoning = latestReasoning;
+  state.status = latestStatus;
   emit();
 }
 
@@ -159,12 +190,14 @@ async function streamChat({ model = 'auto', messages, conversationId = null }) {
   controller = requestController;
   latestContent = '';
   latestReasoning = '';
+  latestStatus = '';
   state.conversationId = conversationId;
   state.error = '';
   state.isStreaming = true;
   state.reasoning = '';
   state.routedModel = '';
   state.startedAt = Date.now();
+  state.status = '';
   state.streamingMessage = '';
   emit();
 
@@ -203,7 +236,14 @@ async function streamChat({ model = 'auto', messages, conversationId = null }) {
     let lineBuffer = '';
 
     const consumeLine = (line) => {
-      if (!line.startsWith('data:')) return;
+      if (!line.startsWith('data:')) {
+        const status = parseStatusComment(line);
+        if (status) {
+          latestStatus = status;
+          schedulePaint();
+        }
+        return;
+      }
       const data = line.slice(5).trimStart();
       if (!data || data === '[DONE]') return;
       try {
@@ -212,11 +252,13 @@ async function streamChat({ model = 'auto', messages, conversationId = null }) {
         const thought = reasoningDelta(delta);
         if (thought) {
           latestReasoning += thought;
+          latestStatus = '';
           schedulePaint();
         }
         if (delta?.content) {
           latestContent += delta.content;
           tokenChunks += 1;
+          latestStatus = '';
           schedulePaint();
         }
         if (parsed.usage) usage = parsed.usage;
@@ -275,9 +317,12 @@ async function streamChat({ model = 'auto', messages, conversationId = null }) {
  * Subscribe a component to the shared chat stream.
  *
  * @returns {{conversationId: string|null, error: string, isStreaming: boolean,
- *   reasoning: string, routedModel: string, startedAt: number,
+ *   reasoning: string, routedModel: string, startedAt: number, status: string,
  *   streamingMessage: string, stop: () => void, streamChat: typeof streamChat}}
- *   The live stream state plus its stable control functions.
+ *   The live stream state plus its stable control functions. `status` is a
+ *   human keepalive string ("Queued — 2 of 3, 15s" / "Working — 42s") shown
+ *   while the request is queued or the upstream has gone quiet, and clears
+ *   itself as soon as real content or reasoning starts arriving.
  */
 function useChatStream() {
   const stream = useSyncExternalStore(subscribe, getStreamSnapshot, getStreamSnapshot);
@@ -287,6 +332,7 @@ function useChatStream() {
 export {
   getStreamSnapshot,
   parseChatSseEvent,
+  parseStatusComment,
   reasoningDelta,
   reasoningTail,
   streamChat,

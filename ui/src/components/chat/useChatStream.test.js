@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { parseChatSseEvent, reasoningDelta, reasoningTail } from './useChatStream.js';
+import { parseChatSseEvent, parseStatusComment, reasoningDelta, reasoningTail } from './useChatStream.js';
 
 test('ordinary content, usage, and model SSE payloads remain available to Chat', () => {
   const event = {
@@ -85,6 +85,34 @@ test('the reasoning tail tolerates empty and missing input', () => {
   assert.equal(reasoningTail(''), '');
   assert.equal(reasoningTail(undefined), '');
   assert.equal(reasoningTail(null), '');
+});
+
+test('a queue-wait comment becomes a human status string', () => {
+  // api/server.js writes ": queued position=N/M waited=Ws\n\n" every 5s while
+  // a request sits in the local queue, before it holds a slot or produces any
+  // delta — the SSE line the UI previously discarded outright.
+  assert.equal(parseStatusComment(': queued position=2/3 waited=15s'), 'Queued — 2 of 3, 15s');
+});
+
+test('a processing keepalive comment becomes a human status string', () => {
+  // api/server.js writes ": processing waited=Ws\n\n" every 10s once a request
+  // holds the local slot but the upstream has been silent for >20s.
+  assert.equal(parseStatusComment(': processing waited=42s'), 'Working — 42s');
+});
+
+test('a processing keepalive from a remote backend (with its backend= suffix) still parses', () => {
+  assert.equal(parseStatusComment(': processing waited=42s backend=ollama'), 'Working — 42s');
+});
+
+test('non-status comments and data lines are not treated as a status', () => {
+  assert.equal(parseStatusComment(': manager queue-wait-ms=120 priority=interactive'), '');
+  assert.equal(parseStatusComment('data: {"choices":[{"delta":{"content":"hi"}}]}'), '');
+  assert.equal(parseStatusComment(''), '');
+});
+
+test('the streaming hook surfaces status and clears it once real output arrives', () => {
+  const source = readFileSync(fileURLToPath(new URL('./useChatStream.js', import.meta.url)), 'utf8');
+  assert.match(source, /parseStatusComment\s*\(line\)/);
 });
 
 test('stream state lives at module scope so navigating away cannot abort it', () => {
