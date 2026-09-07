@@ -173,6 +173,8 @@ import {
   qwen36WorkerPresetSection
 } from './engines.js';
 import { buildHardwareProfile } from './hardware-profile.js';
+import { duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID } from './duo-chain.js';
+import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
@@ -2901,6 +2903,29 @@ if (!config.ds4) {
   try { saveConfig(config); } catch { /* best-effort seed */ }
 }
 
+// Point the default aliases at duo once its weights are on the box: `default-big`
+// becomes the plan -> execute -> review chain, and `default-small` points straight at
+// duo's OWN worker rather than an unrelated small model. That second half is the
+// important one — under duo the worker is already resident, so a small request is
+// served without a load and without evicting the planner.
+//
+// Seeded exactly once, keyed on `duoAliasesSeeded`, so an operator who later repoints
+// either alias keeps their choice on every subsequent boot.
+if (!config.duoAliasesSeeded) {
+  const duoWeights = duoWeightPaths();
+  if (duoWeights.plannerExists && duoWeights.workerExists) {
+    if (!config.aliases || typeof config.aliases !== 'object') config.aliases = {};
+    for (const [name, targets] of Object.entries(duoAliasTargets())) {
+      config.aliases[name] = { targets };
+    }
+    config.duoAliasesSeeded = true;
+    try {
+      saveConfig(config);
+      console.log(`[aliases] duo present: ${BIG_ALIAS} -> ${DUO_CHAIN_ID}, ${SMALL_ALIAS} -> ${DUO_WORKER_ID}`);
+    } catch { /* best-effort seed */ }
+  }
+}
+
 // ── Resource guard (memory fit + thermal governor) ───────────────────────────
 // Added after the gpt-oss-120b incident (system RAM 99.9%, APU 98-99C, crash
 // loop). Runtime protections: thermal throttle/unload, bounded queue, earlier
@@ -5610,6 +5635,11 @@ app.get('/api/models', async (req, res) => {
     // Get local models from filesystem
     const localModels = scanLocalModels();
 
+    // Duo is a workflow across two resident models, not a file, so it is not something
+    // scanLocalModels() can find. Offer it only when both halves are downloaded.
+    const duoEntry = duoChainModelEntry(duoWeightPaths());
+    if (duoEntry) localModels.unshift(duoEntry);
+
     res.json({
       serverModels,
       localModels,
@@ -6489,6 +6519,29 @@ async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
  * (caller then omits MODELS_PRESET so the router behaves exactly as before).
  * @returns {string}
  */
+/**
+ * Absolute paths to the two duo model files, and whether each is present.
+ *
+ * Keyed on the FIRST shard of the planner: llama.cpp resolves the remaining shards from
+ * it, so that one file existing is the right test for "the planner is downloaded".
+ * Shared by the models-preset writer and the model list so the two can never disagree
+ * about whether duo is available.
+ *
+ * @returns {{plannerPath:string, workerPath:string, plannerExists:boolean, workerExists:boolean}}
+ */
+function duoWeightPaths() {
+  const plannerPath = join(
+    MODELS_DIR, DUO_PLANNER_ID, 'Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf'
+  );
+  const workerPath = join(MODELS_DIR, DUO_WORKER_ID, 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf');
+  return {
+    plannerPath,
+    workerPath,
+    plannerExists: existsSync(plannerPath),
+    workerExists: existsSync(workerPath),
+  };
+}
+
 let hardwareProfileCache = null;
 
 /**
@@ -6556,9 +6609,7 @@ function writeModelsPresetFile() {
     // Duo mode: the Qwen3.8-Flash-Next planner and its Qwen3.6-35B-A3B worker. Both
     // are keyed on a shard/file that only exists once the weights are downloaded, so
     // an absent model simply contributes no section.
-    const flashNextDir = join(MODELS_DIR, 'unsloth_Qwen3.8-Flash-Next-GGUF');
-    const flashNextShard = join(flashNextDir, 'Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf');
-    const workerPath = join(MODELS_DIR, 'unsloth_Qwen3.6-35B-A3B-GGUF', 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf');
+    const duoWeights = duoWeightPaths();
     const sections = [
       gemmaMtpPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(gemmaDraftPath) }),
       qwen38MtpPresetSection({
@@ -6568,12 +6619,12 @@ function writeModelsPresetFile() {
       museGlimmerDflashPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(museDraftPath) }),
       qwen38FlashNextPresetSection({
         modelsDir: MODELS_DIR,
-        weightsExist: existsSync(flashNextShard),
+        weightsExist: duoWeights.plannerExists,
         threads: profile.threads,
       }),
       qwen36WorkerPresetSection({
         modelsDir: MODELS_DIR,
-        weightsExist: existsSync(workerPath),
+        weightsExist: duoWeights.workerExists,
         threads: profile.threads,
       }),
     ].filter(Boolean);
