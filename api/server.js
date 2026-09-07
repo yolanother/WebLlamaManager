@@ -11302,18 +11302,50 @@ async function runDuoChain(req, res) {
       error: { message: 'duo requires at least one user message', type: 'invalid_request_error' },
     });
   }
-  if (req.body?.stream === true) {
-    return res.status(400).json({
-      error: {
-        message: 'duo does not support streaming: it is a three-step chain, so there is no single token stream to emit.',
-        type: 'invalid_request_error',
-        code: 'duo_streaming_unsupported',
-      },
-    });
-  }
-
   const maxTokens = Number(req.body?.max_tokens) > 0 ? Number(req.body.max_tokens) : 2048;
   const started = Date.now();
+
+  // The chat UI always streams, so refusing to stream would make duo unusable from the
+  // very place it is selected. The first two steps have no tokens worth showing (a plan
+  // the worker consumes, and work the reviewer consumes), so they run buffered and the
+  // REVIEW — the actual answer — is streamed through as it arrives.
+  if (req.body?.stream === true) {
+    try {
+      const plan = await duoChainStepRequest(DUO_PLANNER_ID, buildPlanPrompt(userPrompt), maxTokens);
+      const work = await duoChainStepRequest(DUO_WORKER_ID, buildExecutePrompt(userPrompt, plan), maxTokens);
+
+      const upstream = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: DUO_PLANNER_ID,
+          messages: [{ role: 'user', content: buildReviewPrompt(userPrompt, plan, work) }],
+          max_tokens: maxTokens,
+          stream: true,
+        }),
+      });
+      if (!upstream.ok || !upstream.body) {
+        throw new Error(`duo review step failed with HTTP ${upstream.status}`);
+      }
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      // Rewrite the upstream model id so the client sees the chain it asked for, not the
+      // planner that happened to produce the final turn.
+      for await (const chunk of upstream.body) {
+        res.write(Buffer.from(chunk).toString('utf8').split(DUO_PLANNER_ID).join(DUO_CHAIN_ID));
+      }
+      return res.end();
+    } catch (error) {
+      console.warn(`[duo] streaming chain failed: ${error.message}`);
+      if (res.headersSent) return res.end();
+      return res.status(502).json({
+        error: { message: `duo chain failed: ${error.message}`, type: 'upstream_error', code: 'duo_chain_failed' },
+      });
+    }
+  }
+
   try {
     const plan = await duoChainStepRequest(DUO_PLANNER_ID, buildPlanPrompt(userPrompt), maxTokens);
     const work = await duoChainStepRequest(DUO_WORKER_ID, buildExecutePrompt(userPrompt, plan), maxTokens);
