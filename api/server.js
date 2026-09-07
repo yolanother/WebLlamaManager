@@ -173,7 +173,10 @@ import {
   qwen36WorkerPresetSection
 } from './engines.js';
 import { buildHardwareProfile } from './hardware-profile.js';
-import { duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID } from './duo-chain.js';
+import {
+  duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID,
+  isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
+} from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
 import { createDs4Updater } from './ds4-updater.js';
@@ -11224,7 +11227,97 @@ function finalizeChatTiming(recorder, {
  * @param {import('express').Response} res Express response.
  * @returns {Promise<void>} Resolves after streaming begins or the response is sent.
  */
+/**
+ * Ask one duo model a single question through the local router.
+ *
+ * Goes back through the router over HTTP rather than calling the engine directly, so the
+ * chain reuses the existing routing, residency and queueing machinery instead of
+ * duplicating it. Both models duo names are resident, so this costs a request, not a load.
+ *
+ * @param {string} model Model id to ask (planner or worker).
+ * @param {string} prompt Fully-built prompt for this step.
+ * @param {number} maxTokens Upper bound on the reply.
+ * @returns {Promise<string>} The assistant text.
+ * @throws {Error} When the step returns a non-OK status or an unusable body.
+ */
+async function duoChainStepRequest(model, prompt, maxTokens) {
+  const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens }),
+  });
+  if (!response.ok) {
+    throw new Error(`duo step '${model}' failed with HTTP ${response.status}`);
+  }
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string') throw new Error(`duo step '${model}' returned no message content`);
+  return text;
+}
+
+/**
+ * Run the duo chain: the planner writes exact steps, the worker carries them out, the
+ * planner reviews the result. Returns the reviewer's report as an ordinary chat
+ * completion, with the intermediate plan and work attached under `duo` so an operator can
+ * see what each half actually did.
+ *
+ * Streaming is not supported: a three-step chain has no single token stream, and pretending
+ * otherwise would emit the planner's tokens as though they were the answer.
+ *
+ * @param {import('express').Request} req Inbound request.
+ * @param {import('express').Response} res Response to write.
+ * @returns {Promise<void>}
+ */
+async function runDuoChain(req, res) {
+  const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+  const userPrompt = messages.filter(m => m?.role === 'user').map(m => m?.content).join('\n\n').trim();
+  if (!userPrompt) {
+    return res.status(400).json({
+      error: { message: 'duo requires at least one user message', type: 'invalid_request_error' },
+    });
+  }
+  if (req.body?.stream === true) {
+    return res.status(400).json({
+      error: {
+        message: 'duo does not support streaming: it is a three-step chain, so there is no single token stream to emit.',
+        type: 'invalid_request_error',
+        code: 'duo_streaming_unsupported',
+      },
+    });
+  }
+
+  const maxTokens = Number(req.body?.max_tokens) > 0 ? Number(req.body.max_tokens) : 2048;
+  const started = Date.now();
+  try {
+    const plan = await duoChainStepRequest(DUO_PLANNER_ID, buildPlanPrompt(userPrompt), maxTokens);
+    const work = await duoChainStepRequest(DUO_WORKER_ID, buildExecutePrompt(userPrompt, plan), maxTokens);
+    const review = await duoChainStepRequest(DUO_PLANNER_ID, buildReviewPrompt(userPrompt, plan, work), maxTokens);
+
+    return res.json({
+      id: `chatcmpl-duo-${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: DUO_CHAIN_ID,
+      choices: [{ index: 0, message: { role: 'assistant', content: review }, finish_reason: 'stop' }],
+      duo: { plan, work, elapsedMs: Date.now() - started },
+    });
+  } catch (error) {
+    console.warn(`[duo] chain failed: ${error.message}`);
+    return res.status(502).json({
+      error: { message: `duo chain failed: ${error.message}`, type: 'upstream_error', code: 'duo_chain_failed' },
+    });
+  }
+}
+
 async function handleChatCompletions(req, res) {
+  // Duo is a workflow across two resident models, not a model the router can serve, so it
+  // must be intercepted before any of the single-model machinery below runs. Resolve
+  // through the alias table first: `default-big` points at the chain, and checking the
+  // RAW name would let that request fall through and 400 as an unknown model.
+  if (isDuoChainRequest(resolveRequestModel(req.body?.model).requestedModel)) {
+    return runDuoChain(req, res);
+  }
+
   const startTime = Date.now();
   const workload = requestWorkload(req);
   const chatTiming = new TimingEvidenceRecorder({ profile: TIMING_EVIDENCE_PROFILES.GENERATION });
