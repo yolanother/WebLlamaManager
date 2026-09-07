@@ -104,6 +104,12 @@ CMD=(
     --host 0.0.0.0
     --port "$PORT"
 )
+# Optional discrete-GPU accelerator. The manager decides whether duo may use the card
+# (api/duo-accelerator.js: no NVIDIA card, accelerator switched off, or the pods agent
+# holding it all mean "no") and passes an endpoint only when it may. Empty on every
+# AMD-only box, so no --rpc flag reaches the router there at all.
+[ -n "${LLAMA_RPC_ENDPOINT:-}" ] && CMD+=(--rpc "$LLAMA_RPC_ENDPOINT")
+
 # Load mode. "per-model" deliberately emits nothing so that a [model] section in
 # --models-preset can choose its own; anything else is applied to every child.
 case "$LOAD_MODE" in
