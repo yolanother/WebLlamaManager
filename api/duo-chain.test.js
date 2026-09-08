@@ -12,6 +12,8 @@ import {
   duoAliasTargets,
   isDuoChainRequest,
   duoChainModelEntry,
+  duoStepBody,
+  DUO_REASONING_EFFORT,
   duoMessageText,
   duoConversation,
   duoStepMessages,
@@ -384,4 +386,28 @@ test('no max_tokens still yields a budget with headroom, never zero', () => {
 
 test('the headroom is real, not a token or two', () => {
   assert.ok(DUO_REASONING_HEADROOM >= 2048, 'a reasoning model needs room to think, not a rounding allowance');
+});
+
+// The planner defaults to unbounded reasoning and, on a substantial request, never
+// converges: measured finish=length with EMPTY content at both 4096 and 12000 tokens
+// (17k and 52k chars of reasoning respectively), versus finish=stop with a real 6.9k
+// answer once effort is bounded. Both flags below are invisible in a normal response
+// and trivial to drop by accident, so they are pinned here.
+test('every duo step bounds reasoning effort, or the planner never answers', () => {
+  const body = duoStepBody('some-model', [{ role: 'user', content: 'hi' }], 1234);
+  assert.equal(body.chat_template_kwargs.reasoning_effort, DUO_REASONING_EFFORT);
+  assert.ok(DUO_REASONING_EFFORT, 'must be a real effort level, never empty');
+});
+
+test('every duo step asks for engine timings, or tok/s degrades to wall clock', () => {
+  const body = duoStepBody('some-model', [{ role: 'user', content: 'hi' }], 1234);
+  assert.equal(body.timings_per_token, true);
+});
+
+test('duoStepBody passes model, messages and budget through unchanged', () => {
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const body = duoStepBody('m', msgs, 99);
+  assert.equal(body.model, 'm');
+  assert.deepEqual(body.messages, msgs);
+  assert.equal(body.max_tokens, 99);
 });

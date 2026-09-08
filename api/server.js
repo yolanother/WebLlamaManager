@@ -178,6 +178,7 @@ import {
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
   duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText, duoStepBudget,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
+  duoStepBody,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
@@ -11279,10 +11280,12 @@ async function duoChainStepRequest(model, messages, maxTokens) {
   const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    // `timings_per_token` is what makes the engine report `timings` on the reply. Without
-    // it the only rate available is tokens over wall clock, which includes queueing and
-    // model load and is the reason duo appeared to run at a fraction of its real speed.
-    body: JSON.stringify({ model, messages, max_tokens: maxTokens, timings_per_token: true }),
+    // duoStepBody carries two flags that are invisible in a normal response and easy to
+    // lose: `timings_per_token` (the only honest source for tokens/sec — without it the
+    // rate degrades to wall clock, including queueing and model load) and a bounded
+    // `reasoning_effort` (without which the planner never stops thinking and returns no
+    // answer at all on a substantial request). Both are pinned by tests in duo-chain.
+    body: JSON.stringify(duoStepBody(model, messages, maxTokens)),
     // dispatcher: llamaDispatcher disables undici's default 300s headersTimeout. A chain
     // step is a whole generation from a large model, so 300s is routinely too short — a
     // healthy planner step was aborted at exactly 300.9s as "fetch failed" without it.

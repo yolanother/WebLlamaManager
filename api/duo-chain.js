@@ -514,3 +514,47 @@ export function duoStepBudget(maxTokens) {
   const requested = Number(maxTokens) > 0 ? Math.floor(Number(maxTokens)) : 2048;
   return requested + DUO_REASONING_HEADROOM;
 }
+
+/**
+ * Reasoning effort applied to every duo step.
+ *
+ * The planner defaults to UNBOUNDED reasoning and, on any substantial request, never
+ * converges on an answer at all — it simply spends whatever budget it is given and stops
+ * on `length` with empty `content`. Measured on drakemore with one design-sized prompt,
+ * same model and prompt, only this setting varying:
+ *
+ *   default          finish=length  content=0     reasoning=17,145 chars  (max_tokens 4096)
+ *   default          finish=length  content=0     reasoning=51,763 chars  (max_tokens 12000)
+ *   reasoning_effort finish=stop    content=6,895 reasoning= 1,211 chars  (max_tokens 3000)
+ *
+ * Reasoning scales with the budget, so raising `max_tokens` does NOT help — it produces
+ * proportionally more thinking and still no answer. Bounding the effort is what makes the
+ * model terminate, and it was also ~6x faster (128s vs 796s). Without this, duo fails on
+ * exactly the open-ended design questions it exists to answer.
+ */
+export const DUO_REASONING_EFFORT = 'medium';
+
+/**
+ * Build the request body for one chain step.
+ *
+ * Kept here rather than inline at the call site so the reasoning-effort and timings flags
+ * are covered by tests: both are invisible in a normal response and easy to drop by
+ * accident, and losing either silently degrades duo (no answer at all, or a throughput
+ * figure that is really wall-clock).
+ *
+ * @param {string} model Model id for this step.
+ * @param {Array<object>} messages Conversation to send, including this step's instruction.
+ * @param {number} maxTokens Token budget for the step (see duoStepBudget).
+ * @returns {object} Request body for /v1/chat/completions.
+ */
+export function duoStepBody(model, messages, maxTokens) {
+  return {
+    model,
+    messages,
+    max_tokens: maxTokens,
+    // Makes the engine report `timings`, the only honest source for tokens/sec.
+    timings_per_token: true,
+    // Makes the model stop thinking and answer. See DUO_REASONING_EFFORT.
+    chat_template_kwargs: { reasoning_effort: DUO_REASONING_EFFORT },
+  };
+}
