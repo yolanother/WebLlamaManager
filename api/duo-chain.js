@@ -24,6 +24,7 @@
 // Unit-tested in duo-chain.test.js.
 
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
+import { degenerateOutputReason } from './degenerate-output.js';
 
 /**
  * The selectable model id for the whole chain. Appears in the model list beside the two
@@ -483,6 +484,14 @@ export function duoStepText(choice) {
       error: 'ran out of tokens while still reasoning and never produced an answer — '
         + 'raise max_tokens rather than acting on an unfinished plan',
     };
+  }
+  // A degraded backend returns one character repeated at full generation speed. The chat
+  // router survives that (it JSON-parses the reply and falls back when parsing fails), but
+  // the chain has no such defence: it would hand '/////' to the next model AS THE PLAN and
+  // the worker would answer something unrelated. Fail loudly instead.
+  const degenerate = degenerateOutputReason(text);
+  if (degenerate) {
+    return { text: '', error: `returned degenerate output — ${degenerate}` };
   }
   return { text, error: null };
 }

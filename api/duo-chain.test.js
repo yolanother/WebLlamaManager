@@ -434,3 +434,26 @@ test('an absent or nonsensical max_tokens still yields a usable budget', () => {
     assert.ok(b > 0 && b <= DUO_STEP_CEILING, `bad input ${bad} gave ${b}`);
   }
 });
+
+// The chat router survives a degraded backend because it JSON-parses the reply and falls
+// back when parsing fails. The chain has no such defence: without this it would hand
+// '/////' to the next model AS THE PLAN, and the worker would answer something unrelated
+// with no sign anything had gone wrong.
+test('a step returning degenerate output fails instead of being chained forward', () => {
+  const r = duoStepText({ message: { content: '/'.repeat(40) }, finish_reason: 'stop' });
+  assert.equal(r.text, '');
+  assert.match(r.error, /degenerate/);
+});
+
+test('the guard catches any repeated character, not just slashes', () => {
+  for (const ch of ['?', '#', '.', '*']) {
+    const r = duoStepText({ message: { content: ch.repeat(40) }, finish_reason: 'stop' });
+    assert.match(r.error || '', /degenerate/, `${ch} should be rejected`);
+  }
+});
+
+test('a real answer still passes the guard untouched', () => {
+  const r = duoStepText({ message: { content: '1. Do the thing\n2. Verify it' }, finish_reason: 'stop' });
+  assert.equal(r.error, null);
+  assert.match(r.text, /Do the thing/);
+});
