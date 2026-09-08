@@ -2,7 +2,7 @@
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeModelKey } from './model-identity.js';
+import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
 
 test('the router id and the on-disk filename are the same model', () => {
   // The exact bug this exists for: /api/v1/models merges the running router's
@@ -44,4 +44,36 @@ test('empty and non-string inputs normalize to an empty key rather than throwing
   assert.equal(normalizeModelKey(''), '');
   assert.equal(normalizeModelKey(null), '');
   assert.equal(normalizeModelKey(undefined), '');
+});
+
+// The router serves a repo DIRECTORY as one model id ('unsloth_Muse-Glimmer-30B-GGUF').
+// The disk scan reports the file inside it ('unsloth_Muse-Glimmer-30B-GGUF/Muse-...gguf').
+// Those are the same model, but normalizeModelKey cannot collapse them because the path
+// form normalises to directory+file. So every model was listed TWICE on /v1/models, once
+// servable and once not, and selecting the path form returned
+// "model '<dir>/<file>.gguf' not found" - which is what an operator hit for two models.
+test('modelDirectoryKey collapses a repo path onto the directory the router serves', () => {
+  assert.equal(
+    modelDirectoryKey('unsloth_Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-UD-Q4_K_XL.gguf'),
+    normalizeModelKey('unsloth_Muse-Glimmer-30B-GGUF'),
+  );
+  assert.equal(
+    modelDirectoryKey('unsloth_Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ3_XXS.gguf'),
+    normalizeModelKey('unsloth_Qwen3.8-Flash-Next-GGUF'),
+  );
+});
+
+test('modelDirectoryKey returns null for a bare model name', () => {
+  assert.equal(modelDirectoryKey('Qwen3-8B-Q4_K_M'), null);
+  assert.equal(modelDirectoryKey('Qwen3-8B-Q4_K_M.gguf'), null);
+});
+
+test('modelDirectoryKey tolerates junk without throwing', () => {
+  for (const v of [null, undefined, '', 42, {}, '/', 'a/']) {
+    assert.doesNotThrow(() => modelDirectoryKey(v));
+  }
+});
+
+test('nested paths key on the top-level repo directory', () => {
+  assert.equal(modelDirectoryKey('repo/sub/file.gguf'), normalizeModelKey('repo'));
 });

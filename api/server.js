@@ -54,7 +54,7 @@ const PROJECT_ROOT = dirname(__dirname);
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
-import { normalizeModelKey } from './model-identity.js';
+import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
@@ -9739,6 +9739,15 @@ async function handleModels(req, res) {
     const localModels = scanLocalModels();
     for (const lm of localModels) {
       if (byId.has(lm.name) || seenNorm.has(norm(lm.name))) continue;
+      // A file inside a repo directory the router already serves is the SAME model. The
+      // router serves the directory as one id; the disk scan sees the file within it, and
+      // normalizeModelKey cannot collapse the two because a path normalises to
+      // directory+file. Listing both advertised every model twice - once servable, once
+      // not - and choosing the path form failed with "model '<dir>/<file>.gguf' not
+      // found". It also exposed speculative-decoding drafters (dflash-kquant.gguf) as
+      // though they were chat models.
+      const dirKey = modelDirectoryKey(lm.name);
+      if (dirKey && seenNorm.has(dirKey)) continue;
       byId.set(lm.name, {
         id: lm.name,
         object: 'model',

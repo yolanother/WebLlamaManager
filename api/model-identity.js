@@ -41,3 +41,33 @@ export function normalizeModelKey(name) {
   }
   return s.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
+
+/**
+ * The normalized key of the repo DIRECTORY a model path lives in, or null when the name
+ * is not a path.
+ *
+ * The router serves a downloaded repo as a single model id — its directory,
+ * `unsloth_Muse-Glimmer-30B-GGUF` — while the disk scan reports the file inside it,
+ * `unsloth_Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-UD-Q4_K_XL.gguf`. Those name the same
+ * servable model, but {@link normalizeModelKey} cannot collapse them: stripping the
+ * extension still leaves directory+file, which never equals the directory alone.
+ *
+ * The consequence was that /v1/models listed every downloaded model twice, once as the
+ * servable directory id and once as a path the router does not know, and choosing the
+ * path form failed with "model '<dir>/<file>.gguf' not found". It also surfaced
+ * speculative-decoding drafters (dflash-kquant.gguf) as if they were chat models.
+ *
+ * Keys on the TOP-LEVEL directory, since that is the unit the router serves.
+ *
+ * @param {unknown} name Model name or repo-relative path.
+ * @returns {string|null} Normalized directory key, or null when `name` has no directory.
+ */
+export function modelDirectoryKey(name) {
+  const s = String(name ?? '');
+  const slash = s.indexOf('/');
+  if (slash <= 0) return null;
+  const dir = s.slice(0, slash);
+  if (!dir) return null;
+  const key = normalizeModelKey(dir);
+  return key || null;
+}
