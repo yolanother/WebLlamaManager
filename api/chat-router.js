@@ -6,6 +6,26 @@
 
 import { BIG_ALIAS, SMALL_ALIAS } from './model-aliases.js';
 
+/**
+ * Token ceiling for one classification.
+ *
+ * This was 64, which is smaller than the answer itself once a REASONING model is on the
+ * other end: those models emit their thinking before the answer, so the budget ran out
+ * mid-word and the router received a truncated name — or nothing at all. Observed in the
+ * field as a reply of `'unsloth_Qwen3.6-'`, and as pure `'/////'` when a degraded child
+ * was asked the same question.
+ *
+ * Measured on drakemore against the real classifier prompt, 4 trials per cell:
+ *   max_tokens 250 -> 3/4   (failure: finish=length, name truncated)
+ *   max_tokens 700 -> 4/4
+ * Reasoning effort made no difference at either budget; the budget was the only variable.
+ *
+ * This is a CEILING, not an allocation: a model that finishes never reaches it, so a
+ * generous value costs nothing on the normal path and only helps when the model needs
+ * room to finish. `default-small` now resolves to a reasoning model, so it needs the room.
+ */
+const CLASSIFICATION_MAX_TOKENS = 2048;
+
 /** Request-time model aliases that invoke the small-brain classifier. */
 export const AUTO_MODEL_ALIASES = Object.freeze(['auto', 'default-router']);
 
@@ -329,7 +349,7 @@ export async function routeAutoModel(body, deps) {
     const completionWork = deps.complete('default-small', messages, {
       stream: false,
       temperature: 0,
-      max_tokens: 64,
+      max_tokens: CLASSIFICATION_MAX_TOKENS,
       signal: controller.signal,
     });
     const timeout = new Promise((_, reject) => {

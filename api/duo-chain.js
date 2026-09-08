@@ -495,7 +495,17 @@ export function duoStepText(choice) {
  * reaches the reply. Measured on the box, a planner asked for three bicycle brake parts
  * spent 520-626 tokens on one run and blew past 2500 on another for the same prompt.
  */
-export const DUO_REASONING_HEADROOM = 4096;
+export const DUO_REASONING_HEADROOM = 32768;
+
+/**
+ * Hard ceiling for one step's generation budget.
+ *
+ * The router serves at --ctx-size 65536, and a step's PROMPT shares that window with its
+ * output: the execute step carries the plan, and the review step carries both the plan and
+ * the work. Reserving a quarter of the window for the prompt keeps a long chain from
+ * running the context out mid-step. Raise this with the router's context, not past it.
+ */
+export const DUO_STEP_CEILING = 49152;
 
 /**
  * The per-step token budget for a caller's `max_tokens`.
@@ -512,7 +522,11 @@ export const DUO_REASONING_HEADROOM = 4096;
  */
 export function duoStepBudget(maxTokens) {
   const requested = Number(maxTokens) > 0 ? Math.floor(Number(maxTokens)) : 2048;
-  return requested + DUO_REASONING_HEADROOM;
+  // A ceiling, not an allocation: a model that finishes never reaches it, so headroom is
+  // free on the normal path and is the difference between an answer and a truncated one.
+  // 4096 of headroom was not enough — the planner still ran out mid-answer on a real
+  // request. Bounded by the context window the router actually serves.
+  return Math.min(requested + DUO_REASONING_HEADROOM, DUO_STEP_CEILING);
 }
 
 /**

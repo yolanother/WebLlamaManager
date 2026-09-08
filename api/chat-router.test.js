@@ -229,7 +229,13 @@ test('routeAutoModel classifies with default-small and rewrites the request mode
   assert.equal(completionCall.model, 'default-small');
   assert.equal(completionCall.opts.stream, false);
   assert.equal(completionCall.opts.temperature, 0);
-  assert.equal(completionCall.opts.max_tokens, 64);
+  // Was 64, which is smaller than the answer itself once default-small resolves to a
+  // REASONING model: it emits its thinking first, so the budget ran out mid-word and
+  // the router got 'unsloth_Qwen3.6-' instead of a name. Measured against the real
+  // prompt: 250 tokens -> 3/4, 700 -> 4/4. Asserted as a floor, not a literal, so it
+  // can never drift back below what a reasoning model needs to finish.
+  assert.ok(completionCall.opts.max_tokens >= 700,
+    `classification budget ${completionCall.opts.max_tokens} is too small for a reasoning model`);
 });
 
 test('routeAutoModel sends only vision-capable candidates for image requests', async () => {

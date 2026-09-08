@@ -25,6 +25,7 @@ import {
   duoStepText,
   duoStepBudget,
   DUO_REASONING_HEADROOM,
+  DUO_STEP_CEILING,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 
@@ -410,4 +411,26 @@ test('duoStepBody passes model, messages and budget through unchanged', () => {
   assert.equal(body.model, 'm');
   assert.deepEqual(body.messages, msgs);
   assert.equal(body.max_tokens, 99);
+});
+
+// A step's budget is a CEILING, not an allocation: a model that finishes never reaches
+// it. 4096 of headroom was measured as insufficient — the planner still ran out mid-answer
+// on a real request, and the router's classifier returned a name truncated to
+// 'unsloth_Qwen3.6-' at 250 tokens while 700 succeeded 4/4.
+test('a step gets real headroom above the callers answer allowance', () => {
+  assert.ok(duoStepBudget(500) >= 500 + 8192, 'headroom must be substantial, not token');
+  assert.ok(DUO_REASONING_HEADROOM >= 8192);
+});
+
+test('a step budget never exceeds the context the router actually serves', () => {
+  // --ctx-size 65536, and the prompt shares that window with the output.
+  assert.equal(duoStepBudget(999999), DUO_STEP_CEILING);
+  assert.ok(DUO_STEP_CEILING < 65536, 'must leave room for the prompt');
+});
+
+test('an absent or nonsensical max_tokens still yields a usable budget', () => {
+  for (const bad of [undefined, null, 0, -5, 'abc']) {
+    const b = duoStepBudget(bad);
+    assert.ok(b > 0 && b <= DUO_STEP_CEILING, `bad input ${bad} gave ${b}`);
+  }
 });
