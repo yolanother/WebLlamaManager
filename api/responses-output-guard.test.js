@@ -223,3 +223,25 @@ test('a background job records the guard failure as a terminal response', () => 
   assert.equal(finalResponse.status, 'failed');
   assert.equal(finalResponse.error.code, 'DEGENERATE_OUTPUT');
 });
+
+test('server.js imports every guard symbol it calls', async () => {
+  // This shipped broken: the call sites were wired but the import was never added,
+  // so every /v1/responses request 502'd with "createResponsesStreamGuard is not
+  // defined". `node --check` cannot see an undefined identifier, the source-grep
+  // wiring tests found the call sites and were satisfied, and the module's own unit
+  // tests import it directly — so nothing failed until a live request ran.
+  //
+  // Assert the binding exists, not merely that the name appears somewhere.
+  const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
+  const imported = new Set();
+  for (const block of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*['"][^'"]+['"]/g)) {
+    for (const name of block[1].split(',')) {
+      const bare = name.trim().split(/\s+as\s+/).pop().trim();
+      if (bare) imported.add(bare);
+    }
+  }
+  for (const symbol of ['createResponsesStreamGuard', 'validateResponsesPayload']) {
+    assert.ok(source.includes(`${symbol}(`), `${symbol} should be called by server.js`);
+    assert.ok(imported.has(symbol), `${symbol} is called but never imported`);
+  }
+});

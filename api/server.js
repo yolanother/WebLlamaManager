@@ -161,6 +161,10 @@ import {
   DEGENERATE_OUTPUT_ERROR,
 } from './completion-output-guard.js';
 import {
+  createResponsesStreamGuard,
+  validateResponsesPayload,
+} from './responses-output-guard.js';
+import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
