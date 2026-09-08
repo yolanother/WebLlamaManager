@@ -14,6 +14,11 @@ accumulated across streamed deltas, passing `STREAM_REPEAT_LIMIT` (256). Observe
 when a loaded llama.cpp child entered a persistent corrupt state and emitted a
 single character forever for every request it received.
 
+**Phrase-level looping.** One line repeated `STREAM_LINE_REPEAT_LIMIT` (30) times
+consecutively. Blank lines do not break the run. Punctuation-only and very short
+lines are excluded, because real code legitimately stacks closing braces and
+brackets. Observed when a reviewer request looped `- **Input Format:**` 1677 times.
+
 ## Contract
 
 - Normal text passes through unchanged, including mixed text such as `What???`.
@@ -91,3 +96,35 @@ cheap and the recurrence data is what is missing.
 
 `/v1/completions` and the DS4 and remote-backend pumps are not covered by the
 degenerate check today.
+
+
+## Runtime incident: phrase-level loop, 2026-09-08
+
+A Qwen3.6-35B-A3B reviewer request ran 265.6s at HTTP 200, produced 12000
+completion tokens entirely inside the reasoning block, and returned no content.
+The reasoning was a loop: 1694 non-empty lines, **12 distinct**, with
+`- **Input Format:**` repeated **1677** times. Degeneration began at the fourth
+line (`Check all constraints, constraints, check all constraints.`).
+
+Temperature was 1.0, so this does **not** require greedy decoding. The children
+report `repeat_penalty = 1.0` (disabled), and the manager's sampling injection
+sets no repetition penalty — nothing pushed the model out of the loop.
+
+The character-run detector missed it entirely: the longest single-character run
+in that output was zero. Replaying the captured 39,809-byte payload through the
+line detector trips after 2,190 bytes — 5.5% of the output, roughly 15s rather
+than 265s.
+
+Note that a `response_format` schema would **not** have prevented this. The
+engine's grammar for this model constrains the content *after* the thinking
+block — `optional("<think>" ... "</think>")` followed by schema-constrained
+content — so it permits unbounded reasoning by design, and a loop inside the
+thinking block is untouched by it.
+
+Separately, and worth knowing: on this engine a bare
+`response_format: {"type":"json_object"}` with no `schema` key applies **no
+grammar at all** for templates routed to the `qwen3_coder` handler (which
+Qwen3.6 is, by its `<tool_call>` / `<function=` / `<parameter=` markers). The
+handler gates on a non-empty schema object, and a bare `json_object` yields an
+empty one. Supply a real schema — either `{"type":"json_object","schema":{...}}`
+or `{"type":"json_schema","json_schema":{"schema":{...}}}` — to get a grammar.

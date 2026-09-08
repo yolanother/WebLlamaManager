@@ -161,3 +161,79 @@ test('a tripped monitor keeps reporting, so a missed check still aborts', () => 
 test('the limit is far above any legitimate run', () => {
   assert.ok(STREAM_REPEAT_LIMIT >= 128, 'too low risks aborting real answers');
 });
+
+// --- phrase-level loops -----------------------------------------------------
+//
+// The character-run monitor above missed a real 265s failure completely. A Qwen3.6
+// reviewer request produced 12000 tokens inside its reasoning block, all of it a
+// loop: 1694 non-empty lines, 12 distinct, with '- **Input Format:**' repeated 1677
+// times. Longest single-character run in that output: 0.
+//
+// Blank lines are interleaved in the real payload (the last 8000 characters held
+// 348 lines and 2 distinct values), so they must not reset the run.
+
+import { STREAM_LINE_REPEAT_LIMIT } from './degenerate-output.js';
+
+/** Feed text through a fresh monitor and return the first trip reason. */
+function feedLines(text) {
+  return createRepetitionMonitor().push(text);
+}
+
+test('trips on the captured reviewer loop', () => {
+  const loop = '   - **Input Format:**\n\n'.repeat(STREAM_LINE_REPEAT_LIMIT + 5);
+  assert.ok(feedLines(`Here's a thinking process:\n\n1. Analyze.\n\n${loop}`));
+});
+
+test('blank lines between repeats do not reset the run, as the real payload had', () => {
+  assert.ok(feedLines('- **Input Format:**\n\n\n'.repeat(STREAM_LINE_REPEAT_LIMIT + 2)));
+});
+
+test('a run split across streamed chunks is still caught', () => {
+  const monitor = createRepetitionMonitor();
+  let tripped = null;
+  for (let i = 0; i < STREAM_LINE_REPEAT_LIMIT + 5 && !tripped; i++) {
+    // Deltas arrive mid-line, as tokens do.
+    tripped = monitor.push('- **Input') || monitor.push(' Format:**\n');
+  }
+  assert.ok(tripped, 'token-sized deltas must still accumulate into lines');
+});
+
+test('the reason names the repeated phrase so the log is actionable', () => {
+  const reason = feedLines('- **Input Format:**\n'.repeat(STREAM_LINE_REPEAT_LIMIT + 1));
+  assert.match(reason, /Input Format/);
+});
+
+test('one differing line resets the run', () => {
+  const near = '- **Input Format:**\n'.repeat(STREAM_LINE_REPEAT_LIMIT - 1);
+  assert.equal(feedLines(`${near}- something else entirely\n${near}`), null);
+});
+
+// --- must not cry wolf ------------------------------------------------------
+
+test('repeated closing braces in code are not a loop', () => {
+  // Punctuation-only lines are excluded: real code stacks them.
+  assert.equal(feedLines('}\n'.repeat(STREAM_LINE_REPEAT_LIMIT + 20)), null);
+  assert.equal(feedLines('  ],\n'.repeat(STREAM_LINE_REPEAT_LIMIT + 20)), null);
+});
+
+test('a markdown table with a repeated column pattern is not a loop', () => {
+  const rows = ['| Alpha | 1 |', '| Beta | 2 |', '| Gamma | 3 |'];
+  let out = '';
+  for (let i = 0; i < STREAM_LINE_REPEAT_LIMIT * 2; i++) out += rows[i % rows.length] + '\n';
+  assert.equal(feedLines(out), null);
+});
+
+test('normal prose and varied list items never trip', () => {
+  let out = '';
+  for (let i = 0; i < STREAM_LINE_REPEAT_LIMIT * 3; i++) out += `- Point number ${i} about bridges.\n`;
+  assert.equal(feedLines(out), null);
+  assert.equal(feedLines('The bridge resonates. '.repeat(200)), null);
+});
+
+test('very short lines are ignored, so a stray repeated token is not a loop', () => {
+  assert.equal(feedLines('ok\n'.repeat(STREAM_LINE_REPEAT_LIMIT + 10)), null);
+});
+
+test('the line threshold is high enough that a false abort is implausible', () => {
+  assert.ok(STREAM_LINE_REPEAT_LIMIT >= 25, 'too low risks discarding a real answer');
+});
