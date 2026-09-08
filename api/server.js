@@ -3299,7 +3299,16 @@ async function preflightModelGuard(modelId, contextSize, { requireKnownSize = fa
   });
 
   if (plan.action === 'serve') { warnContextMayNotFit(modelId, contextSize, cfg); return; }
-  if (plan.action === 'refuse') throwModelTooLarge(modelId, plan.requiredBytes, plan.budgetBytes);
+  if (plan.action === 'refuse') {
+    // Refusing to serve is the single most important guard event to leave a trace of, and
+    // it was the one that logged nothing: the operator got a 502 and the server said
+    // nothing about why. Debugging the refusal that prompted this meant reconstructing the
+    // arithmetic by hand from the error string. Log the inputs, not just the verdict.
+    addLog('system', `[guard] ${modelId}: REFUSED — needs ~${gibStr(plan.requiredBytes)} GiB, `
+      + `budget ~${gibStr(plan.budgetBytes)} GiB, ~${gibStr(plan.reclaimableBudgetBytes)} GiB `
+      + `even after reclaiming (${plan.reason}).`);
+    throwModelTooLarge(modelId, plan.requiredBytes, plan.budgetBytes);
+  }
 
   // plan.action === 'reclaim': free RAM and retry. Honour the recovery toggle —
   // if disabled, fall back to the original hard refuse.
