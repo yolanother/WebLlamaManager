@@ -411,3 +411,31 @@ export function thermalDecision({
   }
   return { state: 'normal', pauseDispatch: false, unload: false };
 }
+
+/**
+ * Memory that could be freed by unloading models, in bytes.
+ *
+ * This feeds {@link planMemoryRecovery}'s refuse-vs-reclaim decision, and getting it too
+ * LOW is what makes the guard refuse a model it could have served. It was llama-server
+ * RSS alone, which badly understates mmap-backed weights: a resident 82 GB model measured
+ * 26.5 GB RSS because its weights live in page cache rather than anonymous memory. The
+ * guard therefore saw almost nothing to reclaim and refused outright —
+ *   needs ~95.3 GiB but only ~58.7 GiB is free
+ * — when evicting the two resident models would have freed ~42 GB and it would have fit.
+ *
+ * Over-estimating here is deliberately safe: 'reclaim' unloads, RE-MEASURES, and refuses
+ * then if it still does not fit. So the bias is toward trying, which is what an operator
+ * expects — free the memory and serve the request rather than decline it.
+ *
+ * @param {object} params
+ * @param {number} [params.rssBytes] Resident memory held by llama-server processes.
+ * @param {Array<number>} [params.residentModelBytes] On-disk sizes of OTHER loaded models,
+ *   whose mmap'd pages the kernel drops once they are unloaded.
+ * @returns {number} Reclaimable bytes, never negative.
+ */
+export function reclaimableMemoryBytes({ rssBytes = 0, residentModelBytes = [] } = {}) {
+  const rss = Math.max(0, Number(rssBytes) || 0);
+  const weights = (Array.isArray(residentModelBytes) ? residentModelBytes : [])
+    .reduce((total, b) => total + Math.max(0, Number(b) || 0), 0);
+  return rss + weights;
+}

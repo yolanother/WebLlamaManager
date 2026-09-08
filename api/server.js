@@ -55,7 +55,7 @@ import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
-import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots, activeRequestHoldsSlot } from './slot-reaper.js';
@@ -3196,6 +3196,30 @@ async function listLoadedModelIds() {
   } catch { return []; }
 }
 
+/**
+ * Bytes that unloading the OTHER resident models would free, for the admission guard.
+ *
+ * The guard's refuse-vs-reclaim decision used llama-server RSS alone, which understates
+ * mmap-backed weights by a wide margin (26.5 GB RSS for a resident 82 GB model, because
+ * the weights are page cache rather than anonymous memory). It therefore refused models
+ * it could have served by evicting. Router model ids are repo DIRECTORIES while the disk
+ * scan reports the files inside them, so sizes are summed per directory.
+ *
+ * @param {string} modelId The model being admitted, excluded from the total.
+ * @returns {Promise<number>} Reclaimable bytes.
+ */
+async function reclaimableBytesForLoad(modelId) {
+  let sizes = [];
+  try {
+    const loaded = (await listLoadedModelIds()).filter(id => id !== modelId);
+    const local = scanLocalModels();
+    sizes = loaded.map(id => local
+      .filter(m => m.name === id || m.name.startsWith(`${id}/`))
+      .reduce((total, m) => total + (m.size || 0), 0));
+  } catch { /* best effort: fall back to RSS alone */ }
+  return reclaimableMemoryBytes({ rssBytes: llamaServerRssBytes(), residentModelBytes: sizes });
+}
+
 /** Format bytes as a 1-decimal GiB string for guard log/error messages. */
 function gibStr(n) { return (n / (2 ** 30)).toFixed(1); }
 
@@ -3271,7 +3295,7 @@ async function preflightModelGuard(modelId, contextSize, { requireKnownSize = fa
 
   const plan = planMemoryRecovery({
     fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(),
-    alreadyLoaded: false, reclaimableBytes: llamaServerRssBytes(), ...knobs
+    alreadyLoaded: false, reclaimableBytes: await reclaimableBytesForLoad(modelId), ...knobs
   });
 
   if (plan.action === 'serve') { warnContextMayNotFit(modelId, contextSize, cfg); return; }
@@ -3288,7 +3312,7 @@ async function preflightModelGuard(modelId, contextSize, { requireKnownSize = fa
   const unloaded = await unloadOtherModels(modelId);
   if (unloaded) {
     await new Promise(r => setTimeout(r, 1500));
-    if (planMemoryRecovery({ fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(), alreadyLoaded: false, reclaimableBytes: llamaServerRssBytes(), ...knobs }).action === 'serve') {
+    if (planMemoryRecovery({ fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(), alreadyLoaded: false, reclaimableBytes: await reclaimableBytesForLoad(modelId), ...knobs }).action === 'serve') {
       addLog('system', `[guard] ${modelId}: freed enough memory by unloading other models; serving.`);
       warnContextMayNotFit(modelId, contextSize, cfg);
       return;
@@ -3309,7 +3333,7 @@ async function preflightModelGuard(modelId, contextSize, { requireKnownSize = fa
   // Re-evaluate on the freshly-restarted (nothing-loaded) box.
   const after = planMemoryRecovery({
     fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(),
-    alreadyLoaded: false, reclaimableBytes: llamaServerRssBytes(), ...knobs
+    alreadyLoaded: false, reclaimableBytes: await reclaimableBytesForLoad(modelId), ...knobs
   });
   if (after.action === 'serve') { warnContextMayNotFit(modelId, contextSize, cfg); return; }
   throwModelTooLarge(modelId, after.requiredBytes, after.budgetBytes);

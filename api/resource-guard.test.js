@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS, reclaimableMemoryBytes } from './resource-guard.js';
 
 const GiB = 2 ** 30;
 
@@ -402,4 +402,53 @@ test('memoryPressureDecision: exposes defaults for the 16/24/32 GiB policy', () 
   assert.equal(DEFAULTS.memWatchBelowBytes, 24 * GiB);
   assert.equal(DEFAULTS.memResumeAboveBytes, 32 * GiB);
   assert.ok(DEFAULTS.memShedCooldownMs > 0);
+});
+
+// The admission guard chooses between refusing and reclaiming by asking whether the model
+// would fit once reclaimable memory is freed. That estimate was llama-server RSS alone,
+// which is badly wrong for mmap-backed weights: a resident 82GB model showed 26.5GB RSS
+// because its weights live in PAGE CACHE, not anonymous memory. So the guard saw almost
+// nothing to reclaim and refused outright:
+//   Model "unsloth_Qwen3.8-Flash-Next-GGUF" is too large to serve safely:
+//   needs ~95.3 GiB but only ~58.7 GiB is free.
+// Evicting the two resident models would have freed ~42GB and it would have fit.
+//
+// Over-estimating here is SAFE: the reclaim path unloads, RE-MEASURES, and refuses then
+// if it still does not fit. Under-estimating is what produced the wrong refusal.
+test('reclaimable memory counts the weights of other resident models, not just RSS', () => {
+  const bytes = reclaimableMemoryBytes({
+    rssBytes: 5 * 2 ** 30,
+    residentModelBytes: [20 * 2 ** 30, 22 * 2 ** 30],
+  });
+  assert.equal(bytes, 47 * 2 ** 30);
+});
+
+test('reclaimable memory is just RSS when nothing else is resident', () => {
+  assert.equal(reclaimableMemoryBytes({ rssBytes: 7 * 2 ** 30, residentModelBytes: [] }), 7 * 2 ** 30);
+});
+
+test('reclaimable memory tolerates junk without going negative', () => {
+  for (const args of [{}, { rssBytes: -1 }, { residentModelBytes: [null, 'x', -5] }]) {
+    const v = reclaimableMemoryBytes(args);
+    assert.ok(Number.isFinite(v) && v >= 0, `bad result ${v}`);
+  }
+});
+
+test('the real refusal becomes a reclaim once page-cached weights are counted', () => {
+  // The numbers from the operator's error, in bytes.
+  const GiB = 2 ** 30;
+  const knobs = { totalBytes: 124.4 * GiB, headroomFrac: 0.12, contextSize: 65536 };
+  const shared = { fileBytes: 81961823936, availableBytes: 73.6 * GiB, ...knobs };
+
+  const rssOnly = planMemoryRecovery({ ...shared, reclaimableBytes: 5 * GiB });
+  assert.equal(rssOnly.action, 'refuse', 'RSS-only estimate reproduces the bad refusal');
+
+  const withWeights = planMemoryRecovery({
+    ...shared,
+    reclaimableBytes: reclaimableMemoryBytes({
+      rssBytes: 5 * GiB,
+      residentModelBytes: [20 * GiB, 22 * GiB],
+    }),
+  });
+  assert.equal(withWeights.action, 'reclaim', 'counting resident weights must reclaim instead');
 });
