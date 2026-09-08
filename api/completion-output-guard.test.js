@@ -162,3 +162,130 @@ test('local, remote, DS4, and backfill chat exits all invoke JSON and SSE guards
     assert.match(body, /validateChatCompletionPayload\s*\(/, `${name} JSON exit is unguarded`);
   }
 });
+
+// --- the Drakemore corrupt-child failure ------------------------------------
+//
+// A loaded Qwen3.6-35B-A3B child served HTTP 200 while emitting 12288 '/' tokens
+// over 304s, twice. The guard above missed it twice over: it only knows the
+// question-mark character, and it never inspects reasoning_content, which is where
+// all of that output lived (visible content stayed empty the whole time).
+//
+// It also could not have caught it by generalising the character alone: each SSE
+// delta carries a single '/', which is not degenerate on its own, so the `safe`
+// latch fires on the very first line and disables the guard for the rest of the
+// stream. Detection has to accumulate across lines.
+
+import { DEGENERATE_OUTPUT_ERROR } from './completion-output-guard.js';
+import { STREAM_REPEAT_LIMIT } from './degenerate-output.js';
+
+/** Build one raw streaming event carrying hidden reasoning rather than content. */
+function reasoningEvent(text) {
+  return `data: ${JSON.stringify({
+    id: 'chatcmpl-test',
+    object: 'chat.completion.chunk',
+    choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }],
+  })}\n\n`;
+}
+
+/** Replay the observed failure: one repeated character per delta, n deltas. */
+function repeatedCharStream(char, count, build) {
+  let stream = '';
+  for (let i = 0; i < count; i++) stream += build(char);
+  return stream;
+}
+
+test('a slash-only reasoning stream is caught, as the corrupt child produced it', () => {
+  const guard = createChatCompletionStreamGuard();
+  const corrupt = repeatedCharStream('/', STREAM_REPEAT_LIMIT + 8, reasoningEvent);
+  const forwarded = pushOneByteAtATime(guard, corrupt) + guard.finish().join('');
+
+  assert.equal(guard.corrupted, true, 'the observed production failure must be caught');
+  assert.match(forwarded, /DEGENERATE_OUTPUT/);
+  assert.match(forwarded, /data: \[DONE\]/);
+});
+
+test('the stream is cut off early rather than run to the token limit', () => {
+  // The point of the guard is latency: 12288 tokens took over 300 seconds.
+  const guard = createChatCompletionStreamGuard();
+  let pushes = 0;
+  while (!guard.corrupted && pushes < 5000) {
+    guard.push(reasoningEvent('/'));
+    pushes++;
+  }
+  assert.equal(guard.corrupted, true);
+  assert.ok(pushes <= STREAM_REPEAT_LIMIT + 4, `aborted after ${pushes} deltas, expected ~${STREAM_REPEAT_LIMIT}`);
+});
+
+test('visible content degenerating is caught too, not just hidden reasoning', () => {
+  const guard = createChatCompletionStreamGuard();
+  const corrupt = repeatedCharStream('/', STREAM_REPEAT_LIMIT + 8, contentEvent);
+  pushOneByteAtATime(guard, corrupt);
+  guard.finish();
+  assert.equal(guard.corrupted, true);
+});
+
+test('corruption that begins after a valid answer is still caught', () => {
+  // The `safe` latch used to be permanent, so a stream that started well could
+  // degenerate for the rest of its length without the guard ever looking again.
+  const guard = createChatCompletionStreamGuard();
+  pushOneByteAtATime(guard, contentEvent('Here is a real and perfectly good answer.'));
+  pushOneByteAtATime(guard, repeatedCharStream('/', STREAM_REPEAT_LIMIT + 8, contentEvent));
+  guard.finish();
+  assert.equal(guard.corrupted, true);
+});
+
+test('a long legitimate answer with markdown rules and code is never cut off', () => {
+  const guard = createChatCompletionStreamGuard();
+  const real = ['# Report\n', '-'.repeat(72), '\n', 'const url = "https://example.com/a/b/c";\n',
+    '// ', '='.repeat(60), '\n', 'Prose continues for a while. '.repeat(30), '\n\n\n\n'];
+  let forwarded = '';
+  for (const piece of real) forwarded += pushOneByteAtATime(guard, contentEvent(piece));
+  forwarded += guard.finish().join('');
+
+  assert.equal(guard.corrupted, false, 'a false abort discards a real answer');
+  assert.doesNotMatch(forwarded, /DEGENERATE_OUTPUT/);
+});
+
+test('a reasoning-only completion of repeated characters is rejected by the JSON guard', () => {
+  // The non-streaming path saw the same failure: content empty, reasoning all slashes.
+  const payload = completion('', { reasoning_content: '/'.repeat(400) });
+  assert.equal(validateChatCompletionPayload(payload), DEGENERATE_OUTPUT_ERROR);
+});
+
+test('an empty completion with real reasoning stays valid', () => {
+  const payload = completion('', { reasoning_content: 'I considered two bridges and picked one.' });
+  assert.equal(validateChatCompletionPayload(payload), null);
+});
+
+test('the degenerate descriptor is frozen and distinguishable from the question-mark one', () => {
+  assert.equal(Object.isFrozen(DEGENERATE_OUTPUT_ERROR), true);
+  assert.equal(Object.isFrozen(DEGENERATE_OUTPUT_ERROR.body.error), true);
+  assert.equal(DEGENERATE_OUTPUT_ERROR.status, 502);
+  assert.equal(DEGENERATE_OUTPUT_ERROR.body.error.code, 'DEGENERATE_OUTPUT');
+  assert.notEqual(DEGENERATE_OUTPUT_ERROR.body.error.code, QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.code);
+});
+
+test('the question-mark contract is unchanged', () => {
+  const guard = createChatCompletionStreamGuard();
+  const corrupt = contentEvent('?') + contentEvent(' ?? \t');
+  const forwarded = pushOneByteAtATime(guard, corrupt + 'data: [DONE]\n\n') + guard.finish().join('');
+  assert.equal(forwarded, `data: ${JSON.stringify(EXPECTED_ERROR.body)}\n\ndata: [DONE]\n\n`);
+  assert.equal(validateChatCompletionPayload(completion('???')), QUESTION_MARK_ONLY_OUTPUT_ERROR);
+});
+
+test('the guard reports which corruption it found, so the log is not misleading', () => {
+  const degenerate = createChatCompletionStreamGuard();
+  pushOneByteAtATime(degenerate, repeatedCharStream('/', STREAM_REPEAT_LIMIT + 8, reasoningEvent));
+  degenerate.finish();
+  assert.equal(degenerate.corruptionError, DEGENERATE_OUTPUT_ERROR);
+
+  const questionMarks = createChatCompletionStreamGuard();
+  pushOneByteAtATime(questionMarks, contentEvent('???'));
+  questionMarks.finish();
+  assert.equal(questionMarks.corruptionError, QUESTION_MARK_ONLY_OUTPUT_ERROR);
+
+  const clean = createChatCompletionStreamGuard();
+  pushOneByteAtATime(clean, contentEvent('A real answer.'));
+  clean.finish();
+  assert.equal(clean.corruptionError, null);
+});

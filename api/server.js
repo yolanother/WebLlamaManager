@@ -1657,6 +1657,12 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
             }
             const outputChunk = needsRewrite ? rewrittenLines.join('\n') : chunk;
             writeGuardedCompletionFragments(res, outputGuard.push(outputChunk));
+            // A corrupt child generates to the token limit regardless. Stop reading
+            // and abort upstream rather than paying another 300 seconds for garbage.
+            if (outputGuard.corrupted) {
+              activeRequests.get(activeReqId)?.abortController?.abort();
+              break;
+            }
           }
           const decoderTail = decoder.decode();
           if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
@@ -10916,8 +10922,47 @@ function injectModelSamplingDefaults(body) {
  * @param {import('express').Response} res Express response.
  * @returns {void}
  */
-function sendQuestionMarkOnlyOutputError(res) {
-  const { status, body } = QUESTION_MARK_ONLY_OUTPUT_ERROR;
+/**
+ * Evict a model whose child produced corrupt output, so the next request for it is
+ * served by a freshly loaded child instead of the same broken one.
+ *
+ * A llama.cpp child can enter a persistent corrupt state and serve HTTP 200 garbage
+ * indefinitely: on Drakemore a Qwen3.6-35B-A3B child emitted 12288 '/' tokens over
+ * 304s for every request until it was evicted, while its sibling on the same GPU
+ * answered correctly. Detecting the corruption without evicting only makes the next
+ * request fail faster, so recovery has to happen here.
+ *
+ * Best-effort and never throws: this runs on an error path that has already decided
+ * what to tell the caller, and a failed eviction must not mask the original fault.
+ *
+ * @param {string} model Concrete model id whose child produced corrupt output.
+ * @param {string} reason Human-readable corruption reason, for the operator log.
+ * @returns {Promise<void>} Resolves once the eviction attempt has completed.
+ */
+async function recycleCorruptModel(model, reason) {
+  if (!model) return;
+  addLog('models', `[corrupt-output] evicting ${model} so the next request reloads it — ${reason}`);
+  console.warn(`[corrupt-output] evicting ${model}: ${reason}`);
+  try {
+    const response = await fetch(`http://localhost:${LLAMA_PORT}/models/unload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!response.ok) {
+      addLog('models', `[corrupt-output] eviction of ${model} was refused (HTTP ${response.status}); it may keep serving corrupt output`);
+      return;
+    }
+    await refreshLoadedModelsSnapshot();
+    addLog('models', `[corrupt-output] evicted ${model}; the next request will load a fresh child`);
+  } catch (error) {
+    addLog('models', `[corrupt-output] eviction of ${model} failed: ${error.message}`);
+  }
+}
+
+function sendQuestionMarkOnlyOutputError(res, descriptor = QUESTION_MARK_ONLY_OUTPUT_ERROR) {
+  const { status, body } = descriptor;
   if (!res.headersSent) {
     res.status(status).json(body);
     return;
@@ -12697,14 +12742,16 @@ async function handleChatCompletions(req, res) {
           // Prefer server-reported timings (accurate inference time) over wall-clock (includes queue wait)
           const wallDuration = Date.now() - startTime;
           if (outputCorrupted) {
+            const corruption = outputGuard.corruptionError || QUESTION_MARK_ONLY_OUTPUT_ERROR;
             logLlm({
               endpoint: 'chat/completions', model, stream: true,
-              status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration: wallDuration,
+              status: corruption.status, duration: wallDuration,
               promptTokens, completionTokens, tokensPerSecond: 0,
               messages: req.body.messages || null, prompt: null, response: null,
-              error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+              error: corruption.body.error.message,
             });
             endActiveRequest(activeReqId, { status: 'error' });
+            void recycleCorruptModel(model, corruption.body.error.code);
             return;
           }
           const inferDuration = serverTimings
@@ -12795,20 +12842,22 @@ async function handleChatCompletions(req, res) {
       clearInterval(nonStreamingHeartbeatTicker);
       nonStreamingHeartbeatTicker = null;
 
-      if (validateChatCompletionPayload(data)) {
+      const corruption = validateChatCompletionPayload(data);
+      if (corruption) {
         const wallDuration = Date.now() - startTime;
         logLlm({
           endpoint: 'chat/completions', model: requestedModel,
-          stream: false, status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status,
+          stream: false, status: corruption.status,
           duration: wallDuration,
           promptTokens: data.usage?.prompt_tokens || 0,
           completionTokens: data.usage?.completion_tokens || 0,
           tokensPerSecond: 0,
           messages: req.body.messages || null, prompt: null, response: null,
-          error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+          error: corruption.body.error.message,
         });
         endActiveRequest(activeReqId, { status: 'error' });
-        sendQuestionMarkOnlyOutputError(res);
+        sendQuestionMarkOnlyOutputError(res, corruption);
+        void recycleCorruptModel(requestedModel, corruption.body.error.code);
         return;
       }
 
