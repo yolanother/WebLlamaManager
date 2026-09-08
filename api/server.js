@@ -3241,7 +3241,8 @@ function warnContextMayNotFit(modelId, contextSize, cfg) {
     headroomFrac: cfg.headroomFrac,
     totalBytes: memTotalBytes(),
     reservedHeadroomBytes: cfg.reservedHeadroomGb > 0 ? cfg.reservedHeadroomGb * (2 ** 30) : undefined,
-    minContext: cfg.minContext
+    minContext: cfg.minContext,
+    mmapped: modelUsesMmap()
   });
   if (fit.fits || fit.recommendedContext === null) return;
   addLog('system', `[guard] ${modelId}: context ${contextSize} may not fit (~${gibStr(fit.requiredBytes)} GiB vs budget ${gibStr(fit.budgetBytes)} GiB); recommended <= ${fit.recommendedContext}. Monitoring memory at runtime.`);
@@ -3289,7 +3290,8 @@ async function preflightModelGuard(modelId, contextSize, { requireKnownSize = fa
     headroomFrac: cfg.headroomFrac,
     totalBytes: memTotalBytes(),
     reservedHeadroomBytes: cfg.reservedHeadroomGb > 0 ? cfg.reservedHeadroomGb * (2 ** 30) : undefined,
-    minContext: cfg.minContext
+    minContext: cfg.minContext,
+    mmapped: modelUsesMmap()
   };
   const ctx = contextSize || cfg.minContext;
 
@@ -6628,6 +6630,24 @@ function duoWeightPaths() {
 function resolveLoadMode() {
   const duo = duoWeightPaths();
   return (duo.plannerExists && duo.workerExists) ? 'per-model' : 'none';
+}
+
+/**
+ * Whether child servers load their weights through mmap, which decides how the
+ * memory guard charges for them.
+ *
+ * This is a board-level property, not a per-model one: 'none' makes
+ * container-start.sh pass --no-mmap to the router, which applies to every child,
+ * while 'per-model' emits nothing and llama.cpp then defaults to mmap. Under mmap
+ * the weights are file-backed page cache rather than anonymous memory, so charging
+ * the full weight file as required FREE memory refuses models that would run
+ * comfortably — Qwen3.8-Flash-Next was refused at "needs ~95.3 GiB but only ~94.4
+ * free" while serving in 32.9 GiB resident.
+ *
+ * @returns {boolean} True when weights are mmap-backed and only partly resident.
+ */
+function modelUsesMmap() {
+  return resolveLoadMode() === 'per-model';
 }
 
 let hardwareProfileCache = null;

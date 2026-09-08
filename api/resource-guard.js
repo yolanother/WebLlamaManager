@@ -21,6 +21,23 @@ export const DEFAULTS = {
   overheadBytes: 3 * (2 ** 30), // ~3 GiB for compute buffers / runtime
   headroomFrac: 0.12,        // keep 12% of total RAM free
   minContext: 4096,          // smallest context worth serving
+  // Share of an mmap-backed model's weight file that must be treated as real
+  // memory pressure. With --load-mode mmap the weights are file-backed page
+  // cache: reclaimable, and re-read from disk on demand. Charging the whole file
+  // as required FREE memory refused Qwen3.8-Flash-Next at "needs ~95.3 GiB but
+  // only ~94.4 free" while that same model was serving in 32.9 GiB resident
+  // against 76.3 GiB of weights — about 43%.
+  //
+  // 0.5 sits above that measurement, so admission stays honest, and it keeps
+  // enough page cache that throughput does not fall off the prefill cliff. It is
+  // deliberately not lower: on this hardware an OOM kill of llama-server has
+  // NULL-dereferenced the amdgpu KFD driver and hard-locked the box, so
+  // under-estimating is a machine-down event, not a failed request.
+  //
+  // ponytail: one empirical fraction for all mmap models. If a model appears
+  // whose resident share differs materially, measure VmRSS against file size and
+  // make this per-model rather than moving the global.
+  mmapResidentFrac: 0.5,
   // Thermal thresholds (deg C), governed on the die temperature (k10temp Tctl,
   // the hotter of GPU/CPU on this shared-die APU).
   warnC: 90,                 // pause dispatching new requests at/above this
@@ -47,12 +64,31 @@ export const DEFAULTS = {
 };
 
 /**
+ * Memory pressure (bytes) attributable to a model's weights.
+ *
+ * Weights loaded normally are anonymous memory and count in full. Weights loaded
+ * with mmap are file-backed page cache — reclaimable, and re-read from disk — so
+ * only a share of them is genuine pressure. See DEFAULTS.mmapResidentFrac for why
+ * that share is what it is.
+ *
+ * @param {{fileBytes:number, mmapped?:boolean, mmapResidentFrac?:number}} a Inputs.
+ * @returns {number} Bytes of real memory pressure from the weights.
+ */
+function weightPressureBytes({ fileBytes, mmapped = false, mmapResidentFrac = DEFAULTS.mmapResidentFrac }) {
+  const bytes = Math.max(0, Number(fileBytes) || 0);
+  if (!mmapped) return bytes;
+  const frac = Math.min(1, Math.max(0, Number(mmapResidentFrac)));
+  return Math.ceil(bytes * frac);
+}
+
+/**
  * Estimate peak memory (bytes) for a model at a given context.
- * @param {{fileBytes:number, contextSize:number, kvBytesPerToken:number, overheadBytes:number}} a
+ * @param {{fileBytes:number, contextSize:number, kvBytesPerToken:number, overheadBytes:number, mmapped?:boolean, mmapResidentFrac?:number}} a
  * @returns {number}
  */
-function estimateBytes({ fileBytes, contextSize, kvBytesPerToken, overheadBytes }) {
-  return fileBytes + Math.max(0, contextSize) * kvBytesPerToken + overheadBytes;
+function estimateBytes({ fileBytes, contextSize, kvBytesPerToken, overheadBytes, mmapped, mmapResidentFrac }) {
+  return weightPressureBytes({ fileBytes, mmapped, mmapResidentFrac })
+    + Math.max(0, contextSize) * kvBytesPerToken + overheadBytes;
 }
 
 /**
@@ -75,7 +111,9 @@ export function checkModelFit({
   kvBytesPerToken = DEFAULTS.kvBytesPerToken,
   overheadBytes = DEFAULTS.overheadBytes,
   headroomFrac = DEFAULTS.headroomFrac,
-  minContext = DEFAULTS.minContext
+  minContext = DEFAULTS.minContext,
+  mmapped = false,
+  mmapResidentFrac = DEFAULTS.mmapResidentFrac
 }) {
   const reserveBase = totalBytes > 0 ? totalBytes : availableBytes;
   const reserveBytes = Number.isFinite(reservedHeadroomBytes)
@@ -85,14 +123,15 @@ export function checkModelFit({
     ? Math.min(availableBytes, totalBytes)
     : availableBytes;
   const budgetBytes = Math.max(0, Math.floor(usableAvailable - reserveBytes));
-  const requiredBytes = estimateBytes({ fileBytes, contextSize, kvBytesPerToken, overheadBytes });
+  const weightBytes = weightPressureBytes({ fileBytes, mmapped, mmapResidentFrac });
+  const requiredBytes = estimateBytes({ fileBytes, contextSize, kvBytesPerToken, overheadBytes, mmapped, mmapResidentFrac });
 
   if (requiredBytes <= budgetBytes) {
     return { fits: true, recommendedContext: contextSize, requiredBytes, budgetBytes, reason: 'fits' };
   }
 
   // Requested context doesn't fit. Can the weights + overhead + minimum context fit at all?
-  const floorBytes = estimateBytes({ fileBytes, contextSize: minContext, kvBytesPerToken, overheadBytes });
+  const floorBytes = estimateBytes({ fileBytes, contextSize: minContext, kvBytesPerToken, overheadBytes, mmapped, mmapResidentFrac });
   if (floorBytes > budgetBytes) {
     return {
       fits: false, recommendedContext: null, requiredBytes, budgetBytes,
@@ -101,7 +140,7 @@ export function checkModelFit({
   }
 
   // Find the largest context (multiple of minContext) that fits the budget.
-  const room = budgetBytes - fileBytes - overheadBytes; // bytes available for KV
+  const room = budgetBytes - weightBytes - overheadBytes; // bytes available for KV
   let ctx = Math.floor(room / kvBytesPerToken);
   // Round down to a multiple of minContext, clamped to >= minContext.
   ctx = Math.max(minContext, ctx - (ctx % minContext));
@@ -141,7 +180,7 @@ export function checkModelFit({
  * @returns {{action:'serve'|'reclaim'|'refuse', requiredBytes:number, budgetBytes:number, reclaimableBudgetBytes:number, reason:string}}
  */
 export function planMemoryRecovery({
-  fileBytes, contextSize, availableBytes, totalBytes, reservedHeadroomBytes,
+  fileBytes, contextSize, availableBytes, totalBytes, reservedHeadroomBytes, mmapped = false,
   alreadyLoaded = false, reclaimableBytes = 0,
   kvBytesPerToken = DEFAULTS.kvBytesPerToken,
   overheadBytes = DEFAULTS.overheadBytes,
@@ -153,6 +192,7 @@ export function planMemoryRecovery({
     overheadBytes,
     headroomFrac,
     minContext,
+    mmapped,
     ...(totalBytes > 0 ? { totalBytes } : {}),
     ...(Number.isFinite(reservedHeadroomBytes) ? { reservedHeadroomBytes } : {}),
   };

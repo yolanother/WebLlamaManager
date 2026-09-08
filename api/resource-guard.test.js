@@ -452,3 +452,98 @@ test('the real refusal becomes a reclaim once page-cached weights are counted', 
   });
   assert.equal(withWeights.action, 'reclaim', 'counting resident weights must reclaim instead');
 });
+
+// --- mmap-backed weights ----------------------------------------------------
+//
+// Qwen3.8-Flash-Next was refused on Drakemore ("needs ~95.3 GiB but only ~94.4
+// free") AFTER the guard had already reclaimed and restarted the engine. It missed
+// by 0.9 GiB. Measured while that same model was loaded and serving: VmRSS 32.9
+// GiB against 76.3 GiB of weights.
+//
+// The 95.3 GiB decomposes exactly as file 76.33 + 65536 tokens * 256 KiB + 3 GiB
+// overhead. The weight term is the error: with --load-mode mmap the weights are
+// file-backed page cache, reclaimable and re-read from disk. They need disk and
+// benefit from cache; they do not need to be free anonymous memory.
+//
+// The safety reserve is deliberately NOT relaxed here. On this hardware an OOM
+// kill of llama-server has hard-locked the box, so under-estimating is a
+// machine-down event.
+
+const DRAKEMORE = {
+  fileBytes: 81_961_823_936,        // Qwen3.8-Flash-Next UD-IQ3_XXS, 3 shards
+  contextSize: 65536,
+  availableBytes: Math.round(94.4 * 2 ** 30),
+  totalBytes: 124 * 2 ** 30,
+};
+
+test('the real refusal is admitted once the weights are known to be mmap-backed', () => {
+  const refused = checkModelFit(DRAKEMORE);
+  assert.equal(refused.fits, false, 'precondition: this is the case that failed');
+
+  const admitted = checkModelFit({ ...DRAKEMORE, mmapped: true });
+  assert.equal(admitted.fits, true);
+  assert.ok(admitted.requiredBytes < refused.requiredBytes);
+});
+
+test('a non-mmap model is judged exactly as before', () => {
+  // Regression: the whole point is that only the mmap case changes.
+  const before = checkModelFit(DRAKEMORE);
+  assert.equal(before.requiredBytes, DRAKEMORE.fileBytes + 65536 * 262144 + 3 * 2 ** 30);
+  assert.equal(checkModelFit({ ...DRAKEMORE, mmapped: false }).requiredBytes, before.requiredBytes);
+});
+
+test('the mmap requirement stays above what the model really resides in', () => {
+  // Measured RSS was 32.9 GiB. Demanding less than that would be dishonest and
+  // would risk the OOM path this guard exists to prevent.
+  const { requiredBytes } = checkModelFit({ ...DRAKEMORE, mmapped: true });
+  assert.ok(requiredBytes > 32.9 * 2 ** 30, `required ${requiredBytes} must exceed measured residency`);
+});
+
+test('KV and overhead are still charged in full under mmap', () => {
+  const small = checkModelFit({ ...DRAKEMORE, mmapped: true, contextSize: 4096 });
+  const large = checkModelFit({ ...DRAKEMORE, mmapped: true, contextSize: 65536 });
+  assert.equal(large.requiredBytes - small.requiredBytes, (65536 - 4096) * 262144);
+});
+
+test('mmap does not admit a model whose KV alone blows the budget', () => {
+  const absurd = checkModelFit({
+    ...DRAKEMORE, mmapped: true, contextSize: 1_000_000,
+  });
+  assert.equal(absurd.fits, false, 'mmap must not become a blank cheque');
+});
+
+test('the safety reserve is still honoured under mmap', () => {
+  // 12% of total is kept free; a request that only fits by eating the reserve fails.
+  const tight = checkModelFit({
+    fileBytes: 10 * 2 ** 30, contextSize: 4096, mmapped: true,
+    availableBytes: 8 * 2 ** 30, totalBytes: 124 * 2 ** 30,
+  });
+  assert.equal(tight.fits, false, 'the reserve must not be spent to admit a model');
+});
+
+test('recovery planning uses the same mmap-aware estimate', () => {
+  const plan = planMemoryRecovery({
+    ...DRAKEMORE, mmapped: true, alreadyLoaded: false, reclaimableBytes: 0,
+  });
+  assert.equal(plan.action, 'serve', 'it fits outright, so nothing needs reclaiming');
+});
+
+test('a genuinely oversized model is still refused rather than thrashing', () => {
+  const plan = planMemoryRecovery({
+    fileBytes: 400 * 2 ** 30, contextSize: 65536, mmapped: true,
+    availableBytes: 90 * 2 ** 30, totalBytes: 124 * 2 ** 30,
+    alreadyLoaded: false, reclaimableBytes: 20 * 2 ** 30,
+  });
+  assert.equal(plan.action, 'refuse');
+});
+
+test('the server tells the guard whether weights are mmap-backed', async () => {
+  // Regression pin: the guard can only apply the mmap term if the caller passes it.
+  // Both admission sites (the fit warning and the recovery plan) must supply it, and
+  // it must derive from the load mode rather than being hardcoded.
+  const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
+  assert.match(source, /function modelUsesMmap\(\)/);
+  assert.match(source, /resolveLoadMode\(\) === 'per-model'/);
+  const sites = source.match(/mmapped: modelUsesMmap\(\)/g) || [];
+  assert.ok(sites.length >= 2, `expected both admission sites to pass mmapped, found ${sites.length}`);
+});
