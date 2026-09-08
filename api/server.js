@@ -1657,12 +1657,6 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
             }
             const outputChunk = needsRewrite ? rewrittenLines.join('\n') : chunk;
             writeGuardedCompletionFragments(res, outputGuard.push(outputChunk));
-            // A corrupt child generates to the token limit regardless. Stop reading
-            // and abort upstream rather than paying another 300 seconds for garbage.
-            if (outputGuard.corrupted) {
-              activeRequests.get(activeReqId)?.abortController?.abort();
-              break;
-            }
           }
           const decoderTail = decoder.decode();
           if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));
@@ -12727,6 +12721,19 @@ async function handleChatCompletions(req, res) {
               outputChunk = rewrittenLines.join('\n');
             }
             writeGuardedCompletionFragments(res, outputGuard.push(outputChunk));
+            // A corrupt child generates to the token limit regardless, so close the
+            // upstream connection rather than paying another 300 seconds for garbage.
+            //
+            // Cancel the body reader specifically; do NOT abort the request-wide
+            // controller here. That controller is also aborted by cleanupActive on the
+            // response's finish/close event, and aborting it mid-loop threw an
+            // AbortError straight through res.end() into this function's catch block,
+            // skipping the corruption handling below — so the client saw the error but
+            // the corrupt child was never evicted.
+            if (outputGuard.corrupted) {
+              try { await reader.cancel(); } catch { /* upstream already gone */ }
+              break;
+            }
           }
           const decoderTail = decoder.decode();
           if (decoderTail) writeGuardedCompletionFragments(res, outputGuard.push(decoderTail));

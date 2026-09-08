@@ -289,3 +289,34 @@ test('the guard reports which corruption it found, so the log is not misleading'
   clean.finish();
   assert.equal(clean.corruptionError, null);
 });
+
+test('the local chat exit recycles the corrupt model and does not abort its way past doing so', () => {
+  // Deployed once without this. The guard correctly returned DEGENERATE_OUTPUT to the
+  // client in 9.3s, but the corrupt child was never evicted: aborting the request-wide
+  // controller inside the read loop threw an AbortError through res.end() into the
+  // catch block, skipping the corruption handling entirely. Cancelling the body reader
+  // closes the upstream connection without touching the controller that cleanupActive
+  // owns. Verified on Drakemore after the fix.
+  const source = readFileSync(fileURLToPath(new URL('./server.js', import.meta.url)), 'utf8');
+  const start = source.indexOf('// ===== LOCAL BACKEND PATH (existing logic) =====');
+  const end = source.indexOf("app.post('/api/v1/chat/completions'", start);
+  assert.ok(start !== -1 && end !== -1, 'local chat exit not found');
+  const local = source.slice(start, end);
+
+  assert.match(local, /recycleCorruptModel\s*\(/, 'corrupt output must evict the child that produced it');
+  assert.match(local, /reader\.cancel\s*\(\)/, 'the upstream body must be cancelled on corruption');
+  assert.doesNotMatch(
+    local,
+    /if \(outputGuard\.corrupted\) \{\s*\n\s*activeRequests\.get\(activeReqId\)\?\.abortController\?\.abort\(\)/,
+    'aborting the request-wide controller mid-loop skips the eviction',
+  );
+});
+
+test('recycleCorruptModel evicts through the router so the next request reloads the model', () => {
+  const source = readFileSync(fileURLToPath(new URL('./server.js', import.meta.url)), 'utf8');
+  const start = source.indexOf('async function recycleCorruptModel(');
+  assert.notEqual(start, -1, 'recycleCorruptModel is missing');
+  const body = source.slice(start, source.indexOf('\nfunction ', start));
+  assert.match(body, /models\/unload/, 'eviction must go through the router unload endpoint');
+  assert.match(body, /catch/, 'eviction runs on an error path and must never throw');
+});
