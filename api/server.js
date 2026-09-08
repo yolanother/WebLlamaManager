@@ -13410,6 +13410,13 @@ async function executeBackgroundResponse({ body, headers, signal, publish }) {
     headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(body),
     signal,
+    // A background job is a WHOLE generation, and undici's default headersTimeout is
+    // 300s. Without this dispatcher any job that runs longer dies as a bare "fetch
+    // failed" that surfaces as a 502 — and it is the long jobs, the only reason to use
+    // the background path at all, that are guaranteed to hit it. A duo chain measures
+    // ~318s end to end, so it failed here every time. Same dispatcher the duo chain and
+    // the router proxy already use.
+    dispatcher: llamaDispatcher,
   });
   if (!body.stream || !response.ok) {
     const text = await response.text();
