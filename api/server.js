@@ -12419,18 +12419,29 @@ async function handleChatCompletions(req, res) {
     // every time, failing the whole request with a 502 even though the router loads it
     // perfectly well when simply asked for a completion.
     //
-    // Skipping is SAFE here and not a weakening of the guarantee: a model with no child
-    // has no slots and therefore no stale KV from a prior lineage or auth scope to leak.
-    // A model that IS resident still erases, and still fails closed if that erase fails.
-    // Mirrors the residency guard the background sweep already uses on this same call.
-    if (slotAssignment && slotAssignment.slotId != null && !slotAssignment.hit
-        && await isLocalModelResident(requestedModel)) {
-      await eraseSlotForColdAssignment({
-        baseUrl: `http://localhost:${LLAMA_PORT}`,
-        model: requestedModel,
-        slotId: slotAssignment.slotId,
-        signal: getActiveRequestSignal(activeReqId),
-      });
+    // When the model is NOT resident the erase is skipped — but the slot assignment must
+    // then be given up too, not silently reused. Skipping the erase alone was too
+    // permissive: a not-resident model is precisely one about to be loaded into a slot a
+    // DIFFERENT model previously occupied (both duo models are served at slot 0), and
+    // reusing that assignment is how another model's KV could participate in this
+    // request. The observed symptom of poisoned KV is a completion of one character
+    // repeated at full generation speed, which is what the operator hit.
+    //
+    // So: resident -> erase as before, failing closed if the erase fails. Not resident ->
+    // no erase (it would race the lazy child load and 502 a slow model, which is the bug
+    // this guard was added for) AND no slot reuse, which costs only a cold prefill.
+    if (slotAssignment && slotAssignment.slotId != null && !slotAssignment.hit) {
+      if (await isLocalModelResident(requestedModel)) {
+        await eraseSlotForColdAssignment({
+          baseUrl: `http://localhost:${LLAMA_PORT}`,
+          model: requestedModel,
+          slotId: slotAssignment.slotId,
+          signal: getActiveRequestSignal(activeReqId),
+        });
+      } else {
+        slotAffinity.invalidate(requestedModel, slotAssignment.lineageKey);
+        slotAssignment = null;
+      }
     }
     // If this conversation has a disk-saved slot dump and its assigned slot is
     // now cold (the child was reloaded since we saved), restore the KV cache
