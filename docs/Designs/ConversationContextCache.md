@@ -89,6 +89,21 @@ the serialized local lane and fails closed if clean ownership cannot be
 established. User input fields `id_slot`, `cache_prompt`, and raw token prompts
 are removed or overwritten on manager-owned chat preparation paths.
 
+### Caller opt-out of prompt caching
+
+A caller may opt OUT of prompt reuse for one request, with body `cache_prompt:
+false` or the header `x-llama-cache-prompt: false` (the header wins). An agentic
+caller needs this so a turn cannot inherit a previous turn's cached context, and
+it is the control that isolates a suspected cross-request contamination.
+
+Opting out is the only caller-side choice. Turning caching ON stays a manager
+resource decision, so an explicit `true` is ignored rather than honoured as an
+override. Only a real boolean `false`, or the exact header string `"false"`,
+counts: the string `"false"` in a JSON body does not, since quietly
+reinterpreting it would let a typo silently disable caching. The caller's own
+`cache_prompt` is still stripped from the upstream body — the manager sets the
+effective value itself.
+
 ## Prepared-context lifecycle
 
 States are:

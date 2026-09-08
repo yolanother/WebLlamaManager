@@ -35,7 +35,8 @@ function headerValue(headers, name) {
  * Parse manager request extensions with headers taking precedence over body fields.
  * @param {Record<string, unknown>} body Caller body.
  * @param {object} headers Caller headers.
- * @returns {{priority:'realtime'|'interactive'|'background',routing:'auto'|'local_only',localOnly:boolean}} Policy.
+ * @returns {{priority:'realtime'|'interactive'|'background',routing:'auto'|'local_only',localOnly:boolean,cachePrompt:false|undefined}}
+ *   Policy. `cachePrompt` is false only when the caller explicitly opted out.
  */
 export function managerRequestPolicy(body = {}, headers = {}) {
   const priority = normalizeRequestPriority(
@@ -46,7 +47,30 @@ export function managerRequestPolicy(body = {}, headers = {}) {
   if (!ROUTING_MODES.has(routing)) {
     throw new TypeError('routing must be auto or local_only');
   }
-  return { priority, routing, localOnly: routing === 'local_only' };
+  return { priority, routing, localOnly: routing === 'local_only', cachePrompt: cachePromptOptOut(body, headers) };
+}
+
+/**
+ * Read a caller's opt-out of llama.cpp prompt caching.
+ *
+ * Opting out is the only thing a caller may say. The manager decides when caching is
+ * ON — that is a resource decision, not the caller's — so an explicit `true` is
+ * ignored rather than treated as an override. Agentic callers need the opt-out so one
+ * turn cannot inherit a previous turn's cached context.
+ *
+ * Only a real boolean false, or the exact header string "false", counts. The string
+ * "false" in the BODY does not: JSON has booleans, and quietly reinterpreting a string
+ * would make a typo silently disable caching.
+ *
+ * @param {Record<string, unknown>} body Caller body.
+ * @param {object} headers Caller headers.
+ * @returns {false|undefined} False when opted out, otherwise undefined.
+ */
+function cachePromptOptOut(body, headers) {
+  const header = headerValue(headers, 'x-llama-cache-prompt');
+  if (typeof header === 'string' && header.trim().toLowerCase() === 'false') return false;
+  if (body?.cache_prompt === false) return false;
+  return undefined;
 }
 
 /**

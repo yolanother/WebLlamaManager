@@ -11917,7 +11917,11 @@ async function handleChatCompletions(req, res) {
     }
     if (slotAssignment && slotAssignment.slotId != null) {
       proxyBody.id_slot = slotAssignment.slotId;
-      proxyBody.cache_prompt = true; // explicit; llama.cpp default is also true
+      // Explicit; llama.cpp's default is also true. A caller may opt OUT (body
+      // cache_prompt:false or the x-llama-cache-prompt:false header) so an agentic
+      // turn cannot inherit a previous turn's cached context. Opting out is the only
+      // caller-side choice: turning caching ON stays a manager resource decision.
+      proxyBody.cache_prompt = requestPolicy?.cachePrompt !== false;
       if (slotAssignment.hit) {
         console.log(`[prefix-cache] HIT model=${requestedModel} slot=${slotAssignment.slotId} key=${slotAssignment.key}`);
       }
