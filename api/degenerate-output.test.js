@@ -81,3 +81,83 @@ test('a long alphanumeric run is not degenerate', () => {
   // what this guard claims to detect; flagging it risks real content.
   assert.equal(isDegenerateOutput('a'.repeat(60)), null);
 });
+
+// --- streaming monitor -----------------------------------------------------
+//
+// The batch detector above can only judge a finished completion, which is far too
+// late: a corrupt child on Drakemore burned 304s and 328s emitting 12288 '/' tokens
+// with status 200 before anyone could tell. The monitor exists to abort such a
+// stream in seconds. Its threshold is therefore about certainty, not speed — a
+// false abort kills a real answer, which is worse than the bug it prevents.
+
+import { createRepetitionMonitor, STREAM_REPEAT_LIMIT } from './degenerate-output.js';
+
+/** Feed a whole string through a fresh monitor, return the first trip reason. */
+function feed(text, opts) {
+  const monitor = createRepetitionMonitor(opts);
+  return monitor.push(text);
+}
+
+test('trips on the observed failure: a long run of a single character', () => {
+  assert.ok(feed('/'.repeat(STREAM_REPEAT_LIMIT)));
+});
+
+test('does not trip one character below the limit', () => {
+  assert.equal(feed('/'.repeat(STREAM_REPEAT_LIMIT - 1)), null);
+});
+
+test('counts a run that spans several chunks, as a real stream delivers it', () => {
+  const monitor = createRepetitionMonitor();
+  let tripped = null;
+  // 64 chunks of 8 slashes = 512 chars; no single chunk is long enough on its own.
+  for (let i = 0; i < 64 && !tripped; i++) tripped = monitor.push('////////');
+  assert.ok(tripped, 'a run split across chunks must still be caught');
+});
+
+test('a different character resets the run', () => {
+  const half = '/'.repeat(STREAM_REPEAT_LIMIT - 1);
+  assert.equal(feed(`${half}x${half}`), null);
+});
+
+test('names the offending character so the log line is actionable', () => {
+  assert.match(feed('?'.repeat(STREAM_REPEAT_LIMIT)), /\?/);
+});
+
+test('catches a repeated letter too, which the batch detector deliberately ignores', () => {
+  // The batch detector excludes letters to protect real content, but nothing
+  // legitimate contains 256 identical consecutive letters.
+  assert.ok(feed('a'.repeat(STREAM_REPEAT_LIMIT)));
+});
+
+// --- must not cry wolf ------------------------------------------------------
+
+test('normal prose never trips', () => {
+  const prose = 'The Golden Gate Bridge and the Brooklyn Bridge are suspension bridges. ';
+  assert.equal(feed(prose.repeat(40)), null);
+});
+
+test('markdown rules and separator comments never trip', () => {
+  assert.equal(feed('# Heading\n\n' + '-'.repeat(80) + '\n\ntext'), null);
+  assert.equal(feed('// ' + '='.repeat(100) + '\n// section\n'), null);
+});
+
+test('deeply indented code never trips', () => {
+  // Whitespace is a plausible near-miss: indentation and blank lines produce the
+  // longest legitimate identical runs in real output.
+  assert.equal(feed('\n'.repeat(40) + ' '.repeat(200) + 'return x;'), null);
+});
+
+test('non-string chunks are ignored rather than throwing', () => {
+  const monitor = createRepetitionMonitor();
+  for (const v of [null, undefined, 42, {}, []]) assert.equal(monitor.push(v), null);
+});
+
+test('a tripped monitor keeps reporting, so a missed check still aborts', () => {
+  const monitor = createRepetitionMonitor();
+  assert.ok(monitor.push('/'.repeat(STREAM_REPEAT_LIMIT)));
+  assert.ok(monitor.push('/'), 'must stay tripped once corrupt');
+});
+
+test('the limit is far above any legitimate run', () => {
+  assert.ok(STREAM_REPEAT_LIMIT >= 128, 'too low risks aborting real answers');
+});

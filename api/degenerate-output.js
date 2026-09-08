@@ -19,6 +19,11 @@
 // rules, separator comments and slash-heavy code untouched, since those are never the
 // entire response.
 //
+// Two detectors share this signature. degenerateOutputReason judges a FINISHED
+// completion; createRepetitionMonitor watches a STREAM and reports as soon as the
+// run appears, because a corrupt child served 12288 repeated tokens over 304s at
+// status 200 and judging it afterwards is far too late to help the caller.
+//
 // Pure and side-effect-free; unit-tested in degenerate-output.test.js.
 
 /**
@@ -62,4 +67,54 @@ export function degenerateOutputReason(text) {
  */
 export function isDegenerateOutput(text) {
   return degenerateOutputReason(text);
+}
+
+/**
+ * Consecutive identical characters that mark a stream as corrupt.
+ *
+ * A corrupt child on Drakemore emitted 12288 '/' tokens over 304s at status 200, so
+ * waiting for the completion to finish is not a usable defence. This is deliberately
+ * far above any legitimate run — the longest real ones are indentation and markdown
+ * rules, both well under 100 — because a false abort discards a real answer and is
+ * worse than the bug being guarded against.
+ */
+export const STREAM_REPEAT_LIMIT = 256;
+
+/**
+ * Create a stateful monitor that watches a streamed completion for the corrupt-child
+ * signature and reports as soon as it appears, rather than after the token limit.
+ *
+ * Unlike {@link degenerateOutputReason}, which judges a finished completion and
+ * deliberately ignores letters and digits to protect real content, this counts a run
+ * of ANY character: at this threshold no legitimate output qualifies, and the same
+ * failure has been seen looping on a letter.
+ *
+ * The run is tracked across chunk boundaries, since a stream delivers a few tokens at
+ * a time and no single chunk is long enough to trip on its own. Once tripped the
+ * monitor stays tripped, so a caller that misses one return value still aborts.
+ *
+ * @param {{limit?: number}} [options] Trip threshold; defaults to {@link STREAM_REPEAT_LIMIT}.
+ * @returns {{push: (chunk: unknown) => string|null}} Monitor whose `push` returns a
+ *   human-readable reason once the stream looks corrupt, otherwise null.
+ */
+export function createRepetitionMonitor({ limit = STREAM_REPEAT_LIMIT } = {}) {
+  let lastChar = null;
+  let run = 0;
+  let tripped = null;
+
+  return {
+    push(chunk) {
+      if (tripped) return tripped;
+      if (typeof chunk !== 'string' || chunk.length === 0) return null;
+      for (const ch of chunk) {
+        if (ch === lastChar) run += 1;
+        else { lastChar = ch; run = 1; }
+        if (run >= limit) {
+          tripped = `stream emitted ${run} consecutive ${JSON.stringify(ch)} characters`;
+          return tripped;
+        }
+      }
+      return null;
+    },
+  };
 }
