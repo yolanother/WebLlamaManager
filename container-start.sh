@@ -109,7 +109,6 @@ CMD=(
     "$LLAMA_SERVER_BIN"
     --models-dir "$MODELS_DIR"
     --models-max "$MODELS_MAX"
-    --ctx-size "$CONTEXT"
     -ngl "$GPU_LAYERS"
     --jinja
     --host 0.0.0.0
@@ -136,7 +135,27 @@ esac
 # Per-model overrides the router cannot auto-detect (e.g. the gemma-4 MTP draft
 # model). The manager writes this INI; each [model] section merges onto the
 # router's auto-generated preset (--model/--mmproj/--ctx-size preserved).
-[ -n "${MODELS_PRESET:-}" ] && [ -f "$MODELS_PRESET" ] && CMD+=(--models-preset "$MODELS_PRESET")
+USE_PRESET=0
+if [ -n "${MODELS_PRESET:-}" ] && [ -f "$MODELS_PRESET" ]; then
+    USE_PRESET=1
+    CMD+=(--models-preset "$MODELS_PRESET")
+fi
+
+# Context size. The router merges its OWN CLI args LAST over every model preset, so
+# --ctx-size here silently overwrites any per-model ctx-size and makes a
+# bounded-context route (e.g. podcast-qwen3.8-16k) impossible to express. In
+# "preset" mode the manager writes the default into the preset's global [*] section
+# instead, where a per-model section can override it.
+#
+# The fallback is deliberate and load-bearing: if the preset is missing or
+# unreadable the router would otherwise get no context at all and drop to
+# llama.cpp's default rather than $CONTEXT, which is a silent and serious
+# regression. So the flag is only dropped when a preset is genuinely in use.
+if [ "${CONTEXT_MODE:-cli}" = "preset" ] && [ "$USE_PRESET" = "1" ]; then
+    :
+else
+    CMD+=(--ctx-size "$CONTEXT")
+fi
 
 # A custom-built llama-server links against shared libs (libllama, libmtmd,
 # libggml-*) that live BESIDE it, and its RUNPATH records the build directory of

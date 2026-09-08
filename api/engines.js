@@ -1169,3 +1169,63 @@ export function largestContextBesideDs4({
       : `Fits beside DS4 at the full ${ctx}-token context (needs ~${gib(requiredBytes)}, ${gib(free)} free).`,
   };
 }
+
+/**
+ * Global preset section carrying the default context for every model.
+ *
+ * llama.cpp treats the section literally named `*` as a global preset that cascades
+ * underneath every model preset, so a per-model `ctx-size` can override it. This
+ * exists because the router merges its OWN CLI ARGS LAST over every model preset
+ * (server-models.cpp, `preset.merge(base_preset)`, and common_preset::merge
+ * overwrites): a `--ctx-size` on the router command line silently overwrites any
+ * per-model context back to the global value, which made per-model contexts
+ * impossible to express. Moving the default here keeps the same effective default
+ * while letting a section such as the bounded podcast alias choose its own.
+ *
+ * @param {{contextSize?: number}} [params] Default context for models that set none.
+ * @returns {{name: string, options: Record<string,string>}|null} Section, or null.
+ */
+export function globalContextPresetSection({ contextSize } = {}) {
+  const ctx = Number(contextSize) || 0;
+  if (ctx <= 0) return null;
+  return { name: '*', options: { 'ctx-size': String(ctx) } };
+}
+
+/**
+ * Bounded-context route over the Qwen3.8-Flash-Next weights, for podcast
+ * author/reviewer calls that are deliberately capped.
+ *
+ * Those calls need roughly 13k tokens, but the canonical entry is configured at
+ * 65536. The oversizing costs real memory — it was ~16 GiB of KV in the admission
+ * estimate that refused the model at "needs ~95.3 GiB but only ~94.4 free" — and
+ * buys nothing for a bounded workload. A preset section whose name is not a
+ * directory under --models-dir becomes its own model entry, so this is a distinct,
+ * separately selectable catalog id over the same weights rather than an alias
+ * sharing the canonical model's instance and context.
+ *
+ * It carries the same load settings as the canonical section because they are what
+ * make this architecture load at all: mmap plus lazy-mode stream the 51B n-gram
+ * table from disk, and cpu-moe puts the experts CPU-side.
+ *
+ * @param {{modelsDir?: string, weightsExist?: boolean, threads?: number}} [params] Inputs.
+ * @returns {{name: string, options: Record<string,string>}|null} Section, or null when
+ *   the weights are absent.
+ */
+export function podcastQwen38PresetSection({ modelsDir, weightsExist, threads } = {}) {
+  if (!weightsExist) return null;
+  return {
+    name: 'podcast-qwen3.8-16k',
+    options: {
+      // Explicit: this entry does not correspond to a scanned directory, so the
+      // router has no auto-detected --model for it.
+      'model': `${modelsDir}/unsloth_Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf`,
+      'ctx-size': '16384',
+      'load-mode': 'mmap',
+      'lazy-mode': 'on',
+      'cpu-moe': '1',
+      'threads': String(threads),
+      'fit': 'off',
+      'parallel': '1',
+    },
+  };
+}

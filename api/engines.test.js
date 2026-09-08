@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readdirSync, statSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   ENGINE_TYPES,
   presetEngine,
@@ -1175,4 +1176,82 @@ test('duo sections render into a valid two-section INI', () => {
   assert.match(ini, /^load-mode = mmap$/m);
   assert.match(ini, /^threads = 16$/m);
   assert.doesNotMatch(ini, /no-mmap/);
+});
+
+// --- bounded-context podcast alias ------------------------------------------
+//
+// Bounded podcast calls need about 13k tokens (1119 prompt + 12000 max), but the
+// canonical Qwen3.8 entry is configured at 65536. That oversizing cost real memory
+// and contributed to a refused admission ("needs ~95.3 GiB but only ~94.4 free").
+// A second preset section over the SAME weights gives a distinct catalog entry at
+// 16384 without moving any global default — the router creates a model entry for a
+// preset section whose name is not a directory in --models-dir.
+//
+// The alias is useless unless the context actually takes effect, which is why the
+// global [*] section exists: the router merges its own CLI args LAST over every
+// model preset, so a --ctx-size on the router command line would overwrite a
+// per-model ctx-size straight back to 65536.
+
+import { podcastQwen38PresetSection, globalContextPresetSection } from './engines.js';
+
+test('the alias is a separate entry over the same weights at a smaller context', () => {
+  const section = podcastQwen38PresetSection({
+    modelsDir: '/volumes/models', weightsExist: true, threads: 16,
+  });
+  assert.equal(section.name, 'podcast-qwen3.8-16k');
+  assert.equal(section.options['ctx-size'], '16384');
+  assert.match(section.options.model, /unsloth_Qwen3\.8-Flash-Next-GGUF/);
+  assert.match(section.options.model, /00001-of-00003\.gguf$/);
+});
+
+test('the alias keeps the settings that make the planner work at all', () => {
+  const section = podcastQwen38PresetSection({
+    modelsDir: '/volumes/models', weightsExist: true, threads: 16,
+  });
+  // Without mmap + lazy-mode the 51B n-gram table is not streamed from disk and the
+  // model does not load; without cpu-moe the experts do not go CPU-side.
+  assert.equal(section.options['load-mode'], 'mmap');
+  assert.equal(section.options['lazy-mode'], 'on');
+  assert.equal(section.options['cpu-moe'], '1');
+  assert.equal(section.options.threads, '16');
+});
+
+test('absent weights contribute no alias section', () => {
+  assert.equal(podcastQwen38PresetSection({ modelsDir: '/volumes/models', weightsExist: false, threads: 16 }), null);
+});
+
+test('the global section carries the default context under the wildcard name', () => {
+  const global = globalContextPresetSection({ contextSize: 65536 });
+  assert.equal(global.name, '*', 'llama.cpp treats the section named * as the global preset');
+  assert.equal(global.options['ctx-size'], '65536');
+});
+
+test('no global section without a context to set', () => {
+  assert.equal(globalContextPresetSection({ contextSize: 0 }), null);
+  assert.equal(globalContextPresetSection({}), null);
+});
+
+test('the rendered INI keeps the alias distinct from the canonical model', () => {
+  const ini = renderModelsPresetIni([
+    globalContextPresetSection({ contextSize: 65536 }),
+    qwen38FlashNextPresetSection({ modelsDir: '/volumes/models', weightsExist: true, threads: 16 }),
+    podcastQwen38PresetSection({ modelsDir: '/volumes/models', weightsExist: true, threads: 16 }),
+  ]);
+  assert.match(ini, /^\[\*\]/m);
+  assert.match(ini, /^\[unsloth_Qwen3\.8-Flash-Next-GGUF\]/m);
+  assert.match(ini, /^\[podcast-qwen3\.8-16k\]/m);
+  // The canonical section must NOT pin a context; it inherits the global one.
+  const canonical = ini.split('[unsloth_Qwen3.8-Flash-Next-GGUF]')[1].split('\n[')[0];
+  assert.doesNotMatch(canonical, /ctx-size/);
+});
+
+test('container-start only drops --ctx-size when a preset is actually in use', () => {
+  // The silent-regression hole: if CONTEXT_MODE says preset but no preset file
+  // exists, the router would get no context at all and fall back to llama.cpp's
+  // default instead of 65536.
+  const script = readFileSync(fileURLToPath(new URL('../container-start.sh', import.meta.url)), 'utf8');
+  assert.match(script, /CONTEXT_MODE/, 'the context mode must be an explicit gate');
+  assert.match(script, /USE_PRESET/, 'dropping --ctx-size must depend on the preset actually being used');
+  assert.doesNotMatch(script, /^\s+--ctx-size "\$CONTEXT"$/m,
+    '--ctx-size must no longer be unconditional inside the CMD array');
 });

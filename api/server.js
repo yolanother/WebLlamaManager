@@ -170,7 +170,9 @@ import {
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection,
   qwen38FlashNextPresetSection,
-  qwen36WorkerPresetSection
+  qwen36WorkerPresetSection,
+  podcastQwen38PresetSection,
+  globalContextPresetSection
 } from './engines.js';
 import { buildHardwareProfile } from './hardware-profile.js';
 import {
@@ -6633,6 +6635,25 @@ function resolveLoadMode() {
 }
 
 /**
+ * Where the default context size is configured.
+ *
+ * 'cli' passes --ctx-size to the router, which merges its own CLI args LAST over
+ * every model preset and therefore makes per-model contexts impossible to express.
+ * 'preset' writes the default into the preset's global [*] section instead, so a
+ * bounded route such as podcast-qwen3.8-16k can override it.
+ *
+ * Only claimed when the planner weights exist, because that is the only case where
+ * we actually emit the bounded route; otherwise nothing needs the indirection and
+ * the simpler CLI path stays in force. container-start.sh independently refuses to
+ * drop --ctx-size unless a preset file is genuinely in use.
+ *
+ * @returns {'cli'|'preset'} Where the router should get its default context.
+ */
+function resolveContextMode() {
+  return duoWeightPaths().plannerExists ? 'preset' : 'cli';
+}
+
+/**
  * Whether child servers load their weights through mmap, which decides how the
  * memory guard charges for them.
  *
@@ -6707,7 +6728,14 @@ function resolveHardwareProfile() {
   return hardwareProfileCache;
 }
 
-function writeModelsPresetFile() {
+/**
+ * Write the per-model preset INI the router reads.
+ *
+ * @param {number} [contextSize] Default context to publish in the global [*] section,
+ *   which must match the context this router would otherwise have received on its CLI.
+ * @returns {string} Path to the written file, or '' when there is nothing to write.
+ */
+function writeModelsPresetFile(contextSize = (config.contextSize || 8192)) {
   try {
     const profile = resolveHardwareProfile();
     const gemmaDraftPath = join(MODELS_DIR, 'google_gemma-4-E2B-it-assistant', 'gemma-4-E2B-it-assistant-BF16.gguf');
@@ -6735,7 +6763,22 @@ function writeModelsPresetFile() {
         weightsExist: duoWeights.workerExists,
         threads: profile.threads,
       }),
+      // Bounded route for podcast author/reviewer calls: same weights, 16384
+      // context. Only meaningful when the default context lives in the preset,
+      // since the router's CLI --ctx-size would otherwise overwrite it.
+      resolveContextMode() === 'preset'
+        ? podcastQwen38PresetSection({
+          modelsDir: MODELS_DIR,
+          weightsExist: duoWeights.plannerExists,
+          threads: profile.threads,
+        })
+        : null,
     ].filter(Boolean);
+    // The global section must lead: it carries the default context that every model
+    // without its own ctx-size inherits once --ctx-size leaves the router CLI.
+    if (resolveContextMode() === 'preset') {
+      sections.unshift(globalContextPresetSection({ contextSize }));
+    }
     const ini = renderModelsPresetIni(sections);
     if (!ini) return '';
     // MUST live under a path the ENGINE can see. The engine runs inside the
@@ -6857,8 +6900,9 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
         NO_WARMUP: config.noWarmup ? '1' : '',
         FLASH_ATTN: config.flashAttn ? '1' : '',
         GPU_LAYERS: String(config.gpuLayers || 99),
-        MODELS_PRESET: writeModelsPresetFile(),
+        MODELS_PRESET: writeModelsPresetFile(contextOverride || config.contextSize || 8192),
         LOAD_MODE: resolveLoadMode(),
+        CONTEXT_MODE: resolveContextMode(),
         HF_TOKEN: resolveHfToken(config, process.env)
       };
 
@@ -7572,6 +7616,7 @@ app.post('/api/server/start', async (req, res) => {
       GPU_LAYERS: String(config.gpuLayers || 99),
       MODELS_PRESET: writeModelsPresetFile(),
       LOAD_MODE: resolveLoadMode(),
+      CONTEXT_MODE: resolveContextMode(),
       HF_TOKEN: resolveHfToken(config, process.env)
     };
 
