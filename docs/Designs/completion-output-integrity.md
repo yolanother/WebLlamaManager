@@ -48,7 +48,31 @@ a visible error and preserves the server's error type and code.
 ## Coverage and accounting
 
 The guard applies to all OpenAI chat-completion exits: local llama.cpp, remote
-offload, DS4, and backfill. Rejected output is recorded as an error rather than a
+offload, DS4, and backfill.
+
+The **Responses transport** (`/v1/responses`) is guarded separately by
+`api/responses-output-guard.js`, because its events carry generated text as
+`response.output_text.delta` / `response.reasoning_text.delta` rather than
+`choices[].delta` — the chat extractor sees nothing there. Detection is shared
+(`createRepetitionMonitor`, `degenerateOutputReason`), so "corrupt" means the same
+thing on both transports.
+
+Two differences are deliberate. Corruption is reported as a real
+`response.failed` event carrying `event.response`, because
+`executeBackgroundResponse` records a final response only from a terminal
+status-bearing event — a bare `{error}` would leave a `background: true` job
+holding `null` with status 200, a silently empty result instead of a failure. And
+there is no withhold-and-release buffering: that exists in the chat guard for the
+question-mark case, whereas here the detector needs a long run before it fires, so
+bytes are forwarded unchanged and only a trip stops the stream.
+
+`background: true` jobs are covered because `executeBackgroundResponse` re-enters
+`/api/v1/responses` rather than calling the engine directly. A test pins that, so
+turning it into a direct engine call cannot silently drop the guard.
+
+`response.function_call_arguments.delta` is deliberately NOT guarded: tool
+arguments are structured JSON where repetition is plausible, and falsely aborting
+a valid tool call is worse than the failure being guarded against. Rejected output is recorded as an error rather than a
 successful request and is excluded from successful throughput accounting.
 
 ## Runtime incident and rollback

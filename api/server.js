@@ -158,6 +158,7 @@ import {
   QUESTION_MARK_ONLY_OUTPUT_ERROR,
   createChatCompletionStreamGuard,
   validateChatCompletionPayload,
+  DEGENERATE_OUTPUT_ERROR,
 } from './completion-output-guard.js';
 import {
   ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
@@ -14033,6 +14034,11 @@ async function handleResponses(req, res) {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      // /v1/responses had no corrupt-output guard at all, while chat did — and this is
+      // the production podcast transport, including background jobs, which re-enter
+      // this same handler. The guard forwards bytes unchanged and only terminates the
+      // stream when a run of repeated characters or lines passes the shared threshold.
+      const outputGuard = createResponsesStreamGuard();
       let completionTokens = 0;
       let promptTokens = 0;
       let model = requestedModel;
@@ -14045,7 +14051,14 @@ async function handleResponses(req, res) {
             if (done) break;
 
             const chunk = decoder.decode(value);
-            res.write(chunk);
+            for (const fragment of outputGuard.push(chunk)) res.write(fragment);
+            if (outputGuard.corrupted) {
+              // Close the upstream connection rather than let a corrupt child keep
+              // generating to its limit. Cancelling the reader avoids touching the
+              // request-wide controller, which the response's own cleanup owns.
+              try { await reader.cancel(); } catch { /* upstream already gone */ }
+              break;
+            }
 
             // Parse SSE data to count tokens
             const lines = chunk.split('\n');
@@ -14069,9 +14082,22 @@ async function handleResponses(req, res) {
               }
             }
           }
+          for (const fragment of outputGuard.finish()) res.write(fragment);
           res.end();
 
           const duration = Date.now() - startTime;
+          if (outputGuard.corrupted) {
+            const corruption = outputGuard.corruptionError || DEGENERATE_OUTPUT_ERROR;
+            addLlmLog({
+              endpoint: 'responses', model, stream: true,
+              status: corruption.status, duration, promptTokens, completionTokens,
+              tokensPerSecond: 0,
+              messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
+              prompt: null, response: null, error: corruption.body.error.message, ...retryFields()
+            });
+            void recycleCorruptModel(model, corruption.body.error.code);
+            return;
+          }
           const tokensPerSecond = duration > 0 ? (completionTokens / (duration / 1000)) : 0;
           recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model, duration });
           addLlmLog({
@@ -14091,6 +14117,28 @@ async function handleResponses(req, res) {
     } else {
       const data = await response.json();
       const duration = Date.now() - startTime;
+      const corruption = validateResponsesPayload(data);
+      if (corruption) {
+        addLlmLog({
+          endpoint: 'responses', model: data.model || requestedModel,
+          stream: false, status: corruption.status, duration,
+          promptTokens: data.usage?.input_tokens || data.usage?.prompt_tokens || 0,
+          completionTokens: data.usage?.output_tokens || data.usage?.completion_tokens || 0,
+          tokensPerSecond: 0,
+          messages: req.body.input ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }]) : null,
+          prompt: null, response: null, error: corruption.body.error.message, ...retryFields()
+        });
+        void recycleCorruptModel(data.model || requestedModel, corruption.body.error.code);
+        // Shaped as a Responses failure, not a bare error: a background job records a
+        // final response only from a status-bearing response object, and would
+        // otherwise hold null with status 200 — a silently empty result.
+        res.status(corruption.status).json({
+          ...data,
+          status: 'failed',
+          error: { ...corruption.body.error },
+        });
+        return;
+      }
       const usage = data.usage || {};
       const promptTokens = usage.input_tokens || usage.prompt_tokens || 0;
       const completionTokens = usage.output_tokens || usage.completion_tokens || 0;
