@@ -71,6 +71,12 @@ The symptom is quiet. `--rpc` still parses — the string lives in
 flag, and simply never offloads anything. Check with `--list-devices`, not with
 whether the process survived.
 
+`--list-devices` answers *this* question — whether the backend exists at all — and
+only this one. It is necessary, not sufficient: an engine can list `RPC0`, having
+reached the server perfectly well, and still serve every token from the CPU. For
+whether work actually lands on the card, use the three-signal bar in
+[Verifying](#verifying).
+
 `scripts/build-llama-cpp.sh` now passes `-DGGML_RPC=ON`. The engine deployed as
 **b10752 predates that change and does not have it**; it must be rebuilt and
 redeployed before any `--rpc` wiring can work. Adding the flag changes no HIP
@@ -320,10 +326,13 @@ llama-server -m Qwen3-8B-Q4_K_M.gguf --rpc 127.0.0.1:50052 -ngl 99 --port 8099
 Baseline the card first (`nvidia-smi --query-gpu=memory.used --format=csv`), then
 watch it during load and generation. What counts as proof:
 
-- `--list-devices` on the client lists an `RPC0` device.
-- VRAM climbs by roughly the model's size above the idle baseline, and the
-  rpc-server's PID appears in `nvidia-smi`'s process table.
-- Generation returns coherent text, and GPU utilisation is non-zero while it does.
+1. `--list-devices` on the client lists an `RPC0` device.
+2. **The load-bearing one:** VRAM climbs by roughly the model's size above the idle
+   baseline **and the rpc-server's own PID is the process holding it** in
+   `nvidia-smi --query-compute-apps`. A CPU fallback cannot fake this; signals 1 and
+   3 it can survive.
+3. Generation returns coherent text at a throughput in the right order of magnitude
+   for the card, and GPU utilisation is non-zero while it does.
 
 A completion alone is **not** evidence: llama.cpp falls back to CPU silently, which
 is exactly the failure this whole document is about. Neither is VRAM alone — check
