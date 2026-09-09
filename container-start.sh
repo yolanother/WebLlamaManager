@@ -6,6 +6,10 @@
 # This script runs inside the ROCm Distrobox, applies gfx1151 unified-memory
 # settings, prepares model and slot-cache directories, and execs llama-server
 # with a literal argv so configurable paths cannot be split or glob-expanded.
+# It is also the ONE place a GPU device selection can land: there is no argv
+# building in JavaScript anywhere, so the manager's GPU pin arrives as the
+# LLAMA_GPU_PCI / LLAMA_GPU_UUID environment variables and is translated here
+# into the vendor's own non-positional device selector.
 
 set -euo pipefail
 
@@ -119,6 +123,21 @@ CMD=(
 # holding it all mean "no") and passes an endpoint only when it may. Empty on every
 # AMD-only box, so no --rpc flag reaches the router there at all.
 [ -n "${LLAMA_RPC_ENDPOINT:-}" ] && CMD+=(--rpc "$LLAMA_RPC_ENDPOINT")
+
+# Optional GPU pin. The manager reserves a named GPU pool (api/gpu-pools.js) and passes
+# the bound card's handle here; unset, nothing below fires and the engine gets the
+# machine's default device exactly as it always has on a one-GPU box.
+#
+# Both handles are NON-POSITIONAL by design. A DRM index (card0/card1) and a backend
+# index (ROCm0/CUDA0) both reorder when an OCuLink card is attached, which is the fault
+# the whole reservation mechanism exists to survive, so neither is ever used:
+#   LLAMA_GPU_PCI  -- the card's PCI address, e.g. 0000:c5:00.0. CUDA_VISIBLE_DEVICES
+#                     accepts a PCI bus id directly, so an NVIDIA card is bound by slot.
+#   LLAMA_GPU_UUID -- amdgpu's sysfs unique_id. ROCR_VISIBLE_DEVICES accepts GPU-<uuid>,
+#                     which is the only stable non-positional selector ROCm offers, and
+#                     it survives the card being re-plugged into another slot.
+[ -n "${LLAMA_GPU_PCI:-}" ] && export CUDA_VISIBLE_DEVICES="$LLAMA_GPU_PCI"
+[ -n "${LLAMA_GPU_UUID:-}" ] && export ROCR_VISIBLE_DEVICES="GPU-$LLAMA_GPU_UUID"
 
 # Load mode. "per-model" deliberately emits nothing so that a [model] section in
 # --models-preset can choose its own; anything else is applied to every child.

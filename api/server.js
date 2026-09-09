@@ -227,6 +227,10 @@ import {
   perCardKeys,
   historyCardKeys,
 } from './gpu-inventory.js';
+import { normalizePoolConfig, resolvePools } from './gpu-pools.js';
+import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority } from './gpu-reservations.js';
+import { drainPlan } from './gpu-drain.js';
+import { acceleratorPlan, rpcRouterArgs } from './duo-accelerator.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -1243,6 +1247,15 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false, ali
   //
   // Deliberately additive: it only ever sets shouldOffload, so an explicitly desired
   // resident model (checked immediately below) still outranks it.
+  // A GPU reservation is taking the card this model runs on. Prefer a peer that can
+  // actually serve it over waiting out the drain. Deliberately additive and gated on
+  // hasViableRemote: a model with nowhere else to go falls through and PARKS in
+  // acquireLocalSlot instead, because a reservation must never fail a caller's request.
+  if (gpuDrainedModels.has(requestedModel) && hasViableRemote) {
+    shouldOffload = true;
+    console.log(`[routing] GPU drain: "${requestedModel}" is on a card being reserved away; serving from a peer`);
+  }
+
   if (alias && hasViableRemote && alias.warm.length > 0 && !alias.warm.some(c => c.host === 'local')) {
     shouldOffload = true;
     console.log(`[routing] alias warm-gate: '${alias.name}' has no warm local target; serving from a warm remote member rather than loading "${requestedModel}"`);
@@ -3498,8 +3511,10 @@ function nvidiaSmiCard(slot) {
 //
 // Telemetry a card cannot report is null, NEVER 0: a confident 0 W / 0 °C on a
 // working 3090 reads as a broken card, which is worse than an honest unknown.
-// Returns { card, name, driver, available, temperature, power, coreClock,
-// busyPercent, vramBytes, vramSource, gttBytes, gttUsedBytes }.
+// Returns { card, name, pci, vendorId, deviceId, uniqueId, driver, available,
+// temperature, power, coreClock, busyPercent, vramBytes, vramSource, gttBytes,
+// gttUsedBytes }. The pci/vendorId/deviceId/uniqueId handles are what
+// api/gpu-pools.js matches a named GPU pool on and what a device pin binds by.
 function readCardSysfs(card) {
   const dev = `/sys/class/drm/${card}/device`;
   const readOpt = (p) => { try { const v = parseInt(readFileSync(p, 'utf-8').trim()); return Number.isFinite(v) ? v : null; } catch { return null; } };
@@ -3559,6 +3574,19 @@ function readCardSysfs(card) {
     // sysfs product_name when the driver publishes one (it is empty on Strix
     // Halo), otherwise the vendor-neutral name the kiosk panel shows.
     name: readText(`${dev}/product_name`) || describeCardName({ vendorId, deviceId, lspciName }),
+    // The card's stable handles, computed above and — until GPU pools needed
+    // them — thrown away. The PCI address survives a DRM renumber, and the
+    // vendor:device pair identifies the card's CLASS, which survives a re-plug
+    // into another slot as well. api/gpu-pools.js matches on these; nothing may
+    // key a GPU on card0/card1, which reorders between the APU and an OCuLink
+    // card. Empty string, not null, where sysfs said nothing, matching `driver`.
+    pci: slot,
+    vendorId,
+    deviceId,
+    // amdgpu's own stable identifier for the physical card. It is the only
+    // non-positional handle ROCm accepts for device selection, so it is what a
+    // pin binds an AMD card by; NVIDIA cards have none and are bound by `pci`.
+    uniqueId: readText(`${dev}/unique_id`),
     driver,
     // A card the running kernel has not bound cannot be used. Say so WITH the
     // reason rather than dropping it: hardware that is physically present and
@@ -4440,6 +4468,10 @@ app.get('/api/settings', (req, res) => {
       gpuLayers: config.gpuLayers || 99,
       requestLogging: config.requestLogging || false,
       maxConcurrentRequests: config.maxConcurrentRequests || 1,
+      // Named GPU pools. Absent from config on every box that has never configured one,
+      // and reported as an empty array there rather than omitted, so a client can tell
+      // "no pools" from "this server is too old to have them".
+      gpus: Array.isArray(config.gpus) ? config.gpus : [],
       localStallMs: config.localStallMs ?? DEFAULT_LOCAL_STALL_MS,
       defaultReasoningEffort: config.defaultReasoningEffort || null,
       modelReasoningEffort: config.modelReasoningEffort || {},
@@ -4479,7 +4511,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken, gpus } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -4565,6 +4597,29 @@ app.post('/api/settings', (req, res) => {
     config.modelReasoningEffort = modelReasoningEffort;
   }
 
+  // Named GPU pools. Validated through the same normalizer the resolver uses, entry by
+  // entry, so a 400 can name the one that is wrong rather than rejecting the whole array
+  // with "invalid". The operator's own text is stored; normalization folds selectors for
+  // comparison and its output is not what should be written back to the settings file.
+  if (gpus !== undefined) {
+    if (!Array.isArray(gpus)) {
+      return res.status(400).json({ error: 'gpus must be an array of GPU pool entries' });
+    }
+    for (const [index, entry] of gpus.entries()) {
+      try {
+        normalizePoolConfig(entry);
+      } catch (err) {
+        return res.status(400).json({ error: `gpus[${index}] (${entry?.id || 'unnamed'}): ${err.message}` });
+      }
+    }
+    const ids = gpus.map((entry) => entry.id.trim());
+    const duplicate = ids.find((id, index) => ids.indexOf(id) !== index);
+    if (duplicate) {
+      return res.status(400).json({ error: `gpus has two entries with the id "${duplicate}"; a GPU id is the handle every caller uses and must be unique` });
+    }
+    config.gpus = gpus;
+  }
+
   if (fullscreenInterval !== undefined) {
     const interval = parseInt(fullscreenInterval);
     if (interval >= 5000 && interval <= 300000) {
@@ -4597,6 +4652,9 @@ app.post('/api/settings', (req, res) => {
   }
 
   saveConfig(config);
+  // Re-resolve against the cards actually present, so a pool edited here takes effect
+  // without a restart and the reservation layer never arbitrates over a stale pool list.
+  if (gpus !== undefined) refreshGpuPools();
   // Never log the raw token.
   const logBody = { ...req.body };
   if ('hfToken' in logBody) logBody.hfToken = logBody.hfToken ? '<redacted>' : '';
@@ -4609,6 +4667,595 @@ app.post('/api/settings', (req, res) => {
     message: 'Settings saved. Restart the server for changes to take effect.'
   });
 });
+
+// ========== GPU pools and reservations ==========
+// Named GPU pools (api/gpu-pools.js) resolved against the cards sysfs reports, leased
+// through the reservation state machine (api/gpu-reservations.js), drained by the pure
+// plan in api/gpu-drain.js and exposed over the seven routes below. Every part of this
+// section is inert on a box with no `gpus` configured: `resolvePools([], ...)` returns no
+// pools, so no reservation can be created, no drain can run, and no pin can be emitted.
+
+/** How often TTLs are swept. Frequent enough that a crashed holder frees its card fast. */
+const GPU_SWEEP_INTERVAL_MS = 5000;
+/** Default lease length when a caller names none, in seconds. */
+const GPU_DEFAULT_TTL_SECONDS = 300;
+/** Default wait for lock/wait when a caller names none, in seconds. */
+const GPU_DEFAULT_TIMEOUT_SECONDS = 30;
+/** Poll interval while waiting for a pending reservation to become held. */
+const GPU_WAIT_POLL_MS = 250;
+/**
+ * How long a drain lets in-flight local work finish before stopping the engine anyway.
+ * A generation in progress holds the card, and killing it would fail a caller for someone
+ * else's scheduling decision — but a wedged request must not strand a holder forever.
+ */
+const GPU_DRAIN_INFLIGHT_WAIT_MS = 120000;
+/** Ceiling on how long a request parks waiting for its card to come back. */
+const GPU_DRAIN_PARK_MAX_MS = 300000;
+/** Label for the one engine child a drain can stop: the local llama.cpp router. */
+const GPU_ENGINE_CHILD = 'llama-server router';
+
+/** Resolved pools, refreshed from settings and from the sysfs card list. */
+let gpuPools = [];
+/** Pool id -> the id of llama-manager's own internal reservation for that pool's pins. */
+const gpuPinReservations = new Map();
+/**
+ * Model id -> 'offload' | 'queue' while its card is reserved away. `resolveBackend` reads
+ * it to prefer a peer, and `acquireLocalSlot` reads it to PARK rather than fail. Empty
+ * whenever nothing is drained, which is always on a box with no pools configured.
+ */
+const gpuDrainedModels = new Map();
+/** Reservation ids whose drain stopped the local engine, so release knows to restart it. */
+const gpuDrainStoppedEngine = new Set();
+
+/**
+ * The reservation state machine. Preemption is cooperative: a victim is told here and the
+ * card is actually surrendered by the drain that follows.
+ */
+const gpuReservations = new GpuReservations({
+  onPreempt: (reservation, reason) => {
+    addLog('system', `GPU ${reservation.gpu} taken from ${reservation.holder} (${reason})`);
+    endGpuReservation(reservation);
+  },
+});
+
+/**
+ * Re-resolve the pools from settings and the cards present, and hand them to the state
+ * machine. Safe to call at any time; a hotplug or a settings edit both land here.
+ *
+ * A malformed stored `gpus` array is logged and treated as no pools rather than thrown:
+ * POST /api/settings validates before persisting, so bad config can only arrive by hand,
+ * and a hand-edited file must not stop the server from serving models.
+ *
+ * @returns {void}
+ */
+function refreshGpuPools() {
+  try {
+    gpuPools = resolvePools(config.gpus, getAllGpuSysfsStats());
+  } catch (err) {
+    gpuPools = [];
+    addLog('system', `GPU pools disabled: ${err.message}`);
+  }
+  gpuReservations.setPools(gpuPools);
+  syncGpuPinReservations();
+}
+
+/**
+ * Give every pool that pins models llama-manager's own reservation on it.
+ *
+ * Model pins ARE reservations — one mechanism, not two — so an external claim at a higher
+ * priority preempts a pin through exactly the same path as it preempts anything else, and
+ * the pin retakes the card when that claim ends. The pin has no TTL: it is llama-manager's
+ * own lease and there is no crashed holder to protect against. A no-expiry lease is
+ * deliberately NOT offered over HTTP, where a crashed remote holder could strand a card.
+ *
+ * @returns {void}
+ */
+function syncGpuPinReservations() {
+  for (const pool of gpuPools) {
+    if (pool.pinnedModels.length === 0) continue;
+    const existing = gpuPinReservations.get(pool.id);
+    if (existing && ['pending', 'held'].includes(gpuReservations.get(existing)?.state)) continue;
+    try {
+      const pin = gpuReservations.reserve({
+        gpu: pool.id,
+        holder: LLAMA_MANAGER_HOLDER,
+        priority: pool.defaultPriority,
+        ttlMs: null,
+        reason: `model pin: ${pool.pinnedModels.join(', ')}`,
+      });
+      gpuPinReservations.set(pool.id, pin.id);
+      // llama-manager is already the thing occupying its own card, so there is nothing to
+      // drain from itself and the pin is held the moment it is granted.
+      if (pin.card) gpuReservations.markHeld(pin.id);
+    } catch (err) {
+      addLog('system', `GPU pin for "${pool.id}" not granted: ${err.message}`);
+    }
+  }
+}
+
+/**
+ * The pool and card the local engine is pinned to right now, if any.
+ *
+ * The local llama.cpp router is ONE process serving every model, so it can be bound to one
+ * card only; the first pool that pins models and currently holds a card supplies that
+ * binding. Per-model placement across several cards would need a router per card, which
+ * this appliance does not run.
+ *
+ * @returns {?{pool: object, card: object}} The pin, or null when nothing is pinned or the
+ *   pinning reservation has been preempted and holds no card.
+ */
+function activeGpuPin() {
+  for (const pool of gpuPools) {
+    if (pool.pinnedModels.length === 0) continue;
+    const held = gpuReservations.get(gpuPinReservations.get(pool.id));
+    if (!held?.card) continue;
+    const card = pool.cards.find((c) => c.card === held.card);
+    if (card) return { pool, card };
+  }
+  return null;
+}
+
+/**
+ * Environment carrying the active GPU pin into the engine.
+ *
+ * Empty on every box with no pin, so the spawn environment is byte-identical to what it
+ * has always been. The handles are deliberately non-positional: `LLAMA_GPU_PCI` is the
+ * card's PCI address, which CUDA_VISIBLE_DEVICES accepts directly, and `LLAMA_GPU_UUID` is
+ * amdgpu's sysfs unique_id, which ROCR_VISIBLE_DEVICES accepts as `GPU-<uuid>`. A DRM or
+ * backend index is never used — indices reordering is the fault this mechanism exists to
+ * survive. container-start.sh does the mapping; see the block there.
+ *
+ * @returns {Object<string,string>} Variables to merge into the engine's environment.
+ */
+function gpuPinEnv() {
+  const pin = activeGpuPin();
+  if (!pin) return {};
+  const env = {};
+  if (pin.card.pci) env.LLAMA_GPU_PCI = pin.card.pci;
+  if (pin.card.uniqueId) env.LLAMA_GPU_UUID = pin.card.uniqueId;
+  if (Object.keys(env).length) {
+    addLog('system', `GPU pin: engine bound to ${pin.card.card} (${pin.pool.id}) via ${Object.keys(env).join(', ')}`);
+  }
+  return env;
+}
+
+/**
+ * Environment carrying duo's optional discrete-GPU accelerator into the engine.
+ *
+ * This is where api/duo-accelerator.js is finally consulted — before this it was imported
+ * by nothing. `rpcRouterArgs` decides whether an endpoint is emitted at all, so a box with
+ * no NVIDIA card, the accelerator switched off, the pods agent holding the card, or a
+ * reservation outranking duo all produce an empty environment and no `--rpc` flag reaches
+ * the router.
+ *
+ * @returns {Object<string,string>} `{LLAMA_RPC_ENDPOINT}` or nothing.
+ */
+function gpuAcceleratorEnv() {
+  const duo = config.duo || {};
+  if (!duo.useAccelerator) return {};
+  const cards = getAllGpuSysfsStats();
+  const nvidia = cards.find((c) => c.vendorId === NVIDIA_VENDOR_ID);
+  const plan = acceleratorPlan({
+    profile: resolveHardwareProfile(),
+    settings: duo,
+    gpu: nvidia ? { totalBytes: nvidia.vramBytes, usedBytes: nvidia.vramUsedBytes } : null,
+    reservations: nvidia ? gpuReservations.list().filter((r) => r.card === nvidia.card) : null,
+  });
+  const args = rpcRouterArgs(plan);
+  if (args.length === 0) {
+    addLog('system', `Duo accelerator not started: ${plan.reason}`);
+    return {};
+  }
+  return { LLAMA_RPC_ENDPOINT: args[1] };
+}
+
+/**
+ * The DRM card the local engine is currently running on.
+ *
+ * With a pin in force that is the pinned card; without one the engine gets the machine's
+ * default device, which is the same card the inventory calls the inference card.
+ *
+ * @returns {?string} The DRM card name, or null when the machine reports no card.
+ */
+function engineBoundCard() {
+  const pin = activeGpuPin();
+  if (pin) return pin.card.card;
+  const cards = getAllGpuSysfsStats();
+  if (cards.length === 0) return null;
+  return buildInventory(cards, memTotalBytes())[0]?.card ?? null;
+}
+
+/**
+ * Drain a pending reservation's card and mark it held.
+ *
+ * Executes the plan api/gpu-drain.js returns: models a peer can serve are marked for
+ * offload, the rest are marked to park, in-flight work is given time to finish, and the
+ * engine child bound to the card is stopped. Nothing here refuses a request.
+ *
+ * @param {string} reservationId The pending reservation to drain for.
+ * @returns {Promise<void>} Resolves once the reservation is held, or immediately when it
+ *   is no longer pending (released or preempted while the drain was running).
+ */
+async function runGpuDrain(reservationId) {
+  const reservation = gpuReservations.get(reservationId);
+  if (!reservation || reservation.state !== 'pending' || !reservation.card) return;
+
+  const engineOnCard = engineBoundCard() === reservation.card;
+  const plan = drainPlan({
+    models: engineOnCard
+      ? loadedModelsSnapshot.map((model) => ({
+        id: model.id,
+        hasViableRemote: !!findFastestAvailableBackend(model.id, 'chat/completions'),
+      }))
+      : [],
+    children: engineOnCard && llamaProcess ? [GPU_ENGINE_CHILD] : [],
+  });
+
+  // Marked BEFORE anything is waited on: a request admitted during the drain must already
+  // see it, or it would take a local slot on a card that is about to disappear.
+  for (const model of plan.offload) gpuDrainedModels.set(model, 'offload');
+  for (const model of plan.queue) gpuDrainedModels.set(model, 'queue');
+
+  if (plan.ready) {
+    gpuReservations.markHeld(reservationId);
+    return;
+  }
+  addLog('system', `GPU ${reservation.gpu} (${reservation.card}) draining for ${reservation.holder}: ${plan.reason}`);
+
+  const deadline = Date.now() + GPU_DRAIN_INFLIGHT_WAIT_MS;
+  while (llamaQueue.active > 0 && Date.now() < deadline) {
+    if (gpuReservations.get(reservationId)?.state !== 'pending') return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  if (gpuReservations.get(reservationId)?.state !== 'pending') return;
+
+  if (plan.stop.length > 0) {
+    await stopLlamaServer({ explicitReclaim: true });
+    gpuDrainStoppedEngine.add(reservationId);
+  }
+  if (gpuReservations.markHeld(reservationId)) {
+    addLog('system', `GPU ${reservation.gpu} (${reservation.card}) is now held by ${reservation.holder}`);
+  }
+}
+
+/**
+ * Undo a drain when a reservation ends, however it ended.
+ *
+ * Released, expired and preempted are the same event from llama-manager's side: the card
+ * is available again, so parked requests are let go and an engine stopped for this holder
+ * is brought back — which reloads the pinned models and drains the queue behind it.
+ *
+ * @param {object} reservation The reservation that ended.
+ * @returns {void}
+ */
+function endGpuReservation(reservation) {
+  gpuDrainedModels.clear();
+  syncGpuPinReservations();
+  if (!gpuDrainStoppedEngine.delete(reservation.id)) return;
+  // Ungoverned: this restart is an explicit scheduling decision, not a crash loop, and the
+  // restart governor exists to damp the latter.
+  restartLlamaServer({ governed: false }).catch((err) => {
+    addLog('system', `Engine restart after GPU release failed: ${err.message}`);
+  });
+}
+
+/**
+ * Whether a request arrived over the loopback interface.
+ *
+ * Reads the SOCKET's peer address, never `req.ip` and never `X-Forwarded-For`. This server
+ * sets no `trust proxy`, so the two agree today; should one ever be enabled, `req.ip`
+ * becomes client-settable through a forwarded header and would hand any remote caller the
+ * loopback grant. The socket address cannot be spoofed by the client.
+ *
+ * This is the whole of the inbound authorization story for now — the operator's choice of
+ * "open on localhost, authenticate from off-box" — so it lives in one function that real
+ * key auth can replace in one place.
+ *
+ * @param {import('express').Request} req The request.
+ * @returns {boolean} True for 127.0.0.0/8, ::1 and the IPv4-mapped form of either.
+ */
+function isLoopbackRequest(req) {
+  const address = req.socket?.remoteAddress || '';
+  return address === '::1' || address.startsWith('127.') || address.startsWith('::ffff:127.');
+}
+
+/**
+ * Guard a mutating GPU route, answering 403 itself when the caller is not local.
+ * @param {import('express').Request} req The request.
+ * @param {import('express').Response} res The response.
+ * @returns {boolean} True when the handler may proceed.
+ */
+function requireLoopback(req, res) {
+  if (isLoopbackRequest(req)) return true;
+  res.status(403).json({
+    error: 'GPU reservations may only be changed from this machine. Off-box callers are read-only until API-key authentication lands.',
+    code: 'NOT_LOOPBACK',
+  });
+  return false;
+}
+
+/**
+ * Turn a reservation-layer refusal into its HTTP response.
+ *
+ * The state machine throws Errors carrying `.code` and `.statusCode` precisely so the
+ * mapping lives here and not in five handlers. A TypeError from a malformed body carries
+ * neither and is a 400.
+ *
+ * @param {import('express').Response} res The response.
+ * @param {Error} err The thrown refusal.
+ * @returns {import('express').Response} The sent response.
+ */
+function sendGpuError(res, err) {
+  return res.status(err.statusCode || 400).json({ error: err.message, code: err.code || 'INVALID_REQUEST' });
+}
+
+/**
+ * Parse a seconds-valued body field into milliseconds.
+ *
+ * The wire uses SECONDS for both `ttlSeconds` and `timeoutSeconds` while the state machine
+ * works in milliseconds; converting at this boundary keeps one unit on the documented
+ * public surface and one inside.
+ *
+ * @param {unknown} value The field as it arrived.
+ * @param {number} fallbackSeconds Used when the field is absent.
+ * @returns {number} Milliseconds.
+ * @throws {TypeError} When the value is present but not a positive finite number.
+ */
+function gpuSecondsToMs(value, fallbackSeconds) {
+  if (value == null || value === '') return fallbackSeconds * 1000;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new TypeError('ttlSeconds and timeoutSeconds must be a positive number of seconds');
+  }
+  return Math.round(seconds * 1000);
+}
+
+/**
+ * Live per-card telemetry keyed by DRM card name, for the pool readout.
+ * @returns {{cards: Object<string,object>, telemetry: Object<string,object>}} The raw card
+ *   records and the VRAM figures `describe()` reads for its soft-claim column.
+ */
+function gpuCardTelemetry() {
+  const cards = {};
+  const telemetry = {};
+  for (const card of getAllGpuSysfsStats()) {
+    cards[card.card] = card;
+    telemetry[card.card] = { totalBytes: card.vramBytes, usedBytes: card.vramUsedBytes };
+  }
+  return { cards, telemetry };
+}
+
+/**
+ * Render one pool for the GPU API, joining the reservation readout to live card load.
+ *
+ * Per-card `vramBytes`, `vramUsedBytes` and `busyPercent` are carried so a client that
+ * would rather route elsewhere than wait can see what the card is doing, and `free` is the
+ * boolean it actually branches on: no active reservation binds the card and no unfriendly
+ * neighbour is sitting on it. Pool `warnings` stay plain strings — an operator readout is
+ * their consumer.
+ *
+ * @param {object} described One entry from `GpuReservations#describe`.
+ * @param {Object<string,object>} liveCards Card records keyed by DRM name.
+ * @returns {object} The pool as the API reports it.
+ */
+function gpuPoolView(described, liveCards) {
+  const pool = gpuPools.find((p) => p.id === described.id);
+  const bound = new Set([...described.held, ...described.pending].map((r) => r.card).filter(Boolean));
+  return {
+    ...described,
+    pinnedModels: pool?.pinnedModels ?? [],
+    defaultPriority: pool?.defaultPriority ?? 0,
+    cards: (pool?.cards ?? []).map((card) => {
+      const live = liveCards[card.card] || card;
+      return {
+        card: card.card,
+        pci: live.pci || null,
+        name: live.name || null,
+        driver: live.driver || null,
+        available: live.available !== false,
+        vramBytes: live.vramBytes ?? null,
+        vramUsedBytes: live.vramUsedBytes ?? null,
+        busyPercent: live.busyPercent ?? null,
+        free: !bound.has(card.card) && !described.softClaimed.includes(card.card),
+      };
+    }),
+  };
+}
+
+/**
+ * Block until a pending reservation resolves one way or another.
+ *
+ * A timeout does NOT cancel the lease: the claim stays pending in its pool's waiting list
+ * and the caller may wait again or release it. Cancelling on timeout would lose a claim's
+ * place in the queue every time a client blinked.
+ *
+ * @param {string} id Reservation id.
+ * @param {number} timeoutMs How long to wait.
+ * @returns {Promise<{status: number, reservation: ?object}>} 200 held, 409 no longer
+ *   pending (preempted, released or expired), 408 still pending at the deadline, 404 gone.
+ */
+async function waitForGpuReservation(id, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    gpuReservations.sweep();
+    const reservation = gpuReservations.get(id);
+    if (!reservation) return { status: 404, reservation: null };
+    if (reservation.state === 'held') return { status: 200, reservation };
+    if (reservation.state !== 'pending') return { status: 409, reservation };
+    if (Date.now() >= deadline) return { status: 408, reservation };
+    await new Promise((resolve) => setTimeout(resolve, GPU_WAIT_POLL_MS));
+  }
+}
+
+// Every named pool with its live load, holders and warnings. Read-only and open to any
+// caller, exactly like /api/stats. `?gpu=` and `?state=` project the reservation list.
+app.get('/api/gpus', (req, res) => {
+  gpuReservations.sweep();
+  const { cards, telemetry } = gpuCardTelemetry();
+  res.json({
+    gpus: gpuReservations.describe({ telemetry }).map((pool) => gpuPoolView(pool, cards)),
+    reservations: gpuReservations.list({ gpu: req.query.gpu, state: req.query.state }),
+  });
+});
+
+// Heartbeat: push a lease's expiry out by its TTL. Registered ahead of the `/:gpu` routes
+// so `reservations` is never read as a pool id.
+app.post('/api/gpus/reservations/:reservationId/renew', (req, res) => {
+  if (!requireLoopback(req, res)) return;
+  try {
+    const reservation = gpuReservations.renew(req.params.reservationId);
+    res.json({ reservation, expiresAt: reservation.expiresAt });
+  } catch (err) {
+    sendGpuError(res, err);
+  }
+});
+
+// Block until a pending claim is genuinely the caller's, or is lost, or the wait runs out.
+app.post('/api/gpus/reservations/:reservationId/wait', async (req, res) => {
+  if (!requireLoopback(req, res)) return;
+  let timeoutMs;
+  try {
+    timeoutMs = gpuSecondsToMs(req.body?.timeoutSeconds, GPU_DEFAULT_TIMEOUT_SECONDS);
+  } catch (err) {
+    return sendGpuError(res, err);
+  }
+  if (!gpuReservations.get(req.params.reservationId)) {
+    return res.status(404).json({ error: `unknown reservation "${req.params.reservationId}"`, code: 'UNKNOWN_RESERVATION' });
+  }
+  const { status, reservation } = await waitForGpuReservation(req.params.reservationId, timeoutMs);
+  if (status === 404) {
+    return res.status(404).json({ error: `unknown reservation "${req.params.reservationId}"`, code: 'UNKNOWN_RESERVATION' });
+  }
+  if (status === 408) {
+    return res.status(408).json({
+      error: `reservation "${reservation.id}" is still pending after ${Math.round(timeoutMs / 1000)}s; it remains queued and may be waited on again`,
+      code: 'WAIT_TIMEOUT',
+      reservation,
+    });
+  }
+  if (status === 409) {
+    return res.status(409).json({ error: `reservation "${reservation.id}" is ${reservation.state}`, code: 'RESERVATION_INACTIVE', reservation });
+  }
+  res.json({ reservation, state: reservation.state });
+});
+
+// Give a card back. Parked requests are let go and an engine stopped for this holder
+// comes back with its pinned models.
+app.delete('/api/gpus/reservations/:reservationId', (req, res) => {
+  if (!requireLoopback(req, res)) return;
+  const reservation = gpuReservations.get(req.params.reservationId);
+  if (!reservation) {
+    return res.status(404).json({ error: `unknown reservation "${req.params.reservationId}"`, code: 'UNKNOWN_RESERVATION' });
+  }
+  if (!gpuReservations.release(req.params.reservationId)) {
+    return res.status(409).json({ error: `reservation "${reservation.id}" is ${reservation.state}`, code: 'RESERVATION_INACTIVE', reservation });
+  }
+  endGpuReservation(reservation);
+  res.json({ state: 'released', reservation: gpuReservations.get(req.params.reservationId) });
+});
+
+// One named pool. `?state=` projects that pool's reservation list.
+app.get('/api/gpus/:gpu', (req, res) => {
+  gpuReservations.sweep();
+  const { cards, telemetry } = gpuCardTelemetry();
+  const described = gpuReservations.describe({ telemetry }).find((pool) => pool.id === req.params.gpu);
+  if (!described) return res.status(404).json({ error: `unknown GPU id "${req.params.gpu}"`, code: 'UNKNOWN_GPU' });
+  res.json({
+    gpu: gpuPoolView(described, cards),
+    reservations: gpuReservations.list({ gpu: req.params.gpu, state: req.query.state }),
+  });
+});
+
+// Claim a card without waiting for it. Returns 202: the card is BOUND but not yet yours —
+// llama-manager still has to get off it. Wait or lock is how a caller finds out when it is.
+app.post('/api/gpus/:gpu/reserve', (req, res) => {
+  if (!requireLoopback(req, res)) return;
+  try {
+    const reservation = gpuReservations.reserve({
+      gpu: req.params.gpu,
+      holder: String(req.body?.holder || '').trim() || 'api',
+      priority: normalizeReservationPriority(req.body?.priority),
+      ttlMs: gpuSecondsToMs(req.body?.ttlSeconds, GPU_DEFAULT_TTL_SECONDS),
+      reason: String(req.body?.reason || ''),
+      noWait: Boolean(req.body?.noWait),
+    });
+    // Fire and forget: the caller asked NOT to wait, and wait/lock are how it finds out.
+    runGpuDrain(reservation.id).catch((err) => addLog('system', `GPU drain failed: ${err.message}`));
+    res.status(202).json({
+      reservationId: reservation.id,
+      state: reservation.state,
+      gpu: reservation.gpu,
+      card: reservation.card,
+      pci: reservation.pci,
+      expiresAt: reservation.expiresAt,
+      reservation,
+    });
+  } catch (err) {
+    sendGpuError(res, err);
+  }
+});
+
+// Reserve and wait in one call: returns 200 only when the card is genuinely the caller's.
+app.post('/api/gpus/:gpu/lock', async (req, res) => {
+  if (!requireLoopback(req, res)) return;
+  let reservation;
+  let timeoutMs;
+  try {
+    timeoutMs = gpuSecondsToMs(req.body?.timeoutSeconds, GPU_DEFAULT_TIMEOUT_SECONDS);
+    reservation = gpuReservations.reserve({
+      gpu: req.params.gpu,
+      holder: String(req.body?.holder || '').trim() || 'api',
+      priority: normalizeReservationPriority(req.body?.priority),
+      ttlMs: gpuSecondsToMs(req.body?.ttlSeconds, GPU_DEFAULT_TTL_SECONDS),
+      reason: String(req.body?.reason || ''),
+      noWait: Boolean(req.body?.noWait),
+    });
+  } catch (err) {
+    return sendGpuError(res, err);
+  }
+  runGpuDrain(reservation.id).catch((err) => addLog('system', `GPU drain failed: ${err.message}`));
+  const result = await waitForGpuReservation(reservation.id, timeoutMs);
+  if (result.status === 200) {
+    return res.json({
+      reservationId: reservation.id,
+      state: 'held',
+      gpu: result.reservation.gpu,
+      card: result.reservation.card,
+      pci: result.reservation.pci,
+      reservation: result.reservation,
+    });
+  }
+  if (result.status === 408) {
+    return res.status(408).json({
+      error: `GPU "${req.params.gpu}" did not become available within ${Math.round(timeoutMs / 1000)}s; reservation ${reservation.id} remains queued`,
+      code: 'WAIT_TIMEOUT',
+      reservationId: reservation.id,
+      reservation: result.reservation,
+    });
+  }
+  res.status(409).json({
+    error: `reservation "${reservation.id}" is ${result.reservation?.state}`,
+    code: 'RESERVATION_INACTIVE',
+    reservation: result.reservation,
+  });
+});
+
+// TTLs only expire because something sweeps them; this is that something. It also promotes
+// a model pin that has just been handed its card back by a departing holder.
+setInterval(() => {
+  for (const expired of gpuReservations.sweep()) {
+    addLog('system', `GPU reservation ${expired.id} on ${expired.gpu} expired (holder ${expired.holder})`);
+    endGpuReservation(expired);
+  }
+  for (const [poolId, id] of gpuPinReservations) {
+    const pin = gpuReservations.get(id);
+    if (pin?.state === 'pending' && pin.card && gpuReservations.markHeld(id)) {
+      addLog('system', `GPU pin for "${poolId}" retook ${pin.card}`);
+    }
+  }
+}, GPU_SWEEP_INTERVAL_MS).unref?.();
+
+refreshGpuPools();
 
 // ========== Model Alias Groups ==========
 // The single routing mechanism: an alias name maps to an ORDERED list of targets, each
@@ -6908,7 +7555,12 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
         MODELS_PRESET: writeModelsPresetFile(contextOverride || config.contextSize || 8192),
         LOAD_MODE: resolveLoadMode(),
         CONTEXT_MODE: resolveContextMode(),
-        HF_TOKEN: resolveHfToken(config, process.env)
+        HF_TOKEN: resolveHfToken(config, process.env),
+        // Both spread empty on a box with no GPU pool configured and no duo accelerator
+        // enabled, so the router's environment there is byte-identical to what it has
+        // always been. start-llama.sh forwards these explicitly into the container.
+        ...gpuPinEnv(),
+        ...gpuAcceleratorEnv()
       };
 
       console.log('[restart] Starting router mode');
@@ -7622,7 +8274,11 @@ app.post('/api/server/start', async (req, res) => {
       MODELS_PRESET: writeModelsPresetFile(),
       LOAD_MODE: resolveLoadMode(),
       CONTEXT_MODE: resolveContextMode(),
-      HF_TOKEN: resolveHfToken(config, process.env)
+      HF_TOKEN: resolveHfToken(config, process.env),
+      // The GPU pin and duo accelerator, exactly as the restart path carries them; both
+      // spread empty when neither is configured.
+      ...gpuPinEnv(),
+      ...gpuAcceleratorEnv()
     };
 
     llamaStartedAt = Date.now();
@@ -10678,6 +11334,18 @@ async function acquireLocalSlot(req, res, {
   if (_gc.enabled && guardDispatchPaused) {
     const tStart = Date.now();
     while (guardDispatchPaused && (Date.now() - tStart) < 120000) {
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+
+  // Guard: a GPU reservation has taken the card this model runs on, and no peer can serve
+  // it. PARK the request until the card comes back rather than failing it — the same
+  // contract as an engine mode swap, and the reason the drain plan queues a model instead
+  // of erroring. Held before the queue slot is taken, mirroring the thermal gate above, so
+  // a parked request does not occupy a slot it cannot use.
+  if (gpuDrainedModels.get(model) === 'queue') {
+    const gpuWaitStart = Date.now();
+    while (gpuDrainedModels.get(model) === 'queue' && (Date.now() - gpuWaitStart) < GPU_DRAIN_PARK_MAX_MS) {
       await new Promise(r => setTimeout(r, 2000));
     }
   }

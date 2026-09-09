@@ -8,7 +8,10 @@
 # selections and address package scripts through Distrobox's /run/host mount;
 # source checkouts preserve their configured container and checkout paths. The
 # Hugging Face credential is delivered through a protected runtime env file so
-# neither Distrobox nor process-status argv exposes its value.
+# neither Distrobox nor process-status argv exposes its value. The forwarded
+# list is EXPLICIT: a variable absent from it reaches the container only through
+# Distrobox's implicit host-environment forwarding, which is why the GPU pin and
+# the duo accelerator endpoint are named there rather than left to chance.
 
 set -euo pipefail
 
@@ -101,4 +104,7 @@ exec env -u HF_TOKEN "$DISTROBOX" enter --additional-flags "--env-file=$CREDENTI
     "GPU_LAYERS=$GPU_LAYERS" \
     "SLOT_SAVE_PATH=$SLOT_SAVE_PATH" \
     "LLAMA_SERVER_BIN=$LLAMA_SERVER_BIN" \
+    "LLAMA_GPU_PCI=${LLAMA_GPU_PCI:-}" \
+    "LLAMA_GPU_UUID=${LLAMA_GPU_UUID:-}" \
+    "LLAMA_RPC_ENDPOINT=${LLAMA_RPC_ENDPOINT:-}" \
     bash "$CONTAINER_START"
