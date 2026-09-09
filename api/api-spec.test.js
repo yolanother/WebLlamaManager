@@ -433,6 +433,10 @@ test('GPU routes document pools, live load, the priority scale, leases, and the 
   }
   assert.match(wait.description, /still pending/i);
   assert.match(wait.description, /preempted/);
+  for (const entry of [wait, lock]) {
+    assert.equal(entry.requestSchema.properties.timeoutSeconds.default, 30);
+    assert.match(entry.description, /timeoutSeconds defaults to 30 seconds/);
+  }
   for (const entry of mutating) {
     assert.match(entry.description, /LOOPBACK-ONLY/);
     assert.match(entry.description, /403/);
@@ -447,7 +451,8 @@ test('GPU routes document pools, live load, the priority scale, leases, and the 
     assert.equal(/[{}]/.test(url), false, `${entry.path} example URL still holds a path placeholder`);
   }
   assert.match(reserve.examples[0].curl, /"holder":"pods-agent"/);
-  assert.match(lock.examples[0].curl, /"timeoutMs":30000/);
+  assert.match(lock.examples[0].curl, /"timeoutSeconds":30/);
+  assert.equal(/timeoutMs|ttlMs/.test(renderLlmsFullReference()), false, 'the GPU surface is seconds throughout, never milliseconds');
   assert.match(release.examples[0].curl, /gpures_example/);
 
   // The generated agent-facing reference must carry the same warnings.

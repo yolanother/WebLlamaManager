@@ -946,8 +946,8 @@ const REQUEST_SERIES_OPTIONS = {
 /** Default reservation lease length applied when a caller omits ttlSeconds. */
 const DEFAULT_GPU_TTL_SECONDS = 300;
 
-/** Default bound on how long wait/lock block before reporting a timeout. */
-const DEFAULT_GPU_WAIT_MS = 30000;
+/** Default seconds wait/lock block before reporting a timeout. Seconds throughout: never milliseconds. */
+const DEFAULT_GPU_WAIT_SECONDS = 30;
 
 /** Shared prose for the signed priority scale, repeated on every claiming route. */
 const GPU_PRIORITY_DESCRIPTION = [
@@ -1107,15 +1107,15 @@ const GPU_LOCK_OPTIONS = {
     'The bound card is named in the response (gpu, card, pci) so a client that sets CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES itself can bind by PCI address — never by a positional index.',
     GPU_PRIORITY_DESCRIPTION,
     GPU_TTL_DESCRIPTION,
-    `Status codes: 200 held, 408 timeoutMs elapsed while the lease was still pending (the lease SURVIVES a timeout — wait on it again, or release it), 409 preempted by a strictly higher-priority claim before it was ever held, 403 non-loopback caller, 404 unknown pool id, 503 the pool matches no present card of that class. timeoutMs defaults to ${DEFAULT_GPU_WAIT_MS} ms.`,
+    `Status codes: 200 held, 408 timeoutSeconds elapsed while the lease was still pending (the lease SURVIVES a timeout — wait on it again, or release it), 409 preempted by a strictly higher-priority claim before it was ever held, 403 non-loopback caller, 404 unknown pool id, 503 the pool matches no present card of that class. timeoutSeconds defaults to ${DEFAULT_GPU_WAIT_SECONDS} seconds.`,
     GPU_LOOPBACK_DESCRIPTION,
   ].join(' '),
-  body: { holder: 'pods-agent', priority: 80, ttlSeconds: 300, timeoutMs: 30000, reason: 'tts render' },
+  body: { holder: 'pods-agent', priority: 80, ttlSeconds: 300, timeoutSeconds: 30, reason: 'tts render' },
   requestSchema: {
     type: 'object',
     properties: {
       ...GPU_CLAIM_REQUEST_SCHEMA.properties,
-      timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_GPU_WAIT_MS, description: 'How long to block before answering 408. A timeout does NOT cancel the lease.' },
+      timeoutSeconds: { type: 'integer', minimum: 1, default: DEFAULT_GPU_WAIT_SECONDS, description: 'How long to block before answering 408. A timeout does NOT cancel the lease.' },
     },
   },
   responseSchema: GPU_RESERVATION_SCHEMA,
@@ -1127,15 +1127,15 @@ const GPU_WAIT_OPTIONS = {
     'Blocks until a pending lease becomes held, is preempted, or the timeout elapses. This is the second half of reserve; lock does both at once.',
     'Status codes: 200 the lease is now "held" and the card is yours, 408 the timeout elapsed and the lease is STILL PENDING (it was not cancelled — wait again or release it), 409 the lease was preempted by a strictly higher-priority claim, 403 non-loopback caller, 404 unknown reservation id.',
     'Waiting on an already-held lease returns 200 immediately. Waiting on a released or expired lease returns 409 carrying its terminal state.',
-    `timeoutMs defaults to ${DEFAULT_GPU_WAIT_MS} ms.`,
+    `timeoutSeconds defaults to ${DEFAULT_GPU_WAIT_SECONDS} seconds.`,
     GPU_TTL_DESCRIPTION,
     GPU_LOOPBACK_DESCRIPTION,
   ].join(' '),
-  body: { timeoutMs: 30000 },
+  body: { timeoutSeconds: 30 },
   requestSchema: {
     type: 'object',
     properties: {
-      timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_GPU_WAIT_MS, description: 'How long to block before answering 408. A timeout does NOT cancel the lease.' },
+      timeoutSeconds: { type: 'integer', minimum: 1, default: DEFAULT_GPU_WAIT_SECONDS, description: 'How long to block before answering 408. A timeout does NOT cancel the lease.' },
     },
   },
   responseSchema: GPU_RESERVATION_SCHEMA,
