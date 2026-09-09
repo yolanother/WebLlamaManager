@@ -20,7 +20,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseSmartLog, parseKmsgFaults, attributePanic } from './drive-health.js';
+import { parseSmartLog, parseKmsgFaults, attributePanic, buildStorageStats } from './drive-health.js';
 
 // Real `nvme smart-log /dev/nvme1` output — the SPCC M.2 4TB holding / and /home.
 const SMART_SPCC = `Smart Log for NVME device:nvme1 namespace-id:ffffffff
@@ -149,4 +149,96 @@ test('attributePanic says unknown rather than guessing', () => {
   // "unknown", never get silently folded into whichever cause was last seen.
   assert.equal(attributePanic('').cause, 'unknown');
   assert.equal(attributePanic('Kernel panic - not syncing: Fatal exception\n').cause, 'unknown');
+});
+
+// ---------------------------------------------------------------------------
+// buildStorageStats — assembling what the dashboard actually renders.
+// ---------------------------------------------------------------------------
+
+// A real snapshot, as written by scripts/health-snapshot.mjs running as root.
+const SNAPSHOT = {
+  generatedAt: '2026-09-09T17:26:24.625Z',
+  nvmeCliAvailable: true,
+  drives: [
+    { name: 'nvme0', model: 'Lexar SSD NQ790 2TB', serial: 'QBC838R008533P220C', firmware: 'SN19644',
+      smartAvailable: true, criticalWarning: 0, temperatureC: 35, availableSparePct: 100,
+      availableSpareThresholdPct: 10, percentageUsedPct: 0, mediaErrors: 0, numErrLogEntries: 0,
+      unsafeShutdowns: 22, powerCycles: 118, powerOnHours: 29 },
+    { name: 'nvme1', model: 'SPCC M.2 PCIe SSD', serial: '6346F71000002ELK', firmware: 'PM040DB8',
+      smartAvailable: true, criticalWarning: 0, temperatureC: 29, availableSparePct: 100,
+      availableSpareThresholdPct: 10, percentageUsedPct: 3, mediaErrors: 0, numErrLogEntries: 0,
+      unsafeShutdowns: 52, powerCycles: 56, powerOnHours: 2158 },
+  ],
+  faults: { ioTimeout: 0, hungTask: 0, controllerNotReady: 0, resetFailure: 0, readOnlyRemount: 0, total: 0 },
+  lastPanic: { epoch: 1788955227, isoTime: '2026-09-09T12:00:27.000Z',
+    cause: 'nvme-controller-hang', markers: { nvme: 12, amdgpu: 0 }, hasDump: true },
+};
+
+// Live hwmon reads, which the API does itself and which need no privilege.
+const TEMPS = { nvme0: 34.8, nvme1: 30.8 };
+const NOW = new Date('2026-09-09T17:28:00.000Z');
+
+test('buildStorageStats prefers the live hwmon temperature over the snapshot SMART value', () => {
+  // The snapshot can be minutes old; hwmon is read on the same request. A panel
+  // showing a stale temperature next to a live one is worse than showing neither.
+  const { drives } = buildStorageStats({ snapshot: SNAPSHOT, temps: TEMPS, now: NOW });
+  assert.equal(drives.find((d) => d.name === 'nvme1').temperatureC, 30.8);
+});
+
+test('buildStorageStats keeps drive identity from sysfs, not the unstable node name', () => {
+  const { drives } = buildStorageStats({ snapshot: SNAPSHOT, temps: TEMPS, now: NOW });
+  const spcc = drives.find((d) => d.serial === '6346F71000002ELK');
+  assert.equal(spcc.model, 'SPCC M.2 PCIe SSD');
+  assert.equal(spcc.percentageUsedPct, 3);
+});
+
+test('buildStorageStats reports temperature with no snapshot at all', () => {
+  // A freshly flashed appliance has hwmon immediately but no snapshot until the
+  // timer first fires. Temperature must not wait on the privileged helper.
+  const { drives, health } = buildStorageStats({ snapshot: null, temps: TEMPS, now: NOW });
+  assert.equal(drives.length, 2);
+  assert.equal(drives[0].temperatureC, 34.8);
+  assert.equal(drives[0].mediaErrors, null);
+  assert.equal(health.snapshotAvailable, false);
+});
+
+test('buildStorageStats marks an old snapshot stale rather than presenting it as current', () => {
+  const late = new Date('2026-09-09T18:30:00.000Z'); // ~64 min after generatedAt
+  const { health } = buildStorageStats({ snapshot: SNAPSHOT, temps: TEMPS, now: late });
+  assert.equal(health.stale, true);
+  const fresh = buildStorageStats({ snapshot: SNAPSHOT, temps: TEMPS, now: NOW });
+  assert.equal(fresh.health.stale, false);
+});
+
+test('buildStorageStats surfaces the last panic cause for the dashboard readout', () => {
+  const { health } = buildStorageStats({ snapshot: SNAPSHOT, temps: TEMPS, now: NOW });
+  assert.equal(health.lastPanic.cause, 'nvme-controller-hang');
+  assert.equal(health.faults.total, 0);
+});
+
+test('buildStorageStats survives a snapshot missing every optional section', () => {
+  // Defensive: the helper writes atomically, but a hand-edited or truncated file
+  // must degrade to unknown rather than throwing inside the stats broadcast —
+  // getSystemStats feeds every WebSocket client on a 1s interval.
+  const { drives, health } = buildStorageStats({ snapshot: { generatedAt: NOW.toISOString() }, temps: TEMPS, now: NOW });
+  assert.equal(drives.length, 2);
+  assert.equal(health.lastPanic, null);
+  assert.equal(health.faults, null);
+});
+
+test('buildStorageStats returns an empty list when there are no drives anywhere', () => {
+  const { drives } = buildStorageStats({ snapshot: null, temps: {}, now: NOW });
+  assert.deepEqual(drives, []);
+});
+
+test('server.js delegates storage assembly to this module rather than inlining it', async () => {
+  // House guard, mirroring api/resource-guard.test.js:271 — the point of a pure
+  // module is lost the moment the logic drifts back into the server file where
+  // it cannot be tested.
+  const { readFile } = await import('node:fs/promises');
+  const src = await readFile(new URL('./server.js', import.meta.url), 'utf8');
+  assert.ok(src.includes("from './drive-health.js'"), 'server.js must import drive-health.js');
+  assert.ok(src.includes('buildStorageStats({'), 'server.js must call buildStorageStats');
+  assert.ok(src.includes('drives: storageStats.drives'), 'stats payload must expose drives');
+  assert.ok(src.includes('storageHealth: storageStats.health'), 'stats payload must expose storageHealth');
 });

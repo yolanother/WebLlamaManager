@@ -144,3 +144,71 @@ export function attributePanic(text) {
   else if (markers.amdgpu > markers.nvme) cause = CAUSE_AMDGPU_SVM;
   return { cause, markers };
 }
+
+/** A snapshot older than this is presented as stale rather than as current. */
+export const SNAPSHOT_STALE_MS = 30 * 60 * 1000;
+
+/**
+ * Assemble what the dashboard renders from the two independent sources.
+ *
+ * Deliberately separates the two so one can fail without taking the other down:
+ * temperature comes from hwmon, which the API reads directly on every request
+ * and which needs no privilege at all; health and crash history come from the
+ * privileged snapshot, which may be absent (freshly flashed appliance, timer not
+ * yet fired) or stale (helper wedged on a failing drive). Temperature must never
+ * wait on the helper, and a stale snapshot must never be shown as current.
+ *
+ * Drives are keyed by controller name for merging but carry their sysfs model
+ * and serial, because nvmeXnY numbering is not stable across boots here.
+ *
+ * @param {object} a
+ * @param {object|null} a.snapshot Parsed health snapshot, or null when unavailable.
+ * @param {Record<string, number|null>} a.temps Live hwmon temperature per controller.
+ * @param {Date} [a.now] Clock, injectable for tests.
+ * @param {number} [a.staleAfterMs] Staleness threshold.
+ * @returns {{drives: Array<object>, health: {snapshotAvailable:boolean, stale:boolean,
+ *   generatedAt:string|null, ageMs:number|null, faults:object|null, lastPanic:object|null}}}
+ *   Per-device rows plus the host-wide storage health summary.
+ */
+export function buildStorageStats({ snapshot, temps = {}, now = new Date(), staleAfterMs = SNAPSHOT_STALE_MS }) {
+  const snapDrives = Array.isArray(snapshot?.drives) ? snapshot.drives : [];
+  const blank = parseSmartLog('');
+
+  // Union of both sources: a drive with a live sensor but no snapshot row still
+  // appears (temperature only), and vice versa.
+  const names = [...new Set([...snapDrives.map((d) => d.name), ...Object.keys(temps)])].sort();
+
+  const drives = names.map((name) => {
+    const row = snapDrives.find((d) => d.name === name) || {};
+    // Every health field present as null when the snapshot did not carry it, so
+    // the shape is identical whether or not the privileged helper has run.
+    const health = Object.fromEntries(Object.keys(blank).map((k) => [k, k in row ? row[k] : null]));
+    return {
+      name,
+      model: row.model ?? null,
+      serial: row.serial ?? null,
+      firmware: row.firmware ?? null,
+      smartAvailable: row.smartAvailable ?? false,
+      ...health,
+      // hwmon wins: it is read on this request, the snapshot may be minutes old.
+      // Assigned after the spread so the null in `health` cannot clobber it.
+      temperatureC: temps[name] ?? row.temperatureC ?? null,
+      smartTemperatureC: row.temperatureC ?? null,
+    };
+  });
+
+  const generatedAt = typeof snapshot?.generatedAt === 'string' ? snapshot.generatedAt : null;
+  const ageMs = generatedAt ? now.getTime() - new Date(generatedAt).getTime() : null;
+
+  return {
+    drives,
+    health: {
+      snapshotAvailable: Boolean(snapshot),
+      stale: ageMs === null ? false : ageMs > staleAfterMs,
+      generatedAt,
+      ageMs,
+      faults: snapshot?.faults ?? null,
+      lastPanic: snapshot?.lastPanic ?? null,
+    },
+  };
+}

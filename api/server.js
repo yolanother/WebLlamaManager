@@ -58,6 +58,7 @@ import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGat
 import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
+import { buildStorageStats } from './drive-health.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
 import { findLeakedSlots, activeRequestHoldsSlot } from './slot-reaper.js';
 import { ds4Queue, acquireDs4Slot, setDs4SlotGrantedObserver } from './ds4-slot.js';
@@ -3440,6 +3441,59 @@ function getCpuTemperature() {
   return null;
 }
 
+// Path of the JSON snapshot written by the root health-snapshot timer. The API
+// only ever READS this: SMART, /dev/kmsg and pstore are all root-only, and a
+// drive in the act of failing can wedge an nvme command indefinitely, so that
+// work must not sit in the request path.
+const HEALTH_SNAPSHOT_PATH = process.env.HEALTH_SNAPSHOT_PATH || '/run/llama-manager/health-snapshot.json';
+
+// Read per-NVMe-controller temperature straight from hwmon.
+//
+// This needs no privilege at all -- verified on the appliance -- so temperature
+// keeps reporting on a freshly flashed box whose snapshot timer has never fired.
+// Each controller links its own hwmon (/sys/class/nvme/nvme1/hwmon3), which is
+// what ties a sensor to a drive; matching by index would be a guess. "Composite"
+// is the drive-level reading, preferred over the individual sensors.
+function getDriveTemperatures() {
+  const out = {};
+  let names;
+  try {
+    names = readdirSync('/sys/class/nvme').filter((n) => /^nvme\d+$/.test(n));
+  } catch { return out; }
+  for (const name of names) {
+    try {
+      const hw = readdirSync(`/sys/class/nvme/${name}`).find((e) => /^hwmon\d+$/.test(e));
+      if (!hw) continue;
+      const dir = `/sys/class/nvme/${name}/${hw}`;
+      let composite = null;
+      let first = null;
+      for (const entry of readdirSync(dir)) {
+        const m = entry.match(/^temp(\d+)_input$/);
+        if (!m) continue;
+        const milli = parseInt(readFileSync(`${dir}/${entry}`, 'utf-8').trim());
+        if (!Number.isFinite(milli)) continue;
+        const degrees = Math.round(milli / 100) / 10;
+        if (first === null) first = degrees;
+        let label = '';
+        try { label = readFileSync(`${dir}/temp${m[1]}_label`, 'utf-8').trim(); } catch { /* unlabeled */ }
+        if (label === 'Composite') composite = degrees;
+      }
+      const value = composite ?? first;
+      if (value !== null) out[name] = value;
+    } catch { continue; }
+  }
+  return out;
+}
+
+// Read the privileged snapshot. Absent is normal and not an error: the timer may
+// not have fired yet, or nvme-cli may be missing. Returns null so the caller
+// renders health as unknown rather than as healthy.
+function readHealthSnapshot() {
+  try {
+    return JSON.parse(readFileSync(HEALTH_SNAPSHOT_PATH, 'utf-8'));
+  } catch { return null; }
+}
+
 // lspci's slot -> name map, resolved AT MOST ONCE for the life of the process.
 // /api/system is polled continuously and every card is described on every poll,
 // so spawning lspci per card per poll would be a real regression. The PCI bus
@@ -3747,6 +3801,7 @@ async function getSystemStats() {
 
   // Get CPU temperature
   const cpuTemp = getCpuTemperature();
+  const storageStats = buildStorageStats({ snapshot: readHealthSnapshot(), temps: getDriveTemperatures() });
 
   // Get GPU/VRAM stats from rocm-smi inside the container
   let gpuStats = null;
@@ -3847,6 +3902,13 @@ async function getSystemStats() {
     // card in its original shape -- unchanged, because the whole dashboard reads
     // it. A single-GPU box gets a one-entry array and looks exactly as it did.
     gpus: buildInventory(getAllGpuSysfsStats(), memTotalBytes()),
+    // Storage, assembled from two independent sources so one can fail without
+    // the other: temperature is read from hwmon on this request and needs no
+    // privilege, while health and crash history come from the root-written
+    // snapshot, which may be absent or stale. Feeds /api/stats and every /ws
+    // broadcast from this single insertion.
+    drives: storageStats.drives,
+    storageHealth: storageStats.health,
     llama: llamaStats,
     embed: embedStats,
     ds4: ds4Stats,
