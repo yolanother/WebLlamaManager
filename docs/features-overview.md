@@ -336,6 +336,29 @@ Turn the host into a full-screen dashboard appliance (gdm autologin → a Waylan
 `scripts/install-kiosk.sh`; target via `KIOSK_URL` in `.env`. See
 [`Utilities/kiosk.md`](Utilities/kiosk.md).
 
+## 13. GPU pools & reservations (multi-GPU boxes)
+
+A box with a discrete card beside the APU can share it with an external program (on
+this appliance, the pods agent doing asset generation and TTS). `config.gpus` names
+each GPU as a **pool matched by card CLASS** — `vendor:device` id or product name,
+never the DRM index or PCI slot, so the name survives a reorder and a re-plug.
+Several cards of one class is **capacity**, not ambiguity.
+
+An external caller then **leases** a card at a signed integer priority (llama-manager's
+baseline is 0): `80` preempts llama-manager, `-10` yields to it. A lease has a TTL and a
+renew heartbeat, so a crashed holder can never strand a card. `pinnedModels` on a pool
+is itself a reservation held by `llama-manager` — one mechanism, not two.
+
+Two things a caller must know: **`reserve` returns 202 with a `pending` lease and the
+card is NOT yours yet** (`lock` is reserve+wait and is what most callers want), and
+draining a card **never fails a request** — resident models route to a peer where one
+can serve them and park in the queue otherwise. Mutating routes are **loopback-only**
+(403 off-box); reads are open like `/api/stats`.
+
+Entirely additive: with no `gpus` array configured, no pool resolves and a one-GPU
+appliance behaves exactly as it did. See
+[`features/gpu-reservations.md`](features/gpu-reservations.md).
+
 ---
 
 ## Ports
@@ -357,6 +380,7 @@ Turn the host into a full-screen dashboard appliance (gdm autologin → a Waylan
 | Offload / protect-resident | `api/protect-resident.js` |
 | DS4 engine | `api/ds4-supervisor.js`, `api/ds4-exclusive.js`, `api/ds4-adaptive.js`, `api/ds4-updater.js`, `start-ds4.sh` |
 | Guards | `api/mem-watchdog.js`, `resource-guard.js`, `restart-governor.js`, `queue-admission.js`, `slot-reaper.js`, `engine-kill.js`, `upstream-retry.js` |
+| GPU pools, reservations, drain, accelerator | `api/gpu-pools.js`, `api/gpu-reservations.js`, `api/gpu-drain.js`, `api/duo-accelerator.js` |
 | Slot KV cache | `api/slot-cache.js` |
 | Embeddings / HF token / app usage | `api/embeddings.js`, `api/hf-token.js`, `api/app-usage.js` |
 | Launchers | `start-llama.sh`, `start-preset.sh`, `container-start.sh`, `start-ds4.sh`, `start-embed.sh` |
@@ -366,6 +390,8 @@ Turn the host into a full-screen dashboard appliance (gdm autologin → a Waylan
 ## Related docs
 
 - [`features/model-alias-groups.md`](features/model-alias-groups.md) — alias groups: config shape, the warm gate, migration from `modelMapping`
+- [`features/gpu-reservations.md`](features/gpu-reservations.md) — GPU pools, priorities, leases, drain, the loopback rule
+- [`Designs/GpuReservations.md`](Designs/GpuReservations.md) — GPU reservation design decisions and their reasons
 - [`ds4-engine.md`](ds4-engine.md) — DeepSeek V4 Flash engine (this feature set's centerpiece)
 - [`ds4-build.md`](ds4-build.md) / [`ds4-auto-update.md`](ds4-auto-update.md) — build + self-updater
 - [`Designs/EngineAbstraction.md`](Designs/EngineAbstraction.md) — engine-seam design

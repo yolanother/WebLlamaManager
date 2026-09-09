@@ -34,6 +34,8 @@ hardware-specific gotchas of the AMD Strix Halo (gfx1151) box it targets.
 - [features/multimodal-api.md](features/multimodal-api.md) — OpenAI-compatible image, audio, video/YouTube, long-media digest, transcription, capability-discovery, and agent-readable documentation contracts
 - [features/glass-ui-and-multimodal-chat.md](features/glass-ui-and-multimodal-chat.md) — glass UI and the shared UI/API multimodal media pipeline
 - [features/model-performance-history.md](features/model-performance-history.md) — per-model prompt/decode/TTFT/speculative history, scenario labels, and the dashboard/API contract
+- [features/gpu-reservations.md](features/gpu-reservations.md) — naming a GPU by class, leasing a card at a priority that preempts llama-manager, `reserve` vs `lock`, TTL, the loopback rule
+- [Designs/GpuReservations.md](Designs/GpuReservations.md) — why pools are class-matched, why model pins are reservations, why preemption is strictly-greater, and the honest CUDA state
 - [Designs/ChatPage.md](Designs/ChatPage.md) · [Designs/ApiDocs.md](Designs/ApiDocs.md) · [Designs/DocsPage.md](Designs/DocsPage.md) — UI page designs
 - [Designs/OpenCode.md](Designs/OpenCode.md) — OpenCode provider integration
 - [Designs/ConversationContextCache.md](Designs/ConversationContextCache.md) — exact input counts, stable conversation affinity, KV preparation, lifecycle, and cache telemetry
