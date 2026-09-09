@@ -22,9 +22,9 @@ export const GPU_MATCH_SELECTORS = ['pciId', 'name', 'pci'];
 
 /** Human labels and placeholders for each selector, for the editor's inputs. */
 export const GPU_MATCH_FIELDS = [
-  { key: 'pciId', label: 'PCI class id', placeholder: '10de:2204', hint: 'vendor:device — survives a re-plug' },
-  { key: 'name', label: 'Product name contains', placeholder: 'RTX 3090', hint: 'case-insensitive substring' },
-  { key: 'pci', label: 'PCI address', placeholder: '0000:c6:00.0', hint: 'exact slot — changes if re-plugged' },
+  { key: 'pciId', label: 'PCI class id', placeholder: 'e.g. 10de:2204', hint: 'vendor:device — survives a re-plug' },
+  { key: 'name', label: 'Product name contains', placeholder: 'e.g. RTX 3090', hint: 'case-insensitive substring' },
+  { key: 'pci', label: 'PCI address', placeholder: 'e.g. 0000:c6:00.0', hint: 'exact slot — changes if re-plugged' },
 ];
 
 /** A `vendor:device` class id, with sysfs's `0x` prefix optional on either half. */

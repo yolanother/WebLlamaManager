@@ -1200,6 +1200,13 @@ function AliasesSection({ setMessage }) {
         <code>gemma4:*</code> — pick one from the list or type your own.{' '}
         <code>default-big</code> and <code>default-small</code> appear here as ordinary aliases.
       </p>
+      <p className="setting-hint" style={{ marginBottom: '12px' }}>
+        <strong>GPU pool</strong> restricts an alias's <em>local</em> targets to one class of card;
+        remote targets are unaffected. Pools are named on the <strong>GPUs</strong> tab.{' '}
+        <strong>Priority</strong> is a signed integer: <code>0</code> is llama-manager's baseline,
+        negative yields to ordinary work, positive preempts it, and a claim takes a held card only if
+        it is strictly higher. Leave it blank to inherit the pool's default.
+      </p>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', gap: '8px', flexWrap: 'wrap' }}>
         <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={refreshRemote} disabled={refreshing || backends.length === 0}>
@@ -1293,13 +1300,11 @@ function AliasesSection({ setMessage }) {
                 />
               </label>
             </div>
-            <p className="setting-hint" style={{ margin: '4px 0 0', color: chosenPool?.problem ? 'var(--error, #f87171)' : undefined }}>
-              {group.gpu
-                ? `Local targets of this alias run only on "${group.gpu}". ${chosenPool?.hint || ''}`
-                : 'This alias may run anywhere — pick a pool to bind its local targets to one class of card.'}
-              {' '}Priority is a signed integer: <code>0</code> is llama-manager's baseline, negative
-              yields to ordinary work, positive preempts it. Blank inherits the pool's default.
-            </p>
+            {group.gpu && (
+              <p className="setting-hint" style={{ margin: '4px 0 0', color: chosenPool?.problem ? 'var(--error, #f87171)' : undefined }}>
+                Local targets run only on <code>{group.gpu}</code>. {chosenPool?.hint || ''}
+              </p>
+            )}
 
             {nameMessages.map(issue => (
               <p key={issue.message} className="setting-hint" style={{ margin: '4px 0 0', color: issue.level === 'error' ? 'var(--error, #f87171)' : 'var(--warning, #fbbf24)' }}>
@@ -1519,7 +1524,9 @@ function GpusSection({ setMessage }) {
                     {card.driver || 'none bound'}
                   </td>
                   <td style={{ padding: '4px 6px' }}>
-                    {card.vramBytes ? `${formatBytes(card.vramUsedBytes || 0)} / ${formatBytes(card.vramBytes)}` : '—'}
+                    {card.vramBytes
+                      ? (card.vramUsedBytes ? `${formatBytes(card.vramUsedBytes)} / ${formatBytes(card.vramBytes)}` : formatBytes(card.vramBytes))
+                      : '—'}
                   </td>
                   <td style={{ padding: '4px 6px' }}>
                     <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => addPoolFromCard(card)}>
@@ -1591,7 +1598,7 @@ function GpusSection({ setMessage }) {
                   className="glass-input"
                   value={row.defaultPriority}
                   inputMode="numeric"
-                  placeholder="0"
+                  placeholder="e.g. 0"
                   aria-label={`Default priority for pool ${row.id || 'unnamed'}`}
                   onChange={e => updateRow(row.rowId, { defaultPriority: e.target.value })}
                   style={{ width: '100%' }}
@@ -1630,7 +1637,9 @@ function GpusSection({ setMessage }) {
                   <li key={card.card || card.pci}>
                     <code>{card.card}</code> {card.name || 'unnamed card'}
                     {card.driver ? ` · ${card.driver}` : ' · no driver bound'}
-                    {card.vramBytes ? ` · ${formatBytes(card.vramUsedBytes || 0)} / ${formatBytes(card.vramBytes)} VRAM` : ''}
+                    {card.vramBytes
+                      ? ` · ${card.vramUsedBytes ? `${formatBytes(card.vramUsedBytes)} / ` : ''}${formatBytes(card.vramBytes)} VRAM`
+                      : ''}
                     {card.busyPercent == null ? '' : ` · ${card.busyPercent}% busy`}
                     {card.free ? '' : ' · reserved'}
                   </li>
