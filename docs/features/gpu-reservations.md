@@ -386,6 +386,77 @@ it can be bound to one card only, and the first pool that pins models and curren
 holds a card supplies that binding. Per-model placement across several cards would
 need a router per card, which this appliance does not run.
 
+### Pinning an ALIAS instead of a model name
+
+`pinnedModels` names concrete model ids. An **alias** can be bound to a pool
+instead, which is what an operator usually wants: `default-big` should run on the
+3090 whatever model it happens to point at this week.
+
+An alias group takes two optional fields alongside `targets`:
+
+```json
+"aliases": {
+  "default-small": {
+    "targets": [{ "host": "local", "model": "Qwen3-8B-Q4_K_M" }],
+    "gpu": "rtx3090",
+    "gpuPriority": 25
+  }
+}
+```
+
+- `gpu` NAMES A POOL, never a card — so it survives a DRM reorder or a re-plug,
+  which is the reason pools exist at all.
+- `gpuPriority` is the same signed scale as everything else here: 0 is
+  llama-manager's baseline, negative yields to ordinary work, positive preempts
+  it. Omit it and the pool's `defaultPriority` applies.
+- Only the alias's **local** targets are pinned. A pool is a local concept, so a
+  target on a remote host routes exactly as it did.
+- Both fields are optional and both are absent from every alias written before
+  they existed; such an alias is stored as `{"targets": [...]}` and nothing else.
+
+Write them through the alias editor — `PUT /api/aliases/:name` — which is the only
+writer for the alias table:
+
+```bash
+curl -X PUT localhost:5250/api/aliases/default-small \
+  -H 'Content-Type: application/json' \
+  -d '{"targets":[{"host":"local","model":"Qwen3-8B-Q4_K_M"}],"gpu":"rtx3090","gpuPriority":25}'
+```
+
+`GET /api/aliases` returns `gpu` and `gpuPriority` per alias (null when unbound),
+and `GET /api/settings` carries a read-only `aliases` view of the same table.
+
+An alias naming a pool that does not exist is a **400 naming both the alias and
+the pool**, never a silently dropped field:
+
+```
+alias "default-small" names GPU pool "rtx5090", which is not configured;
+configured pools are rtx3090, apu
+```
+
+The same applies to a non-integer `gpuPriority`, a `gpuPriority` with no `gpu` to
+apply it to, and an unknown key in the group.
+
+**Precedence.** A model claimed both by a pool's `pinnedModels` and by an alias
+bound to a different pool goes to whichever claim holds the **higher priority**,
+and the decision is logged rather than left to evaluation order:
+
+```
+GPU pin for "gpt-oss-120b": alias "steal" wins the model on pool "apu" at
+priority 99, ahead of pool "rtx3090" pinnedModels on "rtx3090" at 10
+```
+
+An exact tie goes to the pool's own pin, and among pools to config order — the
+same deterministic, operator-visible tie-break `resolvePools` uses. A pool holds
+its lease at the highest priority anything on it asked for, so two aliases on one
+pool are one reservation. A pool left with no models — every one of them won
+elsewhere — takes no reservation at all, and a pin whose pool leaves the plan
+(the alias deleted or retargeted, the pool removed from settings) is released
+rather than holding the card on a lease with no expiry.
+
+The decision is pure and lives in `api/alias-gpu.js`
+(`normalizeAliasGpu`, `aliasPinTargets`, `poolPinPlan`), tested without hardware.
+
 ---
 
 ## The unfriendly neighbour: a busy card with no reservation
@@ -602,7 +673,8 @@ emitted. Everything is additive — a one-GPU appliance behaves exactly as it di
 
 ```bash
 node --test api/gpu-pools.test.js api/gpu-reservations.test.js \
-            api/gpu-drain.test.js api/duo-accelerator.test.js
+            api/gpu-drain.test.js api/duo-accelerator.test.js \
+            api/alias-gpu.test.js
 ```
 
 **Against a live server**, without touching the dev instance on 5250 — start a
@@ -652,6 +724,7 @@ A healthy readout names the card, resolves its PCI address, and reports live VRA
 | Reservation state machine: priority, TTL, preemption (pure) | `api/gpu-reservations.js` |
 | What must happen before a card is honestly held (pure) | `api/gpu-drain.js` |
 | Soft-claim heuristic + duo's rpc-server plan (pure) | `api/duo-accelerator.js` |
+| Alias→pool binding, priority validation, pin precedence (pure) | `api/alias-gpu.js` |
 | Routes, drain execution, pins, loopback rule, sweep timer | `api/server.js` |
 | API/OpenAPI documentation of the routes | `api/api-spec.js` |
 | CLI commands | `cli/catalog.js` |
