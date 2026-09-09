@@ -316,6 +316,47 @@ callers. That is why parking is the floor and offloading is only an optimisation
 
 ---
 
+## How a pin actually reaches the card
+
+A pin does two separate things, and it is worth knowing which is which, because they fail
+differently.
+
+**Reserving** the card is the reservation described below. **Executing** on it depends on
+whether the engine can see the card at all:
+
+| The card | How the model is placed there | If it is not possible |
+|---|---|---|
+| Locally enumerable (an amdgpu card, on the HIP-built engine) | `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES` on the engine, from the card's PCI address or UUID | n/a |
+| Reachable only over RPC (an **NVIDIA** card) | `device = RPC<n>` in that model's `models-preset.ini` section, so llama.cpp's `--device` places just that model there | Logged, and the model serves on the default device |
+
+The NVIDIA row is the one that surprises people. A `*_VISIBLE_DEVICES` variable **filters
+what a backend enumerates — it cannot introduce a device the backend never had.** The
+HIP-built engine never enumerates an NVIDIA card however the kernel binds it, so no such
+variable can ever place a model there. llama.cpp's own `--device` can, using the names
+`--list-devices` prints, and the per-model preset file carries it.
+
+**So a pin to an NVIDIA pool needs the duo accelerator switched on**, because that is what
+attaches the card over RPC and makes `RPC0` exist:
+
+```bash
+curl -X POST localhost:5250/api/settings -H 'Content-Type: application/json' \
+  -d '{"duo": {"useAccelerator": true, "acceleratorPriority": "agent-first"}}'
+```
+
+Without it the pin still reserves the card correctly, and the log says exactly why the
+model is not running there:
+
+```
+GPU pin for "rtx3090" cannot be applied: card1 (nvidia) is not enumerable by this
+engine and no RPC endpoint serves it. Qwen3-8B-Q4_K_M will run on the default
+device. Enable the duo accelerator so the card is attached over RPC.
+```
+
+Verified end to end on drakemore: with the accelerator on, `[Qwen3-8B-Q4_K_M]` gained
+`device = RPC0`, the card went from 727 MiB to 14862 MiB at 94% utilisation, and
+`nvidia-smi --query-compute-apps` showed the **rpc-server's own PID** holding 14130 MiB.
+That last check is the load-bearing one — a silent CPU fallback would still list `RPC0`.
+
 ## Model pins ARE reservations
 
 `pinnedModels` on a pool creates an internal reservation held by
