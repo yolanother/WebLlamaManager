@@ -44,16 +44,47 @@ export function classifyCard({ gttBytes, systemBytes } = {}) {
 }
 
 /**
+ * Folds a card's sysfs `device/vendor` and `device/device` values into the
+ * `vendor:device` class id an operator writes in settings.
+ *
+ * The class id is the only handle on a card that survives BOTH a DRM reorder
+ * and a re-plug into a different PCI slot, so it is what a named GPU is matched
+ * on. sysfs publishes both halves `0x`-prefixed and the operator will not type
+ * them that way, so the prefix is stripped and case folded here, once, rather
+ * than at every comparison.
+ *
+ * @param {?string} vendorId The card's `device/vendor` value, e.g. `0x10de`.
+ * @param {?string} deviceId The card's `device/device` value, e.g. `0x2204`.
+ * @returns {?string} `vendor:device` in lower case without the prefix, e.g.
+ *   `10de:2204`, or null when either half is missing -- a half id would name a
+ *   whole vendor's product line rather than one card, so it is never emitted.
+ */
+export function formatPciId(vendorId, deviceId) {
+  // One argument carrying an already-composed `vendor:device` is accepted so the
+  // rocm-smi and nvidia-smi paths, which have the pair pre-joined, can normalise
+  // through the same function rather than growing a second spelling of this rule.
+  if (deviceId === undefined && typeof vendorId === 'string' && vendorId.includes(':')) {
+    const parts = vendorId.split(':');
+    return parts.length === 2 ? formatPciId(parts[0], parts[1]) : null;
+  }
+  const half = (value) => (typeof value === 'string' ? value.trim().replace(/^0x/i, '').toLowerCase() : '');
+  const vendor = half(vendorId);
+  const device = half(deviceId);
+  return vendor && device ? `${vendor}:${device}` : null;
+}
+
+/**
  * Builds the ordered GPU inventory, inference card first.
  *
  * @param {Array<object>} cards One entry per card as read from sysfs. Recognised
  *   keys: `card`, `name`, `driver`, `vramBytes`, `vramSource`, `gttBytes`, `available`,
- *   `temperature`, `usage`, `power`, `coreClock`, `memClock`.
+ *   `temperature`, `usage`, `power`, `coreClock`, `memClock`, and the card's PCI
+ *   identity as `pci` plus either `vendorId`/`deviceId` or a pre-composed `pciId`.
  * @param {?number} systemBytes Total system memory in bytes.
  * @returns {Array<object>} One entry per card, inference card first, each with
  *   `card`, `name`, `driver`, `kind`, `inference`, `available`, `reason`,
- *   `vramBytes`, `vramSource`, `gttBytes`, `systemBytes` and the telemetry
- *   fields. An empty
+ *   `pci`, `pciId`, `vramBytes`, `vramSource`, `gttBytes`, `systemBytes` and the
+ *   telemetry fields. An empty
  *   array when the machine has no GPU -- never a placeholder card.
  */
 export function buildInventory(cards, systemBytes) {
@@ -70,6 +101,15 @@ export function buildInventory(cards, systemBytes) {
       inference: false,
       available,
       reason: '',
+      // The card's PCI address and class, carried through so a named GPU can be
+      // matched on something steadier than the DRM index this entry is keyed by.
+      // Unknown stays null: an empty string would read downstream as a slot that
+      // is present but blank, and would compare equal to no real address.
+      pci: raw.pci || null,
+      pciId: formatPciId(raw.vendorId, raw.deviceId)
+        // A caller that already composed the class must not have it discarded
+        // for want of the raw pair.
+        || formatPciId(raw.pciId),
       // Unknown is null, never 0. A confident zero and a silent omission are
       // both worse than an honest "unknown", and this readout has shipped both.
       vramBytes: raw.vramBytes ?? null,

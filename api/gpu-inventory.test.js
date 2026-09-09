@@ -18,6 +18,7 @@ import {
   parsePciApertureBytes,
   parseLspciNames,
   describeCardName,
+  formatPciId,
   parseNvidiaSmi,
   resolveGpuSeries,
   gpuMemoryUsagePercent,
@@ -434,4 +435,55 @@ test('a metric prefix never captures another metric that starts the same way', (
   const records = [{ ts: 1, ms: 20, mg: 30, mg_card1: 5 }];
   assert.deepEqual(historyCardKeys(records, 'mg'), ['mg_card1']);
   assert.deepEqual(historyCardKeys(records, 'ms'), []);
+});
+
+/*
+ * PCI IDENTITY.
+ *
+ * The DRM index is not a stable handle -- an OCuLink card enumerates ahead of
+ * the APU on some boots -- so anything that wants to name one card across
+ * reboots needs the card's PCI address and its vendor:device class instead.
+ * buildInventory is the only place the readout is assembled, so it is where
+ * that identity has to be carried through.
+ */
+test('formatPciId folds a sysfs vendor/device pair into a class id', () => {
+  assert.equal(formatPciId('0x10de', '0x2204'), '10de:2204');
+  assert.equal(formatPciId('0x1002', '0x1586'), '1002:1586');
+  assert.equal(formatPciId('10DE', '2204'), '10de:2204', 'the 0x prefix is optional and case is not significant');
+});
+
+test('formatPciId is null when either half is unknown, never a half id', () => {
+  assert.equal(formatPciId('0x10de', null), null);
+  assert.equal(formatPciId(null, '0x2204'), null);
+  assert.equal(formatPciId('', ''), null);
+  assert.equal(formatPciId(), null);
+});
+
+test('the inventory carries each card PCI address and class', () => {
+  const cards = [
+    { card: 'card0', name: 'RTX 3090', pci: '0000:c5:00.0', vendorId: '0x10de', deviceId: '0x2204', vramBytes: 24 * GIB },
+    { card: 'card1', name: 'Radeon 8060S', pci: '0000:c4:00.0', vendorId: '0x1002', deviceId: '0x1586', gttBytes: 120 * GIB },
+  ];
+  const gpus = buildInventory(cards, SYSTEM);
+  const byCard = Object.fromEntries(gpus.map((g) => [g.card, g]));
+
+  assert.equal(byCard.card0.pci, '0000:c5:00.0');
+  assert.equal(byCard.card0.pciId, '10de:2204');
+  assert.equal(byCard.card1.pci, '0000:c4:00.0');
+  assert.equal(byCard.card1.pciId, '1002:1586');
+});
+
+test('a card with no readable PCI identity reports null, not an empty string', () => {
+  // Same rule the rest of this module follows: unknown is null. An empty string
+  // would compare equal to nothing and read as "present but blank" downstream.
+  const gpus = buildInventory([{ card: 'card0', name: 'Graphics adapter', gttBytes: 120 * GIB }], SYSTEM);
+  assert.equal(gpus[0].pci, null);
+  assert.equal(gpus[0].pciId, null);
+});
+
+test('a card that already carries a composed pciId keeps it', () => {
+  // rocm-smi and nvidia-smi paths can hand the class over pre-composed; the
+  // inventory must not discard it just because the raw pair is absent.
+  const gpus = buildInventory([{ card: 'card0', name: 'RTX 3090', pciId: '10DE:2204', vramBytes: 24 * GIB }], SYSTEM);
+  assert.equal(gpus[0].pciId, '10de:2204');
 });
