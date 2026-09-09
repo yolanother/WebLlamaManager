@@ -14,6 +14,13 @@
 // and bursts hard during them. So the default policy is agent-first: duo takes the card
 // only while the agent is demonstrably not using it, and never evicts it.
 //
+// There are now two ways the card can be spoken for, and they are not the same thing. An
+// explicit GPU RESERVATION (api/gpu-reservations.js) above the accelerator's own priority
+// is a stated claim and settles the question outright — it is checked ahead of everything
+// below, llama-first included, because llama-first exists to overrule a guess about the
+// card and a reservation is not a guess. `agentHoldsCard` is that guess: the fallback for
+// an unfriendly neighbour that never learned to reserve anything, inferred from VRAM alone.
+//
 // The measured detail that shapes `agentHoldsCard`: between jobs the agent's two servers
 // hold about 1.45 GB of the 24 GB card. Treating any non-zero usage as "busy" would mean
 // duo never got the card at all, so the test is whether enough headroom remains for the
@@ -31,6 +38,44 @@ export const DEFAULT_RPC_PORT = 50052;
  * relative to the agent's ~1.45 GB idle footprint.
  */
 export const AGENT_RESERVE_BYTES = 8 * 1024 * 1024 * 1024;
+
+/**
+ * Where duo's use of the card sits on the GPU-reservation priority scale.
+ *
+ * Borrowing a card through an rpc-server is ordinary llama-manager work, so it sits at
+ * that scale's baseline. Stated as its own constant rather than imported from
+ * api/gpu-reservations.js because that module imports {@link agentHoldsCard} from this
+ * one, and closing the cycle for a single zero would be a poor trade.
+ * @type {number}
+ */
+export const ACCELERATOR_PRIORITY = 0;
+
+/**
+ * Reservation states that still speak for a card. A pending claim counts: it has already
+ * been granted a card and llama-manager is draining for it, so starting an rpc-server on
+ * that card would be undoing the drain that is in progress.
+ * @type {ReadonlyArray<string>}
+ */
+const CLAIMING_STATES = Object.freeze(['pending', 'held']);
+
+/**
+ * The reservation that outranks the accelerator on this card, if any.
+ *
+ * Strictly higher, matching the state machine's own preemption rule: an equal claim never
+ * takes a card, or two equal claimants would trade it back and forth forever.
+ *
+ * @param {?Array<{state?: string, priority?: number, holder?: string}>} reservations
+ *   Active reservations for THIS card. The caller filters by card; this module describes
+ *   one card and has no pool vocabulary.
+ * @param {number} priority The accelerator's own priority.
+ * @returns {?object} The outranking reservation, or null when none does.
+ */
+function outrankingReservation(reservations, priority) {
+  if (!Array.isArray(reservations)) return null;
+  return reservations.find((r) => (
+    r && CLAIMING_STATES.includes(r.state) && Number.isFinite(r.priority) && r.priority > priority
+  )) || null;
+}
 
 /**
  * Whether the card should be considered spoken for by the pods agent right now.
@@ -60,14 +105,32 @@ export function agentHoldsCard(gpu) {
  * @param {{useAccelerator?: boolean, acceleratorPriority?: string}|null} [params.settings] Operator settings.
  * @param {{totalBytes?: number, usedBytes?: number}|null} [params.gpu] Live VRAM figures.
  * @param {number} [params.port] Port for the rpc-server.
+ * @param {?Array<{state?: string, priority?: number, holder?: string}>} [params.reservations]
+ *   Reservations against THIS card, from api/gpu-reservations.js. An explicit claim above
+ *   {@link ACCELERATOR_PRIORITY} is checked before every VRAM heuristic below, including
+ *   the llama-first override: llama-first exists to overrule a GUESS about who is using
+ *   the card, and a reservation is not a guess. Omit it and every decision here is exactly
+ *   what it was before reservations existed.
+ * @param {number} [params.priority] The accelerator's own priority on that scale.
  * @returns {{startRpc: boolean, endpoint: string|null, reason: string}}
  */
-export function acceleratorPlan({ profile, settings, gpu, port = DEFAULT_RPC_PORT } = {}) {
+export function acceleratorPlan({
+  profile, settings, gpu, port = DEFAULT_RPC_PORT,
+  reservations = null, priority = ACCELERATOR_PRIORITY,
+} = {}) {
   if (!profile?.hasNvidia) {
     return { startRpc: false, endpoint: null, reason: 'no NVIDIA GPU on this machine' };
   }
   if (!settings?.useAccelerator) {
     return { startRpc: false, endpoint: null, reason: 'GPU acceleration disabled by the operator' };
+  }
+  const claim = outrankingReservation(reservations, priority);
+  if (claim) {
+    return {
+      startRpc: false,
+      endpoint: null,
+      reason: `card reserved by ${claim.holder || 'another holder'} at priority ${claim.priority}`,
+    };
   }
   const endpoint = `127.0.0.1:${port}`;
   if (settings.acceleratorPriority === 'llama-first') {

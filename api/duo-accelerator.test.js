@@ -82,3 +82,71 @@ test('an AMD-only box emits no --rpc flag at all — the Frostburn acceptance ch
   const p = acceleratorPlan({ profile: AMD_ONLY, settings: ON });
   assert.deepEqual(rpcRouterArgs(p), []);
 });
+
+// ---- GPU reservations -------------------------------------------------------------
+// Duo's use of the card is ordinary llama-manager work, so it sits at the reservation
+// scale's baseline of 0. A reservation ABOVE that outranks it and the rpc-server must not
+// run; one at or below it does not, and duo keeps the card.
+
+test('a card held above the accelerator\'s own priority yields no rpc-server', () => {
+  const p = acceleratorPlan({
+    profile: NVIDIA, settings: ON, gpu: { totalBytes: 24 * GB, usedBytes: 1.45 * GB },
+    reservations: [{ state: 'held', priority: 80, holder: 'pods' }],
+  });
+  assert.equal(p.startRpc, false);
+  assert.equal(p.endpoint, null);
+  assert.match(p.reason, /pods/);
+  assert.deepEqual(rpcRouterArgs(p), []);
+});
+
+test('a card held BELOW the accelerator\'s priority still runs the rpc-server', () => {
+  const p = acceleratorPlan({
+    profile: NVIDIA, settings: ON, gpu: { totalBytes: 24 * GB, usedBytes: 1.45 * GB },
+    reservations: [{ state: 'held', priority: -5, holder: 'warm-keeper' }],
+  });
+  assert.equal(p.startRpc, true);
+});
+
+test('a reservation at exactly the accelerator\'s priority does not displace it', () => {
+  // Mirrors the state machine: only a STRICTLY higher claim takes a card.
+  const p = acceleratorPlan({
+    profile: NVIDIA, settings: ON, gpu: { totalBytes: 24 * GB, usedBytes: 1.45 * GB },
+    reservations: [{ state: 'held', priority: 0, holder: 'llama-manager' }],
+  });
+  assert.equal(p.startRpc, true);
+});
+
+test('a claim still pending outranks the accelerator too — it is already draining', () => {
+  const p = acceleratorPlan({
+    profile: NVIDIA, settings: ON, gpu: { totalBytes: 24 * GB, usedBytes: 1.45 * GB },
+    reservations: [{ state: 'pending', priority: 80, holder: 'pods' }],
+  });
+  assert.equal(p.startRpc, false);
+});
+
+test('a finished reservation never blocks the accelerator', () => {
+  for (const state of ['released', 'expired', 'preempted']) {
+    const p = acceleratorPlan({
+      profile: NVIDIA, settings: ON, gpu: { totalBytes: 24 * GB, usedBytes: 1.45 * GB },
+      reservations: [{ state, priority: 80, holder: 'pods' }],
+    });
+    assert.equal(p.startRpc, true, `${state} must not hold the card`);
+  }
+});
+
+test('a high-priority reservation beats llama-first, which only overrides the VRAM heuristic', () => {
+  const p = acceleratorPlan({
+    profile: NVIDIA,
+    settings: { useAccelerator: true, acceleratorPriority: 'llama-first' },
+    reservations: [{ state: 'held', priority: 80, holder: 'pods' }],
+  });
+  assert.equal(p.startRpc, false);
+});
+
+test('no reservations at all leaves every existing decision byte-identical', () => {
+  const without = acceleratorPlan({ profile: NVIDIA, settings: ON, gpu: { totalBytes: 24 * GB, usedBytes: 1.45 * GB } });
+  const withEmpty = acceleratorPlan({
+    profile: NVIDIA, settings: ON, gpu: { totalBytes: 24 * GB, usedBytes: 1.45 * GB }, reservations: [],
+  });
+  assert.deepEqual(withEmpty, without);
+});
