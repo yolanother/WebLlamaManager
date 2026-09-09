@@ -52,6 +52,11 @@ cat > "$DROPIN_DIR/10-dev-paths.conf" <<EOF
 [Service]
 ExecStart=
 ExecStart=$NODE_BIN $COLLECTOR
+# The packaged unit sets ProtectHome=yes, which is right when the collector
+# lives in /usr/lib but makes a source checkout under /home invisible to the
+# service -- it fails with MODULE_NOT_FOUND on a file that plainly exists.
+# Undo it here only, so the appliance keeps the hardening.
+ProtectHome=no
 EOF
 chmod 0644 "$DROPIN_DIR/10-dev-paths.conf"
 
@@ -60,7 +65,8 @@ systemctl enable --now llama-manager-health-snapshot.timer
 
 # Run once immediately so the dashboard has a fresh snapshot rather than waiting
 # out the timer's first interval.
-systemctl start llama-manager-health-snapshot.service || true
+RUN_OK=1
+systemctl start llama-manager-health-snapshot.service || RUN_OK=0
 
 echo
 echo "--- timer ---"
@@ -87,4 +93,13 @@ else
   echo "WARNING: $SNAP not readable — check the journal above." >&2
 fi
 echo
-echo "Done. The dashboard should stop reporting a stale snapshot within a minute."
+if [ "$RUN_OK" = 1 ]; then
+  echo "Done. The dashboard should stop reporting a stale snapshot within a minute."
+else
+  # An older snapshot from a previous manual run may still be sitting on disk,
+  # so the summary above can look perfectly healthy while nothing is collecting.
+  # Say so plainly rather than letting that stale file read as success.
+  echo "FAILED: the collector did not run — any snapshot shown above is STALE." >&2
+  echo "Inspect: journalctl -u llama-manager-health-snapshot.service -n 30 --no-pager" >&2
+  exit 1
+fi
