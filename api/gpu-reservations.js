@@ -15,6 +15,15 @@
 // Pure and clock-injected: no timers, no I/O, no Date.now(), so TTL behaviour is
 // deterministic and unit-testable. Pools are resolved elsewhere (api/gpu-pools.js) and
 // handed in; HTTP/CLI/MCP surfaces live in their own layers.
+//
+// Two house conventions it deliberately follows. Priority and cooperative preemption
+// mirror api/request-queue.js. TTL bookkeeping mirrors PreparedContextStore in
+// api/context-cache.js: `expiresAt = now + ttlMs`, records carry createdAt/updatedAt, and
+// leases expire lazily on access as well as through the explicit sweep(). It diverges from
+// that store in one way worth knowing: `holder` is a descriptive label, not an
+// authorization scope like context-cache's `scopeId`, so renew/release do NOT fail closed
+// on ownership. Enforcing who may touch a reservation is the transport layer's job (the
+// epic puts that on the loopback rule), not this state machine's.
 
 import { agentHoldsCard } from './duo-accelerator.js';
 
@@ -29,6 +38,13 @@ const ACTIVE_STATES = Object.freeze(['pending', 'held']);
 
 /**
  * Validate and normalize a caller-supplied reservation priority.
+ *
+ * This is the SIGNED INTEGER GPU-reservation scale, and it is deliberately a separate
+ * vocabulary from the two string scales already in the codebase: REQUEST_PRIORITIES
+ * ('realtime'|'interactive'|'background', api/request-queue.js) and
+ * CONTEXT_PREPARE_PRIORITIES ('interactive'|'background', api/context-prepare-policy.js).
+ * They are not interchangeable and must not be unified: a GPU claim needs an open-ended
+ * ordering around llama-manager's own baseline of 0, which a fixed class list cannot express.
  *
  * Numeric strings are accepted because priorities arrive over HTTP and the CLI as text;
  * rejecting them here would only force an identical parse into every caller.
@@ -79,7 +95,7 @@ export class GpuReservations {
    *   per victim when its card is taken away. Owner callbacks are isolated: a throw from
    *   one cannot corrupt the state machine.
    */
-  constructor({ pools = [], now = Date.now, onPreempt = null } = {}) {
+  constructor({ pools = [], now = () => Date.now(), onPreempt = null } = {}) {
     this._now = now;
     this._onPreempt = onPreempt;
     this._reservations = new Map();
@@ -121,8 +137,10 @@ export class GpuReservations {
    *
    * @param {object} options
    * @param {string} options.gpu Pool id to lease.
-   * @param {string} options.holder Who is holding it, e.g. 'pods' or LLAMA_MANAGER_HOLDER.
-   * @param {number|string} [options.priority] Integer priority; 0 is llama-manager's baseline.
+   * @param {string} options.holder Descriptive label for who holds it, e.g. 'pods' or
+   *   LLAMA_MANAGER_HOLDER. Not an authorization scope — see the file header.
+   * @param {number|string} [options.priority] Signed integer on the GPU-reservation scale;
+   *   0 is llama-manager's baseline. See {@link normalizeReservationPriority}.
    * @param {number|null} [options.ttlMs] Lease length; null means no expiry (internal pins).
    * @param {string} [options.reason] Free-text note surfaced in readouts.
    * @param {boolean} [options.noWait] Refuse instead of waiting when the pool is full.
@@ -139,6 +157,11 @@ export class GpuReservations {
       throw new TypeError('reservation ttlMs must be a positive integer or null');
     }
     const normalized = normalizeReservationPriority(priority);
+
+    // Lazy expiry-on-access, as PreparedContextStore does on create/get/list: a lease
+    // whose TTL ran out must never make a live claim wait just because nobody has called
+    // sweep() yet.
+    this.sweep();
 
     const pool = this._pools.get(gpu);
     if (!pool) throw refusal('UNKNOWN_GPU', `unknown GPU id "${gpu}"`, 404);
@@ -166,6 +189,7 @@ export class GpuReservations {
       state: 'pending',
       reason: reason || '',
       createdAt: now,
+      updatedAt: now,
       grantedAt: null,
     };
     this._reservations.set(record.id, record);
@@ -192,6 +216,7 @@ export class GpuReservations {
     const record = this._reservations.get(id);
     if (!record || record.state !== 'pending' || !record.card) return false;
     record.state = 'held';
+    record.updatedAt = this._now();
     return true;
   }
 
@@ -207,7 +232,9 @@ export class GpuReservations {
     if (!ACTIVE_STATES.includes(record.state)) {
       throw refusal('RESERVATION_INACTIVE', `reservation "${id}" is not active (${record.state})`, 409);
     }
-    if (record.ttlMs != null) record.expiresAt = this._now() + record.ttlMs;
+    const now = this._now();
+    record.updatedAt = now;
+    if (record.ttlMs != null) record.expiresAt = now + record.ttlMs;
     return this._public(record);
   }
 
@@ -220,6 +247,7 @@ export class GpuReservations {
     const record = this._reservations.get(id);
     if (!record || !ACTIVE_STATES.includes(record.state)) return false;
     record.state = 'released';
+    record.updatedAt = this._now();
     this._drain(record.gpu);
     return true;
   }
@@ -227,8 +255,10 @@ export class GpuReservations {
   /**
    * Expire every reservation past its TTL and free the cards they held.
    *
-   * This is what guarantees a crashed holder can never strand a card. Reservations with no
-   * TTL — llama-manager's own model pins — are exempt by design.
+   * This is the prune step of PreparedContextStore's lease registry, made explicit because
+   * this module owns no timer: reserve() runs it on access, and the server runs it on
+   * whatever cadence it likes. It is what guarantees a crashed holder can never strand a
+   * card. Reservations with no TTL — llama-manager's own model pins — are exempt by design.
    *
    * @returns {object[]} The reservations expired by this call.
    */
@@ -238,6 +268,7 @@ export class GpuReservations {
     for (const record of this._active()) {
       if (record.expiresAt == null || now < record.expiresAt) continue;
       record.state = 'expired';
+      record.updatedAt = now;
       expired.push(this._public(record));
     }
     for (const record of expired) this._drain(record.gpu);
@@ -364,6 +395,7 @@ export class GpuReservations {
     record.card = card.card;
     record.pci = card.pci;
     record.grantedAt = now;
+    record.updatedAt = now;
     // The lease starts when the card is granted, not when the claim was filed, so a claim
     // that waited most of its TTL does not expire the instant it finally gets a card.
     if (record.ttlMs != null) record.expiresAt = now + record.ttlMs;
@@ -372,6 +404,7 @@ export class GpuReservations {
   /** Take a card away from its occupant and tell the owner exactly once. */
   _preempt(record, reason) {
     record.state = 'preempted';
+    record.updatedAt = this._now();
     try {
       this._onPreempt?.(this._public(record), reason);
     } catch { /* owner callbacks are isolated, as in PriorityRequestQueue */ }
@@ -409,6 +442,7 @@ export class GpuReservations {
       state: record.state,
       reason: record.reason,
       createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
       grantedAt: record.grantedAt,
     };
   }

@@ -188,6 +188,34 @@ test('a reservation with no TTL is exempt from the sweep', () => {
   assert.equal(reservations.get(pin.id).state, 'held');
 });
 
+test('a claim sweeps expired leases first rather than queueing behind a dead one', () => {
+  // Matches PreparedContextStore's lazy expiry-on-access: a lease past its TTL must
+  // never make a live claim wait, even when nobody has called sweep() yet.
+  const { reservations, clock } = machine([pool('rtx3090', 1)]);
+  const dead = hold(reservations, { gpu: 'rtx3090', holder: 'crashed', priority: 90, ttlMs: 5000 });
+  clock.t = 6001;
+
+  const claim = reservations.reserve({ gpu: 'rtx3090', holder: 'pods', priority: 1 });
+  assert.equal(claim.card, 'card0');
+  assert.equal(reservations.get(dead.id).state, 'expired');
+});
+
+test('every state change stamps updatedAt from the injected clock', () => {
+  const { reservations, clock } = machine([pool('rtx3090', 1)]);
+  const granted = reservations.reserve({ gpu: 'rtx3090', holder: 'pods', priority: 1, ttlMs: 5000 });
+  assert.equal(granted.updatedAt, 1000);
+
+  clock.t = 2000;
+  reservations.markHeld(granted.id);
+  assert.equal(reservations.get(granted.id).updatedAt, 2000);
+  clock.t = 3000;
+  reservations.renew(granted.id);
+  assert.equal(reservations.get(granted.id).updatedAt, 3000);
+  clock.t = 4000;
+  reservations.release(granted.id);
+  assert.equal(reservations.get(granted.id).updatedAt, 4000);
+});
+
 test('renew pushes the lease out and prevents expiry', () => {
   const { reservations, clock } = machine([pool('rtx3090', 1)]);
   const lease = hold(reservations, { gpu: 'rtx3090', holder: 'pods', priority: 5, ttlMs: 5000 });
