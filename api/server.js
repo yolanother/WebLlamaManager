@@ -7207,6 +7207,9 @@ function runKillCommand({ label, command, useContainer, timeoutMs = 4000 }) {
  * exit already opts out explicitly with `false`; no caller here needs `true`
  * today — every existing call site owns the engine it starts).
  *
+ * Also stops duo's rpc-server, because a stopped engine is the only safe moment to do it
+ * and a card held behind a stopped engine is not a shared card.
+ *
  * @param {{explicitReclaim?:boolean}} [params] Shutdown options.
  * @param {boolean} [params.explicitReclaim=false] Authorize host-wide cleanup
  *   even when this instance does not own the running engine.
@@ -7233,6 +7236,14 @@ async function stopLlamaServer({ explicitReclaim = false } = {}) {
     }
   }
   llamaProcess = null;
+
+  // The engine has detached, so the rpc-server is both useless and safe to stop — and
+  // this is the ONLY moment it is safe, because a live client aborts if its server
+  // disappears. Leaving it up would hold VRAM on a shared card behind a stopped engine,
+  // which is exactly what the accelerator's separate-process design exists to avoid; an
+  // idle box would keep the card from the pods agent indefinitely. A restart pays ~250ms
+  // to bring it back, measured on drakemore.
+  await stopRpcServer('the engine it serves has stopped');
 
   // Primary kill — robust host-PID reap. distrobox shares the host PID namespace, so
   // a host `kill -9` reaches the container's (dynamic-port) llama-server workers, and
