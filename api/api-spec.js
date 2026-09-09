@@ -261,12 +261,14 @@ function examplePath(path) {
   const values = {
     author: 'bartowski',
     downloadId: 'download-123',
+    gpu: 'rtx3090',
     id: 'default',
     model: 'gemma-4',
     modelName: 'gemma-4',
     n: '0',
     pid: '1234',
     presetId: 'default',
+    reservationId: 'gpures_example',
     response_id: 'resp_example',
   };
   return path.replace(/\{([^}]+)\}/g, (_match, name) => values[name] ?? 'example');
@@ -932,6 +934,237 @@ const REQUEST_SERIES_OPTIONS = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// GPU pools and reservations.
+//
+// A named GPU is a POOL of interchangeable cards matched by CLASS, so `capacity`
+// may exceed one and a grant binds to one specific card. `reserve` is
+// non-blocking and returns a PENDING lease — the card is not yours yet — while
+// `lock` is reserve+wait and returns only once the lease is HELD.
+// ---------------------------------------------------------------------------
+
+/** Default reservation lease length applied when a caller omits ttlSeconds. */
+const DEFAULT_GPU_TTL_SECONDS = 300;
+
+/** Default bound on how long wait/lock block before reporting a timeout. */
+const DEFAULT_GPU_WAIT_MS = 30000;
+
+/** Shared prose for the signed priority scale, repeated on every claiming route. */
+const GPU_PRIORITY_DESCRIPTION = [
+  'Signed integer priority. 0 is llama-manager\'s own baseline.',
+  'NEGATIVE yields to ordinary llama-manager work — a soft hold that keeps the card associated with you but blocks nobody.',
+  'POSITIVE preempts llama-manager\'s own use.',
+  'Priority only matters once the pool is FULL: the claim then preempts the LOWEST-priority held reservation in that pool, and only when STRICTLY higher than it.',
+  'Equal priority never preempts, so two equal claimants cannot thrash.',
+].join(' ');
+
+/** Shared prose for lease expiry, repeated wherever a lease is created or extended. */
+const GPU_TTL_DESCRIPTION = [
+  `A lease EXPIRES unless it is renewed. ttlSeconds defaults to ${DEFAULT_GPU_TTL_SECONDS} seconds;`,
+  'call POST /api/gpus/reservations/{reservationId}/renew as a heartbeat well inside that window.',
+  'On expiry the card is returned automatically, so a crashed holder can never strand it.',
+  'A lease with no expiry at all is reserved for llama-manager\'s own internal model pins and is not offered over HTTP.',
+].join(' ');
+
+/** Shared prose for the loopback rule guarding every mutating GPU route. */
+const GPU_LOOPBACK_DESCRIPTION = [
+  'This route MUTATES reservation state and is therefore LOOPBACK-ONLY: it accepts callers from 127.0.0.1, ::1 and ::ffff:127.0.0.1 and answers 403 to everyone else.',
+  'Read-only GET /api/gpus and GET /api/gpus/{gpu} stay open, like GET /api/stats.',
+].join(' ');
+
+/** One physical card inside a pool, with the live load a client routes on. */
+const GPU_CARD_SCHEMA = {
+  type: 'object',
+  properties: {
+    card: { type: 'string', description: 'DRM node name such as "card1". Never use it as a key — it reorders between boots.' },
+    name: { type: 'string', description: 'Resolved product name, for example "AMD Radeon Graphics" or "NVIDIA GeForce RTX 3090".' },
+    pci: { type: ['string', 'null'], description: 'PCI address such as "0000:c5:00.0". Stable until the card is physically re-plugged.' },
+    pciId: { type: ['string', 'null'], description: 'vendor:device class id such as "10de:2204". This is what pool matching keys on.' },
+    driver: { type: ['string', 'null'], description: 'Bound kernel driver, for example "amdgpu" or "nvidia".' },
+    available: { type: 'boolean', description: 'False when no driver is bound. Such a card is listed but excluded from capacity.' },
+    vramBytes: { type: ['integer', 'null'], description: 'Total video memory in bytes, or null when the driver does not report it.' },
+    vramUsedBytes: { type: ['integer', 'null'], description: 'Video memory currently in use, in bytes. Read it with vramBytes to decide whether the card has room for your work.' },
+    gttBytes: { type: ['integer', 'null'], description: 'GTT/system-memory aperture in bytes on integrated parts, else null.' },
+    busyPercent: { type: ['number', 'null'], description: 'Instantaneous GPU utilisation, 0-100. High busyPercent with no reservation is the unfriendly-neighbour case reported as softClaimed.' },
+    temperatureC: { type: ['number', 'null'], description: 'Edge temperature in degrees Celsius, or null when unreported.' },
+    softClaimed: { type: 'boolean', description: 'True when the card is visibly busy but holds NO reservation. llama-manager will neither schedule onto it nor evict anything from it.' },
+  },
+};
+
+/** One reservation record, as returned by every claiming and lease route. */
+const GPU_RESERVATION_SCHEMA = {
+  type: 'object',
+  required: ['reservationId', 'gpu', 'state', 'priority', 'holder'],
+  properties: {
+    reservationId: { type: 'string', description: 'Lease handle. Pass it to wait, renew, and release.' },
+    gpu: { type: 'string', description: 'Pool id the lease was taken against.' },
+    card: { type: ['string', 'null'], description: 'DRM node of the specific card this grant bound to, once bound.' },
+    pci: { type: ['string', 'null'], description: 'PCI address of the bound card. Use it to set CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES yourself — never a positional index.' },
+    holder: { type: 'string', description: 'Who holds the lease. "llama-manager" marks an internal model pin.' },
+    priority: { type: 'integer', description: GPU_PRIORITY_DESCRIPTION },
+    state: {
+      type: 'string',
+      enum: ['pending', 'held', 'released', 'expired', 'preempted'],
+      description: 'pending = granted but the card is still draining and NOT yours. held = the card is genuinely yours. released, expired and preempted are terminal.',
+    },
+    ttlSeconds: { type: ['integer', 'null'], description: 'Lease length in seconds. Null only on llama-manager\'s internal pins.' },
+    expiresAt: { type: ['integer', 'null'], description: 'Unix epoch milliseconds at which the lease expires unless renewed.' },
+    reason: { type: 'string', description: 'Free-text reason recorded by the caller, echoed back for operators reading GET /api/gpus.' },
+    createdAt: { type: 'integer', description: 'Unix epoch milliseconds at which the lease was created.' },
+  },
+};
+
+/** One operator-named GPU pool, its live load, and who is on it. */
+const GPU_POOL_SCHEMA = {
+  type: 'object',
+  required: ['id', 'capacity', 'free', 'cards', 'held', 'pending', 'warnings'],
+  properties: {
+    id: { type: 'string', description: 'Stable pool handle used by the API, the llm CLI, MCP, and settings. The DRM index is never a key.' },
+    label: { type: 'string', description: 'Human-readable pool label from settings.' },
+    match: {
+      type: 'object',
+      description: 'Class selectors from settings, ANDed. Any may be omitted; pciId or name alone is the normal case and survives a re-plug into another slot.',
+      properties: {
+        pciId: { type: 'string', description: 'vendor:device id, for example "10de:2204".' },
+        name: { type: 'string', description: 'Case-insensitive substring of the card product name.' },
+        pci: { type: 'string', description: 'Exact PCI address, to pin one physical slot. Not required and not the default.' },
+      },
+    },
+    capacity: { type: 'integer', description: 'Number of matching, driver-bound cards present. Two identical cards under one id is capacity 2, not an error — concurrent claims up to capacity are all granted immediately with no contention. A pool matching zero present cards reports capacity 0 and every claim against it fails.' },
+    free: { type: 'boolean', description: 'True when at least one card in the pool is not currently held, so a claim would be granted without preempting anybody.' },
+    cards: { type: 'array', items: GPU_CARD_SCHEMA, description: 'Every matching card present, including driver-unbound ones excluded from capacity. Read vramBytes, vramUsedBytes and busyPercent here to decide whether to route work elsewhere instead of waiting for this pool.' },
+    held: { type: 'array', items: GPU_RESERVATION_SCHEMA, description: 'Leases currently held on this pool.' },
+    pending: { type: 'array', items: GPU_RESERVATION_SCHEMA, description: 'Leases granted but still draining, plus claims queued for capacity.' },
+    softClaimed: { type: 'boolean', description: 'True when a card in the pool is visibly busy under no reservation — an unfriendly neighbour that never learned to call us.' },
+    pinnedModels: { type: 'array', items: { type: 'string' }, description: 'Models pinned to this pool in settings. A pin IS a reservation, held by "llama-manager" at defaultPriority with no TTL.' },
+    defaultPriority: { type: 'integer', description: 'Priority llama-manager\'s own internal pin on this pool is held at. Defaults to 0.' },
+    warnings: { type: 'array', items: { type: 'string' }, description: 'Resolution problems stated plainly rather than silently: no card of this class present, an empty match selector that deliberately matches nothing, or two pools claiming the same card (first in config order wins).' },
+  },
+};
+
+/** Documentation overrides for the whole-inventory GPU readout. */
+const GPU_LIST_OPTIONS = {
+  description: [
+    'Lists every configured GPU pool with its live per-card load, its current holders, and whether a claim would be granted right now.',
+    'A named GPU is a POOL of interchangeable cards matched by CLASS (vendor:device id and product name) rather than by DRM index or PCI slot, so the id survives both a card0/card1 reorder and a physical re-plug.',
+    'capacity is how many matching driver-bound cards are present and free says whether one of them is unheld.',
+    'Each card carries vramBytes, vramUsedBytes and busyPercent so a client can see the load and decide to route its work elsewhere instead of queueing behind a busy card.',
+    'This route is READ-ONLY and open like GET /api/stats; the mutating GPU routes are loopback-only.',
+  ].join(' '),
+  responseSchema: {
+    type: 'object',
+    required: ['gpus'],
+    properties: {
+      gpus: { type: 'array', items: GPU_POOL_SCHEMA },
+    },
+  },
+};
+
+/** Documentation overrides for the single-pool GPU readout. */
+const GPU_GET_OPTIONS = {
+  description: [
+    'Returns one GPU pool by its settings id, with the same live load, holders, capacity, free flag and warnings as GET /api/gpus.',
+    'Answers 404 when no pool carries that id. A pool that exists but currently matches no present card is NOT a 404 — it is returned with capacity 0 and a warning naming the pool.',
+    'This route is READ-ONLY and open like GET /api/stats.',
+  ].join(' '),
+  responseSchema: GPU_POOL_SCHEMA,
+};
+
+/** Request schema shared by the reserve and lock claiming routes. */
+const GPU_CLAIM_REQUEST_SCHEMA = {
+  type: 'object',
+  properties: {
+    priority: { type: 'integer', default: 0, description: GPU_PRIORITY_DESCRIPTION },
+    ttlSeconds: { type: 'integer', minimum: 1, default: DEFAULT_GPU_TTL_SECONDS, description: GPU_TTL_DESCRIPTION },
+    holder: { type: 'string', description: 'Who is claiming the card, for example "pods-agent". Recorded on the lease and shown to operators on GET /api/gpus.' },
+    reason: { type: 'string', description: 'Free-text reason recorded on the lease, for example "tts batch".' },
+    noWait: { type: 'boolean', default: false, description: 'When true, a claim that cannot be granted now is refused cleanly with 409 instead of parking as pending. Ignored by lock, which waits by definition.' },
+  },
+};
+
+/** Documentation overrides for the non-blocking reserve route. */
+const GPU_RESERVE_OPTIONS = {
+  description: [
+    'Claims a lease on a GPU pool WITHOUT waiting, and returns 202 with state:"pending".',
+    'A 202 DOES NOT MEAN THE CARD IS FREE. This is the single easiest thing to get wrong.',
+    'The lease is only granted; llama-manager then drains the bound card — in-flight work finishes or moves to a peer backend, new requests for models on that card route to a peer or PARK IN THE QUEUE (never 404 or 503), and the llama-server child bound to the card stops.',
+    'Only then does the lease become "held". Follow a reserve with POST /api/gpus/reservations/{reservationId}/wait, or use POST /api/gpus/{gpu}/lock, which is reserve + wait in one call and is what most callers actually want.',
+    GPU_PRIORITY_DESCRIPTION,
+    GPU_TTL_DESCRIPTION,
+    'Status codes: 202 lease created and pending, 403 non-loopback caller, 404 unknown pool id, 409 refused because noWait was set and the pool was full, 503 the pool matches no present card of that class.',
+    GPU_LOOPBACK_DESCRIPTION,
+  ].join(' '),
+  body: { holder: 'pods-agent', priority: 80, ttlSeconds: 300, reason: 'asset generation batch' },
+  requestSchema: GPU_CLAIM_REQUEST_SCHEMA,
+  responseSchema: GPU_RESERVATION_SCHEMA,
+};
+
+/** Documentation overrides for the blocking reserve+wait route. */
+const GPU_LOCK_OPTIONS = {
+  description: [
+    'Reserve + wait in one call: takes a lease on the pool and returns only once the card is GENUINELY YOURS, with state:"held".',
+    'This is what most callers want. Prefer it over reserve unless you specifically need to do other work while llama-manager drains the card.',
+    'The bound card is named in the response (gpu, card, pci) so a client that sets CUDA_VISIBLE_DEVICES or HIP_VISIBLE_DEVICES itself can bind by PCI address — never by a positional index.',
+    GPU_PRIORITY_DESCRIPTION,
+    GPU_TTL_DESCRIPTION,
+    `Status codes: 200 held, 408 timeoutMs elapsed while the lease was still pending (the lease SURVIVES a timeout — wait on it again, or release it), 409 preempted by a strictly higher-priority claim before it was ever held, 403 non-loopback caller, 404 unknown pool id, 503 the pool matches no present card of that class. timeoutMs defaults to ${DEFAULT_GPU_WAIT_MS} ms.`,
+    GPU_LOOPBACK_DESCRIPTION,
+  ].join(' '),
+  body: { holder: 'pods-agent', priority: 80, ttlSeconds: 300, timeoutMs: 30000, reason: 'tts render' },
+  requestSchema: {
+    type: 'object',
+    properties: {
+      ...GPU_CLAIM_REQUEST_SCHEMA.properties,
+      timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_GPU_WAIT_MS, description: 'How long to block before answering 408. A timeout does NOT cancel the lease.' },
+    },
+  },
+  responseSchema: GPU_RESERVATION_SCHEMA,
+};
+
+/** Documentation overrides for the pending-to-held wait route. */
+const GPU_WAIT_OPTIONS = {
+  description: [
+    'Blocks until a pending lease becomes held, is preempted, or the timeout elapses. This is the second half of reserve; lock does both at once.',
+    'Status codes: 200 the lease is now "held" and the card is yours, 408 the timeout elapsed and the lease is STILL PENDING (it was not cancelled — wait again or release it), 409 the lease was preempted by a strictly higher-priority claim, 403 non-loopback caller, 404 unknown reservation id.',
+    'Waiting on an already-held lease returns 200 immediately. Waiting on a released or expired lease returns 409 carrying its terminal state.',
+    `timeoutMs defaults to ${DEFAULT_GPU_WAIT_MS} ms.`,
+    GPU_TTL_DESCRIPTION,
+    GPU_LOOPBACK_DESCRIPTION,
+  ].join(' '),
+  body: { timeoutMs: 30000 },
+  requestSchema: {
+    type: 'object',
+    properties: {
+      timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_GPU_WAIT_MS, description: 'How long to block before answering 408. A timeout does NOT cancel the lease.' },
+    },
+  },
+  responseSchema: GPU_RESERVATION_SCHEMA,
+};
+
+/** Documentation overrides for the lease heartbeat route. */
+const GPU_RENEW_OPTIONS = {
+  description: [
+    'Heartbeat: pushes the lease expiry out by another ttlSeconds from now, and returns the new expiresAt.',
+    GPU_TTL_DESCRIPTION,
+    'Status codes: 200 renewed, 403 non-loopback caller, 404 unknown reservation id, 409 the lease already reached a terminal state (released, expired, or preempted) and cannot be renewed — take a fresh one.',
+    GPU_LOOPBACK_DESCRIPTION,
+  ].join(' '),
+  body: {},
+  responseSchema: GPU_RESERVATION_SCHEMA,
+};
+
+/** Documentation overrides for the lease release route. */
+const GPU_RELEASE_OPTIONS = {
+  description: [
+    'Releases a lease and returns the card to the pool. Release as soon as you are done — do not rely on TTL expiry, which exists only so a crashed holder cannot strand a card.',
+    'On release llama-manager retakes the card: any internal pin on that pool re-acquires it, the pinned model reloads, and requests parked in the queue during the drain resume.',
+    'Idempotent: releasing an already-terminal lease returns 200 carrying its existing terminal state.',
+    'Status codes: 200 released, 403 non-loopback caller, 404 unknown reservation id.',
+    GPU_LOOPBACK_DESCRIPTION,
+  ].join(' '),
+  responseSchema: GPU_RESERVATION_SCHEMA,
+};
+
 const ROUTES = [
   // Media ingestion and artifacts.
   ['POST', '/api/media/upload', 'media', 'Upload image, audio, or video media'],
@@ -962,6 +1195,16 @@ const ROUTES = [
   ['GET', '/api/aliases', 'backends', 'List model alias groups', ALIAS_LIST_OPTIONS],
   ['PUT', '/api/aliases/{name}', 'backends', 'Create or replace a model alias group', ALIAS_PUT_OPTIONS],
   ['DELETE', '/api/aliases/{name}', 'backends', 'Delete a model alias group'],
+
+  // GPU pools and reservations. A named GPU is a POOL of class-matched cards;
+  // reserve is non-blocking and returns a PENDING lease, lock is reserve+wait.
+  ['GET', '/api/gpus', 'gpu', 'List GPU pools with live load and holders', GPU_LIST_OPTIONS],
+  ['GET', '/api/gpus/{gpu}', 'gpu', 'Get one GPU pool with live load and holders', GPU_GET_OPTIONS],
+  ['POST', '/api/gpus/{gpu}/reserve', 'gpu', 'Reserve a GPU without waiting', GPU_RESERVE_OPTIONS],
+  ['POST', '/api/gpus/{gpu}/lock', 'gpu', 'Lock a GPU: reserve and wait until it is held', GPU_LOCK_OPTIONS],
+  ['POST', '/api/gpus/reservations/{reservationId}/wait', 'gpu', 'Wait for a GPU reservation to be held', GPU_WAIT_OPTIONS],
+  ['POST', '/api/gpus/reservations/{reservationId}/renew', 'gpu', 'Renew a GPU reservation lease', GPU_RENEW_OPTIONS],
+  ['DELETE', '/api/gpus/reservations/{reservationId}', 'gpu', 'Release a GPU reservation', GPU_RELEASE_OPTIONS],
 
   // Health, status, and request queue.
   ['GET', '/api/status', 'system', 'Get detailed manager status'],

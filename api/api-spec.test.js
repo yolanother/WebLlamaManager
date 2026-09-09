@@ -37,6 +37,13 @@ const CURRENT_ENDPOINT_KEYS = [
   'GET /api/backends/routing',
   'POST /api/backends/routing',
   'GET /api/status',
+  'GET /api/gpus',
+  'GET /api/gpus/{gpu}',
+  'POST /api/gpus/{gpu}/reserve',
+  'POST /api/gpus/{gpu}/lock',
+  'POST /api/gpus/reservations/{reservationId}/wait',
+  'POST /api/gpus/reservations/{reservationId}/renew',
+  'DELETE /api/gpus/reservations/{reservationId}',
   'GET /health',
   'GET /api/health/gpu',
   'GET /api/v1/health',
@@ -356,6 +363,99 @@ test('contracts 9 and 11: prepared-context docs distinguish exact reuse, append 
   assert.match(reference, /DS4/);
   assert.match(reference, /unsupported/i);
   assert.match(reference, /alias/i);
+});
+
+test('GPU routes document pools, live load, the priority scale, leases, and the loopback rule', () => {
+  const byKey = new Map(ENDPOINTS.map(entry => [`${entry.method} ${entry.path}`, entry]));
+  const list = byKey.get('GET /api/gpus');
+  const show = byKey.get('GET /api/gpus/{gpu}');
+  const reserve = byKey.get('POST /api/gpus/{gpu}/reserve');
+  const lock = byKey.get('POST /api/gpus/{gpu}/lock');
+  const wait = byKey.get('POST /api/gpus/reservations/{reservationId}/wait');
+  const renew = byKey.get('POST /api/gpus/reservations/{reservationId}/renew');
+  const release = byKey.get('DELETE /api/gpus/reservations/{reservationId}');
+  const claiming = [reserve, lock];
+  const mutating = [reserve, lock, wait, renew, release];
+
+  for (const entry of [list, show, ...mutating]) {
+    assert.ok(entry, 'every GPU route must be catalogued');
+    assert.deepEqual(entry.tags, ['gpu']);
+  }
+
+  // A client must be able to read the load and route elsewhere instead of waiting.
+  const pool = list.responseSchema.properties.gpus.items;
+  const card = pool.properties.cards.items.properties;
+  for (const field of ['vramBytes', 'vramUsedBytes', 'busyPercent']) {
+    assert.ok(card[field], `per-card ${field} is an explicit requirement`);
+  }
+  for (const field of ['capacity', 'free', 'warnings', 'held', 'pending']) {
+    assert.ok(pool.properties[field], `pool readout needs ${field}`);
+  }
+  assert.equal(pool.properties.capacity.type, 'integer');
+  assert.equal(pool.properties.free.type, 'boolean');
+  assert.deepEqual(show.responseSchema, pool, 'one pool reads exactly like a pool in the list');
+
+  // pending vs held is the thing integrators get wrong.
+  assert.deepEqual(
+    reserve.responseSchema.properties.state.enum,
+    ['pending', 'held', 'released', 'expired', 'preempted'],
+  );
+  assert.match(reserve.description, /202 DOES NOT MEAN THE CARD IS FREE/);
+  assert.match(reserve.description, /pending/);
+  assert.match(reserve.description, /lock/);
+  assert.match(lock.description, /reserve \+ wait/i);
+  assert.match(lock.description, /state:"held"/);
+
+  // The signed priority scale, on both claiming routes.
+  for (const entry of claiming) {
+    const priority = entry.requestSchema.properties.priority;
+    assert.equal(priority.type, 'integer');
+    assert.equal(priority.default, 0);
+    assert.match(priority.description, /NEGATIVE/);
+    assert.match(priority.description, /POSITIVE/);
+    assert.match(priority.description, /STRICTLY higher/);
+    assert.match(entry.description, /baseline/);
+  }
+
+  // A lease expires unless renewed, and the default must be stated.
+  for (const entry of [...claiming, wait, renew]) {
+    assert.match(entry.description, /EXPIRES unless it is renewed/);
+    assert.match(entry.description, /defaults to 300 seconds/);
+  }
+  for (const entry of claiming) {
+    assert.equal(entry.requestSchema.properties.ttlSeconds.default, 300);
+  }
+  assert.equal(renew.responseSchema.properties.expiresAt.type[0], 'integer');
+
+  // wait's three outcomes, and the loopback rule on every mutating route.
+  for (const code of ['200', '408', '409']) {
+    assert.ok(wait.description.includes(code), `wait must document ${code}`);
+  }
+  assert.match(wait.description, /still pending/i);
+  assert.match(wait.description, /preempted/);
+  for (const entry of mutating) {
+    assert.match(entry.description, /LOOPBACK-ONLY/);
+    assert.match(entry.description, /403/);
+  }
+  assert.equal(/LOOPBACK-ONLY/.test(list.description), false, 'the read-only inventory stays open');
+
+  // Examples must be runnable as written against a live dev server.
+  for (const entry of [list, show, ...mutating]) {
+    const example = entry.examples[0];
+    assert.match(example.curl, /^curl -s -X (GET|POST|DELETE) 'http:\/\/localhost:5250\/api\/gpus/);
+    const url = example.curl.split("'")[1];
+    assert.equal(/[{}]/.test(url), false, `${entry.path} example URL still holds a path placeholder`);
+  }
+  assert.match(reserve.examples[0].curl, /"holder":"pods-agent"/);
+  assert.match(lock.examples[0].curl, /"timeoutMs":30000/);
+  assert.match(release.examples[0].curl, /gpures_example/);
+
+  // The generated agent-facing reference must carry the same warnings.
+  const reference = renderLlmsFullReference();
+  assert.match(reference, /### GET \/api\/gpus\n/);
+  assert.match(reference, /### DELETE \/api\/gpus\/reservations\/\{reservationId\}\n/);
+  assert.match(reference, /202 DOES NOT MEAN THE CARD IS FREE/);
+  assert.match(reference, /busyPercent/);
 });
 
 test('contracts 7 and 11: agent reference documents cursor-exclusive resumable background streaming', () => {
