@@ -37,6 +37,31 @@ export const BASELINE_PRIORITY = 0;
 const ACTIVE_STATES = Object.freeze(['pending', 'held']);
 
 /**
+ * Project a reservation record into the shape the HTTP API publishes.
+ *
+ * The record carries its lease length as `ttlMs` because every internal deadline
+ * calculation is in milliseconds, but the documented HTTP surface is SECONDS end to end --
+ * `api/api-spec.js` declares `ttlSeconds`, and `api/api-spec.test.js` asserts that no
+ * `ttlMs` survives into the rendered reference. Emitting the raw record made the server
+ * contradict its own OpenAPI document, so every response path projects through here.
+ *
+ * Only the DURATION is converted. `expiresAt`, `createdAt`, `updatedAt` and `grantedAt`
+ * stay epoch-milliseconds, which is unambiguous and is what the spec already documents.
+ *
+ * @param {?object} record A reservation record, or a nullish value to pass through.
+ * @returns {?object} The record with `ttlMs` replaced by `ttlSeconds`, or the nullish
+ *   value unchanged. A null `ttlMs` -- llama-manager's own no-expiry model pin -- stays
+ *   null rather than becoming 0, because "never expires" and "expires immediately" are
+ *   opposite meanings. A sub-second lease rounds UP, so a lease that exists is never
+ *   reported as a lease of zero seconds.
+ */
+export function reservationView(record) {
+  if (record == null) return record;
+  const { ttlMs, ...rest } = record;
+  return { ...rest, ttlSeconds: ttlMs == null ? null : Math.max(1, Math.round(ttlMs / 1000)) };
+}
+
+/**
  * Validate and normalize a caller-supplied reservation priority.
  *
  * This is the SIGNED INTEGER GPU-reservation scale, and it is deliberately a separate

@@ -228,7 +228,7 @@ import {
   historyCardKeys,
 } from './gpu-inventory.js';
 import { normalizePoolConfig, resolvePools } from './gpu-pools.js';
-import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority } from './gpu-reservations.js';
+import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority, reservationView } from './gpu-reservations.js';
 import { drainPlan } from './gpu-drain.js';
 import { acceleratorPlan, rpcRouterArgs } from './duo-accelerator.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
@@ -5058,6 +5058,10 @@ function gpuPoolView(described, liveCards) {
   const bound = new Set([...described.held, ...described.pending].map((r) => r.card).filter(Boolean));
   return {
     ...described,
+    // describe() hands back raw records carrying the internal `ttlMs`; the published
+    // contract is seconds, so both lists are projected on the way out.
+    held: described.held.map(reservationView),
+    pending: described.pending.map(reservationView),
     pinnedModels: pool?.pinnedModels ?? [],
     defaultPriority: pool?.defaultPriority ?? 0,
     cards: (pool?.cards ?? []).map((card) => {
@@ -5109,7 +5113,7 @@ app.get('/api/gpus', (req, res) => {
   const { cards, telemetry } = gpuCardTelemetry();
   res.json({
     gpus: gpuReservations.describe({ telemetry }).map((pool) => gpuPoolView(pool, cards)),
-    reservations: gpuReservations.list({ gpu: req.query.gpu, state: req.query.state }),
+    reservations: gpuReservations.list({ gpu: req.query.gpu, state: req.query.state }).map(reservationView),
   });
 });
 
@@ -5119,7 +5123,7 @@ app.post('/api/gpus/reservations/:reservationId/renew', (req, res) => {
   if (!requireLoopback(req, res)) return;
   try {
     const reservation = gpuReservations.renew(req.params.reservationId);
-    res.json({ reservation, expiresAt: reservation.expiresAt });
+    res.json({ reservation: reservationView(reservation), expiresAt: reservation.expiresAt });
   } catch (err) {
     sendGpuError(res, err);
   }
@@ -5145,13 +5149,13 @@ app.post('/api/gpus/reservations/:reservationId/wait', async (req, res) => {
     return res.status(408).json({
       error: `reservation "${reservation.id}" is still pending after ${Math.round(timeoutMs / 1000)}s; it remains queued and may be waited on again`,
       code: 'WAIT_TIMEOUT',
-      reservation,
+      reservation: reservationView(reservation),
     });
   }
   if (status === 409) {
-    return res.status(409).json({ error: `reservation "${reservation.id}" is ${reservation.state}`, code: 'RESERVATION_INACTIVE', reservation });
+    return res.status(409).json({ error: `reservation "${reservation.id}" is ${reservation.state}`, code: 'RESERVATION_INACTIVE', reservation: reservationView(reservation) });
   }
-  res.json({ reservation, state: reservation.state });
+  res.json({ reservation: reservationView(reservation), state: reservation.state });
 });
 
 // Give a card back. Parked requests are let go and an engine stopped for this holder
@@ -5163,10 +5167,10 @@ app.delete('/api/gpus/reservations/:reservationId', (req, res) => {
     return res.status(404).json({ error: `unknown reservation "${req.params.reservationId}"`, code: 'UNKNOWN_RESERVATION' });
   }
   if (!gpuReservations.release(req.params.reservationId)) {
-    return res.status(409).json({ error: `reservation "${reservation.id}" is ${reservation.state}`, code: 'RESERVATION_INACTIVE', reservation });
+    return res.status(409).json({ error: `reservation "${reservation.id}" is ${reservation.state}`, code: 'RESERVATION_INACTIVE', reservation: reservationView(reservation) });
   }
   endGpuReservation(reservation);
-  res.json({ state: 'released', reservation: gpuReservations.get(req.params.reservationId) });
+  res.json({ state: 'released', reservation: reservationView(gpuReservations.get(req.params.reservationId)) });
 });
 
 // One named pool. `?state=` projects that pool's reservation list.
@@ -5177,7 +5181,7 @@ app.get('/api/gpus/:gpu', (req, res) => {
   if (!described) return res.status(404).json({ error: `unknown GPU id "${req.params.gpu}"`, code: 'UNKNOWN_GPU' });
   res.json({
     gpu: gpuPoolView(described, cards),
-    reservations: gpuReservations.list({ gpu: req.params.gpu, state: req.query.state }),
+    reservations: gpuReservations.list({ gpu: req.params.gpu, state: req.query.state }).map(reservationView),
   });
 });
 
@@ -5203,7 +5207,7 @@ app.post('/api/gpus/:gpu/reserve', (req, res) => {
       card: reservation.card,
       pci: reservation.pci,
       expiresAt: reservation.expiresAt,
-      reservation,
+      reservation: reservationView(reservation),
     });
   } catch (err) {
     sendGpuError(res, err);
@@ -5237,7 +5241,7 @@ app.post('/api/gpus/:gpu/lock', async (req, res) => {
       gpu: result.reservation.gpu,
       card: result.reservation.card,
       pci: result.reservation.pci,
-      reservation: result.reservation,
+      reservation: reservationView(result.reservation),
     });
   }
   if (result.status === 408) {
@@ -5245,13 +5249,13 @@ app.post('/api/gpus/:gpu/lock', async (req, res) => {
       error: `GPU "${req.params.gpu}" did not become available within ${Math.round(timeoutMs / 1000)}s; reservation ${reservation.id} remains queued`,
       code: 'WAIT_TIMEOUT',
       reservationId: reservation.id,
-      reservation: result.reservation,
+      reservation: reservationView(result.reservation),
     });
   }
   res.status(409).json({
     error: `reservation "${reservation.id}" is ${result.reservation?.state}`,
     code: 'RESERVATION_INACTIVE',
-    reservation: result.reservation,
+    reservation: reservationView(result.reservation),
   });
 });
 

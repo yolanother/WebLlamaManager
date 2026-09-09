@@ -17,6 +17,7 @@ import {
   LLAMA_MANAGER_HOLDER,
   BASELINE_PRIORITY,
   normalizeReservationPriority,
+  reservationView,
 } from './gpu-reservations.js';
 
 /** Build a resolved-pool fixture in the shape api/gpu-pools.js emits. */
@@ -392,4 +393,59 @@ test('an owner callback that throws cannot break the state machine', () => {
   const claim = reservations.reserve({ gpu: 'rtx3090', holder: 'b', priority: 5 });
   assert.equal(reservations.get(victim.id).state, 'preempted');
   assert.equal(claim.card, 'card0');
+});
+
+// --- reservationView: the wire projection -----------------------------------
+//
+// The record's internal lease length is milliseconds, but the whole documented HTTP
+// surface is seconds (api-spec.js declares `ttlSeconds` and api-spec.test.js asserts no
+// `ttlMs` survives into the rendered reference). These tests pin the conversion so a
+// response can never again disagree with the document that describes it.
+
+test('reservationView reports the lease in seconds, never milliseconds', () => {
+  const { reservations } = machine([pool('rtx3090', 1)]);
+  const held = hold(reservations, { gpu: 'rtx3090', holder: 'pods', priority: 80, ttlMs: 600000 });
+
+  const view = reservationView(reservations.get(held.id));
+
+  assert.equal(view.ttlSeconds, 600);
+  assert.equal('ttlMs' in view, false, 'the internal millisecond field must not reach the wire');
+});
+
+test('reservationView keeps a no-expiry internal pin as null rather than zero', () => {
+  const { reservations } = machine([pool('rtx3090', 1)]);
+  const pin = hold(reservations, { gpu: 'rtx3090', holder: 'llama-manager', priority: 0, ttlMs: null });
+
+  const view = reservationView(reservations.get(pin.id));
+
+  assert.equal(view.ttlSeconds, null);
+  assert.equal('ttlMs' in view, false);
+});
+
+test('reservationView preserves every other field untouched', () => {
+  const { reservations } = machine([pool('rtx3090', 1)]);
+  const held = hold(reservations, { gpu: 'rtx3090', holder: 'pods', priority: 80, ttlMs: 5000 });
+  const record = reservations.get(held.id);
+
+  const view = reservationView(record);
+
+  for (const key of Object.keys(record)) {
+    if (key === 'ttlMs') continue;
+    assert.deepEqual(view[key], record[key], `${key} must pass through unchanged`);
+  }
+  // Timestamps stay epoch-milliseconds; only the DURATION is converted.
+  assert.equal(view.expiresAt, record.expiresAt);
+});
+
+test('reservationView rounds a sub-second lease up rather than to zero', () => {
+  const { reservations } = machine([pool('rtx3090', 1)]);
+  const held = hold(reservations, { gpu: 'rtx3090', holder: 'pods', priority: 1, ttlMs: 400 });
+
+  // A lease that exists must never report as a lease of zero seconds.
+  assert.equal(reservationView(reservations.get(held.id)).ttlSeconds, 1);
+});
+
+test('reservationView passes null and undefined straight through', () => {
+  assert.equal(reservationView(null), null);
+  assert.equal(reservationView(undefined), undefined);
 });
