@@ -233,6 +233,10 @@ is self-contained.)
 - `install.sh` — defaults `DISTROBOX_CONTAINER=llama-rocm-7.2.4`; `LLAMA_SERVER_BIN` prefers `~/.local/bin/llama-server` when it exists, else `/usr/local/bin/llama-server`.
 - `scripts/build-llama-cpp.sh` — builds the pinned commit (the current engine).
 - `.llama-cpp-version` — the pinned commit (b10752 as of 2026-09-01).
+- [`llama-cpp-cuda-rpc-build-and-deployment.md`](llama-cpp-cuda-rpc-build-and-deployment.md)
+  — the NVIDIA half. This ROCm engine borrows a discrete NVIDIA card by attaching to a
+  separate CUDA-built `ggml-rpc-server` with `--rpc`, which requires it to be built with
+  `-DGGML_RPC=ON`. The b10752 engine was NOT, so it must be rebuilt for that path.
 - Skills: `build-llama-cpp` (custom build/update the engine), `deploy-llama-manager`
   (deploy/restart), `system-health-monitor` (don't compile while the box is redlining).
 - [`strix-halo-gpu-stability.md`](strix-halo-gpu-stability.md) — the two distinct

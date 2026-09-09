@@ -13,10 +13,12 @@
 # SAME pinned llama.cpp commit as scripts/build-llama-cpp.sh, so the wire protocol
 # versions agree by construction. A mismatched pair fails the RPC hello handshake.
 #
-# nvcc is required only to COMPILE. The produced binaries need nothing but
-# `libcuda.so.1` at run time, which the NVIDIA driver already installs — so the
-# appliance never needs a CUDA toolkit. The compile therefore happens inside a
-# `nvidia/cuda:*-devel-*` Docker image and no GPU is needed to build.
+# nvcc is required only to COMPILE, so the compile happens inside a
+# `nvidia/cuda:*-devel-*` Docker image and no GPU is needed to build. The appliance
+# never needs a CUDA compiler — but it DOES need the CUDA runtime libraries
+# (libcudart, libcublas, libcublasLt), which come from the toolkit rather than the
+# driver, so they are staged alongside the binary. `libcuda.so.1` alone is not
+# enough, however natural that assumption is.
 #
 #   scripts/build-llama-cpp-cuda.sh                 # build, stage into dist/
 #   LLAMA_CUDA_CLEAN=1 scripts/build-llama-cpp-cuda.sh   # wipe the build dir first

@@ -38,7 +38,7 @@ double the engine build.
    llama-server  (HIP / ROCm, gfx1151, in the ROCm distrobox)
         │  --rpc 127.0.0.1:50052        ← RPC *client* backend, compile-time
         ▼
-   ggml-rpc-server  (CUDA, on the host, needs only libcuda.so.1)
+   ggml-rpc-server  (CUDA, on the host: no nvcc, but needs the CUDA runtime libs)
         │
         ▼
    NVIDIA card
