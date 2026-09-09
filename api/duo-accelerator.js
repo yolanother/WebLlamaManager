@@ -27,7 +27,12 @@
 // agent to burst — not whether the card is untouched.
 //
 // Pure and side-effect-free: the caller reads GPU telemetry and spawns or kills the
-// rpc-server. Unit-tested in duo-accelerator.test.js.
+// rpc-server. That caller is gpuAcceleratorEnv() in api/server.js, and the decisions it
+// makes about the PROCESS — which binary, when to start or stop it, and whether the
+// endpoint may be handed to the engine at all — live in api/rpc-supervisor.js. Note in
+// particular that a `startRpc: true` plan is not on its own enough to emit `--rpc`: the
+// endpoint has to be proved live first, because llama.cpp aborts on a refused one rather
+// than degrading. Unit-tested in duo-accelerator.test.js.
 
 /** Port the duo rpc-server listens on. Matches llama.cpp's own rpc-server default. */
 export const DEFAULT_RPC_PORT = 50052;

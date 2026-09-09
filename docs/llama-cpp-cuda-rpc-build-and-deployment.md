@@ -15,14 +15,19 @@ AMD half; read that one first for how the engine directory and the router work.
 > *runtime* libraries — see [What the target actually needs](#what-the-target-actually-needs),
 > which is the one place the obvious assumption is wrong.
 
-**Status (2026-09-09):** proven and packaged. A CUDA `ggml-rpc-server` built by this
-procedure loaded Qwen3-8B-Q4_K_M onto drakemore's RTX 3090 and served a completion at
-132 tok/s — see [Verifying](#verifying) for the measurements. It now also ships as two
-Debian packages built by `scripts/package-cuda-rpc.sh`, installed and verified on
-drakemore: see [Packaging](#packaging-how-this-reaches-an-installed-box). What is not
-done is the *release* integration — the private respin repo does not yet build these
-packages, so an ISO built today still does not carry them; the exact remaining changes
-are listed in that section.
+**Status (2026-09-09):** proven, wired, and packaged. A CUDA `ggml-rpc-server` built by
+this procedure loaded Qwen3-8B-Q4_K_M onto drakemore's RTX 3090 and served a completion at
+132 tok/s — see [Verifying](#verifying) for the measurements. The ROCm engine was rebuilt
+with `-DGGML_RPC=ON` and promoted on both dev servers, and the manager now starts, stops and
+probes the rpc-server itself — see
+[Supervision](#supervision-who-starts-and-stops-it-and-why-nothing-else-can). It also ships
+as two Debian packages built by `scripts/package-cuda-rpc.sh`, installed and verified on
+drakemore — see [Packaging](#packaging-how-this-reaches-an-installed-box) — so the packaged
+path the supervisor resolves is real on that box.
+
+What is NOT done is the *release* integration: the private respin repo does not yet build
+these packages, so an ISO built today still does not carry them. The exact remaining changes
+are listed in the Packaging section.
 
 ## Why RPC and not a second engine
 
@@ -288,6 +293,83 @@ CUDA_VISIBLE_DEVICES=0000:65:00.0                               # PCI form
 ```
 
 Get the UUID with `nvidia-smi --query-gpu=uuid,pci.bus_id --format=csv`.
+
+## Supervision: who starts and stops it, and why nothing else can
+
+The manager runs the rpc-server itself — `api/rpc-supervisor.js` for the decisions,
+`gpuAcceleratorEnv()` in `api/server.js` for the process I/O. There is deliberately
+**no systemd unit**: a card that is only usable while a unit is enabled is not
+shareable, which is the whole reason the accelerator goes through a separate process
+at all.
+
+**Which binary**, in order (`resolveRpcServerBin`):
+
+1. `LLAMA_RPC_SERVER_BIN`, if set. This is how a source checkout or a test points at
+   one.
+2. On a packaged install, `/usr/lib/llama-manager/engine-cuda/current/ggml-rpc-server`.
+3. Otherwise **none** — and the accelerator then behaves exactly as if it were
+   switched off, logged, never an error. A settings file copied from an appliance onto
+   a developer box degrades rather than failing.
+
+Step 2 is where `llama-manager-cuda-rpc` installs the engine (`<ref>/` plus a `current`
+symlink); the hand-rolled [Deploying](#deploying) recipe above stages the same tree
+under `/var/lib/` instead, which is why a hand-staged tree needs
+`LLAMA_RPC_SERVER_BIN`.
+
+The binary's directory goes on the child's `LD_LIBRARY_PATH`, and it is bound to
+`127.0.0.1` unconditionally. The packaged tree does not *need* the former — every
+artifact has `RUNPATH $ORIGIN` and the CUDA runtime reaches it through relative
+symlinks into the sibling `cuda-runtime-13/` directory — but a hand-staged
+`dist/llama-cpp-cuda/` tree does, and setting it changes nothing for the packaged
+one: with it set, `ldd` still resolves `libcudart`, `libcublas` and `libcublasLt` out
+of `engine-cuda/current/` and only `libcuda.so.1` from the driver.
+
+### llama.cpp does not degrade at either end — measured, 2026-09-08
+
+This is the fact the whole design bends around. Both halves were measured on the
+promoted b10752 RPC engine:
+
+| Event | What llama.cpp does |
+|---|---|
+| `--rpc` at an endpoint nothing is listening on | **SIGABRT while PARSING argv** — exit 134 from `rpc_dispatcher::start` via `common_params_parse`, before any model is touched. `llama-server --rpc 127.0.0.1:59999 --list-devices` is enough to reproduce it. |
+| rpc-server dies while an engine is attached | The engine survives the death itself and keeps answering `/health`, then **aborts on its next request**: `ggml-rpc.cpp:566 "Remote RPC server crashed or returned malformed response"` → `ggml_abort` in `rpc_dispatcher::work`. The request that triggers it returns an empty body. |
+
+Neither falls back to local execution. So:
+
+- **The endpoint is proved before it is emitted.** Every engine start does a real TCP
+  connect, and anything short of a completed connection — refused, timed out,
+  unprobed — means no `--rpc`, a log line saying so, and an engine that serves
+  locally. Having just started the server does not count as proof.
+- **The rpc-server is never stopped while an engine is attached.** The engine stops
+  first, always. This is why a reservation that outranks duo is handled explicitly in
+  `drainForReservation()` rather than by `drainPlan()`: the engine runs on the APU and
+  only *borrows* the NVIDIA card, so `engineBoundCard()` never matches the accelerator
+  card and the generic drain would have handed the holder a card the rpc-server was
+  still sitting on.
+- **An rpc-server that dies on its own is logged and NOT restarted.** Any attached
+  engine is already doomed and a fresh server does not heal its connection; the
+  engine's own restart brings both halves back up together. Restarting only the
+  rpc-server would produce a card-holding process behind a dead engine and make the
+  restart governor's crash loop harder to explain, not easier.
+
+### Lifecycle in one line each
+
+| Trigger | Effect |
+|---|---|
+| `acceleratorPlan()` says the card may be borrowed, at engine start | Start the rpc-server, wait for it to accept a connection (20s ceiling), then emit `--rpc`. |
+| Operator switches `duo.useAccelerator` off | Stop it. |
+| The plan stops wanting the card (agent burst, reservation, no NVIDIA card) | Stop it. |
+| A reservation outranking duo is granted on that card | Stop the **engine**, then the rpc-server. Releasing the reservation restarts the engine, which starts the rpc-server again. |
+| Manager shutdown | Stop the engine, then the rpc-server. |
+
+Verified end to end on drakemore against a throwaway manager instance (its own config,
+data and ports; a stub `start-llama.sh` that only records its environment): with no
+binary and with a binary that exits without listening, `LLAMA_RPC_ENDPOINT` is unset
+and the engine starts; with the real CUDA `ggml-rpc-server` it is started, waited for,
+emitted, preempted by a priority-80 reservation on `rtx3090`, restored on release, and
+stopped by manager shutdown.
+
+## Packaging: how this should reach an installed box
 
 ## Packaging: how this reaches an installed box
 
