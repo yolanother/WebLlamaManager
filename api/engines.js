@@ -525,14 +525,45 @@ export function resolveQwen38Context(contextSize) {
  *   caller-verified weight availability, and the physical core count.
  * @returns {{name:string, options:Object<string,string>}|null} Section descriptor, or null.
  */
-export function qwen36WorkerPresetSection({ modelsDir, weightsExist, threads } = {}) {
+export function qwen36WorkerPresetSection({ modelsDir, weightsExist, threads, contextSize } = {}) {
   if (!weightsExist) return null;
   return {
     name: 'unsloth_Qwen3.6-35B-A3B-GGUF',
     options: {
       'threads': String(threads),
+      // duo is planner -> worker -> reviewer, so the chain's usable window is
+      // min(planner, worker). Raising only the planner (e0683b4) raised nothing a caller
+      // could use: a 93,401-token request still failed here with the engine's own
+      // "request (98827 tokens) exceeds the available context size (65536 tokens)".
+      'ctx-size': String(resolveQwen36Context(contextSize)),
     },
   };
+}
+
+/**
+ * The context window the Qwen3.6-35B-A3B worker was trained for, from its GGUF metadata
+ * (`qwen35moe.context_length`) -- the same window as the planner's.
+ *
+ * Memory measured on drakemore with both duo models resident before adopting it: planner
+ * 55.5 GB RSS at 262144, worker 2.0 GB (Q4_K_XL, mmap keeps resident low), 76 GB available.
+ * The worker's 40 layers and 2 KV heads cost roughly 11 GB of KV at the full window.
+ * @type {number}
+ */
+export const QWEN36_WORKER_CONTEXT = 262144;
+
+/**
+ * Resolve the worker's context, clamped to what the model can actually do.
+ *
+ * Same contract as {@link resolveQwen38Context}: a smaller box may ask for less, nothing may
+ * ask for more, because exceeding the trained window degrades output quality silently
+ * instead of failing.
+ *
+ * @param {*} contextSize Requested size, or anything at all.
+ * @returns {number} A positive integer no greater than {@link QWEN36_WORKER_CONTEXT}.
+ */
+export function resolveQwen36Context(contextSize) {
+  if (!Number.isSafeInteger(contextSize) || contextSize <= 0) return QWEN36_WORKER_CONTEXT;
+  return Math.min(contextSize, QWEN36_WORKER_CONTEXT);
 }
 
 /**

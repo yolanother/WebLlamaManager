@@ -31,6 +31,7 @@ import {
   museGlimmerDflashPresetSection,
   qwen38FlashNextPresetSection,
   QWEN38_FLASH_NEXT_CONTEXT,
+  QWEN36_WORKER_CONTEXT,
   qwen36WorkerPresetSection,
   validatePresetEngineFields,
   resolveDs4ModelPath,
@@ -1376,4 +1377,41 @@ test('qwen38FlashNextPresetSection: the context never exceeds what the model was
   const s = qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16, contextSize: 999999 });
   assert.equal(s.options['ctx-size'], String(QWEN38_FLASH_NEXT_CONTEXT),
     'asking beyond the trained window would degrade quality silently');
+});
+
+// --- the duo WORKER's context ---------------------------------------------------
+//
+// Raising only the planner achieved nothing a caller could use: duo is planner -> worker ->
+// reviewer, so its usable window is min(planner, worker). A 93,401-token request failed with
+// the engine's own "request (98827 tokens) exceeds the available context size (65536
+// tokens)" because the worker still inherited the box default. Its GGUF declares
+// qwen35moe.context_length = 262144, the same as the planner's.
+
+test('qwen36WorkerPresetSection: asks for the full trained context', () => {
+  const s = qwen36WorkerPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16 });
+  assert.equal(s.options['ctx-size'], String(QWEN36_WORKER_CONTEXT));
+  assert.equal(QWEN36_WORKER_CONTEXT, 262144, 'what the worker GGUF declares');
+});
+
+test('duo is usable at the planner window only if BOTH halves match', () => {
+  // The regression this guards: raising one model and calling the chain "big context".
+  assert.equal(QWEN36_WORKER_CONTEXT, QWEN38_FLASH_NEXT_CONTEXT,
+    'duo usable context is min(planner, worker); a mismatch silently caps the chain');
+});
+
+test('qwen36WorkerPresetSection: an explicit override wins, and is clamped', () => {
+  const smaller = qwen36WorkerPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16, contextSize: 131072 });
+  assert.equal(smaller.options['ctx-size'], '131072');
+  const absurd = qwen36WorkerPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16, contextSize: 999999 });
+  assert.equal(absurd.options['ctx-size'], String(QWEN36_WORKER_CONTEXT));
+  for (const bad of [0, -1, 'lots', null, 1.5]) {
+    const s = qwen36WorkerPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16, contextSize: bad });
+    assert.equal(s.options['ctx-size'], String(QWEN36_WORKER_CONTEXT), `override ${bad} must not reach the engine`);
+  }
+});
+
+test('the worker keeps everything else it already had', () => {
+  const s = qwen36WorkerPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16 });
+  assert.equal(s.name, 'unsloth_Qwen3.6-35B-A3B-GGUF');
+  assert.equal(s.options.threads, '16');
 });
