@@ -27,6 +27,7 @@ import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, rea
 import { fileURLToPath } from 'url';
 import { dirname, join, basename, isAbsolute, relative, resolve } from 'path';
 import { createServer } from 'http';
+import { createConnection } from 'net';
 import { WebSocketServer } from 'ws';
 import { cpus, totalmem, freemem, loadavg, hostname as systemHostname, networkInterfaces, homedir } from 'os';
 import { EventEmitter } from 'events';
@@ -233,7 +234,11 @@ import { drainPlan, reservationsNeedingDrain } from './gpu-drain.js';
 import { acceleratorPlan, rpcRouterArgs,
   engineSupportsRpc,
   parseEngineNeededLibs,
+  DEFAULT_RPC_PORT,
 } from './duo-accelerator.js';
+import {
+  resolveRpcServerBin, rpcServerCommand, supervisorAction, rpcEndpointGate,
+} from './rpc-supervisor.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -4851,7 +4856,12 @@ function gpuPinEnv() {
  * reservation outranking duo all produce an empty environment and no `--rpc` flag reaches
  * the router.
  *
- * @returns {Object<string,string>} `{LLAMA_RPC_ENDPOINT}` or nothing.
+ * It is also where the rpc-server process is started and stopped, and where the endpoint
+ * is PROVED live before it is emitted. Nothing is emitted on the strength of having just
+ * started the server: llama.cpp aborts on a refused endpoint while parsing its own command
+ * line, so the last word belongs to an actual connection.
+ *
+ * @returns {Promise<Object<string,string>>} `{LLAMA_RPC_ENDPOINT}` or nothing.
  */
 /**
  * The engine binary the router will launch, mirroring start-llama.sh's own resolution.
@@ -4903,9 +4913,133 @@ function engineHasRpcBackend() {
   return supported;
 }
 
-function gpuAcceleratorEnv() {
+/**
+ * The running rpc-server child, or null. `card` is the DRM card it was started for, so a
+ * reservation that preempts duo can tell whether this process is the thing in its way.
+ * @type {?{process: import('child_process').ChildProcess, card: ?string, port: number}}
+ */
+let rpcServer = null;
+
+/** How long a TCP probe waits before calling the endpoint dead. */
+const RPC_PROBE_TIMEOUT_MS = 1500;
+
+/** How long to keep probing after a start before giving up on it. */
+const RPC_START_TIMEOUT_MS = 20_000;
+
+/**
+ * Whether something is accepting TCP connections at `host:port` right now.
+ *
+ * The one question that matters before `--rpc` is emitted. Resolves false on refusal,
+ * timeout, DNS failure and every other error: the caller treats anything short of a
+ * completed connection as dead, because the engine SIGABRTs on a refused endpoint while
+ * parsing its own command line.
+ *
+ * @param {string} endpoint `host:port`.
+ * @param {number} [timeoutMs] Probe timeout.
+ * @returns {Promise<boolean>} True only when the connection completed.
+ */
+function probeTcpEndpoint(endpoint, timeoutMs = RPC_PROBE_TIMEOUT_MS) {
+  const idx = String(endpoint || '').lastIndexOf(':');
+  if (idx <= 0) return Promise.resolve(false);
+  const host = endpoint.slice(0, idx);
+  const port = Number(endpoint.slice(idx + 1));
+  if (!Number.isFinite(port) || port <= 0) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch { /* already gone */ }
+      resolve(ok);
+    };
+    const socket = createConnection({ host, port });
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+/**
+ * Stop the rpc-server, if one is running.
+ *
+ * NEVER call this while an engine is attached to it. A dying rpc-server aborts its client
+ * on the client's next request — ggml-rpc.cpp:566, measured 2026-09-08 — so the engine has
+ * to be stopped first, and every caller here does that.
+ *
+ * @param {string} why Operator-readable reason, logged.
+ * @returns {Promise<void>} Resolves once the child has exited or been given up on.
+ */
+async function stopRpcServer(why) {
+  const current = rpcServer;
+  if (!current) return;
+  rpcServer = null;
+  addLog('system', `Duo accelerator: stopping the rpc-server — ${why}`);
+  await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      try { current.process.kill('SIGKILL'); } catch { /* already gone */ }
+      resolve();
+    }, 5000);
+    current.process.once('exit', () => { clearTimeout(timer); resolve(); });
+    try { current.process.kill('SIGTERM'); } catch { clearTimeout(timer); resolve(); }
+  });
+}
+
+/**
+ * Start the rpc-server and wait for it to accept a connection.
+ *
+ * Returns only once the endpoint is genuinely up, because the caller's next act is to hand
+ * that endpoint to an engine that aborts if it is not.
+ *
+ * @param {string} bin Path to the rpc-server binary.
+ * @param {number} port Port to listen on.
+ * @param {?string} card The DRM card this server is being started for.
+ * @returns {Promise<boolean>} True when the endpoint is accepting connections.
+ */
+async function startRpcServer(bin, port, card) {
+  const recipe = rpcServerCommand({ bin, port, env: process.env });
+  const child = spawn(recipe.command, recipe.args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...recipe.env },
+    detached: false,
+  });
+  rpcServer = { process: child, card, port };
+  child.stdout.on('data', (d) => addLog('system', `[rpc-server] ${String(d).trim()}`));
+  child.stderr.on('data', (d) => addLog('system', `[rpc-server] ${String(d).trim()}`));
+  child.on('exit', (code, signal) => {
+    if (rpcServer?.process !== child) return; // stopRpcServer already accounted for it
+    rpcServer = null;
+    // Deliberately NOT restarted here. Any engine attached to this server is already
+    // doomed — it aborts on its next request — and a fresh rpc-server does not heal that
+    // connection. The engine's own restart brings both halves back up together, and this
+    // line is what makes that restart explicable instead of a mystery crash loop.
+    addLog('system', `Duo accelerator: the rpc-server exited (code ${code}, signal ${signal}). `
+      + 'Any engine attached to it will abort on its next request and be restarted without '
+      + 'the accelerator until an rpc-server is up again.');
+  });
+  child.on('error', (err) => addLog('system', `Duo accelerator: rpc-server failed to launch: ${err.message}`));
+
+  const endpoint = `127.0.0.1:${port}`;
+  const deadline = Date.now() + RPC_START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (rpcServer?.process !== child) return false; // exited or was stopped while we waited
+    if (await probeTcpEndpoint(endpoint)) {
+      addLog('system', `Duo accelerator: rpc-server listening on ${endpoint} (${bin})`);
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  await stopRpcServer(`it did not start listening on ${endpoint} within ${RPC_START_TIMEOUT_MS / 1000}s`);
+  return false;
+}
+
+async function gpuAcceleratorEnv() {
   const duo = config.duo || {};
-  if (!duo.useAccelerator) return {};
+  if (!duo.useAccelerator) {
+    // The switch was turned off while a server was running; free the card.
+    await stopRpcServer('the operator switched the accelerator off');
+    return {};
+  }
   const cards = getAllGpuSysfsStats();
   const nvidia = cards.find((c) => c.vendorId === NVIDIA_VENDOR_ID);
   const plan = acceleratorPlan({
@@ -4932,9 +5066,33 @@ function gpuAcceleratorEnv() {
         + 'Rebuild with scripts/build-llama-cpp.sh — see docs/llama-cpp-cuda-rpc-build-and-deployment.md'
       : plan.reason;
     addLog('system', `Duo accelerator not started: ${why}`);
+    await stopRpcServer(why);
     return {};
   }
-  return { LLAMA_RPC_ENDPOINT: args[1] };
+
+  // The process half. Everything above decided whether the card MAY be borrowed; nothing
+  // until now started or stopped the thing that actually borrows it.
+  const port = rpcServer?.port || DEFAULT_RPC_PORT;
+  const bin = resolveRpcServerBin({ env: process.env, packaged: RUNTIME_PATHS.packaged });
+  const binAvailable = !!bin && existsSync(bin);
+  const act = supervisorAction({ wanted: true, running: !!rpcServer, binAvailable });
+  if (act.action === 'stop') await stopRpcServer(act.reason);
+  if (act.action === 'none' && !rpcServer) addLog('system', `Duo accelerator not started: ${act.reason}`);
+  if (act.action === 'start') await startRpcServer(bin, port, nvidia?.card ?? null);
+
+  // The gate. Not "did we start it" but "is anything answering right now", because a
+  // refused endpoint does not disable the accelerator, it aborts the engine mid-parse.
+  const endpoint = rpcServer ? `127.0.0.1:${rpcServer.port}` : args[1];
+  const gate = rpcEndpointGate({
+    wanted: true,
+    endpoint,
+    reachable: rpcServer ? await probeTcpEndpoint(endpoint) : false,
+  });
+  if (!gate.emit) {
+    addLog('system', `Duo accelerator not attached: ${gate.reason}`);
+    return {};
+  }
+  return { LLAMA_RPC_ENDPOINT: gate.endpoint };
 }
 
 /**
@@ -4987,6 +5145,19 @@ async function runGpuDrain(reservationId) {
  *   stops being pending (released or preempted while the drain was running).
  */
 async function drainForReservation(reservationId, reservation) {
+  // The accelerator card is NOT the card the engine is bound to — the engine runs on the
+  // APU and borrows the NVIDIA card through the rpc-server — so drainPlan below never sees
+  // it and would hand the holder a card still owned by our rpc-server. Handled here
+  // instead, and in this order: the engine first, the rpc-server second. Reversing them
+  // aborts the engine, because a client whose rpc-server disappears dies on its next
+  // request (ggml-rpc.cpp:566, measured 2026-09-08).
+  if (rpcServer && rpcServer.card && rpcServer.card === reservation.card) {
+    if (llamaProcess) {
+      await stopLlamaServer({ explicitReclaim: true });
+      gpuDrainStoppedEngine.add(reservationId);
+    }
+    await stopRpcServer(`${reservation.holder} reserved ${reservation.gpu} at priority ${reservation.priority}`);
+  }
 
   const engineOnCard = engineBoundCard() === reservation.card;
   const plan = drainPlan({
@@ -7688,7 +7859,7 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
         // enabled, so the router's environment there is byte-identical to what it has
         // always been. start-llama.sh forwards these explicitly into the container.
         ...gpuPinEnv(),
-        ...gpuAcceleratorEnv()
+        ...(await gpuAcceleratorEnv())
       };
 
       console.log('[restart] Starting router mode');
@@ -8406,7 +8577,7 @@ app.post('/api/server/start', async (req, res) => {
       // The GPU pin and duo accelerator, exactly as the restart path carries them; both
       // spread empty when neither is configured.
       ...gpuPinEnv(),
-      ...gpuAcceleratorEnv()
+      ...(await gpuAcceleratorEnv())
     };
 
     llamaStartedAt = Date.now();
@@ -16215,7 +16386,9 @@ function shutdownWithTimeout(signal) {
     stopLlamaServer({ explicitReclaim: false }),
     stopEmbedServer(),
     stopDs4Server(),
-  ]).finally(() => process.exit(0));
+  // Last, and only after the engine is down: the rpc-server outlives an abrupt manager
+  // exit otherwise, holding VRAM on a card whose owner is gone.
+  ]).then(() => stopRpcServer('llama-manager is shutting down')).finally(() => process.exit(0));
 }
 
 process.on('SIGTERM', () => shutdownWithTimeout('SIGTERM'));
