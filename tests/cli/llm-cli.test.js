@@ -81,6 +81,37 @@ test('ergonomic commands preserve every MCP method, path, query, and JSON body',
       path: '/api/v1/chat/completions',
       body: { model: 'qwen-27b', messages, stream: false, temperature: 0.2, max_tokens: 64 },
     },
+    { args: ['gpu', 'list'], method: 'GET', path: '/api/gpus' },
+    { args: ['gpu', 'show', 'rtx3090'], method: 'GET', path: '/api/gpus/rtx3090' },
+    {
+      args: ['gpu', 'lock', 'rtx3090', '--priority', '80', '--ttl', '120', '--timeout', '30', '--holder', 'pods', '--reason', 'tts burst'],
+      method: 'POST',
+      path: '/api/gpus/rtx3090/lock',
+      body: { priority: 80, ttlSeconds: 120, timeoutSeconds: 30, holder: 'pods', reason: 'tts burst' },
+    },
+    {
+      args: ['gpu', 'reserve', 'rtx3090', '--priority', '-5', '--ttl', '60', '--holder', 'pods', '--reason', 'warm standby'],
+      method: 'POST',
+      path: '/api/gpus/rtx3090/reserve',
+      body: { priority: -5, ttlSeconds: 60, holder: 'pods', reason: 'warm standby' },
+    },
+    {
+      args: ['gpu', 'reserve', 'rtx3090', '--no-wait'],
+      method: 'POST',
+      path: '/api/gpus/rtx3090/reserve',
+      body: { noWait: true },
+    },
+    {
+      args: ['gpu', 'wait', 'res-123', '--timeout', '45'],
+      method: 'POST',
+      path: '/api/gpus/reservations/res-123/wait',
+      body: { timeoutSeconds: 45 },
+    },
+    { args: ['gpu', 'renew', 'res-123'], method: 'POST', path: '/api/gpus/reservations/res-123/renew' },
+    { args: ['gpu', 'release', 'res-123'], method: 'DELETE', path: '/api/gpus/reservations/res-123' },
+    { args: ['gpu', 'reservations'], method: 'GET', path: '/api/gpus' },
+    { args: ['gpu', 'reservations', '--gpu', 'rtx3090'], method: 'GET', path: '/api/gpus/rtx3090' },
+    { args: ['gpu', 'reservations', '--state', 'held'], method: 'GET', path: '/api/gpus', query: { state: 'held' } },
   ];
 
   for (const expected of cases) {
@@ -129,6 +160,34 @@ test('installed model deletion and active download cancellation require explicit
     '/api/models/org/model/model.gguf',
     '/api/downloads/org/model:Q6',
   ]);
+});
+
+test('gpu --priority is a signed integer and never silently becomes NaN', async t => {
+  const manager = await startManager();
+  t.after(manager.close);
+
+  successfulOutput(await runAt(manager.url, ['gpu', 'lock', 'rtx3090', '--priority', '-1']));
+  assert.deepEqual(manager.requests.at(-1).body, { priority: -1 });
+
+  const nonInteger = await runAt(manager.url, ['gpu', 'lock', 'rtx3090', '--priority', 'high']);
+  assert.notEqual(nonInteger.code, 0);
+  assert.match(nonInteger.stderr, /--priority.*integer/i);
+  assert.doesNotMatch(nonInteger.stderr, /\n\s+at\s/);
+
+  const fractional = await runAt(manager.url, ['gpu', 'reserve', 'rtx3090', '--priority', '1.5']);
+  assert.notEqual(fractional.code, 0);
+  assert.match(fractional.stderr, /--priority.*integer/i);
+  assert.doesNotMatch(fractional.stderr, /\n\s+at\s/);
+
+  assert.equal(manager.requests.length, 1, 'rejected --priority must never reach the manager');
+});
+
+test('gpu lock blocks for a free card while gpu reserve returns a pending reservation immediately', async () => {
+  const metadata = JSON.parse(successfulOutput(await runCli(['help', '--json'])));
+  const lock = metadata.commands.find(item => item.path.join(' ') === 'gpu lock');
+  const reserve = metadata.commands.find(item => item.path.join(' ') === 'gpu reserve');
+  assert.match(lock.summary, /block/i);
+  assert.match(reserve.summary, /pending|not yet/i);
 });
 
 test('manager URL comes from LLAMA_MANAGER_URL and global --url takes precedence', async t => {
@@ -425,7 +484,7 @@ test('HTTP, connection, JSON, command, and usage failures are concise and nonzer
 test('help and docs expose one complete machine- and human-readable command catalog', async () => {
   const metadata = JSON.parse(successfulOutput(await runCli(['help', '--json'])));
   const serialized = JSON.stringify(metadata);
-  for (const command of ['status', 'models', 'downloads', 'api', 'request', 'chat']) {
+  for (const command of ['status', 'models', 'downloads', 'api', 'request', 'chat', 'gpu']) {
     assert.match(serialized, new RegExp(`"?${command}"?`), `machine help missing ${command}`);
   }
   for (const option of ['--json', '--get', '--graphql', '--url']) {
@@ -443,7 +502,7 @@ test('help and docs expose one complete machine- and human-readable command cata
   assert.match(docs, /llm status/);
   assert.match(docs, /--graphql/);
   assert.ok(fullDocs.length > docs.length, '--full should expand the reference');
-  for (const command of ['models delete', 'downloads cancel', 'api call', 'request METHOD PATH', 'chat']) {
+  for (const command of ['models delete', 'downloads cancel', 'api call', 'request METHOD PATH', 'chat', 'gpu lock', 'gpu reserve']) {
     assert.match(fullDocs, new RegExp(command.replaceAll(' ', '\\s+'), 'i'));
   }
 });

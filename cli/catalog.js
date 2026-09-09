@@ -114,6 +114,40 @@ function exactPositionals(values, expected) {
   if (values.length > expected) throw new Error(`unexpected argument: ${values[expected]}`);
 }
 
+/**
+ * Parses a signed integer and reports a usage error for non-integer input,
+ * so a typo (e.g. `--priority high`) fails loudly instead of becoming NaN.
+ *
+ * @param {string|undefined} value Text to parse.
+ * @param {string} name Option name used in diagnostics.
+ * @returns {number|undefined} Parsed integer when supplied.
+ */
+function integerOption(value, name) {
+  if (value === undefined) return undefined;
+  if (!/^-?\d+$/.test(value)) throw new Error(`${name} must be an integer`);
+  return Number(value);
+}
+
+/**
+ * Builds the shared priority/ttl/holder/reason body fields used by both
+ * `gpu lock` and `gpu reserve`, including only the fields the caller supplied.
+ *
+ * @param {Map<string, string[]>} options Parsed option values.
+ * @returns {object} Partial GPU claim request body.
+ */
+function gpuClaimBody(options) {
+  const body = {};
+  const priority = integerOption(option(options, 'priority'), '--priority');
+  if (priority !== undefined) body.priority = priority;
+  const ttl = numberOption(option(options, 'ttl'), '--ttl');
+  if (ttl !== undefined) body.ttlSeconds = ttl;
+  const holder = option(options, 'holder');
+  if (holder !== undefined) body.holder = holder;
+  const reason = option(options, 'reason');
+  if (reason !== undefined) body.reason = reason;
+  return body;
+}
+
 /** Ergonomic commands backed by Llama Manager HTTP operations. */
 const COMMANDS = [
   command(['status'], 'llm status', 'Show manager and inference-server health.', [], ({ positionals }) => {
@@ -264,6 +298,82 @@ const COMMANDS = [
     if (maxTokens !== undefined) body.max_tokens = maxTokens;
     return { method: 'POST', path: '/api/v1/chat/completions', body };
   }),
+  command(['gpu', 'list'], 'llm gpu list', 'List GPU pools with capacity, live load, holders, and free status.', [], ({ positionals }) => {
+    exactPositionals(positionals, 0);
+    return { method: 'GET', path: '/api/gpus' };
+  }),
+  command(['gpu', 'show'], 'llm gpu show ID', 'Show one GPU pool: capacity, bound cards, live load, and current holders.', [], ({ positionals }) => {
+    const id = required(positionals, 0, 'ID');
+    exactPositionals(positionals, 1);
+    return { method: 'GET', path: `/api/gpus/${encodeURIComponent(id)}` };
+  }),
+  command(['gpu', 'lock'], 'llm gpu lock ID [--priority N] [--ttl SECONDS] [--timeout SECONDS] [--holder NAME] [--reason TEXT]',
+    'Reserve a GPU pool and BLOCK until the card is genuinely free and yours. Unlike `gpu reserve`, this does not return until the reservation is held.',
+    [
+      '--priority N       Signed priority; 0 is llama-manager\'s own baseline, negative yields to it, positive preempts it.',
+      '--ttl SECONDS      Lease lifetime before the hold expires without a renew.',
+      '--timeout SECONDS  Give up waiting after this long instead of blocking forever.',
+      '--holder NAME      Identify the caller holding the lease.',
+      '--reason TEXT      Human-readable justification recorded with the reservation.',
+    ],
+    ({ positionals, options }) => {
+      const id = required(positionals, 0, 'ID');
+      exactPositionals(positionals, 1);
+      const body = gpuClaimBody(options);
+      const timeout = numberOption(option(options, 'timeout'), '--timeout');
+      if (timeout !== undefined) body.timeoutSeconds = timeout;
+      return { method: 'POST', path: `/api/gpus/${encodeURIComponent(id)}/lock`, body };
+    }),
+  command(['gpu', 'reserve'], 'llm gpu reserve ID [--priority N] [--ttl SECONDS] [--holder NAME] [--reason TEXT] [--no-wait]',
+    'Request a GPU pool WITHOUT blocking: returns immediately with a pending reservation that is NOT yet yours. Use `gpu wait` to block on it, or `gpu lock` to do both in one call.',
+    [
+      '--priority N   Signed priority; 0 is llama-manager\'s own baseline, negative yields to it, positive preempts it.',
+      '--ttl SECONDS  Lease lifetime before the hold expires without a renew.',
+      '--holder NAME  Identify the caller holding the lease.',
+      '--reason TEXT  Human-readable justification recorded with the reservation.',
+      '--no-wait      Always return pending, even if the pool has free capacity right now.',
+    ],
+    ({ positionals, options }) => {
+      const id = required(positionals, 0, 'ID');
+      exactPositionals(positionals, 1);
+      const body = gpuClaimBody(options);
+      if (options.has('no-wait')) body.noWait = true;
+      return { method: 'POST', path: `/api/gpus/${encodeURIComponent(id)}/reserve`, body };
+    }),
+  command(['gpu', 'wait'], 'llm gpu wait RESERVATION_ID [--timeout SECONDS]', 'Block on a pending reservation until it is held, times out, or is preempted.', [
+    '--timeout SECONDS  Give up waiting after this long instead of blocking forever.',
+  ], ({ positionals, options }) => {
+    const id = required(positionals, 0, 'RESERVATION_ID');
+    exactPositionals(positionals, 1);
+    const body = {};
+    const timeout = numberOption(option(options, 'timeout'), '--timeout');
+    if (timeout !== undefined) body.timeoutSeconds = timeout;
+    return { method: 'POST', path: `/api/gpus/reservations/${encodeURIComponent(id)}/wait`, body };
+  }),
+  command(['gpu', 'renew'], 'llm gpu renew RESERVATION_ID', 'Send a heartbeat that extends a held reservation before its TTL expires.', [], ({ positionals }) => {
+    const id = required(positionals, 0, 'RESERVATION_ID');
+    exactPositionals(positionals, 1);
+    return { method: 'POST', path: `/api/gpus/reservations/${encodeURIComponent(id)}/renew` };
+  }),
+  command(['gpu', 'release'], 'llm gpu release RESERVATION_ID', 'Release a reservation and return the card to the pool. Not destructive: this is routine teardown and does not require --yes.', [], ({ positionals }) => {
+    const id = required(positionals, 0, 'RESERVATION_ID');
+    exactPositionals(positionals, 1);
+    return { method: 'DELETE', path: `/api/gpus/reservations/${encodeURIComponent(id)}` };
+  }),
+  command(['gpu', 'reservations'], 'llm gpu reservations [--gpu ID] [--state STATE]',
+    'List reservations, optionally scoped to one GPU pool and/or filtered to one state (pending, held, released, expired, preempted).',
+    [
+      '--gpu ID     Scope to one GPU pool instead of every pool.',
+      '--state STATE  Filter to one reservation state.',
+    ],
+    ({ positionals, options }) => {
+      exactPositionals(positionals, 0);
+      const gpu = option(options, 'gpu');
+      const state = option(options, 'state');
+      const query = state !== undefined ? [['state', state]] : [];
+      if (gpu !== undefined) return { method: 'GET', path: `/api/gpus/${encodeURIComponent(gpu)}`, query };
+      return { method: 'GET', path: '/api/gpus', query };
+    }),
 ];
 
 /** Generic and documentation commands implemented by the execution engine. */

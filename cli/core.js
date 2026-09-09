@@ -19,8 +19,9 @@ const VALUE_OPTIONS = new Set([
   'gpu-layers', 'auto-start', 'no-warmup', 'flash-attn', 'quantization',
   'filename', 'pattern', 'limit', 'messages', 'message', 'temperature',
   'max-tokens', 'param', 'query', 'header', 'form', 'output',
+  'priority', 'ttl', 'timeout', 'holder', 'reason', 'gpu', 'state',
 ]);
-const FLAG_OPTIONS = new Set(['json', 'yes', 'help', 'full']);
+const FLAG_OPTIONS = new Set(['json', 'yes', 'help', 'full', 'no-wait']);
 
 /** Expected command-line usage failure. */
 class UsageError extends Error {
