@@ -1,4 +1,5 @@
-// Llama Manager — public MCP inference and prepared-context tool contracts.
+// Llama Manager — public MCP inference, prepared-context, and GPU reservation
+// tool contracts.
 // Copyright (c) Llama Manager project. Use of this file is governed by the
 // LICENSE file in the repository root.
 //
@@ -152,4 +153,115 @@ test('contract 10: context MCP tools map prepare, poll, and release without hidd
   const released = await captureToolCall('llama_release_prepared_context', { id: 'ctx_opaque' });
   assert.equal(released.captured.url, 'http://localhost:5250/api/v1/context/ctx_opaque');
   assert.equal(released.captured.method, 'DELETE');
+});
+
+test('contract: GPU reservation MCP tools are listed with semantics-carrying schemas', () => {
+  const byName = new Map(tools.map(tool => [tool.name, tool]));
+  const expected = [
+    'llama_list_gpus',
+    'llama_lock_gpu',
+    'llama_reserve_gpu',
+    'llama_wait_gpu_reservation',
+    'llama_renew_gpu_reservation',
+    'llama_release_gpu',
+  ];
+  for (const name of expected) {
+    const tool = byName.get(name);
+    assert.ok(tool, `missing MCP tool ${name}`);
+    assert.equal(tool.inputSchema.type, 'object');
+    assert.ok(Array.isArray(tool.inputSchema.required));
+    assert.ok(tool.description.trim());
+  }
+
+  const list = byName.get('llama_list_gpus');
+  assert.match(list.description, /load/i);
+  assert.match(list.description, /route elsewhere|instead of waiting/i);
+
+  const lock = byName.get('llama_lock_gpu');
+  assert.deepEqual(lock.inputSchema.required, ['gpu']);
+  assert.match(lock.description, /BLOCK/);
+  assert.match(lock.description, /llama_reserve_gpu/);
+  assert.match(lock.description, /pending/i);
+
+  const reserve = byName.get('llama_reserve_gpu');
+  assert.deepEqual(reserve.inputSchema.required, ['gpu']);
+  assert.match(reserve.description, /immediately/i);
+  assert.match(reserve.description, /llama_lock_gpu/);
+  assert.match(reserve.description, /pending/i);
+  assert.match(reserve.description, /not yet yours/i);
+
+  for (const name of ['llama_lock_gpu', 'llama_reserve_gpu']) {
+    const tool = byName.get(name);
+    assert.match(tool.inputSchema.properties.priority.description, /0 is llama-manager/);
+    assert.match(tool.inputSchema.properties.priority.description, /negative/i);
+    assert.match(tool.inputSchema.properties.priority.description, /positive/i);
+    assert.match(tool.inputSchema.properties.ttlSeconds.description, /expire/i);
+  }
+
+  const wait = byName.get('llama_wait_gpu_reservation');
+  assert.deepEqual(wait.inputSchema.required, ['reservationId']);
+
+  const renew = byName.get('llama_renew_gpu_reservation');
+  assert.deepEqual(renew.inputSchema.required, ['reservationId']);
+  assert.match(renew.description, /expire/i);
+
+  const release = byName.get('llama_release_gpu');
+  assert.deepEqual(release.inputSchema.required, ['reservationId']);
+});
+
+test('contract: GPU reservation MCP tools map to the fixed HTTP contract', async () => {
+  const listed = await captureToolCall('llama_list_gpus', {});
+  assert.equal(listed.captured.url, 'http://localhost:5250/api/gpus');
+  assert.equal(listed.captured.method, 'GET');
+
+  const locked = await captureToolCall('llama_lock_gpu', {
+    gpu: 'rtx3090',
+    priority: 80,
+    ttlSeconds: 300,
+    timeoutMs: 60000,
+    holder: 'pods-agent',
+    reason: 'tts burst',
+  });
+  assert.equal(locked.captured.url, 'http://localhost:5250/api/gpus/rtx3090/lock');
+  assert.equal(locked.captured.method, 'POST');
+  assert.deepEqual(locked.captured.body, {
+    priority: 80,
+    ttlSeconds: 300,
+    timeoutMs: 60000,
+    holder: 'pods-agent',
+    reason: 'tts burst',
+  });
+
+  const reserved = await captureToolCall('llama_reserve_gpu', {
+    gpu: 'rtx3090',
+    priority: -5,
+    ttlSeconds: 120,
+    holder: 'pods-agent',
+    reason: 'warm standby',
+    noWait: true,
+  });
+  assert.equal(reserved.captured.url, 'http://localhost:5250/api/gpus/rtx3090/reserve');
+  assert.equal(reserved.captured.method, 'POST');
+  assert.deepEqual(reserved.captured.body, {
+    priority: -5,
+    ttlSeconds: 120,
+    holder: 'pods-agent',
+    reason: 'warm standby',
+    noWait: true,
+  });
+
+  const waited = await captureToolCall('llama_wait_gpu_reservation', { reservationId: 'res_123', timeoutMs: 5000 });
+  assert.equal(waited.captured.url, 'http://localhost:5250/api/gpus/reservations/res_123/wait');
+  assert.equal(waited.captured.method, 'POST');
+  assert.deepEqual(waited.captured.body, { timeoutMs: 5000 });
+
+  const renewed = await captureToolCall('llama_renew_gpu_reservation', { reservationId: 'res_123' });
+  assert.equal(renewed.captured.url, 'http://localhost:5250/api/gpus/reservations/res_123/renew');
+  assert.equal(renewed.captured.method, 'POST');
+  assert.equal(renewed.captured.body, undefined);
+
+  const released = await captureToolCall('llama_release_gpu', { reservationId: 'res_123' });
+  assert.equal(released.captured.url, 'http://localhost:5250/api/gpus/reservations/res_123');
+  assert.equal(released.captured.method, 'DELETE');
+  assert.equal(released.captured.body, undefined);
 });

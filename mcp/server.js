@@ -4,8 +4,9 @@
 // LICENSE file in the repository root.
 //
 // Publishes model, runtime, synchronous chat, background Responses (including
-// bounded retained-event replay), and prepared-context REST operations as MCP
-// tools, with import-safe exported definitions and handlers for validation.
+// bounded retained-event replay), prepared-context, and GPU reservation REST
+// operations as MCP tools, with import-safe exported definitions and handlers
+// for validation.
 /**
  * Run this file directly to expose Llama Manager APIs as MCP tools.
  *
@@ -428,6 +429,81 @@ export const tools = [
       properties: { id: { type: 'string', description: 'Opaque prepared-context handle.' } },
       required: ['id'],
     }
+  },
+  {
+    name: 'llama_list_gpus',
+    description: 'List configured GPU pools with their capacity, per-card live load, and current holders. Reports load precisely (not just free/busy) so a caller can choose to route work to a less-loaded pool instead of waiting for a card to free up.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: 'llama_lock_gpu',
+    description: 'Reserve a GPU pool and BLOCK until a card is actually free and bound to you — llama-manager has finished draining its own work off it before this returns. Use this when you need the card in hand before proceeding. For a non-blocking claim that returns immediately with a PENDING reservation you must separately wait on, use llama_reserve_gpu instead. The granted lease EXPIRES after ttlSeconds unless renewed with llama_renew_gpu_reservation; release it with llama_release_gpu when done.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        gpu: { type: 'string', description: 'GPU pool id to lock (see llama_list_gpus).' },
+        priority: { type: 'integer', description: "Signed priority. 0 is llama-manager's own baseline; negative yields to llama-manager (a soft hold that blocks nobody); positive preempts llama-manager and, if the pool is full, its lowest-priority holder — only when strictly higher. Default 0." },
+        ttlSeconds: { type: 'number', description: 'Lease lifetime in seconds once held. The reservation EXPIRES and the card is returned automatically if not renewed before this elapses.' },
+        timeoutMs: { type: 'number', description: 'Maximum time to block waiting for the card to become free before giving up (default: manager default).' },
+        holder: { type: 'string', description: 'Identifier for who holds this lease (e.g. agent/tool name), for observability.' },
+        reason: { type: 'string', description: 'Human-readable reason for the reservation, for observability.' }
+      },
+      required: ['gpu']
+    }
+  },
+  {
+    name: 'llama_reserve_gpu',
+    description: "Claim a GPU pool WITHOUT blocking. Returns immediately with a PENDING reservation that is not yet yours to use — llama-manager may still be draining its own work off the card. Call llama_wait_gpu_reservation to block until the reservation reaches 'held' before using the card. For a call that blocks until the card is actually free, use llama_lock_gpu instead. The reservation EXPIRES after ttlSeconds unless renewed with llama_renew_gpu_reservation.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        gpu: { type: 'string', description: 'GPU pool id to reserve (see llama_list_gpus).' },
+        priority: { type: 'integer', description: "Signed priority. 0 is llama-manager's own baseline; negative yields to llama-manager (a soft hold that blocks nobody); positive preempts llama-manager and, if the pool is full, its lowest-priority holder — only when strictly higher. Default 0." },
+        ttlSeconds: { type: 'number', description: 'Lease lifetime in seconds once held. The reservation EXPIRES and the card is returned automatically if not renewed before this elapses.' },
+        holder: { type: 'string', description: 'Identifier for who holds this lease (e.g. agent/tool name), for observability.' },
+        reason: { type: 'string', description: 'Human-readable reason for the reservation, for observability.' },
+        noWait: { type: 'boolean', description: 'If true, fail immediately when no capacity is free or preemptable instead of queuing a pending reservation.' }
+      },
+      required: ['gpu']
+    }
+  },
+  {
+    name: 'llama_wait_gpu_reservation',
+    description: "Block until a pending reservation from llama_reserve_gpu reaches 'held' (the card is genuinely yours), or until it is preempted, expires, or timeoutMs elapses.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reservationId: { type: 'string', description: 'Reservation id returned by llama_reserve_gpu or llama_lock_gpu.' },
+        timeoutMs: { type: 'number', description: 'Maximum time to block before returning with the current (possibly still pending) state.' }
+      },
+      required: ['reservationId']
+    }
+  },
+  {
+    name: 'llama_renew_gpu_reservation',
+    description: 'Heartbeat a pending or held reservation to push out its TTL. Reservations EXPIRE and the card is returned automatically if not renewed before ttlSeconds elapses — call this periodically for any long-lived hold.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reservationId: { type: 'string', description: 'Reservation id to renew.' }
+      },
+      required: ['reservationId']
+    }
+  },
+  {
+    name: 'llama_release_gpu',
+    description: 'Release a GPU reservation, immediately returning the card to llama-manager or to the next pending reservation. Always release when finished rather than relying on TTL expiry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reservationId: { type: 'string', description: 'Reservation id to release.' }
+      },
+      required: ['reservationId']
+    }
   }
 ];
 
@@ -541,6 +617,41 @@ export async function handleTool(name, args) {
 
     case 'llama_release_prepared_context':
       return apiCall('DELETE', `/api/v1/context/${encodeURIComponent(args.id)}`);
+
+    case 'llama_list_gpus':
+      return apiCall('GET', '/api/gpus');
+
+    case 'llama_lock_gpu': {
+      const body = {};
+      if (args.priority !== undefined) body.priority = args.priority;
+      if (args.ttlSeconds !== undefined) body.ttlSeconds = args.ttlSeconds;
+      if (args.timeoutMs !== undefined) body.timeoutMs = args.timeoutMs;
+      if (args.holder !== undefined) body.holder = args.holder;
+      if (args.reason !== undefined) body.reason = args.reason;
+      return apiCall('POST', `/api/gpus/${encodeURIComponent(args.gpu)}/lock`, body);
+    }
+
+    case 'llama_reserve_gpu': {
+      const body = {};
+      if (args.priority !== undefined) body.priority = args.priority;
+      if (args.ttlSeconds !== undefined) body.ttlSeconds = args.ttlSeconds;
+      if (args.holder !== undefined) body.holder = args.holder;
+      if (args.reason !== undefined) body.reason = args.reason;
+      if (args.noWait !== undefined) body.noWait = args.noWait;
+      return apiCall('POST', `/api/gpus/${encodeURIComponent(args.gpu)}/reserve`, body);
+    }
+
+    case 'llama_wait_gpu_reservation': {
+      const body = {};
+      if (args.timeoutMs !== undefined) body.timeoutMs = args.timeoutMs;
+      return apiCall('POST', `/api/gpus/reservations/${encodeURIComponent(args.reservationId)}/wait`, body);
+    }
+
+    case 'llama_renew_gpu_reservation':
+      return apiCall('POST', `/api/gpus/reservations/${encodeURIComponent(args.reservationId)}/renew`);
+
+    case 'llama_release_gpu':
+      return apiCall('DELETE', `/api/gpus/reservations/${encodeURIComponent(args.reservationId)}`);
 
     default:
       throw new Error(`Unknown tool: ${name}`);
