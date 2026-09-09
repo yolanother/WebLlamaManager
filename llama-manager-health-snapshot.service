@@ -1,0 +1,26 @@
+# Llama Manager — privileged system-health snapshot collector.
+# Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
+#
+# Oneshot unit driven by llama-manager-health-snapshot.timer. Runs the collector
+# as root because SMART (/dev/nvme*), the kernel ring buffer (/dev/kmsg under
+# kernel.dmesg_restrict=1) and the pstore archive are all root-only, and writes a
+# world-readable JSON snapshot the unprivileged API server reads.
+
+[Unit]
+Description=Llama Manager storage health snapshot
+Documentation=file:/usr/share/doc/llama-manager/SystemHealth.md
+After=systemd-pstore.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/node /opt/llama-manager/scripts/health-snapshot.mjs
+# A drive in the act of failing can wedge an nvme command indefinitely; the
+# collector must never become the thing that hangs.
+TimeoutStartSec=60
+Nice=10
+IOSchedulingClass=idle
+# Root is required for the three inputs above, but nothing else is.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX

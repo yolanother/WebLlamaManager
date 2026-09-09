@@ -1,0 +1,19 @@
+# Llama Manager — cadence for the storage health snapshot.
+# Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
+#
+# Fires shortly after boot so last-crash attribution is on the dashboard as soon
+# as an operator looks, then every few minutes. SMART wear and panic history move
+# slowly; polling harder would only add wakeups on a machine that is already
+# pushed hard.
+
+[Unit]
+Description=Run the Llama Manager storage health snapshot periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=llama-manager-health-snapshot.service
+
+[Install]
+WantedBy=timers.target
