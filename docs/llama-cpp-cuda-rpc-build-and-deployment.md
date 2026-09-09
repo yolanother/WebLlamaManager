@@ -369,8 +369,6 @@ and the engine starts; with the real CUDA `ggml-rpc-server` it is started, waite
 emitted, preempted by a priority-80 reservation on `rtx3090`, restored on release, and
 stopped by manager shutdown.
 
-## Packaging: how this should reach an installed box
-
 ## Packaging: how this reaches an installed box
 
 The standing rule is that a fix which does not land in the ISO/installer is lost at
