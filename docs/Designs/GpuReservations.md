@@ -336,8 +336,9 @@ behaves exactly as it did.
 ## The state of CUDA execution (as of 2026-09-08)
 
 Recorded honestly because the epic's value depends on it and the answer has been moving.
-Tracked as `T312557bb1b9bc`; the build procedure lives in
-`docs/llama-cpp-cuda-rpc-build-and-deployment.md`.
+Tracked as `T312557bb1b9bc`. The build procedure is written up in
+`docs/llama-cpp-cuda-rpc-build-and-deployment.md`, which lands with that task and is
+not in this tree yet.
 
 **Reservations protect the card. They do not make it usable.** As of this writing
 llama-manager cannot execute anything on the discrete RTX 3090.

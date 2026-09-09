@@ -537,8 +537,9 @@ The failure mode is **quiet** â€” the router starts and simply never offloads â€
 the diagnostic to check is `--list-devices` showing an `RPC0` entry, not "the
 process survived."
 
-Tracked as task `T312557bb1b9bc`; build procedure in
-`docs/llama-cpp-cuda-rpc-build-and-deployment.md`.
+Tracked as task `T312557bb1b9bc`. The build procedure is written up in
+`docs/llama-cpp-cuda-rpc-build-and-deployment.md`, which lands with that task and is
+not in this tree yet.
 
 ---
 
