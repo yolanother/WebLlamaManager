@@ -192,6 +192,7 @@ import {
   duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText, duoStepBudget,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
   duoStepBody,
+  duoStepFailure,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 import { createDs4Supervisor } from './ds4-supervisor.js';
@@ -12629,7 +12630,12 @@ function finalizeChatTiming(recorder, {
  * @throws {Error} When the step returns a non-OK status or an unusable body.
  */
 async function duoChainStepRequest(model, messages, maxTokens, controls = null) {
-  const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
+  // Timed, so a failure message can say HOW LONG it ran. The one real failure of this path
+  // correlated with duration rather than payload size, and that was invisible without it.
+  const stepStartedAt = Date.now();
+  let response;
+  try {
+    response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     // duoStepBody carries two flags that are invisible in a normal response and easy to
@@ -12641,10 +12647,19 @@ async function duoChainStepRequest(model, messages, maxTokens, controls = null) 
     // dispatcher: llamaDispatcher disables undici's default 300s headersTimeout. A chain
     // step is a whole generation from a large model, so 300s is routinely too short — a
     // healthy planner step was aborted at exactly 300.9s as "fetch failed" without it.
-    dispatcher: llamaDispatcher,
-  });
+      dispatcher: llamaDispatcher,
+    });
+  } catch (cause) {
+    // A dropped connection is a DIFFERENT fault from an engine error and used to be
+    // indistinguishable from one — both surfaced as a bare status-less failure.
+    throw new Error(duoStepFailure({ model, elapsedMs: Date.now() - stepStartedAt, cause }));
+  }
   if (!response.ok) {
-    throw new Error(`duo step '${model}' failed with HTTP ${response.status}`);
+    // The engine's own words, which were previously read and discarded.
+    const body = await response.text().catch(() => '');
+    throw new Error(duoStepFailure({
+      model, status: response.status, elapsedMs: Date.now() - stepStartedAt, body,
+    }));
   }
   const data = await response.json();
   // Both duo models are reasoning models, and a step that never reached an answer must not

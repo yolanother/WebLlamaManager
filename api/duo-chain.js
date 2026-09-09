@@ -596,3 +596,46 @@ export function duoStepBody(model, messages, maxTokens, callerControls = null) {
     chat_template_kwargs: { reasoning_effort: DUO_REASONING_EFFORT, ...(callerKwargs || {}) },
   };
 }
+
+/** Longest engine-response excerpt an error message will carry. */
+const DUO_FAILURE_BODY_LIMIT = 400;
+
+/**
+ * Describe a failed chain step in enough detail to diagnose it.
+ *
+ * The old message was `duo step '<model>' failed with HTTP <status>` and nothing else. When
+ * a real failure arrived (T3129f9e3ca4d4 — the planner died after 69 minutes with the engine
+ * reporting a dropped client connection) that message excluded nothing: not a timeout, not a
+ * transport failure, not an engine error, not an overload. Every hypothesis had to be tested
+ * from outside the process and the cause is still unknown. An error message IS the diagnosis
+ * surface, and this one carried no evidence at all.
+ *
+ * Elapsed time is included because that failure correlated with DURATION rather than payload
+ * size — 60k and 108k requests succeeded in shorter runs while a 51k one died at 69 minutes.
+ * Without the number in the message, that pattern is invisible.
+ *
+ * @param {object} params
+ * @param {string} [params.model] The step's model id.
+ * @param {number} [params.status] HTTP status, when the request completed with one.
+ * @param {number} [params.elapsedMs] How long the step ran before failing.
+ * @param {string} [params.body] The engine's response body, truncated.
+ * @param {Error|{message?:string}} [params.cause] Transport failure, when there is no status.
+ * @returns {string} A single-line message. Never throws: it runs on the failure path, and
+ *   an exception here would replace a diagnosable error with a formatter stack trace.
+ */
+export function duoStepFailure({ model, status, elapsedMs, body, cause } = {}) {
+  const parts = [`duo step '${model ?? 'unknown'}'`];
+  if (status) parts.push(`failed with HTTP ${status}`);
+  else if (cause) parts.push(`failed in transport: ${String(cause?.message ?? cause)}`);
+  else parts.push('failed');
+  if (Number.isFinite(elapsedMs) && elapsedMs > 0) {
+    const s = Math.round(elapsedMs / 1000);
+    parts.push(s >= 60 ? `after ${Math.floor(s / 60)}m${s % 60}s (${elapsedMs}ms)` : `after ${s}s`);
+  }
+  if (typeof body === 'string' && body.trim()) {
+    const t = body.trim();
+    parts.push(`— engine said: ${t.length > DUO_FAILURE_BODY_LIMIT
+      ? `${t.slice(0, DUO_FAILURE_BODY_LIMIT)}…(${t.length} chars)` : t}`);
+  }
+  return parts.join(' ');
+}

@@ -26,6 +26,7 @@ import {
   duoStepBudget,
   DUO_REASONING_HEADROOM,
   DUO_STEP_CEILING,
+  duoStepFailure,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 
@@ -527,4 +528,44 @@ test('duoStepBody with no caller controls is exactly what it always was', () => 
   const b = duoStepBody('m', [], 100);
   assert.deepEqual(b, { model: 'm', messages: [], max_tokens: 100, timings_per_token: true,
     chat_template_kwargs: { reasoning_effort: DUO_REASONING_EFFORT } });
+});
+
+// --- a failed step must say enough to be diagnosable ------------------------------
+//
+// A real failure (T3129f9e3ca4d4) produced only "duo step 'X' failed with HTTP 500" after
+// 69 minutes. That message excludes nothing: not a timeout, not a dropped connection, not
+// an engine error, not an overload. Every hypothesis had to be tested from the outside and
+// the cause is still unknown. The message is the diagnosis surface; it was empty.
+
+test('duoStepFailure names the step, the status, the elapsed time and the body', () => {
+  const msg = duoStepFailure({ model: 'planner-x', status: 500, elapsedMs: 4163149,
+    body: '{"error":"context shift disabled"}' });
+  assert.match(msg, /planner-x/);
+  assert.match(msg, /500/);
+  assert.match(msg, /69m|4163|69 min/i, 'elapsed must be there — this one correlated with duration');
+  assert.match(msg, /context shift disabled/, 'the engine said something; do not discard it');
+});
+
+test('duoStepFailure reports a transport failure distinctly from an HTTP status', () => {
+  // "fetch failed" with no status is a DROPPED CONNECTION, a different fault from a 500,
+  // and the two were indistinguishable in the old message.
+  const msg = duoStepFailure({ model: 'planner-x', elapsedMs: 90000,
+    cause: new Error('other side closed') });
+  assert.match(msg, /planner-x/);
+  assert.match(msg, /other side closed/);
+  assert.doesNotMatch(msg, /HTTP undefined|HTTP null/);
+});
+
+test('duoStepFailure survives a missing body or cause without throwing', () => {
+  // It runs on the failure path; throwing here would replace a diagnosable error with a
+  // stack trace from the error formatter.
+  assert.ok(duoStepFailure({ model: 'm', status: 500 }).includes('m'));
+  assert.ok(duoStepFailure({}).length > 0);
+  assert.ok(duoStepFailure({ model: 'm', status: 500, body: null, cause: null }).includes('500'));
+});
+
+test('duoStepFailure truncates a huge body rather than emitting it whole', () => {
+  const msg = duoStepFailure({ model: 'm', status: 500, body: 'x'.repeat(5000) });
+  assert.ok(msg.length < 1200, 'an error message is not a log dump');
+  assert.match(msg, /x{50}/, 'but it must keep enough to be useful');
 });
