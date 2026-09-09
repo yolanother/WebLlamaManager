@@ -4717,6 +4717,12 @@ const gpuReservations = new GpuReservations({
     endGpuReservation(reservation);
   },
 });
+// NOTHING in this section may call back INTO gpuReservations from onPreempt. The callback
+// fires mid-transaction, after the victim has been moved out of the way but BEFORE the
+// claim that displaced it is bound to the card, so a reserve() from inside it sees a free
+// card that is about to be taken and hands it out twice — observed live as two holders on
+// a capacity-1 pool. Re-establishing llama-manager's own pin is therefore deferred to the
+// sweep timer below, which is the one place that runs outside any transaction.
 
 /**
  * Re-resolve the pools from settings and the cards present, and hand them to the state
@@ -4782,13 +4788,16 @@ function syncGpuPinReservations() {
  * this appliance does not run.
  *
  * @returns {?{pool: object, card: object}} The pin, or null when nothing is pinned or the
- *   pinning reservation has been preempted and holds no card.
+ *   pinning reservation is not currently held.
  */
 function activeGpuPin() {
   for (const pool of gpuPools) {
     if (pool.pinnedModels.length === 0) continue;
     const held = gpuReservations.get(gpuPinReservations.get(pool.id));
-    if (!held?.card) continue;
+    // The state must be checked, not just the card: a preempted reservation KEEPS the
+    // `card` it was bound to as a record of what it lost, so testing the card alone would
+    // report the engine as pinned to a card another holder has just taken.
+    if (held?.state !== 'held' || !held.card) continue;
     const card = pool.cards.find((c) => c.card === held.card);
     if (card) return { pool, card };
   }
@@ -4925,12 +4934,15 @@ async function runGpuDrain(reservationId) {
  * is available again, so parked requests are let go and an engine stopped for this holder
  * is brought back — which reloads the pinned models and drains the queue behind it.
  *
+ * Deliberately does NOT re-establish llama-manager's model pin: this runs from onPreempt,
+ * mid-transaction, and reserving from there double-books the card. The sweep timer picks
+ * the pin back up within a tick.
+ *
  * @param {object} reservation The reservation that ended.
  * @returns {void}
  */
 function endGpuReservation(reservation) {
   gpuDrainedModels.clear();
-  syncGpuPinReservations();
   if (!gpuDrainStoppedEngine.delete(reservation.id)) return;
   // Ungoverned: this restart is an explicit scheduling decision, not a crash loop, and the
   // restart governor exists to damp the latter.
@@ -5030,9 +5042,12 @@ function gpuCardTelemetry() {
  *
  * Per-card `vramBytes`, `vramUsedBytes` and `busyPercent` are carried so a client that
  * would rather route elsewhere than wait can see what the card is doing, and `free` is the
- * boolean it actually branches on: no active reservation binds the card and no unfriendly
- * neighbour is sitting on it. Pool `warnings` stay plain strings — an operator readout is
- * their consumer.
+ * boolean it actually branches on: whether a reservation would be granted on this card
+ * right now. A SOFT claim deliberately does not clear it — `reserve()` ignores soft claims
+ * entirely, so reporting free:false for one would say a claim will fail when it will
+ * succeed. The advisory signal stays visible in the pool's own `softClaimed` list, which
+ * is where a caller weighing whether the card is worth taking should read it. Pool
+ * `warnings` stay plain strings — an operator readout is their consumer.
  *
  * @param {object} described One entry from `GpuReservations#describe`.
  * @param {Object<string,object>} liveCards Card records keyed by DRM name.
@@ -5056,7 +5071,7 @@ function gpuPoolView(described, liveCards) {
         vramBytes: live.vramBytes ?? null,
         vramUsedBytes: live.vramUsedBytes ?? null,
         busyPercent: live.busyPercent ?? null,
-        free: !bound.has(card.card) && !described.softClaimed.includes(card.card),
+        free: !bound.has(card.card),
       };
     }),
   };
@@ -5247,6 +5262,8 @@ setInterval(() => {
     addLog('system', `GPU reservation ${expired.id} on ${expired.gpu} expired (holder ${expired.holder})`);
     endGpuReservation(expired);
   }
+  // Outside any transaction, so this is where a pin preempted away is re-established.
+  syncGpuPinReservations();
   for (const [poolId, id] of gpuPinReservations) {
     const pin = gpuReservations.get(id);
     if (pin?.state === 'pending' && pin.card && gpuReservations.markHeld(id)) {
