@@ -22,13 +22,13 @@
 
 import express from 'express';
 import cors from 'cors';
-import { spawn, exec, execSync } from 'child_process';
+import { spawn, exec, execSync, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync, unlinkSync, realpathSync, readlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, basename, isAbsolute, relative, resolve } from 'path';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { cpus, totalmem, freemem, loadavg, hostname as systemHostname, networkInterfaces } from 'os';
+import { cpus, totalmem, freemem, loadavg, hostname as systemHostname, networkInterfaces, homedir } from 'os';
 import { EventEmitter } from 'events';
 import { createHash } from 'crypto';
 import { lookup as dnsLookup } from 'dns/promises';
@@ -230,7 +230,10 @@ import {
 import { normalizePoolConfig, resolvePools } from './gpu-pools.js';
 import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority, reservationView } from './gpu-reservations.js';
 import { drainPlan, reservationsNeedingDrain } from './gpu-drain.js';
-import { acceleratorPlan, rpcRouterArgs } from './duo-accelerator.js';
+import { acceleratorPlan, rpcRouterArgs,
+  engineSupportsRpc,
+  parseEngineNeededLibs,
+} from './duo-accelerator.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
 const RUNTIME_PATHS = resolveRuntimePaths(process.env, {
@@ -4850,6 +4853,56 @@ function gpuPinEnv() {
  *
  * @returns {Object<string,string>} `{LLAMA_RPC_ENDPOINT}` or nothing.
  */
+/**
+ * The engine binary the router will launch, mirroring start-llama.sh's own resolution.
+ * Packaged installs run /usr/local/bin/llama-server from INSIDE the container; a source
+ * checkout runs the host-visible one under ~/.local/bin.
+ * @type {string}
+ */
+const LLAMA_SERVER_BIN = process.env.LLAMA_SERVER_BIN
+  || (RUNTIME_PATHS.packaged ? '/usr/local/bin/llama-server' : join(homedir(), '.local/bin/llama-server'));
+
+/** Cached RPC-backend probe: `{ key, supported }`, keyed by engine path + mtime. */
+let engineRpcProbe = null;
+
+/**
+ * Whether the engine binary we are about to launch has an RPC backend linked in.
+ *
+ * THREE-STATE on purpose. `false` means we looked and the backend is definitively absent,
+ * so `--rpc` would parse and then silently do nothing. `null` means we could not look at
+ * all -- which is the NORMAL case on a packaged appliance, where the engine lives inside
+ * the container and this host-side path does not exist. Treating unprobeable as absent
+ * would disable a working accelerator on every appliance; treating it as present restores
+ * the old silent failure. So the caller emits the flag and logs that it could not verify.
+ *
+ * Cached against path + mtime, so a rebuild is picked up without re-running readelf on
+ * every engine start.
+ *
+ * @returns {?boolean} True linked, false definitively absent, null unprobeable.
+ */
+function engineHasRpcBackend() {
+  let key;
+  try {
+    key = `${LLAMA_SERVER_BIN}:${statSync(LLAMA_SERVER_BIN).mtimeMs}`;
+  } catch {
+    return null; // not on this filesystem -- packaged/containerised engine
+  }
+  if (engineRpcProbe?.key === key) return engineRpcProbe.supported;
+  let supported = null;
+  try {
+    const out = execFileSync('readelf', ['-d', LLAMA_SERVER_BIN], {
+      encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const needed = parseEngineNeededLibs(out);
+    // An ELF with no NEEDED entries at all means readelf told us nothing useful.
+    supported = needed.length === 0 ? null : engineSupportsRpc(needed);
+  } catch {
+    supported = null; // no readelf, or not an ELF we can read
+  }
+  engineRpcProbe = { key, supported };
+  return supported;
+}
+
 function gpuAcceleratorEnv() {
   const duo = config.duo || {};
   if (!duo.useAccelerator) return {};
@@ -4861,9 +4914,24 @@ function gpuAcceleratorEnv() {
     gpu: nvidia ? { totalBytes: nvidia.vramBytes, usedBytes: nvidia.vramUsedBytes } : null,
     reservations: nvidia ? gpuReservations.list().filter((r) => r.card === nvidia.card) : null,
   });
-  const args = rpcRouterArgs(plan);
+  const engineRpc = engineHasRpcBackend();
+  // Only a definitive `false` blocks the flag; `null` (unprobeable) still emits, with a
+  // warning, so a packaged appliance is never silently deprived of its accelerator.
+  const args = rpcRouterArgs(plan, { engineSupportsRpc: engineRpc !== false });
+  if (plan.startRpc && engineRpc === null) {
+    addLog('system', `Duo accelerator: could not verify that ${LLAMA_SERVER_BIN} has an RPC `
+      + 'backend linked in, so --rpc is being passed unverified. If the card is never used, '
+      + 'check the engine was built with -DGGML_RPC=ON.');
+  }
   if (args.length === 0) {
-    addLog('system', `Duo accelerator not started: ${plan.reason}`);
+    // Distinguish "policy said no" from "the engine physically cannot", because the second
+    // is an operator action (rebuild) and the first is working as designed.
+    const why = plan.startRpc && !engineRpc
+      ? `the engine at ${LLAMA_SERVER_BIN} has no RPC backend linked in (built without `
+        + '-DGGML_RPC=ON), so --rpc would parse and then silently do nothing. '
+        + 'Rebuild with scripts/build-llama-cpp.sh — see docs/llama-cpp-cuda-rpc-build-and-deployment.md'
+      : plan.reason;
+    addLog('system', `Duo accelerator not started: ${why}`);
     return {};
   }
   return { LLAMA_RPC_ENDPOINT: args[1] };

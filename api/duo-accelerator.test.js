@@ -9,6 +9,8 @@ import {
   rpcRouterArgs,
   agentHoldsCard,
   AGENT_RESERVE_BYTES,
+  engineSupportsRpc,
+  parseEngineNeededLibs,
 } from './duo-accelerator.js';
 
 const GB = 1024 * 1024 * 1024;
@@ -149,4 +151,65 @@ test('no reservations at all leaves every existing decision byte-identical', () 
     profile: NVIDIA, settings: ON, gpu: { totalBytes: 24 * GB, usedBytes: 1.45 * GB }, reservations: [],
   });
   assert.deepEqual(withEmpty, without);
+});
+
+// --- the engine must actually HAVE an RPC backend -----------------------------
+//
+// The b10752 engine was built without -DGGML_RPC=ON. `--rpc` still PARSES, because the
+// option string lives in libllama-common rather than in the backend, so the engine
+// started, logged nothing unusual, and simply never attached to the remote card. Every
+// test above, and the whole accelerator path, looked correct while doing nothing at all.
+// These pin the check that makes that failure visible instead of silent.
+
+test('an engine linked against the RPC backend supports --rpc', () => {
+  const needed = ['libggml.so.0', 'libggml-cpu.so.0', 'libggml-hip.so.0', 'libggml-rpc.so.0', 'libc.so.6'];
+  assert.equal(engineSupportsRpc(needed), true);
+});
+
+test('an engine without the RPC backend does not, however well --rpc parses', () => {
+  // This is exactly b10752's NEEDED list, read off the deployed binary.
+  const needed = ['libggml.so.0', 'libggml-cpu.so.0', 'libggml-hip.so.0', 'libggml-base.so.0', 'libc.so.6'];
+  assert.equal(engineSupportsRpc(needed), false);
+});
+
+test('a version-suffixed RPC library still counts', () => {
+  assert.equal(engineSupportsRpc(['libggml-rpc.so.0.22.0']), true);
+});
+
+test('an unreadable binary is treated as UNSUPPORTED, never assumed good', () => {
+  // If we cannot tell, emitting --rpc risks another silent no-op. Refusing to emit it
+  // costs a documented log line; assuming support costs a card that never gets used.
+  assert.equal(engineSupportsRpc(null), false);
+  assert.equal(engineSupportsRpc([]), false);
+  assert.equal(engineSupportsRpc(undefined), false);
+});
+
+test('parseEngineNeededLibs reads the NEEDED entries out of readelf -d output', () => {
+  const output = [
+    'Dynamic section at offset 0x2d10 contains 30 entries:',
+    '  Tag        Type                         Name/Value',
+    ' 0x0000000000000001 (NEEDED)             Shared library: [libggml-hip.so.0]',
+    ' 0x0000000000000001 (NEEDED)             Shared library: [libggml-rpc.so.0]',
+    ' 0x000000000000001d (RUNPATH)            Library runpath: [/home/yolan/llama.cpp/build/bin]',
+  ].join('\n');
+  assert.deepEqual(parseEngineNeededLibs(output), ['libggml-hip.so.0', 'libggml-rpc.so.0']);
+});
+
+test('parseEngineNeededLibs never throws on junk', () => {
+  // Runs at engine start; an exception here would stop the engine from starting at all.
+  assert.deepEqual(parseEngineNeededLibs(''), []);
+  assert.deepEqual(parseEngineNeededLibs(null), []);
+  assert.deepEqual(parseEngineNeededLibs('readelf: Error: Not an ELF file'), []);
+});
+
+test('end to end: a plan that would start the accelerator is refused on an RPC-less engine', () => {
+  const plan = acceleratorPlan({
+    profile: { hasNvidia: true },
+    settings: { useAccelerator: true, acceleratorPriority: 'llama-first' },
+    gpu: { totalBytes: 24 * 1024 ** 3, usedBytes: 1.4 * 1024 ** 3 },
+  });
+  assert.equal(plan.startRpc, true, 'precondition: this plan would otherwise start');
+  // The engine, not the policy, is what makes it impossible.
+  assert.deepEqual(rpcRouterArgs(plan, { engineSupportsRpc: false }), []);
+  assert.deepEqual(rpcRouterArgs(plan, { engineSupportsRpc: true }), ['--rpc', plan.endpoint]);
 });

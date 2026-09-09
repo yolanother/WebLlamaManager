@@ -146,9 +146,55 @@ export function acceleratorPlan({
  * The router arguments this plan implies. Empty on every path that does not start an
  * rpc-server, so a box without the accelerator emits no `--rpc` flag at all.
  * @param {{startRpc?: boolean, endpoint?: string|null}|null|undefined} plan From {@link acceleratorPlan}.
+ * @param {object} [options]
+ * @param {boolean} [options.engineSupportsRpc=true] Whether the engine binary actually has
+ *   an RPC backend linked in -- see {@link engineSupportsRpc}. False emits nothing, because
+ *   `--rpc` on an engine without the backend parses and then silently does nothing.
  * @returns {string[]} Arguments to append to the router command line.
  */
-export function rpcRouterArgs(plan) {
+export function rpcRouterArgs(plan, { engineSupportsRpc = true } = {}) {
   if (!plan?.startRpc || !plan.endpoint) return [];
+  // A policy decision to use the card is worthless if the engine cannot honour it. The
+  // deployed b10752 build had no RPC backend and `--rpc` was a silent no-op; refusing to
+  // emit the flag turns that into a logged refusal the operator can act on.
+  if (!engineSupportsRpc) return [];
   return ['--rpc', plan.endpoint];
+}
+
+/**
+ * Extract the `NEEDED` shared libraries from `readelf -d` output.
+ *
+ * @param {?string} readelfOutput Raw stdout of `readelf -d <binary>`.
+ * @returns {string[]} Library names in the order listed; empty for junk, unreadable
+ *   output or a non-ELF file. Never throws: this runs on the engine-start path, and an
+ *   exception here would stop the engine starting at all.
+ */
+export function parseEngineNeededLibs(readelfOutput) {
+  if (typeof readelfOutput !== 'string') return [];
+  const out = [];
+  for (const line of readelfOutput.split('\n')) {
+    const match = /\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]/.exec(line);
+    if (match) out.push(match[1]);
+  }
+  return out;
+}
+
+/**
+ * Whether an engine binary can actually honour `--rpc`.
+ *
+ * llama.cpp registers the RPC backend at COMPILE time (`#ifdef GGML_USE_RPC` in
+ * ggml-backend-reg.cpp) and `GGML_BACKEND_DL` is off, so backends are linked statically
+ * rather than scanned for at runtime -- dropping a `libggml-rpc.so` beside a binary built
+ * without the flag does nothing. Meanwhile `--rpc` still PARSES, because the option string
+ * lives in libllama-common. So the only honest test is whether the backend is linked in.
+ *
+ * @param {?string[]} neededLibs From {@link parseEngineNeededLibs}.
+ * @returns {boolean} True only when an RPC backend library is linked. An empty or nullish
+ *   list reads as UNSUPPORTED: if we cannot tell, refusing to emit `--rpc` costs one log
+ *   line, whereas assuming support costs a card that is never actually used and gives no
+ *   sign of it.
+ */
+export function engineSupportsRpc(neededLibs) {
+  if (!Array.isArray(neededLibs) || neededLibs.length === 0) return false;
+  return neededLibs.some((lib) => typeof lib === 'string' && lib.startsWith('libggml-rpc.so'));
 }

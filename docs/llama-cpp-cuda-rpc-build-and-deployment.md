@@ -326,7 +326,14 @@ llama-server -m Qwen3-8B-Q4_K_M.gguf --rpc 127.0.0.1:50052 -ngl 99 --port 8099
 Baseline the card first (`nvidia-smi --query-gpu=memory.used --format=csv`), then
 watch it during load and generation. What counts as proof:
 
-1. `--list-devices` on the client lists an `RPC0` device.
+1. `--list-devices` on the client lists an `RPC0` device. **Put `--rpc` BEFORE
+   `--list-devices` on the command line.** Arguments are processed in order and
+   the device list is produced where the flag appears, so
+   `--list-devices --rpc host:port` prints the local backends only and looks
+   exactly like a build with no RPC backend at all. Verified on Frostburn against
+   drakemore: the same binary printed `ROCm0` alone in that order and
+   `ROCm0` + `RPC0: 192.168.1.79:50052 (24123 MiB, 23135 MiB free)` with the flags
+   reversed. This is the most likely way to conclude a good build is broken.
 2. **The load-bearing one:** VRAM climbs by roughly the model's size above the idle
    baseline **and the rpc-server's own PID is the process holding it** in
    `nvidia-smi --query-compute-apps`. A CPU fallback cannot fake this; signals 1 and
