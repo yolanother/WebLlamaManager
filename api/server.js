@@ -13387,13 +13387,32 @@ async function handleChatCompletions(req, res) {
         // Non-streaming. Same heartbeat-whitespace trick as the local path
         // so opencode-style clients (60-90s TCP read timeout, stream:false)
         // don't abort during the remote backend's first-token wait.
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Transfer-Encoding', 'chunked');
-        res.flushHeaders();
+        //
+        // Headers are deliberately NOT flushed yet — the same fix the local path
+        // already carries, which this branch never received. Flushing here committed
+        // HTTP 200 before any upstream work had happened, so every later failure could
+        // only be delivered as a 200 carrying an {error:...} body: a caller reading the
+        // status saw success and neither failed over nor retried. Measured: a
+        // REASONING_EXHAUSTED that should have been 502 arrived as 200 OK in 0.297s,
+        // nowhere near the heartbeat interval. It matters most HERE, because with
+        // backends.preferLocal false ordinary traffic routes remote by default.
+        //
+        // Arm the ticker and commit nothing. Nothing needs the headers until the first
+        // interval elapses, so for the first 20s the real status code is still
+        // available — which covers every error worth failing over on.
+        let remoteHeadersCommitted = false;
         const heartbeatTicker = setInterval(() => {
-          if (!res.writableEnded) {
-            try { res.write('\n'); } catch {}
+          if (res.writableEnded) return;
+          if (!remoteHeadersCommitted) {
+            remoteHeadersCommitted = true;
+            try {
+              res.setHeader('Content-Type', 'application/json');
+              res.setHeader('Transfer-Encoding', 'chunked');
+              res.setHeader('X-Accel-Buffering', 'no');
+              res.flushHeaders();
+            } catch { /* headers already sent by another path */ }
           }
+          try { res.write('\n'); } catch {}
         }, 20_000);
         let data;
         try {
