@@ -98,15 +98,30 @@ echo "  RPC protocol version: $RPC_PROTO"
 [ "$LLAMA_CUDA_CLEAN" = "1" ] && { echo "  (clean) removing $BUILD_DIR"; rm -rf "$BUILD_DIR"; }
 
 # ---- 2/3. Configure + build inside the CUDA toolkit container ----------------
+# The stock nvidia/cuda:*-devel image ships nvcc but no cmake, and the build runs
+# as the invoking user (so the artifacts on the bind mount are not root-owned),
+# which leaves no way to apt-get anything at run time. So derive a small image
+# once that carries the host toolchain, and cache it by tag.
+BUILD_IMAGE="llama-cpp-cuda-build:$(printf '%s' "$CUDA_IMAGE" | tr -c 'A-Za-z0-9_.-' '-')"
+if ! docker image inspect "$BUILD_IMAGE" >/dev/null 2>&1; then
+  echo "  building toolchain image $BUILD_IMAGE"
+  docker build -t "$BUILD_IMAGE" - <<EOF
+FROM $CUDA_IMAGE
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake build-essential git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+EOF
+fi
+
 # GGML_NATIVE is OFF on purpose: the build host and the appliance are not
 # guaranteed to be the same microarchitecture, and -march=native would emit
 # instructions that fault on the target.
-echo "[2/4] Configuring + [3/4] building in $CUDA_IMAGE (this is the long part)..."
+echo "[2/4] Configuring + [3/4] building in $BUILD_IMAGE (this is the long part)..."
 docker run --rm \
   -v "$LLAMA_CPP_DIR:/src" \
   -u "$(id -u):$(id -g)" \
   -e HOME=/tmp \
-  "$CUDA_IMAGE" \
+  "$BUILD_IMAGE" \
   bash -c "
     set -euo pipefail
     cmake -S /src -B /src/$BUILD_SUBDIR \
@@ -120,7 +135,7 @@ docker run --rm \
       -DLLAMA_BUILD_TESTS=OFF \
       -DLLAMA_BUILD_EXAMPLES=OFF \
       -DLLAMA_CURL=OFF
-    cmake --build /src/$BUILD_SUBDIR --target rpc-server -j '$JOBS'
+    cmake --build /src/$BUILD_SUBDIR --target ggml-rpc-server -j '$JOBS'
   "
 
 # ---- 4. Stage the artifact set ------------------------------------------------
@@ -129,7 +144,10 @@ docker run --rm \
 # HIP router's engine directory is missing it (the ROCm build does not pass
 # -DGGML_RPC=ON). It is backend-agnostic — sockets and ggml-base only — so the
 # copy built here is the one that goes into the router's engine directory.
-NEW_BIN="$BUILD_DIR/bin/rpc-server"
+# Upstream renamed the target and the binary from `rpc-server` to
+# `ggml-rpc-server`. The old name is what the stale rpc-server inside the podman
+# image is called; do not be misled by it.
+NEW_BIN="$BUILD_DIR/bin/ggml-rpc-server"
 [ -x "$NEW_BIN" ] || { echo "ERROR: build did not produce $NEW_BIN"; exit 1; }
 
 echo "[4/4] Staging -> $STAGE_DIR"

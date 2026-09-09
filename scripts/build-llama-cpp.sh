@@ -69,6 +69,16 @@ echo "  HEAD now: $(git log -1 --format='%h %s')"
 # ---- 2/3. Configure + build INSIDE the distrobox (ROCm toolchain) ------------
 # Flags mirror the known-good config captured from the prior build's CMakeCache:
 #   GGML_HIP=ON, AMDGPU_TARGETS=gfx1151, shared libs, server+tools, native, Release.
+#
+# GGML_RPC=ON is what lets this router borrow a discrete NVIDIA card via `--rpc`.
+# The RPC backend is registered at COMPILE time (`#ifdef GGML_USE_RPC` in
+# ggml/src/ggml-backend-reg.cpp), NOT dynamically loaded, so dropping a
+# libggml-rpc.so beside an engine built without this flag does nothing. The
+# b10752 engine deployed on drakemore was built without it: `--rpc` parses
+# (the string is in libllama-common) but no RPC backend exists to bind to.
+# Rebuilding with this flag is therefore a prerequisite for the CUDA
+# accelerator path — see docs/llama-cpp-cuda-rpc-build-and-deployment.md.
+# It changes no HIP codegen; it only adds the socket client backend.
 [ "$LLAMA_CPP_CLEAN" = "1" ] && { echo "  (clean) removing $BUILD_DIR"; rm -rf "$BUILD_DIR"; }
 
 echo "[2/4] Configuring + [3/4] building in distrobox '$DISTROBOX_CONTAINER' (this is the long part)..."
@@ -88,6 +98,7 @@ distrobox enter "$DISTROBOX_CONTAINER" -- bash -lc "
     -DGGML_HIP_NO_VMM=ON \
     -DGGML_HIP_MMQ_MFMA=ON \
     -DGGML_HIP_ROCWMMA_FATTN=ON \
+    -DGGML_RPC=ON \
     -DGGML_NATIVE=ON \
     -DBUILD_SHARED_LIBS=ON \
     -DLLAMA_BUILD_SERVER=ON \
