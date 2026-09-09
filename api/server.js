@@ -12564,7 +12564,7 @@ function finalizeChatTiming(recorder, {
  * @returns {Promise<{text:string, body:Object}>} The assistant text and the upstream body.
  * @throws {Error} When the step returns a non-OK status or an unusable body.
  */
-async function duoChainStepRequest(model, messages, maxTokens) {
+async function duoChainStepRequest(model, messages, maxTokens, controls = null) {
   const response = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -12573,7 +12573,7 @@ async function duoChainStepRequest(model, messages, maxTokens) {
     // rate degrades to wall clock, including queueing and model load) and a bounded
     // `reasoning_effort` (without which the planner never stops thinking and returns no
     // answer at all on a substantial request). Both are pinned by tests in duo-chain.
-    body: JSON.stringify(duoStepBody(model, messages, maxTokens)),
+    body: JSON.stringify(duoStepBody(model, messages, maxTokens, controls)),
     // dispatcher: llamaDispatcher disables undici's default 300s headersTimeout. A chain
     // step is a whole generation from a large model, so 300s is routinely too short — a
     // healthy planner step was aborted at exactly 300.9s as "fetch failed" without it.
@@ -12600,9 +12600,9 @@ async function duoChainStepRequest(model, messages, maxTokens) {
  * @returns {Promise<string>} The step's text.
  * @throws {Error} When the step fails or produces nothing.
  */
-async function duoChainStep(role, model, messages, maxTokens, collected) {
+async function duoChainStep(role, model, messages, maxTokens, collected, controls = null) {
   const startedAt = Date.now();
-  const { text, body } = await duoChainStepRequest(model, messages, maxTokens);
+  const { text, body } = await duoChainStepRequest(model, messages, maxTokens, controls);
   collected.push(duoStepStats({ role, model, elapsedMs: Date.now() - startedAt, body }));
   return text;
 }
@@ -12619,15 +12619,46 @@ async function duoChainStep(role, model, messages, maxTokens, collected) {
  * @param {Array<{role:string, content:string}>} history Conversation turns before the request.
  * @param {string} request The operator's current request.
  * @param {number} maxTokens Per-step token budget.
+ * @param {?Object} controls Caller-supplied generation controls (temperature, response_format,
+ *   chat_template_kwargs, ...) forwarded to every step. See duoStepBody for what duo owns.
  * @returns {Promise<{plan:string, work:string, review:string, duo:Object}>} Step texts and the `duo` envelope.
  * @throws {Error} When any step fails or produces nothing.
  */
-async function runDuoChainSteps(history, request, maxTokens) {
+/**
+ * The generation controls a caller set, forwarded to every duo step.
+ *
+ * duo used to build each step's body from scratch, so `enable_thinking`, `temperature`,
+ * `response_format` and everything else the caller asked for was silently discarded — the
+ * service never sent the instruction the caller was being told the model had ignored.
+ * duoStepBody decides what duo keeps ownership of; this only gathers what to offer it.
+ *
+ * @param {object} body The inbound request body.
+ * @returns {object} Controls to forward, empty when the caller set none.
+ */
+function duoCallerControls(body) {
+  const out = {};
+  for (const key of DUO_FORWARDED_CONTROLS) {
+    if (body?.[key] !== undefined) out[key] = body[key];
+  }
+  return out;
+}
+
+/** Request fields duo forwards to each step; duoStepBody rejects the ones duo owns. */
+const DUO_FORWARDED_CONTROLS = Object.freeze([
+  'temperature', 'top_p', 'top_k', 'min_p', 'repeat_penalty',
+  'presence_penalty', 'frequency_penalty', 'seed', 'stop',
+  'response_format', 'chat_template_kwargs', 'reasoning_format',
+]);
+
+async function runDuoChainSteps(history, request, maxTokens, controls = null) {
   const started = Date.now();
   const stepStats = [];
-  const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats);
-  const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats);
-  const review = await duoChainStep('review', DUO_PLANNER_ID, duoStepMessages(history, buildReviewPrompt(request, plan, work)), maxTokens, stepStats);
+  const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats, controls);
+  const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats, controls);
+  const review = await duoChainStep('review', DUO_PLANNER_ID, duoStepMessages(history, buildReviewPrompt(request, plan, work)), maxTokens, stepStats, controls);
+  // `review` is now the ANSWER (the reviewer returns corrected work, not commentary),
+  // so the envelope keeps plan and work for inspection. Nothing is lost: the caller
+  // receives the answer it asked for, and both intermediate steps remain visible.
   return { plan, work, review, duo: { plan, work, elapsedMs: Date.now() - started, stats: duoChainStats(stepStats) } };
 }
 
@@ -12658,8 +12689,8 @@ async function runDuoChain(req, res) {
   if (req.body?.stream === true) {
     try {
       const stepStats = [];
-      const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats);
-      const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats);
+      const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats, controls);
+      const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats, controls);
 
       const reviewStartedAt = Date.now();
       const upstream = await fetch(`http://localhost:${LLAMA_PORT}/v1/chat/completions`, {
@@ -12739,7 +12770,7 @@ async function runDuoChain(req, res) {
   }
 
   try {
-    const { review, duo } = await runDuoChainSteps(history, request, maxTokens);
+    const { review, duo } = await runDuoChainSteps(history, request, maxTokens, duoCallerControls(req.body));
     return res.json({
       id: `chatcmpl-duo-${Date.now()}`,
       object: 'chat.completion',
@@ -12781,7 +12812,7 @@ async function runDuoChainResponses(req, res) {
   }
   const maxTokens = duoStepBudget(req.body?.max_output_tokens ?? req.body?.max_tokens);
   try {
-    const { review, duo } = await runDuoChainSteps(history, request, maxTokens);
+    const { review, duo } = await runDuoChainSteps(history, request, maxTokens, duoCallerControls(req.body));
     const response = duoResponsesEnvelope({
       id: `resp_duo_${Date.now()}`,
       model: DUO_CHAIN_ID,

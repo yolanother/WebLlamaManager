@@ -120,8 +120,13 @@ export function buildReviewPrompt(userPrompt, plan, work) {
   return [
     'You are the reviewer. Judge the work against the ORIGINAL REQUEST, not against the plan.',
     'A green test suite is not proof of correctness — read what was actually written and',
-    'say plainly if it is wrong, incomplete, or solves a different problem.',
-    'Report what was done, what was not, and anything the operator must check.',
+    'decide whether it is wrong, incomplete, or solves a different problem.',
+    '',
+    'Then RETURN THE FINAL ANSWER to the ORIGINAL REQUEST.',
+    'If the work is correct, return it unchanged. If it is wrong or incomplete, return the',
+    'corrected version. Output ONLY the answer, in exactly the form the ORIGINAL REQUEST',
+    'asked for — no commentary, no verdict, no preamble, nothing else. If the request asked',
+    'for JSON, your entire reply must be that JSON.',
     '',
     'ORIGINAL REQUEST:',
     String(userPrompt ?? ''),
@@ -570,14 +575,24 @@ export const DUO_REASONING_EFFORT = 'medium';
  * @param {number} maxTokens Token budget for the step (see duoStepBudget).
  * @returns {object} Request body for /v1/chat/completions.
  */
-export function duoStepBody(model, messages, maxTokens) {
+export function duoStepBody(model, messages, maxTokens, callerControls = null) {
+  const { chat_template_kwargs: callerKwargs, ...rest } = callerControls || {};
+  // duo OWNS these four and a caller cannot take them: it budgets tokens per step
+  // (duoStepBudget), it chooses which model runs each step, it builds the step's messages
+  // from the chain history, and it needs `timings` to report honest tokens/sec.
+  const OWNED = ['model', 'messages', 'max_tokens', 'timings_per_token'];
+  const forwarded = {};
+  for (const [k, v] of Object.entries(rest)) if (!OWNED.includes(k)) forwarded[k] = v;
   return {
+    ...forwarded,
     model,
     messages,
     max_tokens: maxTokens,
     // Makes the engine report `timings`, the only honest source for tokens/sec.
     timings_per_token: true,
-    // Makes the model stop thinking and answer. See DUO_REASONING_EFFORT.
-    chat_template_kwargs: { reasoning_effort: DUO_REASONING_EFFORT },
+    // duo's default keeps the model from thinking forever (see DUO_REASONING_EFFORT), but
+    // the caller's kwargs are spread AFTER it and therefore win. An explicit
+    // enable_thinking:false used to be replaced outright by this object; now it survives.
+    chat_template_kwargs: { reasoning_effort: DUO_REASONING_EFFORT, ...(callerKwargs || {}) },
   };
 }

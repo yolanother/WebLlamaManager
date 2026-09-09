@@ -457,3 +457,74 @@ test('a real answer still passes the guard untouched', () => {
   assert.equal(r.error, null);
   assert.match(r.text, /Do the thing/);
 });
+
+// --- the chain must return the ANSWER, not a review of it ------------------------
+//
+// Measured on drakemore: a duo request asking for strict JSON returned 1412 characters of
+// markdown prose ("**Verdict: The work is correct.**") as message.content, while duo.work
+// held the perfect, schema-conformant JSON. The reviewer's commentary was being returned in
+// place of the answer, and the answer was discarded into an envelope field no
+// OpenAI-compatible client reads. That is the whole of T312677f9f21cc.
+
+test('buildReviewPrompt asks for the ANSWER, corrected if needed — never a report', () => {
+  const p = buildReviewPrompt('Return only JSON matching {"a":string}', 'the plan', '{"a":"x"}');
+  // The output contract is the point: the reviewer must not narrate.
+  assert.match(p, /final answer|corrected|answer to the ORIGINAL REQUEST/i);
+  assert.doesNotMatch(p, /Report what was done/i, 'the old prompt asked for a report');
+  assert.match(p, /no commentary|only the answer|nothing else/i);
+  // It still has to be able to fix bad work — the review is why duo exists.
+  assert.match(p, /wrong|incomplete|corrected/i);
+  // And it still receives everything it needs to judge.
+  assert.match(p, /ORIGINAL REQUEST/); assert.match(p, /PLAN/); assert.match(p, /WORK PRODUCED/);
+});
+
+test('buildReviewPrompt carries the original request verbatim so the shape survives', () => {
+  const req = 'Answer as strict JSON matching {"state_machine_file":string} and nothing else.';
+  assert.ok(buildReviewPrompt(req, 'p', 'w').includes(req));
+});
+
+// --- caller controls must reach the model ----------------------------------------
+//
+// duoStepBody took three arguments, so chat_template_kwargs (including
+// enable_thinking:false), temperature, response_format, stop and seed were all discarded
+// for anything routed through duo. See T3126b6b7cca1d.
+
+test('duoStepBody threads the caller sampling controls through', () => {
+  const b = duoStepBody('m', [], 100, { temperature: 0.2, top_p: 0.8, seed: 7 });
+  assert.equal(b.temperature, 0.2);
+  assert.equal(b.top_p, 0.8);
+  assert.equal(b.seed, 7);
+});
+
+test('duoStepBody MERGES chat_template_kwargs so the caller wins over duo default', () => {
+  const b = duoStepBody('m', [], 100, { chat_template_kwargs: { enable_thinking: false } });
+  assert.equal(b.chat_template_kwargs.enable_thinking, false, 'explicit caller control must survive');
+  assert.equal(b.chat_template_kwargs.reasoning_effort, DUO_REASONING_EFFORT, 'duo still supplies its default');
+});
+
+test('duoStepBody lets the caller override duo reasoning_effort explicitly', () => {
+  const b = duoStepBody('m', [], 100, { chat_template_kwargs: { reasoning_effort: 'low' } });
+  assert.equal(b.chat_template_kwargs.reasoning_effort, 'low');
+});
+
+test('duoStepBody carries response_format, so a json_object request is constrained', () => {
+  const b = duoStepBody('m', [], 100, { response_format: { type: 'json_object' } });
+  assert.deepEqual(b.response_format, { type: 'json_object' });
+});
+
+test('duoStepBody keeps duo ownership of model, messages, max_tokens and timings', () => {
+  // duo budgets tokens per step (duoStepBudget) and needs timings; a caller cannot take those.
+  const b = duoStepBody('planner', [{ role: 'user', content: 'x' }], 512, {
+    model: 'somethingelse', messages: [], max_tokens: 999999, timings_per_token: false,
+  });
+  assert.equal(b.model, 'planner');
+  assert.equal(b.max_tokens, 512);
+  assert.equal(b.timings_per_token, true);
+  assert.equal(b.messages.length, 1);
+});
+
+test('duoStepBody with no caller controls is exactly what it always was', () => {
+  const b = duoStepBody('m', [], 100);
+  assert.deepEqual(b, { model: 'm', messages: [], max_tokens: 100, timings_per_token: true,
+    chat_template_kwargs: { reasoning_effort: DUO_REASONING_EFFORT } });
+});
