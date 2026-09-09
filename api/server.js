@@ -235,6 +235,7 @@ import {
 import { normalizePoolConfig, resolvePools } from './gpu-pools.js';
 import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority, reservationView } from './gpu-reservations.js';
 import { drainPlan, reservationsNeedingDrain } from './gpu-drain.js';
+import { normalizeAliasGpu, poolPinPlan } from './alias-gpu.js';
 import { acceleratorPlan, rpcRouterArgs,
   engineSupportsRpc,
   parseEngineNeededLibs,
@@ -1048,7 +1049,15 @@ function setDefaultAliasTarget(name, target) {
   const result = validateAlias(config, name, [{ host: 'local', model }], localModelNames());
   if (!result.ok) return result;
   if (!config.aliases || typeof config.aliases !== 'object') config.aliases = {};
-  config.aliases[name] = result.value;
+  // This is a write-view onto the TARGET only. The group's GPU binding is carried over,
+  // because retargeting default-big from the General tab must not silently unpin it from
+  // the card the operator put it on.
+  const existing = config.aliases[name];
+  config.aliases[name] = {
+    ...result.value,
+    ...(typeof existing?.gpu === 'string' ? { gpu: existing.gpu } : {}),
+    ...(Number.isSafeInteger(existing?.gpuPriority) ? { gpuPriority: existing.gpuPriority } : {}),
+  };
   return { ok: true, warnings: result.warnings };
 }
 
@@ -4485,6 +4494,10 @@ app.get('/api/settings', (req, res) => {
       // and reported as an empty array there rather than omitted, so a client can tell
       // "no pools" from "this server is too old to have them".
       gpus: Array.isArray(config.gpus) ? config.gpus : [],
+      // READ-ONLY view of the alias table, carrying each group's optional `gpu` /
+      // `gpuPriority`. The alias routes are the only writer — PUT /api/aliases/:name —
+      // and a second writer here is exactly how two surfaces for one table drift apart.
+      aliases: config.aliases && typeof config.aliases === 'object' ? config.aliases : {},
     // Readable as well as writable: the accelerator switch is what makes a pin to a
     // discrete card reachable, so an operator must be able to see its current state.
     duo: {
@@ -4726,6 +4739,18 @@ const GPU_ENGINE_CHILD = 'llama-server router';
 
 /** Resolved pools, refreshed from settings and from the sysfs card list. */
 let gpuPools = [];
+/**
+ * Which models each pool pins and at what priority, with every contest between a pool's
+ * own `pinnedModels` and an alias bound to a pool already decided — see
+ * `poolPinPlan` in api/alias-gpu.js. This, not `pool.pinnedModels`, is what the pin path
+ * reads: an alias bound to a pool contributes its local targets here exactly as a
+ * `pinnedModels` entry does, and the two are reconciled in one place rather than at each
+ * of the three call sites.
+ * @type {Array<{id: string, models: Array<string>, priority: number}>}
+ */
+let gpuPinPlan = [];
+/** Last plan commentary logged, so an unchanged plan does not restate itself every sweep. */
+let gpuPinPlanLog = '';
 /** Pool id -> the id of llama-manager's own internal reservation for that pool's pins. */
 const gpuPinReservations = new Map();
 
@@ -4783,6 +4808,16 @@ function refreshGpuPools() {
     addLog('system', `GPU pools disabled: ${err.message}`);
   }
   gpuReservations.setPools(gpuPools);
+  // Fold the alias bindings in before anything reserves: a pin taken at the pool's own
+  // priority and corrected afterwards would briefly hold the card at the wrong rank.
+  const plan = poolPinPlan(gpuPools, config.aliases);
+  gpuPinPlan = plan.pools;
+  const commentary = [...plan.warnings, ...plan.notes];
+  const rendered = commentary.join('\n');
+  if (rendered !== gpuPinPlanLog) {
+    for (const line of commentary) addLog('system', line);
+    gpuPinPlanLog = rendered;
+  }
   syncGpuPinReservations();
 }
 
@@ -4798,24 +4833,43 @@ function refreshGpuPools() {
  * @returns {void}
  */
 function syncGpuPinReservations() {
-  for (const pool of gpuPools) {
-    if (pool.pinnedModels.length === 0) continue;
-    const existing = gpuPinReservations.get(pool.id);
-    if (existing && ['pending', 'held'].includes(gpuReservations.get(existing)?.state)) continue;
+  // A pin whose pool has left the plan -- the alias that bound it was deleted or
+  // retargeted, or the pool itself was removed from settings -- must give the card back.
+  // Nothing else revisits it, and a lease with no expiry and no owner holds a card forever.
+  for (const [poolId, id] of gpuPinReservations) {
+    if (gpuPinPlan.some((p) => p.id === poolId)) continue;
+    gpuReservations.release(id);
+    gpuPinReservations.delete(poolId);
+    addLog('system', `GPU pin for "${poolId}" released: nothing pins that pool any more`);
+  }
+  for (const planned of gpuPinPlan) {
+    const existing = gpuPinReservations.get(planned.id);
+    const active = existing && ['pending', 'held'].includes(gpuReservations.get(existing)?.state)
+      ? gpuReservations.get(existing)
+      : null;
+    if (active) {
+      // An alias whose gpuPriority was just edited must actually take effect. The lease
+      // already exists at the old rank and nothing else would ever revisit it, so it is
+      // dropped and retaken; a rank that has not moved is left strictly alone.
+      if (active.priority === planned.priority) continue;
+      addLog('system', `GPU pin for "${planned.id}" moves from priority ${active.priority} to ${planned.priority}`);
+      gpuReservations.release(existing);
+      gpuPinReservations.delete(planned.id);
+    }
     try {
       const pin = gpuReservations.reserve({
-        gpu: pool.id,
+        gpu: planned.id,
         holder: LLAMA_MANAGER_HOLDER,
-        priority: pool.defaultPriority,
+        priority: planned.priority,
         ttlMs: null,
-        reason: `model pin: ${pool.pinnedModels.join(', ')}`,
+        reason: `model pin: ${planned.models.join(', ')}`,
       });
-      gpuPinReservations.set(pool.id, pin.id);
+      gpuPinReservations.set(planned.id, pin.id);
       // llama-manager is already the thing occupying its own card, so there is nothing to
       // drain from itself and the pin is held the moment it is granted.
       if (pin.card) gpuReservations.markHeld(pin.id);
     } catch (err) {
-      addLog('system', `GPU pin for "${pool.id}" not granted: ${err.message}`);
+      addLog('system', `GPU pin for "${planned.id}" not granted: ${err.message}`);
     }
   }
 }
@@ -4832,8 +4886,9 @@ function syncGpuPinReservations() {
  *   pinning reservation is not currently held.
  */
 function activeGpuPin() {
-  for (const pool of gpuPools) {
-    if (pool.pinnedModels.length === 0) continue;
+  for (const planned of gpuPinPlan) {
+    const pool = gpuPools.find((p) => p.id === planned.id);
+    if (!pool) continue;
     const held = gpuReservations.get(gpuPinReservations.get(pool.id));
     // The state must be checked, not just the card: a preempted reservation KEEPS the
     // `card` it was bound to as a record of what it lost, so testing the card alone would
@@ -4877,18 +4932,19 @@ function activeGpuPin() {
 function gpuPinPresetDevices(rpcEndpoint) {
   const rpcEndpoints = rpcEndpoint ? [rpcEndpoint] : [];
   const pins = {};
-  for (const pool of gpuPools) {
-    if (!pool.pinnedModels?.length) continue;
+  for (const planned of gpuPinPlan) {
+    const pool = gpuPools.find((p) => p.id === planned.id);
+    if (!pool) continue;
     for (const card of pool.cards || []) {
       const device = resolvePinDevice({ card, rpcEndpoints, endpoint: rpcEndpoint });
       if (device) {
-        for (const model of pool.pinnedModels) pins[model] = device;
+        for (const model of planned.models) pins[model] = device;
         break;
       }
       if (!LOCALLY_ENUMERABLE_DRIVERS.includes(card.driver || '')) {
         addLog('system', `GPU pin for "${pool.id}" cannot be applied: ${card.card} (${card.driver || 'no driver'}) `
           + 'is not enumerable by this engine and no RPC endpoint serves it. '
-          + `${pool.pinnedModels.join(', ')} will run on the default device. `
+          + `${planned.models.join(', ')} will run on the default device. `
           + 'Enable the duo accelerator so the card is attached over RPC.');
       }
     }
@@ -5631,8 +5687,12 @@ refreshGpuPools();
  * Render one alias group with a live preview of what it currently resolves to, so the
  * operator can see whether a target is reachable without issuing a request.
  *
+ * `gpu` and `gpuPriority` are reported as null when the alias binds no pool, rather than
+ * omitted, so a client can tell "runs anywhere" from "this server is too old to bind an
+ * alias to a pool at all".
+ *
  * @param {string} name the alias name.
- * @param {{targets: Array<{host: string, model: string}>}} group the stored group.
+ * @param {{targets: Array<{host: string, model: string}>, gpu?: string, gpuPriority?: number}} group the stored group.
  * @returns {object} the group plus its resolved candidates split into warm and cold.
  */
 function aliasView(name, group) {
@@ -5640,6 +5700,8 @@ function aliasView(name, group) {
   return {
     name,
     targets: Array.isArray(group?.targets) ? group.targets : [],
+    gpu: typeof group?.gpu === 'string' ? group.gpu : null,
+    gpuPriority: Number.isSafeInteger(group?.gpuPriority) ? group.gpuPriority : null,
     candidates: routing?.candidates ?? [],
     warm: routing?.warm ?? [],
     cold: routing?.cold ?? [],
@@ -5664,11 +5726,32 @@ app.put('/api/aliases/:name', (req, res) => {
   if (!result.ok) return res.status(400).json({ error: result.error });
 
   const name = req.params.name.trim();
+  // The optional GPU binding. Validated against the pools that actually exist, so an alias
+  // naming a pool that does not is a 400 naming both — never a field quietly dropped on
+  // the way to disk, which is the failure this area has been cured of twice.
+  let binding;
+  try {
+    binding = normalizeAliasGpu(name, { gpu: req.body?.gpu, gpuPriority: req.body?.gpuPriority }, gpuPools.map(p => p.id));
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
   if (!config.aliases || typeof config.aliases !== 'object') config.aliases = {};
   const existed = Object.prototype.hasOwnProperty.call(config.aliases, name);
-  config.aliases[name] = result.value;
+  const rebound = binding.gpu !== (config.aliases[name]?.gpu ?? null);
+  // An alias that binds no pool is stored as `{targets}` and nothing else, byte-identical
+  // to every alias written before this field existed.
+  config.aliases[name] = {
+    ...result.value,
+    ...(binding.gpu ? { gpu: binding.gpu } : {}),
+    ...(binding.gpuPriority === null ? {} : { gpuPriority: binding.gpuPriority }),
+  };
   saveConfig(config);
-  addLog('backends', `${existed ? 'Updated' : 'Created'} alias '${name}' -> ${result.value.targets.map(t => `${t.host}/${t.model}`).join(', ')}`);
+  // Only when a pool binding is involved: re-resolving reads sysfs, and an ordinary alias
+  // edit has nothing to do with the cards.
+  if (rebound || binding.gpu) refreshGpuPools();
+  addLog('backends', `${existed ? 'Updated' : 'Created'} alias '${name}' -> ${result.value.targets.map(t => `${t.host}/${t.model}`).join(', ')}`
+    + (binding.gpu ? ` on GPU pool '${binding.gpu}'${binding.gpuPriority === null ? '' : ` at priority ${binding.gpuPriority}`}` : ''));
   for (const warning of result.warnings) addLog('backends', `Alias '${name}': ${warning}`);
 
   res.json({
@@ -5689,6 +5772,8 @@ app.delete('/api/aliases/:name', (req, res) => {
   const removed = config.aliases[name];
   delete config.aliases[name];
   saveConfig(config);
+  // A deleted alias must give its card back; nothing else revisits the pin plan.
+  if (removed?.gpu) refreshGpuPools();
   addLog('backends', `Removed alias '${name}'`);
   res.json({ success: true, removed: { name, targets: removed?.targets ?? [] } });
 });

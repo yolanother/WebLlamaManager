@@ -296,3 +296,41 @@ test('plan order follows the operator\'s pool order, so the engine pin is predic
   });
   assert.deepEqual(plan.pools.map((p) => p.id), ['first', 'second']);
 });
+
+// ---------- server.js wiring ----------
+// server.js is a monolith with no exports, so these read its source, in the house style of
+// api/backend-registration.test.js. They guard the three places where the wiring has
+// actually been wrong: the pin path reading the raw `pinnedModels` instead of the decided
+// plan, the alias write path accepting a pool that does not exist, and a pin outliving the
+// alias that asked for it.
+
+import { readFile } from 'fs/promises';
+
+const SERVER = await readFile(new URL('./server.js', import.meta.url), 'utf8');
+
+test('the pin path reads the decided plan, never a pool\'s raw pinnedModels', () => {
+  for (const fn of ['function syncGpuPinReservations()', 'function activeGpuPin()', 'function gpuPinPresetDevices(']) {
+    const start = SERVER.indexOf(fn);
+    assert.notEqual(start, -1, `${fn} must still exist`);
+    const body = SERVER.slice(start, SERVER.indexOf('\n}\n', start));
+    assert.equal(body.includes('pinnedModels'), false, `${fn} must consult gpuPinPlan, not pinnedModels`);
+    assert.equal(body.includes('gpuPinPlan'), true, `${fn} must consult gpuPinPlan`);
+  }
+});
+
+test('PUT /api/aliases/:name validates the GPU binding and 400s rather than storing it', () => {
+  const start = SERVER.indexOf("app.put('/api/aliases/:name'");
+  assert.notEqual(start, -1);
+  const handler = SERVER.slice(start, SERVER.indexOf('\n});', start));
+  assert.match(handler, /normalizeAliasGpu\(/);
+  assert.match(handler, /catch \(err\) \{\s*return res\.status\(400\)/);
+  // The binding must be validated BEFORE anything is written to config.aliases.
+  assert.ok(handler.indexOf('normalizeAliasGpu(') < handler.indexOf('config.aliases[name] ='));
+});
+
+test('a pin whose pool has left the plan is released, not left holding the card', () => {
+  const start = SERVER.indexOf('function syncGpuPinReservations()');
+  const body = SERVER.slice(start, SERVER.indexOf('\n}\n', start));
+  assert.match(body, /gpuPinReservations\)\s*\{[\s\S]*gpuReservations\.release/);
+  assert.match(body, /gpuPinReservations\.delete/);
+});
