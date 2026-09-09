@@ -359,15 +359,17 @@ Neither falls back to local execution. So:
 | `acceleratorPlan()` says the card may be borrowed, at engine start | Start the rpc-server, wait for it to accept a connection (20s ceiling), then emit `--rpc`. |
 | Operator switches `duo.useAccelerator` off | Stop it. |
 | The plan stops wanting the card (agent burst, reservation, no NVIDIA card) | Stop it. |
+| The engine stops for any reason — idle shutdown, a ds4 swap, an operator stop, a restart | Stop it, inside `stopLlamaServer()`. A card held behind a stopped engine is not a shared card, and a detached engine is the only safe moment to stop it. |
 | A reservation outranking duo is granted on that card | Stop the **engine**, then the rpc-server. Releasing the reservation restarts the engine, which starts the rpc-server again. |
 | Manager shutdown | Stop the engine, then the rpc-server. |
 
 Verified end to end on drakemore against a throwaway manager instance (its own config,
 data and ports; a stub `start-llama.sh` that only records its environment): with no
 binary and with a binary that exits without listening, `LLAMA_RPC_ENDPOINT` is unset
-and the engine starts; with the real CUDA `ggml-rpc-server` it is started, waited for,
-emitted, preempted by a priority-80 reservation on `rtx3090`, restored on release, and
-stopped by manager shutdown.
+and the engine starts; with the real CUDA `ggml-rpc-server` — including the packaged one,
+resolved with no configuration at all — it is started, waited for, emitted, preempted by
+a priority-80 reservation on `rtx3090`, restored on release, and stopped by both an engine
+stop (24 GB card back from 988 MiB to its 727 MiB idle baseline) and manager shutdown.
 
 ## Packaging: how this reaches an installed box
 
