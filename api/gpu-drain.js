@@ -70,3 +70,34 @@ export function drainPlan({ models = [], children = [], inFlight = 0 } = {}) {
 
   return { offload, queue, stop, ready: false, reason: blockers.join('; ') };
 }
+
+/**
+ * Which pending reservations have been handed a card but have no drain running.
+ *
+ * A claim granted by a route handler gets its drain started by that handler. A claim that
+ * had to QUEUE is different: the state machine promotes it from the waiting list when
+ * capacity frees — inside `release()`, `sweep()` or `setPools()` — binding a card to a
+ * record that stays `pending`. No route observes that, so nothing starts its drain and
+ * nothing ever calls `markHeld`. The claim then occupies the card, without ever becoming
+ * usable, until its TTL expires; `wait` returns 408 the whole time.
+ *
+ * The promotion cannot start its own drain, because it happens inside a state-machine
+ * transaction and re-entering `gpuReservations` from there double-books the card (observed
+ * live, and recorded above the `onPreempt` callback in api/server.js). So the sweep timer
+ * — already the established place for exactly this "outside any transaction" work — asks
+ * this function what it missed.
+ *
+ * @param {?Array<object>} reservations Reservation records, as `GpuReservations#list`
+ *   returns them. A nullish or ragged list yields an empty result rather than throwing:
+ *   this runs on a timer, and an exception would stop TTL expiry for every pool.
+ * @param {Set<string>} inFlight Ids whose drain is already running. Starting a second
+ *   drain for one races the first over stopping the engine child.
+ * @returns {string[]} Reservation ids needing a drain, in the order given.
+ */
+export function reservationsNeedingDrain(reservations, inFlight) {
+  if (!Array.isArray(reservations)) return [];
+  const running = inFlight instanceof Set ? inFlight : new Set();
+  return reservations
+    .filter((r) => r && r.state === 'pending' && r.card && !running.has(r.id))
+    .map((r) => r.id);
+}

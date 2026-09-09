@@ -229,7 +229,7 @@ import {
 } from './gpu-inventory.js';
 import { normalizePoolConfig, resolvePools } from './gpu-pools.js';
 import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority, reservationView } from './gpu-reservations.js';
-import { drainPlan } from './gpu-drain.js';
+import { drainPlan, reservationsNeedingDrain } from './gpu-drain.js';
 import { acceleratorPlan, rpcRouterArgs } from './duo-accelerator.js';
 dotenv.config({ path: join(PROJECT_ROOT, '.env') });
 
@@ -4698,6 +4698,17 @@ const GPU_ENGINE_CHILD = 'llama-server router';
 let gpuPools = [];
 /** Pool id -> the id of llama-manager's own internal reservation for that pool's pins. */
 const gpuPinReservations = new Map();
+
+/**
+ * Reservation ids whose drain is currently running.
+ *
+ * A route handler starts a drain for the claim it just created; the sweep starts one for a
+ * claim the state machine promoted off the waiting list behind everyone's back. Both must
+ * consult this, because two concurrent drains for one reservation race each other over
+ * stopping the engine child.
+ * @type {Set<string>}
+ */
+const gpuDrainsInFlight = new Set();
 /**
  * Model id -> 'offload' | 'queue' while its card is reserved away. `resolveBackend` reads
  * it to prefer a peer, and `acquireLocalSlot` reads it to PARK rather than fail. Empty
@@ -4888,6 +4899,26 @@ function engineBoundCard() {
 async function runGpuDrain(reservationId) {
   const reservation = gpuReservations.get(reservationId);
   if (!reservation || reservation.state !== 'pending' || !reservation.card) return;
+  // Tracked here rather than at each call site so no future caller can forget it.
+  if (gpuDrainsInFlight.has(reservationId)) return;
+  gpuDrainsInFlight.add(reservationId);
+  try {
+    await drainForReservation(reservationId, reservation);
+  } finally {
+    gpuDrainsInFlight.delete(reservationId);
+  }
+}
+
+/**
+ * The drain itself. Split from {@link runGpuDrain} only so the in-flight bookkeeping above
+ * cannot be bypassed by an early return in here.
+ *
+ * @param {string} reservationId The pending reservation to drain for.
+ * @param {object} reservation Its record, already validated as pending and card-bound.
+ * @returns {Promise<void>} Resolves once the reservation is held, or immediately when it
+ *   stops being pending (released or preempted while the drain was running).
+ */
+async function drainForReservation(reservationId, reservation) {
 
   const engineOnCard = engineBoundCard() === reservation.card;
   const plan = drainPlan({
@@ -5273,6 +5304,14 @@ setInterval(() => {
     if (pin?.state === 'pending' && pin.card && gpuReservations.markHeld(id)) {
       addLog('system', `GPU pin for "${poolId}" retook ${pin.card}`);
     }
+  }
+  // An EXTERNAL claim promoted off the waiting list is bound to a card by the state
+  // machine, inside a transaction no route handler sees. Without this it would stay
+  // pending until its TTL ran out -- holding the card, and answering every `wait` with a
+  // 408. Pins are handled above and are already held by the time we get here.
+  for (const id of reservationsNeedingDrain(gpuReservations.list(), gpuDrainsInFlight)) {
+    if (gpuPinReservations.get(gpuReservations.get(id)?.gpu) === id) continue;
+    runGpuDrain(id).catch((err) => addLog('system', `GPU drain failed: ${err.message}`));
   }
 }, GPU_SWEEP_INTERVAL_MS).unref?.();
 
