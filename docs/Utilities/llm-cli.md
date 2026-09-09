@@ -49,6 +49,7 @@ same catalog used by the parser, so agents do not need to scrape this page.
   `downloads list|status|cancel`
 - Operations: `processes list`, `logs`
 - Inference: `chat`
+- GPU reservations: `gpu list|show|lock|reserve|wait|renew|release|reservations`
 - Complete API: `api list`, `api call OPERATION_ID`, and
   `request METHOD PATH`
 
@@ -57,6 +58,62 @@ interactive confirmation prompt. HTTP, connection, JSON, command, and usage
 failures write concise diagnostics to stderr and use a nonzero exit code. A zero
 exit code means the command and any requested output projection succeeded.
 Credential-like response fields are masked before output.
+
+## GPU reservations
+
+Named GPUs (`cli/catalog.js` `gpu` family) are POOLS of interchangeable cards
+matched by class, not individual devices — a settings entry like `rtx3090` can
+match one or several present cards, and a reservation binds to whichever one is
+free. This is how an external agent (for example the pods agent driving asset
+generation or TTS on a discrete card) coordinates with llama-manager's own use
+of the same hardware.
+
+```bash
+llm gpu list                          # every pool: capacity, live load, free:bool
+llm gpu show rtx3090                  # one pool: bound cards, holders, load
+llm gpu reservations                  # every reservation across every pool
+llm gpu reservations --gpu rtx3090 --state held
+```
+
+**`lock` vs `reserve` — this is the part integrators get wrong.** `gpu lock`
+BLOCKS and does not return until the card is genuinely free and the reservation
+is held — llama-manager drains in-flight work off the card first. `gpu reserve`
+returns IMMEDIATELY with a pending reservation that is NOT yet yours; poll it
+with `gpu wait`, or just use `gpu lock` if you want one call that does both.
+
+`--priority` is a SIGNED integer: `0` is llama-manager's own baseline, a
+NEGATIVE value yields to llama-manager's ordinary work (a soft, non-blocking
+hold), and a POSITIVE value preempts it. A non-integer value (`--priority high`,
+`--priority 1.5`) is a usage error, not a silent `NaN`.
+
+A complete pods-style hold/renew/release cycle:
+
+```bash
+# Block until the card is ours, at a priority that preempts llama-manager's
+# own use of it, with a lease that expires if we vanish without a renew.
+RESERVATION_ID=$(llm gpu lock rtx3090 \
+  --priority 80 --ttl 300 --holder pods --reason 'tts burst' \
+  --get reservationId)
+
+# ... do the work that needs the card ...
+
+# Heartbeat before the 300s TTL lapses, for a job that runs long.
+llm gpu renew "$RESERVATION_ID"
+
+# ... more work ...
+
+# Hand the card back. Not destructive — no --yes required.
+llm gpu release "$RESERVATION_ID"
+```
+
+The non-blocking equivalent, useful when the caller has other work to do while
+waiting:
+
+```bash
+RESERVATION_ID=$(llm gpu reserve rtx3090 --priority 80 --ttl 300 --get reservationId)
+llm gpu wait "$RESERVATION_ID" --timeout 60   # blocks up to 60s, then gives up
+llm gpu release "$RESERVATION_ID"
+```
 
 ## Complete API, multipart, and binary operations
 
