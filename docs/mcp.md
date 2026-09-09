@@ -4,15 +4,15 @@ Use of this document is governed by the LICENSE file in the repository root.
 
 Setup and public tool reference for Llama Manager's Model Context Protocol
 server. This document explains synchronous chat, OpenAI-compatible background
-Responses, resumable streaming, and the manager-specific prepared-context and
-routing extensions exposed to MCP clients.
+Responses, resumable streaming, the manager-specific prepared-context and
+routing extensions, and the GPU reservation lifecycle exposed to MCP clients.
 -->
 
 # Llama Manager MCP Server
 
 The bundled MCP server calls the Llama Manager HTTP API so agents can inspect
 the host, run synchronous chat, manage OpenAI-compatible background Responses,
-and use prepared llama.cpp contexts.
+use prepared llama.cpp contexts, and reserve GPU pools.
 
 ## Configure a client
 
@@ -246,6 +246,98 @@ limits. For local preparation, take `resolvedModel` from the prepared response,
 match that concrete id in `llama_list_models`, and use its advertised `n_ctx`.
 Never substitute a global default for an unknown alias context. A multi-target
 local/remote Response has no single effective context before routing.
+
+## GPU reservation tools
+
+These tools expose the GPU pool inventory and reservation lifecycle described in
+[GPU Reservations](Designs/GpuReservations.md). A "GPU" here is a named POOL of
+interchangeable cards matched by class (vendor:device id / product name), not a
+single physical card — see `llama_list_gpus`.
+
+| Tool | HTTP | Purpose |
+|---|---|---|
+| `llama_list_gpus` | `GET /api/gpus` | Inventory, capacity, live per-card load, and current holders |
+| `llama_lock_gpu` | `POST /api/gpus/{gpu}/lock` | Reserve and BLOCK until the card is actually free |
+| `llama_reserve_gpu` | `POST /api/gpus/{gpu}/reserve` | Reserve without blocking; returns a PENDING reservation |
+| `llama_wait_gpu_reservation` | `POST /api/gpus/reservations/{id}/wait` | Block on a pending reservation until held/expired/preempted/timeout |
+| `llama_renew_gpu_reservation` | `POST /api/gpus/reservations/{id}/renew` | Heartbeat a lease to push out its TTL |
+| `llama_release_gpu` | `DELETE /api/gpus/reservations/{id}` | Release a reservation immediately |
+
+### `llama_list_gpus` — check load before you wait
+
+Reports live per-pool load precisely, not just a free/busy flag, so a caller can
+choose to route work to a less-loaded pool instead of queuing for this one:
+
+```json
+{"tool": "llama_list_gpus", "arguments": {}}
+```
+
+### `llama_lock_gpu` vs `llama_reserve_gpu`
+
+`llama_lock_gpu` **blocks** until llama-manager has finished draining its own
+work off the card and the card is genuinely yours. `llama_reserve_gpu` returns
+**immediately** with a `pending` reservation that is **not yet yours to use** —
+you must call `llama_wait_gpu_reservation` (or poll) until it reaches `held`
+before using the card. Use `llama_lock_gpu` when you just want the card and are
+happy to block for it; use `llama_reserve_gpu` + `llama_wait_gpu_reservation`
+when you want to do other work while the card drains, or want to give up with
+`noWait` instead of queuing.
+
+Both accept `priority` — a **signed integer**: `0` is llama-manager's own
+baseline, **negative** yields to llama-manager (a soft hold that blocks
+nobody), and **positive** preempts llama-manager and, if the pool is full, its
+lowest-priority holder (only when strictly higher).
+
+Every granted lease **expires** after `ttlSeconds` unless renewed with
+`llama_renew_gpu_reservation` — an agent that locks or reserves a card and
+never renews will lose it automatically rather than stranding it.
+
+### Worked example: hold, renew, release
+
+```json
+{
+  "tool": "llama_lock_gpu",
+  "arguments": {
+    "gpu": "rtx3090",
+    "priority": 80,
+    "ttlSeconds": 300,
+    "holder": "pods-agent",
+    "reason": "tts burst"
+  }
+}
+```
+
+This blocks until the card is free, then returns a held reservation such as
+`{"reservationId": "res_abc123", "state": "held", "card": "card1", "gpu": "rtx3090"}`.
+While work continues, heartbeat the lease before its 300-second TTL elapses:
+
+```json
+{"tool": "llama_renew_gpu_reservation", "arguments": {"reservationId": "res_abc123"}}
+```
+
+When finished, release it immediately rather than waiting for expiry:
+
+```json
+{"tool": "llama_release_gpu", "arguments": {"reservationId": "res_abc123"}}
+```
+
+For the non-blocking variant, reserve then wait:
+
+```json
+{
+  "tool": "llama_reserve_gpu",
+  "arguments": {"gpu": "rtx3090", "priority": 80, "ttlSeconds": 300, "holder": "pods-agent"}
+}
+```
+
+returns `{"reservationId": "res_abc123", "state": "pending"}` right away, then:
+
+```json
+{"tool": "llama_wait_gpu_reservation", "arguments": {"reservationId": "res_abc123", "timeoutMs": 60000}}
+```
+
+blocks (up to `timeoutMs`) until the reservation reaches `held`, is preempted,
+expires, or the timeout is hit.
 
 ## Other available tools
 
