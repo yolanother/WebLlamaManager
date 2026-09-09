@@ -466,7 +466,7 @@ export function museGlimmerDflashPresetSection({ modelsDir, draftExists } = {}) 
  * @returns {{name:string, options:Object<string,string>}|null} Section descriptor, or
  *   null when the weights are absent so the router serves its other models normally.
  */
-export function qwen38FlashNextPresetSection({ modelsDir, weightsExist, threads } = {}) {
+export function qwen38FlashNextPresetSection({ modelsDir, weightsExist, threads, contextSize } = {}) {
   if (!weightsExist) return null;
   return {
     name: 'unsloth_Qwen3.8-Flash-Next-GGUF',
@@ -477,8 +477,38 @@ export function qwen38FlashNextPresetSection({ modelsDir, weightsExist, threads 
       'threads': String(threads),
       'fit': 'off',
       'parallel': '1',
+      // This model reads files and large inputs, so its window is its binding constraint.
+      // It inherited the box-wide default (65536) -- a quarter of what it was trained for.
+      'ctx-size': String(resolveQwen38Context(contextSize)),
     },
   };
+}
+
+/**
+ * The context window Qwen3.8 Flash-Next was trained for, from its own GGUF metadata
+ * (`qwen4exp.context_length`).
+ *
+ * Measured on drakemore before adopting it: loading at this size took the box from 25 GB
+ * used to 85 GB with 38 GB still free, and the engine's /props reported n_ctx = 262144, so
+ * the full window fits alongside the 77 GB of weights with real headroom.
+ * @type {number}
+ */
+export const QWEN38_FLASH_NEXT_CONTEXT = 262144;
+
+/**
+ * Resolve the context for Qwen3.8 Flash-Next, clamped to what the model can actually do.
+ *
+ * A box with less memory can ask for less. Nothing can ask for MORE than the trained
+ * window: exceeding it does not fail loudly, it degrades output quality silently, which is
+ * the worst way for a limit to be enforced.
+ *
+ * @param {*} contextSize Requested size, or anything at all.
+ * @returns {number} A positive integer no greater than {@link QWEN38_FLASH_NEXT_CONTEXT};
+ *   the full window when the request is missing or nonsensical.
+ */
+export function resolveQwen38Context(contextSize) {
+  if (!Number.isSafeInteger(contextSize) || contextSize <= 0) return QWEN38_FLASH_NEXT_CONTEXT;
+  return Math.min(contextSize, QWEN38_FLASH_NEXT_CONTEXT);
 }
 
 /**

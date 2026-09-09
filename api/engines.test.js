@@ -30,6 +30,7 @@ import {
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection,
   qwen38FlashNextPresetSection,
+  QWEN38_FLASH_NEXT_CONTEXT,
   qwen36WorkerPresetSection,
   validatePresetEngineFields,
   resolveDs4ModelPath,
@@ -1243,9 +1244,16 @@ test('the rendered INI keeps the alias distinct from the canonical model', () =>
   assert.match(ini, /^\[\*\]/m);
   assert.match(ini, /^\[unsloth_Qwen3\.8-Flash-Next-GGUF\]/m);
   assert.match(ini, /^\[podcast-qwen3\.8-16k\]/m);
-  // The canonical section must NOT pin a context; it inherits the global one.
+  // The canonical section DOES pin its own context, and deliberately so. It used to
+  // inherit the global 65536; that was a quarter of the 262144 the model is trained for,
+  // and this model's job is reading files and large inputs. The two sections must still
+  // differ -- the bounded podcast route keeps its own small window, which is the property
+  // this test has always really been about.
   const canonical = ini.split('[unsloth_Qwen3.8-Flash-Next-GGUF]')[1].split('\n[')[0];
-  assert.doesNotMatch(canonical, /ctx-size/);
+  const podcast = ini.split('[podcast-qwen3.8-16k]')[1].split('\n[')[0];
+  assert.match(canonical, /ctx-size = 262144/);
+  assert.match(podcast, /ctx-size = 16384/);
+  assert.notEqual(canonical, podcast);
 });
 
 test('container-start only drops --ctx-size when a preset is actually in use', () => {
@@ -1335,4 +1343,37 @@ test('pinEnvApplies is true only for a locally enumerable card', () => {
   assert.equal(pinEnvApplies({ driver: 'nvidia' }), false);
   assert.equal(pinEnvApplies({}), false);
   assert.equal(pinEnvApplies(null), false);
+});
+
+// --- Qwen3.8 Flash-Next context ------------------------------------------------
+//
+// This model processes files and large inputs, so its context is the constraint that
+// matters most for it. Its GGUF declares qwen4exp.context_length = 262144, and it was
+// inheriting the box-wide 65536 -- a quarter of what it was trained for. Measured on
+// drakemore: loading at 262144 took memory from 25 GB used to 85 GB with 38 GB still
+// free, and /props reported n_ctx = 262144, so the full window fits with headroom.
+
+test('qwen38FlashNextPresetSection: asks for the full trained context, not the box default', () => {
+  const s = qwen38FlashNextPresetSection({ modelsDir: '/home/u/models', weightsExist: true, threads: 16 });
+  assert.equal(s.options['ctx-size'], String(QWEN38_FLASH_NEXT_CONTEXT));
+  assert.equal(QWEN38_FLASH_NEXT_CONTEXT, 262144, 'the value the GGUF declares it was trained for');
+});
+
+test('qwen38FlashNextPresetSection: an explicit context override wins', () => {
+  // A box with less memory must be able to ask for less without editing code.
+  const s = qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16, contextSize: 131072 });
+  assert.equal(s.options['ctx-size'], '131072');
+});
+
+test('qwen38FlashNextPresetSection: a nonsense override falls back rather than emitting garbage', () => {
+  for (const bad of [0, -1, 'lots', null, undefined, 1.5]) {
+    const s = qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16, contextSize: bad });
+    assert.equal(s.options['ctx-size'], String(QWEN38_FLASH_NEXT_CONTEXT), `override ${bad} must not reach the engine`);
+  }
+});
+
+test('qwen38FlashNextPresetSection: the context never exceeds what the model was trained for', () => {
+  const s = qwen38FlashNextPresetSection({ modelsDir: '/m', weightsExist: true, threads: 16, contextSize: 999999 });
+  assert.equal(s.options['ctx-size'], String(QWEN38_FLASH_NEXT_CONTEXT),
+    'asking beyond the trained window would degrade quality silently');
 });
