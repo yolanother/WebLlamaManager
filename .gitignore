@@ -41,3 +41,6 @@ opencode.json~
 api/node_modules
 ui/node_modules
 node_modules/
+
+# CUDA engine build artifacts (hundreds of MB of CUDA runtime libraries)
+/dist/

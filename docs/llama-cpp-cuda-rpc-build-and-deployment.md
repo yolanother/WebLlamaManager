@@ -11,8 +11,15 @@ AMD half; read that one first for how the engine directory and the router work.
 > `scripts/build-llama-cpp-cuda.sh` builds that server inside a
 > `nvidia/cuda:*-devel` container from the **same commit pinned in
 > `.llama-cpp-version`** as the ROCm build, so the two halves speak the same wire
-> protocol. The appliance needs **no CUDA toolkit** — only `libcuda.so.1`, which the
-> driver already installs.
+> protocol. The appliance needs **no CUDA compiler**, but it does need the CUDA
+> *runtime* libraries — see [What the target actually needs](#what-the-target-actually-needs),
+> which is the one place the obvious assumption is wrong.
+
+**Status (2026-09-08):** proven, not installed. A CUDA `ggml-rpc-server` built by
+this procedure loaded Qwen3-8B-Q4_K_M onto drakemore's RTX 3090 and served a
+completion at 132 tok/s — see [Verifying](#verifying) for the measurements. Nothing
+is packaged or wired yet, and the deployed b10752 HIP engine still cannot attach
+because it was built without `-DGGML_RPC=ON`.
 
 ## Why RPC and not a second engine
 
@@ -103,6 +110,42 @@ grep 'define RPC_PROTO' ~/llama.cpp/ggml/include/ggml-rpc.h
 HIP-built (`readelf -d` shows `NEEDED libggml-hip.so.0`), so it targets an AMD card
 anyway. Do not reach for it.
 
+## What the target actually needs
+
+It is very natural to assume — and the original investigation into this did assume —
+that because `libcuda.so.1` comes from the driver, a prebuilt CUDA binary needs
+nothing else. **That is wrong**, and it is the single fact that decides how this gets
+packaged. `readelf -d libggml-cuda.so.0.22.0` on the built artifact:
+
+```
+NEEDED  libcudart.so.13     ← CUDA runtime   — from the TOOLKIT, not the driver
+NEEDED  libcublas.so.13     ← BLAS           — from the TOOLKIT, not the driver
+NEEDED  libcuda.so.1        ← driver         — the only one already on the box
+```
+
+`libcublas` in turn needs `libcublasLt.so.13`. So three toolkit libraries have to
+reach the appliance one way or another, totalling **~595 MB** — of which ~540 MB is
+`libcublasLt` alone, a fatbinary carrying every architecture NVIDIA ships.
+
+`nvprune` is the normal answer to that and **does not work here**:
+
+```
+nvprune fatal : Input file 'libcublas.so.13.0.2.14' not relocatable
+```
+
+CUDA 13's redistributable shared objects are not prunable fatbinaries; nvprune
+operates on relocatable objects and static libraries. There is no trimming to be had.
+
+`GGML_STATIC=ON` would link `cudart_static` / `cublas_static` and remove the
+dependency, but it also does `add_link_options(-static)` globally
+(`ggml/src/CMakeLists.txt`), which is incompatible with `BUILD_SHARED_LIBS` and with
+dlopening the driver. Not usable.
+
+One dependency *was* removable: **`GGML_CUDA_NCCL` defaults to `ON`**, and a build
+that finds NCCL picks up a `libnccl.so.2` dependency worth another ~200 MB. A
+single-card appliance has no use for collective communication, so the build passes
+`-DGGML_CUDA_NCCL=OFF`.
+
 ## Naming: `ggml-rpc-server`, not `rpc-server`
 
 Upstream renamed both the CMake target and the executable. At the pinned commit
@@ -125,8 +168,11 @@ That is the whole procedure. It:
    cannot `apt-get` at run time. The derived image is cached by tag; only the first
    run pays for it.
 3. Configures and builds the `ggml-rpc-server` target in `~/llama.cpp/build-cuda`.
-4. Stages `ggml-rpc-server`, every `libggml*.so*`, and a `BUILD-INFO` provenance
-   stamp into `dist/llama-cpp-cuda/`.
+4. Stages `ggml-rpc-server`, every `libggml*.so*`, the three CUDA runtime libraries,
+   and a `BUILD-INFO` provenance stamp into `dist/llama-cpp-cuda/` — one flat
+   directory, ~647 MB, complete enough to run by itself.
+
+`dist/` is gitignored; the artifact set is far too large to commit.
 
 Useful knobs (all env vars):
 
@@ -147,6 +193,16 @@ Useful knobs (all env vars):
   the same microarchitecture, and `-march=native` emits instructions that fault on a
   different one. The ROCm build can afford `NATIVE=ON` because it compiles on the
   machine it runs on; this one is cross-built in a container.
+
+- **`libcuda` is only a stub at link time.** The NVIDIA devel image ships
+  `lib64/stubs/libcuda.so` with no `libcuda.so.1` name, because the real library
+  belongs to the driver on the target. `libggml-cuda.so` links anyway (shared
+  libraries tolerate undefined symbols), and then the *executable* link fails with a
+  wall of `undefined reference to cuMemCreate`. The toolchain image gives the stub
+  its SONAME and the build passes `-Wl,-rpath-link` for it — **`-rpath-link`, not
+  `-rpath`**, so the stub's path is used at link time and never recorded in the
+  binary. A recorded rpath here would risk loading the stub instead of the driver at
+  run time.
 
 No GPU is needed to build. `nvcc` compiles for `sm_86` on any machine.
 
@@ -179,6 +235,11 @@ LD_LIBRARY_PATH=/var/lib/llama-manager/engine-cuda/current \
   /var/lib/llama-manager/engine-cuda/current/ggml-rpc-server \
     --host 127.0.0.1 --port 50052
 ```
+
+`LD_LIBRARY_PATH` is required even though the binary's own RUNPATH is `$ORIGIN`:
+that covers the `libggml*` siblings, but `libggml-cuda.so` resolves the CUDA runtime
+libraries through the normal search path. This mirrors how `container-start.sh` puts
+the ROCm engine directory on `LD_LIBRARY_PATH`.
 
 Bind to `127.0.0.1`. The RPC protocol is unauthenticated and lets a peer allocate
 buffers and run graphs; upstream says as much. Anything wider needs a deliberate
@@ -213,8 +274,18 @@ Recommended shape — **a new binary package, `llama-manager-cuda-rpc`** (amd64)
   carries a large CUDA-fat binary. Pull it in from an
   `llama-manager-appliance-nvidia-*` meta-package, alongside the existing
   `llama-manager-nvidia-runtime`, exactly as `-gb10` is pulled in for the Spark.
-- **Depends:** the NVIDIA driver package providing `libcuda.so.1`. Nothing else — no
-  CUDA toolkit, no runtime libraries; the build statically carries what it needs.
+- **Depend on the CUDA runtime, do not vendor it.** The three toolkit libraries are
+  ~595 MB and cannot be trimmed (see
+  [What the target actually needs](#what-the-target-actually-needs)). Putting them in
+  the `.deb` roughly doubles the appliance image for one optional card. Depend on
+  NVIDIA's own packages instead — `cuda-cudart-13-0` and `libcublas-13-0` from the
+  CUDA apt repository — plus the driver package that provides `libcuda.so.1`. The
+  NVIDIA appliance variant already configures NVIDIA apt sources for
+  `llama-manager-nvidia-runtime`, so this adds a dependency rather than a new
+  mechanism. Vendoring is the fallback if that repository is not acceptable offline;
+  the build stages the libraries either way, so the fallback needs no build change.
+- **Pin the CUDA major version in the dependency.** The libraries are `.so.13`; a
+  package built against CUDA 13 must not be satisfied by a CUDA 12 runtime.
 - **Do NOT ship a systemd unit for it.** The manager starts and stops the rpc-server
   itself, because a card that is only usable while a unit is enabled is not shareable
   — that is the whole point of `acceleratorPlan()` in `api/duo-accelerator.js`. The
@@ -255,4 +326,38 @@ watch it during load and generation. What counts as proof:
 - Generation returns coherent text, and GPU utilisation is non-zero while it does.
 
 A completion alone is **not** evidence: llama.cpp falls back to CPU silently, which
-is exactly the failure this whole document is about.
+is exactly the failure this whole document is about. Neither is VRAM alone — check
+all three, because each one has a plausible innocent explanation on its own.
+
+### Measured result, drakemore, 2026-09-08
+
+Idle baseline `1475 MiB, 0 %` — the pods agent's two resident processes (344 MiB and
+1108 MiB), matching the ~1.45 GB figure `api/duo-accelerator.js` documents.
+
+```
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24123 MiB):
+  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes
+
+client --list-devices:
+  RPC0: 127.0.0.1:50052 (24123 MiB, 22387 MiB free)
+
+Qwen3-8B-Q4_K_M.gguf, -ngl 99:   VRAM 1475 -> 6192 -> 12128 MiB
+
+nvidia-smi --query-compute-apps:
+  2109229  /opt/speech/.venv/bin/python    344 MiB   ← pods agent, untouched
+  2110020  python3                        1108 MiB   ← pods agent, untouched
+  3536986  ./ggml-rpc-server             10648 MiB   ← ours
+
+completion:  prompt 275.7 tok/s, generate 132.2 tok/s
+             system_fingerprint b10752-b96806d96
+GPU util sampled at 2 Hz:  0, 0, 92, 93, 0 %   ← spike aligns with generation
+```
+
+132 tok/s on an 8B Q4 is discrete-GPU throughput and nothing like this box's CPU
+path, so the timing corroborates the VRAM and utilisation readings instead of the
+conclusion resting on any single one.
+
+On teardown the card returned to exactly `1475 MiB, 0 %` with both pods-agent
+processes still resident and never signalled — which is also the first direct
+demonstration that the card is **borrowed and released**, the property the whole
+rpc-server design exists to get.

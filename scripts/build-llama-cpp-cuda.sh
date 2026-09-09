@@ -102,16 +102,22 @@ echo "  RPC protocol version: $RPC_PROTO"
 # as the invoking user (so the artifacts on the bind mount are not root-owned),
 # which leaves no way to apt-get anything at run time. So derive a small image
 # once that carries the host toolchain, and cache it by tag.
+#
+# The image also ships libcuda only as a link-time STUB, under
+# .../lib64/stubs/libcuda.so, and with no `libcuda.so.1` name — because the real
+# one belongs to the driver on the target machine. libggml-cuda.so links fine
+# (shared libraries tolerate undefined symbols) but the final executable link
+# then fails with a wall of `undefined reference to cuMemCreate` and friends.
+# The stub is given its SONAME here so the linker can find it by that name.
 BUILD_IMAGE="llama-cpp-cuda-build:$(printf '%s' "$CUDA_IMAGE" | tr -c 'A-Za-z0-9_.-' '-')"
-if ! docker image inspect "$BUILD_IMAGE" >/dev/null 2>&1; then
-  echo "  building toolchain image $BUILD_IMAGE"
-  docker build -t "$BUILD_IMAGE" - <<EOF
+echo "  ensuring toolchain image $BUILD_IMAGE (layer-cached)"
+docker build -t "$BUILD_IMAGE" - <<EOF
 FROM $CUDA_IMAGE
 RUN apt-get update \
  && apt-get install -y --no-install-recommends cmake build-essential git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+RUN ln -sf libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
 EOF
-fi
 
 # GGML_NATIVE is OFF on purpose: the build host and the appliance are not
 # guaranteed to be the same microarchitecture, and -march=native would emit
@@ -129,13 +135,39 @@ docker run --rm \
       -DGGML_CUDA=ON \
       -DGGML_RPC=ON \
       -DCMAKE_CUDA_ARCHITECTURES='$CUDA_ARCHS' \
+      -DGGML_CUDA_NCCL=OFF \
       -DGGML_NATIVE=OFF \
       -DBUILD_SHARED_LIBS=ON \
+      -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+      -DCMAKE_EXE_LINKER_FLAGS='-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
       -DLLAMA_BUILD_SERVER=OFF \
       -DLLAMA_BUILD_TESTS=OFF \
       -DLLAMA_BUILD_EXAMPLES=OFF \
       -DLLAMA_CURL=OFF
     cmake --build /src/$BUILD_SUBDIR --target ggml-rpc-server -j '$JOBS'
+
+    # ---- CUDA runtime libraries -----------------------------------------------
+    # libggml-cuda needs libcudart and libcublas/libcublasLt at RUN time. These
+    # come from the CUDA TOOLKIT, not from the driver, so — contrary to the
+    # convenient assumption that libcuda.so.1 is enough — the target does not
+    # already have them. They are staged here so the artifact set is complete and
+    # testable on its own.
+    #
+    # They are large: ~595 MB, almost all of it libcublasLt fatbinary carrying
+    # every architecture NVIDIA ships. nvprune would normally trim that to the
+    # targeted arch, but it rejects these files as not relocatable -- CUDA 13
+    # redistributable .so files are not prunable fatbinaries -- so there is no
+    # trimming to be had here. The packaging answer is to DEPEND on the distro
+    # cuda-cudart / libcublas packages instead of shipping these; see the
+    # packaging section of the doc.
+    mkdir -p /src/$BUILD_SUBDIR/cudart
+    cp -a /usr/local/cuda/lib64/libcudart.so.*  /src/$BUILD_SUBDIR/cudart/
+    cp -a /usr/local/cuda/lib64/libcublas.so.*  /src/$BUILD_SUBDIR/cudart/
+    cp -a /usr/local/cuda/lib64/libcublasLt.so.* /src/$BUILD_SUBDIR/cudart/
+    # Recreate the SONAME symlinks the loader actually resolves (libcublas.so.13
+    # -> libcublas.so.13.0.2.14 and so on). ldconfig -n derives them from each
+    # file's own SONAME, which beats parsing version suffixes by hand.
+    ldconfig -n /src/$BUILD_SUBDIR/cudart
   "
 
 # ---- 4. Stage the artifact set ------------------------------------------------
@@ -155,6 +187,9 @@ rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
 cp -a "$NEW_BIN" "$STAGE_DIR/"
 cp -a "$BUILD_DIR"/bin/libggml*.so* "$STAGE_DIR/"
+# Flat, single directory: the binary's RUNPATH is $ORIGIN and the deployment puts
+# this one directory on LD_LIBRARY_PATH, exactly as the ROCm engine directory works.
+cp -a "$BUILD_DIR"/cudart/. "$STAGE_DIR/"
 # A provenance stamp, so a binary found on a box can be traced back to a commit.
 cat > "$STAGE_DIR/BUILD-INFO" <<EOF
 llama.cpp-ref=$LLAMA_CPP_REF
