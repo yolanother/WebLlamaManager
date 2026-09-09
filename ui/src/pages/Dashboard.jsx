@@ -15,6 +15,7 @@ import {
 import { API_BASE, formatBytes, formatUptime, formatModelName } from '../api.js';
 import { isLocalKioskHost, requestSystemLogin } from '../kiosk-control.js';
 import { resolveGpuPanel } from '../gpu-panel.js';
+import { resolveDrivePanel, resolveDriveAlerts, resolveLastCrash } from '../drive-panel.js';
 import { useVisiblePolling } from '../hooks/useVisiblePolling.js';
 import {
   StatCard,
@@ -425,6 +426,10 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
     stats?.gpu,
     stats?.context,
     stats?.guard,
+    // Storage must be in the signature or the drive tiles render once and then
+    // freeze at their first values for the life of the page.
+    stats?.drives,
+    stats?.storageHealth,
   ]);
 
   // Thermal-guard state — folded into the status strip's right side.
@@ -671,6 +676,24 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     {Object.entries(stats.backends).map(([id, b]) => (
                       <span key={id} style={{ marginRight: '12px' }}>
                         {id}: {b.active}/{b.active + b.pending} {b.tokPerSec > 0 ? `${b.tokPerSec} t/s` : ''} {b.totalCost > 0 ? `$${b.totalCost.toFixed(4)}` : ''}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+              </div>
+            )}
+            {/* Kiosk shows the same storage the main grid does. A tile added
+                only to the main grid is invisible on an appliance, which spends
+                its life in this view. */}
+            {resolveDrivePanel(stats).length > 0 && (
+              <div className="resource-card glass-panel" style={{ minWidth: 'auto' }}>
+                <div className="resource-info">
+                  <span className="resource-label">Storage</span>
+                  <span className="resource-detail" style={{ fontSize: '0.8em' }}>
+                    {resolveDrivePanel(stats).map((drive) => (
+                      <span key={drive.key} style={{ marginRight: '12px' }}>
+                        {drive.title}
+                        {drive.temperature !== null ? `: ${drive.temperature}\u00b0C` : ''}
                       </span>
                     ))}
                   </span>
@@ -1072,6 +1095,30 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
             ) : null}
           </div>
         </div>
+        {/* Storage alerts sit beside the thermal guard message operators already
+            watch. Controller faults rank above SMART wear because they are the
+            only signals that actually precede a lockup on this hardware. */}
+        {resolveDriveAlerts(stats).map((alert, i) => (
+          <div key={i} className={`server-status-strip glass-panel ${alert.severity}`}>
+            <div className="status-strip-left">
+              <span className={`status-strip-dot ${alert.severity}`} />
+              <span className="status-strip-state">{alert.message}</span>
+            </div>
+          </div>
+        ))}
+        {resolveLastCrash(stats) && (
+          <div className="server-status-strip glass-panel warning">
+            <div className="status-strip-left">
+              <span className="status-strip-dot warning" />
+              <span className="status-strip-state">
+                Last crash: {resolveLastCrash(stats).label}
+                {resolveLastCrash(stats).isoTime
+                  ? ` \u00b7 ${new Date(resolveLastCrash(stats).isoTime).toLocaleString()}`
+                  : ''}
+              </span>
+            </div>
+          </div>
+        )}
         <MemoizedRenderBoundary dependencies={[statusTilesSignature]}>
         <div className="status-grid status-grid-compact">
           <StatCard
@@ -1388,6 +1435,30 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 <span className="resource-detail" style={{ fontSize: '0.7em', opacity: 0.7 }}>
                   Not used for inference
                 </span>
+              </div>
+            </div>
+          ))}
+
+          {resolveDrivePanel(stats).map((drive) => (
+            <div
+              className="resource-card glass-panel"
+              key={drive.key}
+              style={drive.known ? undefined : { opacity: 0.55 }}
+            >
+              <div className="resource-info">
+                <span className="resource-label">{drive.title}</span>
+                {/* Never a bare 0%: a drive the privileged helper has not read
+                    says "health unknown" rather than showing a figure that looks
+                    like a clean result. */}
+                <span className="resource-detail">{drive.detail}</span>
+                {drive.temperature !== null && (
+                  <span
+                    className="resource-detail"
+                    style={{ color: severityColor(sensorSeverity(drive.temperature, stats?.guard)) }}
+                  >
+                    {drive.temperature}\u00b0C
+                  </span>
+                )}
               </div>
             </div>
           ))}
