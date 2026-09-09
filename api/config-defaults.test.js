@@ -82,16 +82,27 @@ test('reasoning models get a bounded effort by default', () => {
   assert.equal(c.modelReasoningEffort['*qwen3.8-27b*'], 'medium');
 });
 
-test('an operator value replaces the seeded defaults entirely', () => {
-  // Not merged: a persisted map is the operator's whole answer, so they can clear an
-  // entry by omitting it rather than fighting a default they cannot remove.
+test('an operator value overrides that pattern and keeps the rest of the defaults', () => {
   const c = applyConfigDefaults({ modelReasoningEffort: { '*qwen3.6-35b*': 'low' } });
-  assert.deepEqual(c.modelReasoningEffort, { '*qwen3.6-35b*': 'low' });
+  assert.equal(c.modelReasoningEffort['*qwen3.6-35b*'], 'low', 'the operator wins');
+  assert.equal(c.modelReasoningEffort['*qwen3.8-27b*'], 'medium', 'the others still apply');
 });
 
-test('an operator can disable the defaults with an empty map', () => {
-  const c = applyConfigDefaults({ modelReasoningEffort: {} });
-  assert.deepEqual(c.modelReasoningEffort, {});
+test('an EMPTY persisted map still gets the defaults', () => {
+  // Reversal of an earlier decision here, on evidence. Treating {} as "deliberately
+  // cleared" made the defaults inert on exactly the box that needed them: drakemore had
+  // `modelReasoningEffort: {}` persisted from initialisation, never an operator choice,
+  // so the fix silently did nothing there while working on a fresh install. {} is what an
+  // uninitialised box looks like, not an instruction.
+  assert.deepEqual(applyConfigDefaults({ modelReasoningEffort: {} }).modelReasoningEffort,
+    { ...DEFAULT_MODEL_REASONING_EFFORT });
+});
+
+test('a pattern can be disabled explicitly with a null value', () => {
+  // The escape hatch the empty map used to be, made unambiguous.
+  const c = applyConfigDefaults({ modelReasoningEffort: { '*qwen3.6-35b*': null } });
+  assert.equal(c.modelReasoningEffort['*qwen3.6-35b*'], null);
+  assert.equal(c.modelReasoningEffort['*qwen3.8-27b*'], 'medium');
 });
 
 test('defaultReasoningEffort is NOT set globally', () => {

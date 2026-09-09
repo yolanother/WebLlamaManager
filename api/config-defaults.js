@@ -56,8 +56,8 @@ export const DEFAULT_MODEL_REASONING_EFFORT = Object.freeze({
 export function applyConfigDefaults(config = {}, env = process.env) {
   const merged = {
     autoStart: true,
-    // Replaced wholesale by a persisted map rather than merged, so an operator can clear
-    // an entry by omitting it instead of fighting a default they cannot remove.
+    // Placeholder; the real merge happens below, because a persisted map must OVERRIDE
+    // per key rather than replace the whole set. See the merge for why.
     modelReasoningEffort: { ...DEFAULT_MODEL_REASONING_EFFORT },
     modelsMax: Number.parseInt(env.MODELS_MAX, 10) || 2,
     contextSize: Number.parseInt(env.CONTEXT_SIZE, 10) || 8192,
@@ -67,6 +67,16 @@ export function applyConfigDefaults(config = {}, env = process.env) {
     ...config,
   };
   if (env.AUTO_START === 'false') merged.autoStart = false;
+  // Per-KEY override, not wholesale replacement. An empty persisted map is what an
+  // uninitialised box looks like -- drakemore carried `modelReasoningEffort: {}` from
+  // initialisation and never an operator decision -- so treating {} as "deliberately
+  // cleared" made these defaults inert on precisely the machine that needed them while
+  // working on a fresh install. To disable one pattern, set its value to null.
+  merged.modelReasoningEffort = {
+    ...DEFAULT_MODEL_REASONING_EFFORT,
+    ...(config.modelReasoningEffort && typeof config.modelReasoningEffort === 'object'
+      ? config.modelReasoningEffort : {}),
+  };
   return merged;
 }
 
