@@ -364,8 +364,14 @@ Three facts worth carrying forward:
    directory is inert even though that directory looks exactly like a plugin directory.
    `-DGGML_RPC=ON` has been added to `scripts/build-llama-cpp.sh`; the ROCm engine must
    be rebuilt and redeployed before any wiring works. The failure mode is **quiet** — the
-   router starts and simply never offloads — so the diagnostic is `--list-devices`
-   showing an `RPC0` entry, not "the process survived."
+   router starts and simply never offloads — so "the process survived" proves nothing.
+   The bar is three signals together, since each has an innocent explanation alone:
+   `--list-devices` lists an `RPC0` entry, **the rpc-server PID owns the climbing VRAM**
+   in `nvidia-smi`'s process table, and throughput is in the right order of magnitude.
+   `RPC0` alone is necessary but not sufficient — it proves the router has an RPC backend
+   and reached the server, not that any tensor landed on the card; an engine can list
+   `RPC0` and serve entirely from CPU. The VRAM-ownership signal is the one a CPU
+   fallback cannot fake.
 
 2. **A CUDA target needs more than `libcuda.so.1`.** Earlier notes in this epic said the
    target needed only the driver library; that is false. `libggml-cuda.so` also NEEDs
@@ -380,8 +386,12 @@ Three facts worth carrying forward:
    unaffected.** Killing the rpc-server returned the card to baseline immediately with
    the pods agent still resident — the card is *borrowed*, not claimed, which is exactly
    what `api/duo-accelerator.js` assumes and why that indirection was chosen over a
-   second CUDA-linked llama-server build. Nothing found in that work argues for changing
-   any reservation semantics.
+   second CUDA-linked llama-server build. That measurement, not a preference, is what
+   settles the question: a CUDA-linked engine would hold the card for the router's whole
+   lifetime, and holding the card for a process lifetime is precisely the property that
+   makes it unshareable. For the same reason the CUDA rpc-server is to be packaged with
+   **no systemd unit**, so llama-manager owns start and stop. Nothing found in that work
+   argues for changing any reservation semantics.
 
 The earlier "amd-XOR-nvidia" platform concern recorded in epic `T310ec1fa136dd` is
 **stale**: both driver stacks are loaded and bound simultaneously on drakemore

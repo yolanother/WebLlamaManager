@@ -534,8 +534,17 @@ engine was compiled without `-DGGML_RPC=ON`, and ggml registers the RPC backend 
 rebuilt and redeployed first.
 
 The failure mode is **quiet** — the router starts and simply never offloads — so
-the diagnostic to check is `--list-devices` showing an `RPC0` entry, not "the
-process survived."
+"the process survived" proves nothing. Three signals together are the bar, because
+each has an innocent explanation on its own:
+
+1. `--list-devices` lists an `RPC0` entry (the router has an RPC backend and reached
+   the server),
+2. **the rpc-server PID owns the VRAM** in `nvidia-smi`'s process table as it climbs,
+3. throughput is in the right order of magnitude.
+
+Signal 2 is the load-bearing one: an engine can list `RPC0` and still serve entirely
+from CPU, and a CPU fallback cannot fake the rpc-server process holding the card's
+memory.
 
 Tracked as task `T312557bb1b9bc`. The build procedure is written up in
 `docs/llama-cpp-cuda-rpc-build-and-deployment.md`, which lands with that task and is
