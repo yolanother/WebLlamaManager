@@ -1291,3 +1291,20 @@ export function applyDevicePins(sections = [], pins = null) {
   }
   return out;
 }
+
+/**
+ * Whether a `*_VISIBLE_DEVICES` pin is meaningful for this card.
+ *
+ * Those variables FILTER what a backend enumerates; they cannot introduce a device the
+ * backend never had. For a card the engine cannot enumerate, emitting one is not merely
+ * useless -- ROCm's HIP runtime honours `CUDA_VISIBLE_DEVICES` as an alias, so restricting
+ * the engine to a device it never sees can leave it with no usable device at all and drop
+ * it silently to CPU. Such a card is reached with `--device RPC<n>` instead; see
+ * {@link resolvePinDevice}.
+ *
+ * @param {?{driver?: string}} card The pinned card.
+ * @returns {boolean} True only when the engine's own backend enumerates this card.
+ */
+export function pinEnvApplies(card) {
+  return LOCALLY_ENUMERABLE_DRIVERS.includes(card?.driver || '');
+}

@@ -182,6 +182,7 @@ import {
   resolvePinDevice,
   applyDevicePins,
   LOCALLY_ENUMERABLE_DRIVERS,
+  pinEnvApplies,
 } from './engines.js';
 import { buildHardwareProfile } from './hardware-profile.js';
 import {
@@ -4880,6 +4881,10 @@ function gpuPinPresetDevices(rpcEndpoint) {
 function gpuPinEnv() {
   const pin = activeGpuPin();
   if (!pin) return {};
+  // A card this engine cannot enumerate is reached with `--device RPC<n>` from the models
+  // preset, never with a *_VISIBLE_DEVICES filter -- see pinEnvApplies. Emitting both would
+  // contradict itself in the log AND risk restricting the engine to a device it never sees.
+  if (!pinEnvApplies(pin.card)) return {};
   const env = {};
   if (pin.card.pci) env.LLAMA_GPU_PCI = pin.card.pci;
   if (pin.card.uniqueId) env.LLAMA_GPU_UUID = pin.card.uniqueId;

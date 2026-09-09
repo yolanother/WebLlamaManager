@@ -47,6 +47,7 @@ import {
   shouldLogDs4Verdict,
   resolvePinDevice,
   applyDevicePins,
+  pinEnvApplies,
 } from './engines.js';
 
 // ── isEngineProcessComm (heat/RSS attribution) ───────────────────────────────
@@ -1323,4 +1324,15 @@ test('a pinned section renders as a real INI device line', () => {
   const ini = renderModelsPresetIni(applyDevicePins([], { 'Qwen3-8B-Q4_K_M': 'RPC0' }));
   assert.match(ini, /\[Qwen3-8B-Q4_K_M\]/);
   assert.match(ini, /^device = RPC0$/m);
+});
+
+// A *_VISIBLE_DEVICES pin is only meaningful for a card the engine's own backend
+// enumerates. Emitting one for a card it cannot see is worse than useless: ROCm's HIP
+// runtime honours CUDA_VISIBLE_DEVICES as an alias, so restricting the engine to a device
+// it never enumerates can leave it with NO usable device and drop it silently to CPU.
+test('pinEnvApplies is true only for a locally enumerable card', () => {
+  assert.equal(pinEnvApplies({ driver: 'amdgpu' }), true);
+  assert.equal(pinEnvApplies({ driver: 'nvidia' }), false);
+  assert.equal(pinEnvApplies({}), false);
+  assert.equal(pinEnvApplies(null), false);
 });
