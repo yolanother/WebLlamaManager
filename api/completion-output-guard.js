@@ -62,6 +62,63 @@ export const DEGENERATE_OUTPUT_ERROR = Object.freeze({
   }),
 });
 
+/**
+ * Build the classified error for a completion whose whole budget went to reasoning.
+ *
+ * Carries the numbers rather than only a message: a caller cannot size its next attempt
+ * without knowing how many tokens were actually spent, and asking it to parse prose for
+ * that would be a worse API than the empty 200 this replaces.
+ *
+ * @param {number} completionTokens Tokens the model spent producing nothing visible.
+ * @param {string} finishReason The upstream finish reason, always 'length' here.
+ * @returns {{status:number, body:object}} Error descriptor in the shape callers already use.
+ */
+function reasoningExhaustedError(completionTokens, finishReason) {
+  return {
+    status: 502,
+    body: {
+      error: {
+        message: `The model spent its entire ${completionTokens}-token output budget on `
+          + 'reasoning and produced no visible content before being cut off. Raise max_tokens '
+          + 'to cover the reasoning as well as the answer, or disable thinking for this '
+          + 'request (chat_template_kwargs: {"enable_thinking": false}).',
+        type: 'upstream_output_error',
+        code: 'REASONING_EXHAUSTED',
+        completion_tokens: completionTokens,
+        finish_reason: finishReason,
+      },
+    },
+  };
+}
+
+/**
+ * Whether a payload is a completion cut off with nothing to show for it.
+ *
+ * Four conditions, ALL required, because "empty output is valid" is true in general and this
+ * is the one case where it is not:
+ *   - nothing visible across every choice;
+ *   - no tool_calls -- a tool-call-only reply is contentless BY DESIGN, and classifying it
+ *     would break every tool-using caller;
+ *   - finish_reason 'length' -- the model was CUT OFF. One that legitimately had nothing to
+ *     say finishes with 'stop';
+ *   - completion_tokens > 0 -- tokens were actually spent.
+ * Together they admit no other reading, which is why this can be an error rather than a
+ * heuristic warning.
+ *
+ * @param {unknown} payload OpenAI-compatible chat-completion response.
+ * @returns {?{completionTokens:number, finishReason:string}} The evidence, or null.
+ */
+function reasoningExhaustion(payload) {
+  const choices = Array.isArray(payload?.choices) ? payload.choices : [];
+  if (choices.length === 0) return null;
+  const cut = choices.find((c) => c?.finish_reason === 'length');
+  if (!cut) return null;
+  if (Array.isArray(cut?.message?.tool_calls) && cut.message.tool_calls.length > 0) return null;
+  const completionTokens = Number(payload?.usage?.completion_tokens);
+  if (!Number.isFinite(completionTokens) || completionTokens <= 0) return null;
+  return { completionTokens, finishReason: 'length' };
+}
+
 /** Return text carried by a string or OpenAI content-part array. */
 function contentText(value) {
   if (typeof value === 'string') return value;
@@ -88,8 +145,9 @@ function chatCompletionText(payload) {
 /**
  * Validate a complete OpenAI chat-completion payload.
  *
- * Empty output and tool-call-only messages are valid. Normal or mixed text is
- * returned unchanged by callers because this function only reports corruption.
+ * Tool-call-only messages are valid, and so is empty output EXCEPT when the model was cut
+ * off having spent its whole budget producing nothing visible -- see reasoningExhaustion.
+ * Normal or mixed text is returned unchanged by callers.
  *
  * @param {unknown} payload OpenAI-compatible chat-completion response.
  * @returns {typeof QUESTION_MARK_ONLY_OUTPUT_ERROR|null} Corruption descriptor,
@@ -103,6 +161,13 @@ export function validateChatCompletionPayload(payload) {
   // which is exactly how the corrupt child presented: empty content, 12288 slashes.
   if (degenerateOutputReason(visible || chatCompletionReasoning(payload))) {
     return DEGENERATE_OUTPUT_ERROR;
+  }
+  // Checked LAST, so genuinely corrupt output keeps its own code: garbage in the reasoning
+  // block and an exhausted budget can co-occur, and DEGENERATE_OUTPUT is the more specific
+  // diagnosis of the two.
+  if (!visible) {
+    const exhausted = reasoningExhaustion(payload);
+    if (exhausted) return reasoningExhaustedError(exhausted.completionTokens, exhausted.finishReason);
   }
   return null;
 }

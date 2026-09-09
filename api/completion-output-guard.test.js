@@ -320,3 +320,80 @@ test('recycleCorruptModel evicts through the router so the next request reloads 
   assert.match(body, /models\/unload/, 'eviction must go through the router unload endpoint');
   assert.match(body, /catch/, 'eviction runs on an error path and must never throw');
 });
+
+// --- reasoning exhaustion ------------------------------------------------------
+//
+// Measured on drakemore: a 126k-token prompt with max_tokens=120 and thinking enabled
+// returned completion_tokens=120, content='', finish_reason='length', HTTP 200. The whole
+// budget went into the reasoning block and nothing was emitted. Downstream saw only "did
+// not return JSON". An empty 200 is neither valid output nor a classified failure, so the
+// caller cannot retry intelligently.
+
+const exhausted = {
+  choices: [{ message: { role: 'assistant', content: '' }, finish_reason: 'length' }],
+  usage: { prompt_tokens: 126472, completion_tokens: 120, total_tokens: 126592 },
+};
+
+test('reasoning exhaustion is classified, not returned as an empty 200', () => {
+  const err = validateChatCompletionPayload(exhausted);
+  assert.ok(err, 'must not pass as a valid empty response');
+  assert.equal(err.body.error.code, 'REASONING_EXHAUSTED');
+  // The caller has to be able to act: the message must say what to change.
+  assert.match(err.body.error.message, /max_tokens|thinking|reasoning/i);
+});
+
+test('the error carries the numbers needed to size the next attempt', () => {
+  const err = validateChatCompletionPayload(exhausted);
+  assert.equal(err.body.error.completion_tokens, 120);
+  assert.equal(err.body.error.finish_reason, 'length');
+});
+
+test('a normal short answer is untouched', () => {
+  assert.equal(validateChatCompletionPayload({
+    choices: [{ message: { content: '42' }, finish_reason: 'stop' }],
+    usage: { completion_tokens: 2 },
+  }), null);
+});
+
+test('a legitimately empty reply that FINISHED is untouched', () => {
+  // finish_reason 'stop' means the model chose to say nothing. That is not exhaustion.
+  assert.equal(validateChatCompletionPayload({
+    choices: [{ message: { content: '' }, finish_reason: 'stop' }],
+    usage: { completion_tokens: 0 },
+  }), null);
+});
+
+test('a tool-call-only reply is untouched even when cut off', () => {
+  // Contentless by design; classifying it would break every tool-using caller.
+  assert.equal(validateChatCompletionPayload({
+    choices: [{
+      message: { content: '', tool_calls: [{ id: 'c1', function: { name: 'f', arguments: '{}' } }] },
+      finish_reason: 'length',
+    }],
+    usage: { completion_tokens: 40 },
+  }), null);
+});
+
+test('a truncated reply WITH content is untouched — that is ordinary truncation', () => {
+  assert.equal(validateChatCompletionPayload({
+    choices: [{ message: { content: 'a partial answ' }, finish_reason: 'length' }],
+    usage: { completion_tokens: 120 },
+  }), null);
+});
+
+test('no tokens spent is not exhaustion, whatever the finish reason', () => {
+  assert.equal(validateChatCompletionPayload({
+    choices: [{ message: { content: '' }, finish_reason: 'length' }],
+    usage: { completion_tokens: 0 },
+  }), null);
+});
+
+test('corrupt output still wins over the exhaustion classification', () => {
+  // Garbage in reasoning with empty content was the ORIGINAL corrupt-child signature and
+  // must keep its own code; the two must not be confused.
+  const err = validateChatCompletionPayload({
+    choices: [{ message: { content: '', reasoning_content: '/'.repeat(12288) }, finish_reason: 'length' }],
+    usage: { completion_tokens: 12288 },
+  });
+  assert.equal(err.body.error.code, 'DEGENERATE_OUTPUT');
+});

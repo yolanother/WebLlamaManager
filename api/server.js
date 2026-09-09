@@ -1710,10 +1710,10 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
           if (outputCorrupted) {
             addLlmLog({
               endpoint, model: requestedModel, stream: true,
-              status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration,
+              status: outputError.status, duration,
               promptTokens, completionTokens, tokensPerSecond: 0,
               messages: req.body.messages || null, prompt: null, response: null,
-              error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+              error: outputError.body.error.message,
               backend: chosen.id, requestBody: req.body, backfill: true,
             });
             endActiveRequest(activeReqId, { status: 'error' });
@@ -1737,20 +1737,21 @@ function setupBackfillRace(req, res, { requestedModel, endpoint, proxyBody, isSt
       } else {
         // Non-streaming backfill response
         const data = await response.json();
-        if (validateChatCompletionPayload(data)) {
+        const outputError = validateChatCompletionPayload(data);
+        if (outputError) {
           const duration = Date.now() - startTime;
           addLlmLog({
             endpoint, model: requestedModel, stream: false,
-            status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration,
+            status: outputError.status, duration,
             promptTokens: data.usage?.prompt_tokens || 0,
             completionTokens: data.usage?.completion_tokens || 0,
             tokensPerSecond: 0,
             messages: req.body.messages || null, prompt: null, response: null,
-            error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+            error: outputError.body.error.message,
             backend: chosen.id, requestBody: req.body, backfill: true,
           });
           endActiveRequest(activeReqId, { status: 'error' });
-          sendQuestionMarkOnlyOutputError(res);
+          sendQuestionMarkOnlyOutputError(res, outputError);
           return;
         }
         const duration = Date.now() - startTime;
@@ -12326,7 +12327,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
       try { res.end(); } catch { /* ignore */ }
       const dur = Date.now() - startTime;
       if (outputCorrupted) {
-        addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration: dur, promptTokens, completionTokens, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message, backend: 'ds4', requestBody: req.body });
+        addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: outputError.status, duration: dur, promptTokens, completionTokens, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: outputError.body.error.message, backend: 'ds4', requestBody: req.body });
         endActiveRequest(activeReqId, { status: 'error' });
         return;
       }
@@ -12338,11 +12339,12 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
 
     // Non-streaming.
     const data = await upstream.json();
-    if (validateChatCompletionPayload(data)) {
+    const outputError = validateChatCompletionPayload(data);
+        if (outputError) {
       const dur = Date.now() - startTime;
-      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration: dur, promptTokens: data.usage?.prompt_tokens || 0, completionTokens: data.usage?.completion_tokens || 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message, backend: 'ds4', requestBody: req.body });
+      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: outputError.status, duration: dur, promptTokens: data.usage?.prompt_tokens || 0, completionTokens: data.usage?.completion_tokens || 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: outputError.body.error.message, backend: 'ds4', requestBody: req.body });
       endActiveRequest(activeReqId, { status: 'error' });
-      sendQuestionMarkOnlyOutputError(res);
+      sendQuestionMarkOnlyOutputError(res, outputError);
       return;
     }
     if (mediaMetadata) {
@@ -13311,10 +13313,10 @@ async function handleChatCompletions(req, res) {
             if (outputCorrupted) {
               addLlmLog({
                 endpoint: 'chat/completions', model, stream: true,
-                status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration,
+                status: outputError.status, duration,
                 promptTokens, completionTokens, tokensPerSecond: 0,
                 messages: req.body.messages || null, prompt: null, response: null,
-                error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+                error: outputError.body.error.message,
                 backend: backend.id, requestBody: req.body,
               });
               endActiveRequest(activeReqId, { status: 'error' });
@@ -13368,20 +13370,21 @@ async function handleChatCompletions(req, res) {
         } finally {
           clearInterval(heartbeatTicker);
         }
-        if (validateChatCompletionPayload(data)) {
+        const outputError = validateChatCompletionPayload(data);
+        if (outputError) {
           const duration = Date.now() - startTime;
           addLlmLog({
             endpoint: 'chat/completions', model: requestedModel, stream: false,
-            status: QUESTION_MARK_ONLY_OUTPUT_ERROR.status, duration,
+            status: outputError.status, duration,
             promptTokens: data.usage?.prompt_tokens || 0,
             completionTokens: data.usage?.completion_tokens || 0,
             tokensPerSecond: 0,
             messages: req.body.messages || null, prompt: null, response: null,
-            error: QUESTION_MARK_ONLY_OUTPUT_ERROR.body.error.message,
+            error: outputError.body.error.message,
             backend: backend.id, requestBody: req.body,
           });
           endActiveRequest(activeReqId, { status: 'error' });
-          sendQuestionMarkOnlyOutputError(res);
+          sendQuestionMarkOnlyOutputError(res, outputError);
           return;
         }
         const duration = Date.now() - startTime;
