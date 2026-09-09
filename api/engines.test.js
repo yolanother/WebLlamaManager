@@ -45,6 +45,8 @@ import {
   ds4ChatDeltaText,
   ds4ResponsesEventText,
   shouldLogDs4Verdict,
+  resolvePinDevice,
+  applyDevicePins,
 } from './engines.js';
 
 // ── isEngineProcessComm (heat/RSS attribution) ───────────────────────────────
@@ -1254,4 +1256,71 @@ test('container-start only drops --ctx-size when a preset is actually in use', (
   assert.match(script, /USE_PRESET/, 'dropping --ctx-size must depend on the preset actually being used');
   assert.doesNotMatch(script, /^\s+--ctx-size "\$CONTEXT"$/m,
     '--ctx-size must no longer be unconditional inside the CMD array');
+});
+
+// --- device pins: putting one model on a specific GPU --------------------------
+//
+// A pin has to reach the ENGINE, and *_VISIBLE_DEVICES cannot express "the card that is
+// only reachable over RPC" — that variable filters what a backend enumerates, and a
+// HIP-built engine never enumerates an NVIDIA card at all. llama.cpp's own answer is
+// `--device <name>`, taking the names `--list-devices` prints, and the models-preset INI
+// carries it per model (common/preset.cpp maps INI keys to CLI options generically).
+
+test('a card the engine cannot enumerate locally resolves to its RPC device', () => {
+  // One --rpc endpoint => it is RPC0. The index is assignment order over that list.
+  assert.equal(resolvePinDevice({ card: { driver: 'nvidia' }, rpcEndpoints: ['127.0.0.1:50052'], endpoint: '127.0.0.1:50052' }), 'RPC0');
+});
+
+test('the RPC index follows the --rpc list order, and is never assumed to be 0', () => {
+  const rpcEndpoints = ['10.0.0.5:50052', '127.0.0.1:50052', '10.0.0.9:50052'];
+  assert.equal(resolvePinDevice({ card: { driver: 'nvidia' }, rpcEndpoints, endpoint: '127.0.0.1:50052' }), 'RPC1');
+  assert.equal(resolvePinDevice({ card: { driver: 'nvidia' }, rpcEndpoints, endpoint: '10.0.0.9:50052' }), 'RPC2');
+});
+
+test('a locally enumerable card yields no RPC device — the existing path handles it', () => {
+  assert.equal(resolvePinDevice({ card: { driver: 'amdgpu' }, rpcEndpoints: ['127.0.0.1:50052'], endpoint: '127.0.0.1:50052' }), null);
+});
+
+test('an unreachable card with no RPC endpoint yields null, so the caller can say why', () => {
+  // No accelerator running: the pin cannot be expressed at all. Null, so the caller logs
+  // it rather than emitting a device name that does not exist.
+  assert.equal(resolvePinDevice({ card: { driver: 'nvidia' }, rpcEndpoints: [], endpoint: null }), null);
+  assert.equal(resolvePinDevice({ card: { driver: 'nvidia' }, rpcEndpoints: ['127.0.0.1:50052'], endpoint: '10.9.9.9:50052' }), null);
+});
+
+test('applyDevicePins adds a section for a model that has none', () => {
+  const out = applyDevicePins([], { 'Qwen3-8B-Q4_K_M': 'RPC0' });
+  assert.deepEqual(out, [{ name: 'Qwen3-8B-Q4_K_M', options: { device: 'RPC0' } }]);
+});
+
+test('applyDevicePins MERGES into an existing section rather than duplicating it', () => {
+  // Two sections with the same name in one INI is the bug this test exists to prevent:
+  // the model already has an MTP section, and a pin must not shadow or duplicate it.
+  const sections = [{ name: 'unsloth_Qwen3.8-27B-GGUF', options: { 'spec-type': 'draft-mtp', parallel: '1' } }];
+  const out = applyDevicePins(sections, { 'unsloth_Qwen3.8-27B-GGUF': 'RPC0' });
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0].options, { 'spec-type': 'draft-mtp', parallel: '1', device: 'RPC0' });
+});
+
+test('applyDevicePins leaves unpinned sections untouched and preserves order', () => {
+  const sections = [
+    { name: 'a', options: { x: '1' } },
+    { name: 'b', options: { y: '2' } },
+  ];
+  const out = applyDevicePins(sections, { b: 'RPC0' });
+  assert.deepEqual(out.map((s) => s.name), ['a', 'b']);
+  assert.deepEqual(out[0].options, { x: '1' });
+  assert.equal(out[1].options.device, 'RPC0');
+});
+
+test('applyDevicePins with no pins returns the sections unchanged', () => {
+  const sections = [{ name: 'a', options: { x: '1' } }];
+  assert.deepEqual(applyDevicePins(sections, {}), sections);
+  assert.deepEqual(applyDevicePins(sections, null), sections);
+});
+
+test('a pinned section renders as a real INI device line', () => {
+  const ini = renderModelsPresetIni(applyDevicePins([], { 'Qwen3-8B-Q4_K_M': 'RPC0' }));
+  assert.match(ini, /\[Qwen3-8B-Q4_K_M\]/);
+  assert.match(ini, /^device = RPC0$/m);
 });

@@ -178,7 +178,10 @@ import {
   qwen38FlashNextPresetSection,
   qwen36WorkerPresetSection,
   podcastQwen38PresetSection,
-  globalContextPresetSection
+  globalContextPresetSection,
+  resolvePinDevice,
+  applyDevicePins,
+  LOCALLY_ENUMERABLE_DRIVERS,
 } from './engines.js';
 import { buildHardwareProfile } from './hardware-profile.js';
 import {
@@ -4835,6 +4838,45 @@ function activeGpuPin() {
  *
  * @returns {Object<string,string>} Variables to merge into the engine's environment.
  */
+/**
+ * Per-model `device` pins for the models-preset INI.
+ *
+ * `gpuPinEnv()` handles the card the engine can enumerate itself. This handles the card it
+ * CANNOT: an NVIDIA card is invisible to the HIP-built engine however the kernel binds it,
+ * so `*_VISIBLE_DEVICES` can never name it, and the only handle that works is llama.cpp's
+ * own `--device RPC<n>` -- carried per model by the preset INI. Without this a pin to the
+ * discrete card reserved the card correctly and then silently did nothing.
+ *
+ * A pin that cannot be expressed is LOGGED and skipped, so the model still serves on the
+ * default device rather than failing; silence is what this whole area is being cured of.
+ *
+ * @param {?string} rpcEndpoint The endpoint `--rpc` was given, or null when the accelerator
+ *   is not running.
+ * @returns {Object<string,string>} Model id -> `RPC<n>`, empty when nothing is pinned to a
+ *   remotely-served card.
+ */
+function gpuPinPresetDevices(rpcEndpoint) {
+  const rpcEndpoints = rpcEndpoint ? [rpcEndpoint] : [];
+  const pins = {};
+  for (const pool of gpuPools) {
+    if (!pool.pinnedModels?.length) continue;
+    for (const card of pool.cards || []) {
+      const device = resolvePinDevice({ card, rpcEndpoints, endpoint: rpcEndpoint });
+      if (device) {
+        for (const model of pool.pinnedModels) pins[model] = device;
+        break;
+      }
+      if (!LOCALLY_ENUMERABLE_DRIVERS.includes(card.driver || '')) {
+        addLog('system', `GPU pin for "${pool.id}" cannot be applied: ${card.card} (${card.driver || 'no driver'}) `
+          + 'is not enumerable by this engine and no RPC endpoint serves it. '
+          + `${pool.pinnedModels.join(', ')} will run on the default device. `
+          + 'Enable the duo accelerator so the card is attached over RPC.');
+      }
+    }
+  }
+  return pins;
+}
+
 function gpuPinEnv() {
   const pin = activeGpuPin();
   if (!pin) return {};
@@ -7697,7 +7739,7 @@ function resolveHardwareProfile() {
  *   which must match the context this router would otherwise have received on its CLI.
  * @returns {string} Path to the written file, or '' when there is nothing to write.
  */
-function writeModelsPresetFile(contextSize = (config.contextSize || 8192)) {
+function writeModelsPresetFile(contextSize = (config.contextSize || 8192), { rpcEndpoint = null } = {}) {
   try {
     const profile = resolveHardwareProfile();
     const gemmaDraftPath = join(MODELS_DIR, 'google_gemma-4-E2B-it-assistant', 'gemma-4-E2B-it-assistant-BF16.gguf');
@@ -7741,7 +7783,7 @@ function writeModelsPresetFile(contextSize = (config.contextSize || 8192)) {
     if (resolveContextMode() === 'preset') {
       sections.unshift(globalContextPresetSection({ contextSize }));
     }
-    const ini = renderModelsPresetIni(sections);
+    const ini = renderModelsPresetIni(applyDevicePins(sections, gpuPinPresetDevices(rpcEndpoint)));
     if (!ini) return '';
     // MUST live under a path the ENGINE can see. The engine runs inside the
     // distrobox, which mounts only $HOME and /run/host. On a packaged appliance
@@ -7850,6 +7892,9 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
       });
     } else {
       const startScript = join(PROJECT_ROOT, 'start-llama.sh');
+      // Resolved BEFORE the preset is written: the preset needs the RPC endpoint to name
+      // the device a pinned model runs on, and object literals evaluate top to bottom.
+      const accelEnv = await gpuAcceleratorEnv();
       const env = {
         ...RUNTIME_ENV,
         MODELS_DIR,
@@ -7862,7 +7907,8 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
         NO_WARMUP: config.noWarmup ? '1' : '',
         FLASH_ATTN: config.flashAttn ? '1' : '',
         GPU_LAYERS: String(config.gpuLayers || 99),
-        MODELS_PRESET: writeModelsPresetFile(contextOverride || config.contextSize || 8192),
+        MODELS_PRESET: writeModelsPresetFile(contextOverride || config.contextSize || 8192,
+          { rpcEndpoint: accelEnv.LLAMA_RPC_ENDPOINT || null }),
         LOAD_MODE: resolveLoadMode(),
         CONTEXT_MODE: resolveContextMode(),
         HF_TOKEN: resolveHfToken(config, process.env),
@@ -7870,7 +7916,7 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
         // enabled, so the router's environment there is byte-identical to what it has
         // always been. start-llama.sh forwards these explicitly into the container.
         ...gpuPinEnv(),
-        ...(await gpuAcceleratorEnv())
+        ...accelEnv
       };
 
       console.log('[restart] Starting router mode');
@@ -8572,6 +8618,9 @@ app.post('/api/server/start', async (req, res) => {
     currentPreset = null;
 
     const startScript = join(PROJECT_ROOT, 'start-llama.sh');
+    // Same ordering constraint as the restart path: the endpoint must be known before the
+    // preset that names its device is written.
+    const accelEnv = await gpuAcceleratorEnv();
     const env = {
       ...RUNTIME_ENV,
       MODELS_DIR,
@@ -8581,14 +8630,14 @@ app.post('/api/server/start', async (req, res) => {
       NO_WARMUP: config.noWarmup ? '1' : '',
       FLASH_ATTN: config.flashAttn ? '1' : '',
       GPU_LAYERS: String(config.gpuLayers || 99),
-      MODELS_PRESET: writeModelsPresetFile(),
+      MODELS_PRESET: writeModelsPresetFile(undefined, { rpcEndpoint: accelEnv.LLAMA_RPC_ENDPOINT || null }),
       LOAD_MODE: resolveLoadMode(),
       CONTEXT_MODE: resolveContextMode(),
       HF_TOKEN: resolveHfToken(config, process.env),
       // The GPU pin and duo accelerator, exactly as the restart path carries them; both
       // spread empty when neither is configured.
       ...gpuPinEnv(),
-      ...(await gpuAcceleratorEnv())
+      ...accelEnv
     };
 
     llamaStartedAt = Date.now();

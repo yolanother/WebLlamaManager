@@ -1229,3 +1229,65 @@ export function podcastQwen38PresetSection({ modelsDir, weightsExist, threads } 
     },
   };
 }
+
+/**
+ * Drivers whose cards the locally-built engine enumerates as its own devices.
+ *
+ * The engine on this appliance is HIP-built, so it sees amdgpu cards and nothing else. An
+ * NVIDIA card in the same box is invisible to it however the kernel binds it, and is
+ * reachable ONLY as an RPC device served by a CUDA `ggml-rpc-server`. That asymmetry is the
+ * whole reason a pin cannot always be expressed as a `*_VISIBLE_DEVICES` variable.
+ * @type {string[]}
+ */
+export const LOCALLY_ENUMERABLE_DRIVERS = ['amdgpu'];
+
+/**
+ * The `--device` name for a pinned card, when that card is only reachable over RPC.
+ *
+ * `--list-devices` names an attached RPC server `RPC<n>`, where n is the card's position in
+ * the comma-separated `--rpc` list the router was started with. The index is therefore
+ * assignment order and MUST be derived from that list -- hardcoding `RPC0` breaks the moment
+ * a second endpoint is configured, and breaks silently, by pinning to the wrong machine.
+ *
+ * @param {object} params
+ * @param {{driver?: string}} params.card The card the pin resolved to.
+ * @param {string[]} [params.rpcEndpoints] Endpoints passed to `--rpc`, in order.
+ * @param {?string} [params.endpoint] The endpoint serving this card.
+ * @returns {?string} `RPC<n>`, or null when the card is locally enumerable (the existing
+ *   device-selector path applies), or when no RPC endpoint serves it (the pin cannot be
+ *   expressed at all and the caller must say so rather than emit a name that does not exist).
+ */
+export function resolvePinDevice({ card, rpcEndpoints = [], endpoint = null } = {}) {
+  const driver = card?.driver || '';
+  if (LOCALLY_ENUMERABLE_DRIVERS.includes(driver)) return null;
+  if (!endpoint || !Array.isArray(rpcEndpoints)) return null;
+  const index = rpcEndpoints.indexOf(endpoint);
+  return index >= 0 ? `RPC${index}` : null;
+}
+
+/**
+ * Merge per-model `device` pins into the models-preset sections.
+ *
+ * Merges rather than appends: a model may ALREADY have a section (an MTP drafter, a context
+ * override), and emitting a second section with the same name would leave two presets of the
+ * same name in one INI -- at best redundant, at worst shadowing the first.
+ *
+ * @param {Array<{name:string, options:Object<string,string>}>} sections Existing sections.
+ * @param {?Object<string,string>} pins Model id -> device name, from {@link resolvePinDevice}.
+ * @returns {Array<{name:string, options:Object<string,string>}>} Sections in their original
+ *   order, each pinned model carrying `device`, plus a new section per pinned model that had
+ *   none. Returns the input untouched when there are no pins.
+ */
+export function applyDevicePins(sections = [], pins = null) {
+  const entries = Object.entries(pins || {});
+  if (entries.length === 0) return sections;
+  const out = (sections || []).map((s) => {
+    const device = pins[s.name];
+    return device ? { ...s, options: { ...s.options, device } } : s;
+  });
+  const present = new Set(out.map((s) => s.name));
+  for (const [name, device] of entries) {
+    if (!present.has(name)) out.push({ name, options: { device } });
+  }
+  return out;
+}
