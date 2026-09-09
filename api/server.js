@@ -239,6 +239,7 @@ import { acceleratorPlan, rpcRouterArgs,
   engineSupportsRpc,
   parseEngineNeededLibs,
   DEFAULT_RPC_PORT,
+  normalizeDuoSettings,
 } from './duo-accelerator.js';
 import {
   resolveRpcServerBin, rpcServerCommand, supervisorAction, rpcEndpointGate,
@@ -4484,6 +4485,12 @@ app.get('/api/settings', (req, res) => {
       // and reported as an empty array there rather than omitted, so a client can tell
       // "no pools" from "this server is too old to have them".
       gpus: Array.isArray(config.gpus) ? config.gpus : [],
+    // Readable as well as writable: the accelerator switch is what makes a pin to a
+    // discrete card reachable, so an operator must be able to see its current state.
+    duo: {
+      useAccelerator: !!config.duo?.useAccelerator,
+      acceleratorPriority: config.duo?.acceleratorPriority || 'agent-first',
+    },
       localStallMs: config.localStallMs ?? DEFAULT_LOCAL_STALL_MS,
       defaultReasoningEffort: config.defaultReasoningEffort || null,
       modelReasoningEffort: config.modelReasoningEffort || {},
@@ -4523,7 +4530,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken, gpus } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken, gpus, duo } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -4562,6 +4569,17 @@ app.post('/api/settings', (req, res) => {
       config.gpuLayers = layers;
     } else {
       return res.status(400).json({ error: 'GPU layers must be between 0 and 999' });
+    }
+  }
+
+  if (duo !== undefined) {
+    // The accelerator is what attaches a discrete card over RPC, so this is the switch that
+    // makes an NVIDIA pin reachable at all. Rejected loudly rather than coerced: silently
+    // substituting a policy is how a card gets taken from something already using it.
+    try {
+      config.duo = { ...(config.duo || {}), ...normalizeDuoSettings(duo) };
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
     }
   }
 

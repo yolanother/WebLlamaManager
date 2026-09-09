@@ -203,3 +203,34 @@ export function engineSupportsRpc(neededLibs) {
   if (!Array.isArray(neededLibs) || neededLibs.length === 0) return false;
   return neededLibs.some((lib) => typeof lib === 'string' && lib.startsWith('libggml-rpc.so'));
 }
+
+/** The two accelerator policies. `agent-first` is the safe default; see {@link normalizeDuoSettings}. */
+export const ACCELERATOR_PRIORITIES = Object.freeze(['agent-first', 'llama-first']);
+
+/**
+ * Validate the operator's duo/accelerator settings.
+ *
+ * Exists because there was no supported way to turn the accelerator on at all: the settings
+ * route did not accept `duo` and nothing else wrote it, so the discrete card could only be
+ * enabled by hand-editing config.json on the box.
+ *
+ * @param {?object} value The `duo` object from a settings request.
+ * @returns {{useAccelerator: boolean, acceleratorPriority: string}} Normalized settings.
+ * @throws {TypeError} When the value is not an object, `useAccelerator` is not a boolean, or
+ *   the priority is not one of {@link ACCELERATOR_PRIORITIES}. An unknown priority throws
+ *   rather than falling back, because silently substituting a policy is how a card gets
+ *   taken from something that was using it.
+ */
+export function normalizeDuoSettings(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('duo settings must be an object');
+  }
+  const { useAccelerator = false, acceleratorPriority = 'agent-first' } = value;
+  if (typeof useAccelerator !== 'boolean') {
+    throw new TypeError('duo.useAccelerator must be a boolean');
+  }
+  if (!ACCELERATOR_PRIORITIES.includes(acceleratorPriority)) {
+    throw new TypeError(`duo.acceleratorPriority must be one of ${ACCELERATOR_PRIORITIES.join(', ')}`);
+  }
+  return { useAccelerator, acceleratorPriority };
+}

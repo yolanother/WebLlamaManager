@@ -11,6 +11,7 @@ import {
   AGENT_RESERVE_BYTES,
   engineSupportsRpc,
   parseEngineNeededLibs,
+  normalizeDuoSettings,
 } from './duo-accelerator.js';
 
 const GB = 1024 * 1024 * 1024;
@@ -212,4 +213,29 @@ test('end to end: a plan that would start the accelerator is refused on an RPC-l
   // The engine, not the policy, is what makes it impossible.
   assert.deepEqual(rpcRouterArgs(plan, { engineSupportsRpc: false }), []);
   assert.deepEqual(rpcRouterArgs(plan, { engineSupportsRpc: true }), ['--rpc', plan.endpoint]);
+});
+
+// The accelerator had no supported way to be switched on: POST /api/settings did not
+// accept `duo`, and no other route wrote it, so the only way to enable the discrete card
+// was hand-editing config.json on the box. These pin the validation for the settings key.
+test('normalizeDuoSettings accepts the two documented priorities', () => {
+  assert.deepEqual(normalizeDuoSettings({ useAccelerator: true, acceleratorPriority: 'agent-first' }),
+    { useAccelerator: true, acceleratorPriority: 'agent-first' });
+  assert.deepEqual(normalizeDuoSettings({ useAccelerator: true, acceleratorPriority: 'llama-first' }),
+    { useAccelerator: true, acceleratorPriority: 'llama-first' });
+});
+
+test('normalizeDuoSettings defaults to agent-first, never llama-first', () => {
+  // The default must be the SAFE one: agent-first leaves the card to the pods agent unless
+  // it is demonstrably free. Defaulting to llama-first would quietly take a card away from
+  // whatever else on the box was using it.
+  assert.deepEqual(normalizeDuoSettings({ useAccelerator: true }),
+    { useAccelerator: true, acceleratorPriority: 'agent-first' });
+  assert.deepEqual(normalizeDuoSettings({}), { useAccelerator: false, acceleratorPriority: 'agent-first' });
+});
+
+test('normalizeDuoSettings rejects an unknown priority rather than silently defaulting', () => {
+  assert.throws(() => normalizeDuoSettings({ acceleratorPriority: 'whatever' }), TypeError);
+  assert.throws(() => normalizeDuoSettings({ useAccelerator: 'yes' }), TypeError);
+  assert.throws(() => normalizeDuoSettings([]), TypeError);
 });
