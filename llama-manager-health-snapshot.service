@@ -13,7 +13,9 @@ After=systemd-pstore.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/node /opt/llama-manager/scripts/health-snapshot.mjs
+# The appliance ships its own Node at this path; /usr/bin/node may not exist.
+# Matches the interpreter llama-manager.service itself uses.
+ExecStart=/usr/lib/llama-manager/node/bin/node /usr/lib/llama-manager/scripts/health-snapshot.mjs
 # A drive in the act of failing can wedge an nvme command indefinitely; the
 # collector must never become the thing that hangs.
 TimeoutStartSec=60
