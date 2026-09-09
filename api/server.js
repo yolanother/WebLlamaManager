@@ -216,7 +216,9 @@ import {
   resolveDistributionPolicy,
 } from './distribution-policy.js';
 import { beginLlamaUpdate, createLlamaSourceUpdateSpec } from './llama-update-controller.js';
-import { applyConfigDefaults } from './config-defaults.js';
+import { applyConfigDefaults,
+  modelPatternMatches,
+} from './config-defaults.js';
 import { scheduleAutoStart } from './auto-start.js';
 import { resolveAltPort, listenBestEffort } from './alt-port.js';
 import { shouldIdleShutdown } from './idle-shutdown.js';
@@ -12133,9 +12135,9 @@ function injectReasoningEffort(body) {
   let effort = null;
 
   for (const [pattern, value] of Object.entries(perModel)) {
-    // Support glob-style wildcards: "gpt-oss*" matches "gpt-oss-2025"
-    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
-    if (regex.test(model)) {
+    // Glob wildcards only; every other character is literal and matching ignores case.
+    // Both of those were silent bugs here — see modelPatternMatches.
+    if (modelPatternMatches(pattern, model)) {
       effort = value;
       break;
     }
