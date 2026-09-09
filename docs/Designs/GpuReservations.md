@@ -404,7 +404,7 @@ module 610.43.02 and `nvidia_uvm` live.
 
 | Task | State | Effect |
 |---|---|---|
-| `T312594d909a54` | open | A claim that had to **queue** is bound to a card when one frees but is never promoted to `held`; `wait` on it 408s until the TTL expires. Claims granted immediately are unaffected. Workaround: release and lock again. |
+| `T312594d909a54` | **fixed** (`3dec3f2`) | A claim that had to **queue** was bound to a card when one freed but was never promoted to `held`; `wait` on it 408'd until the TTL expired. The sweep timer now starts the drain the promotion could not start itself — promotion happens inside a transaction, and reserving from there double-books the card. Promotion latency is therefore bounded by the 5 s sweep interval. |
 | `T31258b5e1fa2b` | open | `softClaimed` is permanently populated on a Strix Halo box, because the 8 GiB headroom figure is meaningless against 1 GiB of dedicated VRAM. Advisory only; blocks nothing. |
 | `T31256f487e4ee` | open | `gen-openapi.mjs` emits only `200` response objects for all 131 operations, so the GPU routes' load-bearing `202`/`408`/`409`/`503` codes are prose, not schema. A generated client assumes 200. |
 | `T3125955cb14f3` | open | The declared **200** schemas for the GPU routes diverge from what the server returns in six places (pool `free` is an integer not a boolean, `softClaimed` an array not a boolean, the reservation schema requires a field the records do not carry). |

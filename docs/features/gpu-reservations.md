@@ -474,15 +474,14 @@ pending ──▶ held ──▶ released
 | `holder` | `"api"` | `reserve`, `lock` |
 | `noWait` | `false` | `reserve`, `lock` |
 
-> **Known defect: a queued claim is not promoted (task `T312594d909a54`, open).**
-> A claim that must wait for capacity is bound to a card when one frees, but is
-> **not currently drained or moved to `held`** — only `reserve` and `lock` start a
-> drain, and the sweep promotes llama-manager's own pins only. `wait` on such a
-> claim returns 408 until its TTL expires, while the claim occupies the card.
-> Until that lands, **treat a 408 from `lock` as "release this lease and lock
-> again"** rather than waiting on it. A claim that is granted immediately — which
-> is every claim that either finds spare capacity or outranks the current holder —
-> is unaffected.
+> **A queued claim is promoted within one sweep (~5 s).** A claim that must wait
+> for capacity is bound to a card as soon as one frees, and the sweep timer then
+> drains that card and moves the claim to `held` — so `wait` on a queued claim
+> resolves normally. The promotion cannot happen instantly: it occurs inside a
+> state-machine transaction, and starting a drain from there would hand the same
+> card to two holders. Budget a `timeoutSeconds` comfortably above the 5 s sweep
+> interval when you expect to queue. (This was defect `T312594d909a54`, fixed in
+> `3dec3f2`; before that fix such a claim stayed `pending` until its TTL expired.)
 
 > **Known gap: non-200 codes are prose in OpenAPI (task `T31256f487e4ee`, open).**
 > `scripts/gen-openapi.mjs` emits only a `200` response object per operation, for
