@@ -1,0 +1,39 @@
+#!/bin/sh
+# Copyright (c) 2026 DoubTech. Use of this file is governed by the LICENSE file
+# in the repository root.
+#
+# Debian postinst for the llama-manager-cuda-rpc package. It points the
+# /usr/lib/llama-manager/engine-cuda/current symlink at the versioned engine
+# directory this package just unpacked, which is the path llama-manager resolves
+# when it launches the CUDA ggml-rpc-server for a discrete NVIDIA card. The
+# reference to link is read from the packaged-ref marker the package ships, so
+# this script is static and needs no build-time substitution. It deliberately
+# never starts anything: the manager owns the lifetime of the rpc-server process,
+# because a card that is only usable while a systemd unit is enabled cannot be
+# shared with the other workloads on the box.
+set -e
+
+ENGINE_ROOT=/usr/lib/llama-manager/engine-cuda
+REF_MARKER="$ENGINE_ROOT/packaged-ref"
+
+case "$1" in
+  configure)
+    if [ ! -f "$REF_MARKER" ]; then
+      echo "llama-manager-cuda-rpc: missing $REF_MARKER; cannot resolve engine ref" >&2
+      exit 1
+    fi
+    ref="$(cat "$REF_MARKER")"
+    if [ ! -x "$ENGINE_ROOT/$ref/ggml-rpc-server" ]; then
+      echo "llama-manager-cuda-rpc: $ENGINE_ROOT/$ref/ggml-rpc-server is missing or not executable" >&2
+      exit 1
+    fi
+    # Relative target so the link is correct inside a chroot, an installer
+    # target root, and the live squashfs layer alike.
+    ln -sfn "$ref" "$ENGINE_ROOT/current"
+    ;;
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

@@ -1,0 +1,30 @@
+#!/bin/sh
+# Copyright (c) 2026 DoubTech. Use of this file is governed by the LICENSE file
+# in the repository root.
+#
+# Debian postrm for the llama-manager-cuda-rpc package. It removes the
+# /usr/lib/llama-manager/engine-cuda/current symlink created by the postinst, but
+# only when that symlink has been left dangling by the removal. An operator or a
+# test deployment may have repointed 'current' at a hand-built engine directory
+# that this package does not own, and silently deleting that would break a
+# working box; a link whose target still resolves is therefore left alone.
+set -e
+
+ENGINE_ROOT=/usr/lib/llama-manager/engine-cuda
+
+case "$1" in
+  remove|purge)
+    if [ -L "$ENGINE_ROOT/current" ]; then
+      target="$(readlink "$ENGINE_ROOT/current")"
+      case "$target" in
+        /*) resolved="$target" ;;
+        *)  resolved="$ENGINE_ROOT/$target" ;;
+      esac
+      [ -x "$resolved/ggml-rpc-server" ] || rm -f "$ENGINE_ROOT/current"
+    fi
+    rmdir --ignore-fail-on-non-empty "$ENGINE_ROOT" 2>/dev/null || true
+    ;;
+esac
+
+#DEBHELPER#
+exit 0
