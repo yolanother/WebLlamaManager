@@ -975,28 +975,35 @@ const GPU_LOOPBACK_DESCRIPTION = [
 /** One physical card inside a pool, with the live load a client routes on. */
 const GPU_CARD_SCHEMA = {
   type: 'object',
+  required: ['card', 'pci', 'name', 'driver', 'available', 'vramBytes', 'vramUsedBytes', 'busyPercent', 'free'],
   properties: {
     card: { type: 'string', description: 'DRM node name such as "card1". Never use it as a key — it reorders between boots.' },
-    name: { type: 'string', description: 'Resolved product name, for example "AMD Radeon Graphics" or "NVIDIA GeForce RTX 3090".' },
+    name: { type: ['string', 'null'], description: 'Resolved product name, for example "AMD Radeon Graphics" or "NVIDIA GeForce RTX 3090". Null when sysfs reports none.' },
     pci: { type: ['string', 'null'], description: 'PCI address such as "0000:c5:00.0". Stable until the card is physically re-plugged.' },
-    pciId: { type: ['string', 'null'], description: 'vendor:device class id such as "10de:2204". This is what pool matching keys on.' },
     driver: { type: ['string', 'null'], description: 'Bound kernel driver, for example "amdgpu" or "nvidia".' },
     available: { type: 'boolean', description: 'False when no driver is bound. Such a card is listed but excluded from capacity.' },
     vramBytes: { type: ['integer', 'null'], description: 'Total video memory in bytes, or null when the driver does not report it.' },
     vramUsedBytes: { type: ['integer', 'null'], description: 'Video memory currently in use, in bytes. Read it with vramBytes to decide whether the card has room for your work.' },
-    gttBytes: { type: ['integer', 'null'], description: 'GTT/system-memory aperture in bytes on integrated parts, else null.' },
-    busyPercent: { type: ['number', 'null'], description: 'Instantaneous GPU utilisation, 0-100. High busyPercent with no reservation is the unfriendly-neighbour case reported as softClaimed.' },
-    temperatureC: { type: ['number', 'null'], description: 'Edge temperature in degrees Celsius, or null when unreported.' },
-    softClaimed: { type: 'boolean', description: 'True when the card is visibly busy but holds NO reservation. llama-manager will neither schedule onto it nor evict anything from it.' },
+    busyPercent: { type: ['number', 'null'], description: 'Instantaneous GPU utilisation, 0-100. High busyPercent with no reservation is the unfriendly-neighbour case reported in the pool\'s softClaimed list.' },
+    free: {
+      type: 'boolean',
+      description: 'Per-card BOOLEAN: true when no active reservation is bound to THIS card. Do not confuse it with the pool-level `free`, which is an integer COUNT of unbound cards in the whole pool. A card is free:false only while a reservation holds it — a soft claim (busy under no reservation) leaves it free:true.',
+    },
   },
 };
 
-/** One reservation record, as returned by every claiming and lease route. */
+/**
+ * One reservation record, as returned inside every claiming and lease response.
+ *
+ * The record's own lease handle is `id`. The claiming routes ALSO repeat it at the top
+ * level of their envelope as `reservationId`, which is the name the path parameter uses;
+ * inside the record itself it is always `id`.
+ */
 const GPU_RESERVATION_SCHEMA = {
   type: 'object',
-  required: ['reservationId', 'gpu', 'state', 'priority', 'holder'],
+  required: ['id', 'gpu', 'state', 'priority', 'holder'],
   properties: {
-    reservationId: { type: 'string', description: 'Lease handle. Pass it to wait, renew, and release.' },
+    id: { type: 'string', description: 'Lease handle, for example "res-1". Pass it to wait, renew, and release as the {reservationId} path parameter.' },
     gpu: { type: 'string', description: 'Pool id the lease was taken against.' },
     card: { type: ['string', 'null'], description: 'DRM node of the specific card this grant bound to, once bound.' },
     pci: { type: ['string', 'null'], description: 'PCI address of the bound card. Use it to set CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES yourself — never a positional index.' },
@@ -1011,31 +1018,32 @@ const GPU_RESERVATION_SCHEMA = {
     expiresAt: { type: ['integer', 'null'], description: 'Unix epoch milliseconds at which the lease expires unless renewed.' },
     reason: { type: 'string', description: 'Free-text reason recorded by the caller, echoed back for operators reading GET /api/gpus.' },
     createdAt: { type: 'integer', description: 'Unix epoch milliseconds at which the lease was created.' },
+    updatedAt: { type: 'integer', description: 'Unix epoch milliseconds of the last state change, renewal, or rebind.' },
+    grantedAt: { type: ['integer', 'null'], description: 'Unix epoch milliseconds at which the lease was bound to a card, or null while it is still queued for capacity.' },
   },
 };
 
 /** One operator-named GPU pool, its live load, and who is on it. */
 const GPU_POOL_SCHEMA = {
   type: 'object',
-  required: ['id', 'capacity', 'free', 'cards', 'held', 'pending', 'warnings'],
+  required: ['id', 'label', 'capacity', 'free', 'cards', 'held', 'pending', 'softClaimed', 'warnings', 'pinnedModels', 'defaultPriority'],
   properties: {
     id: { type: 'string', description: 'Stable pool handle used by the API, the llm CLI, MCP, and settings. The DRM index is never a key.' },
-    label: { type: 'string', description: 'Human-readable pool label from settings.' },
-    match: {
-      type: 'object',
-      description: 'Class selectors from settings, ANDed. Any may be omitted; pciId or name alone is the normal case and survives a re-plug into another slot.',
-      properties: {
-        pciId: { type: 'string', description: 'vendor:device id, for example "10de:2204".' },
-        name: { type: 'string', description: 'Case-insensitive substring of the card product name.' },
-        pci: { type: 'string', description: 'Exact PCI address, to pin one physical slot. Not required and not the default.' },
-      },
-    },
+    label: { type: 'string', description: 'Human-readable pool label from settings, falling back to the pool id.' },
     capacity: { type: 'integer', description: 'Number of matching, driver-bound cards present. Two identical cards under one id is capacity 2, not an error — concurrent claims up to capacity are all granted immediately with no contention. A pool matching zero present cards reports capacity 0 and every claim against it fails.' },
-    free: { type: 'boolean', description: 'True when at least one card in the pool is not currently held, so a claim would be granted without preempting anybody.' },
+    free: {
+      type: 'integer',
+      minimum: 0,
+      description: 'Pool-level COUNT of cards not currently bound to a reservation: capacity minus the number of occupied cards. Any value above 0 means a claim would be granted right now without preempting anybody, and 0 means the pool is full (or has no cards at all). This is NOT the same field as the per-card `free`, which is a BOOLEAN saying whether that one card is unbound.',
+    },
     cards: { type: 'array', items: GPU_CARD_SCHEMA, description: 'Every matching card present, including driver-unbound ones excluded from capacity. Read vramBytes, vramUsedBytes and busyPercent here to decide whether to route work elsewhere instead of waiting for this pool.' },
     held: { type: 'array', items: GPU_RESERVATION_SCHEMA, description: 'Leases currently held on this pool.' },
     pending: { type: 'array', items: GPU_RESERVATION_SCHEMA, description: 'Leases granted but still draining, plus claims queued for capacity.' },
-    softClaimed: { type: 'boolean', description: 'True when a card in the pool is visibly busy under no reservation — an unfriendly neighbour that never learned to call us.' },
+    softClaimed: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'DRM node names of the cards in this pool that are visibly busy under NO reservation — unfriendly neighbours that never learned to call us. Empty when nothing is soft-claimed, and empty on an appliance with no telemetry wired rather than reporting every card busy. A soft claim is advisory only: it does not block a claim and does not clear the pool\'s `free` count.',
+    },
     pinnedModels: { type: 'array', items: { type: 'string' }, description: 'Models pinned to this pool in settings. A pin IS a reservation, held by "llama-manager" at defaultPriority with no TTL.' },
     defaultPriority: { type: 'integer', description: 'Priority llama-manager\'s own internal pin on this pool is held at. Defaults to 0.' },
     warnings: { type: 'array', items: { type: 'string' }, description: 'Resolution problems stated plainly rather than silently: no card of this class present, an empty match selector that deliberately matches nothing, or two pools claiming the same card (first in config order wins).' },
@@ -1047,15 +1055,17 @@ const GPU_LIST_OPTIONS = {
   description: [
     'Lists every configured GPU pool with its live per-card load, its current holders, and whether a claim would be granted right now.',
     'A named GPU is a POOL of interchangeable cards matched by CLASS (vendor:device id and product name) rather than by DRM index or PCI slot, so the id survives both a card0/card1 reorder and a physical re-plug.',
-    'capacity is how many matching driver-bound cards are present and free says whether one of them is unheld.',
+    'capacity is how many matching driver-bound cards are present and free COUNTS how many of them are unbound right now; the per-card free is a separate boolean for that one card.',
     'Each card carries vramBytes, vramUsedBytes and busyPercent so a client can see the load and decide to route its work elsewhere instead of queueing behind a busy card.',
+    'Alongside gpus the response carries a flat reservations list of every lease the manager knows about, in any state. Narrow it with the ?gpu= and ?state= query parameters, which project that list only — the gpus array is always complete.',
     'This route is READ-ONLY and open like GET /api/stats; the mutating GPU routes are loopback-only.',
   ].join(' '),
   responseSchema: {
     type: 'object',
-    required: ['gpus'],
+    required: ['gpus', 'reservations'],
     properties: {
       gpus: { type: 'array', items: GPU_POOL_SCHEMA },
+      reservations: { type: 'array', items: GPU_RESERVATION_SCHEMA, description: 'Every reservation the manager holds, flattened across pools and including terminal ones, filtered by ?gpu= and ?state= when supplied.' },
     },
   },
 };
@@ -1063,11 +1073,19 @@ const GPU_LIST_OPTIONS = {
 /** Documentation overrides for the single-pool GPU readout. */
 const GPU_GET_OPTIONS = {
   description: [
-    'Returns one GPU pool by its settings id, with the same live load, holders, capacity, free flag and warnings as GET /api/gpus.',
+    'Returns one GPU pool by its settings id, with the same live load, holders, capacity, free count and warnings as GET /api/gpus.',
+    'The pool is NESTED under a "gpu" key, not returned at the root, and is accompanied by that pool\'s reservations — narrow them with ?state=.',
     'Answers 404 when no pool carries that id. A pool that exists but currently matches no present card is NOT a 404 — it is returned with capacity 0 and a warning naming the pool.',
     'This route is READ-ONLY and open like GET /api/stats.',
   ].join(' '),
-  responseSchema: GPU_POOL_SCHEMA,
+  responseSchema: {
+    type: 'object',
+    required: ['gpu', 'reservations'],
+    properties: {
+      gpu: GPU_POOL_SCHEMA,
+      reservations: { type: 'array', items: GPU_RESERVATION_SCHEMA, description: 'Reservations taken against this pool, in any state, filtered by ?state= when supplied.' },
+    },
+  },
 };
 
 /** Request schema shared by the reserve and lock claiming routes. */
@@ -1080,6 +1098,23 @@ const GPU_CLAIM_REQUEST_SCHEMA = {
     reason: { type: 'string', description: 'Free-text reason recorded on the lease, for example "tts batch".' },
     noWait: { type: 'boolean', default: false, description: 'When true, a claim that cannot be granted now is refused cleanly with 409 instead of parking as pending. Ignored by lock, which waits by definition.' },
   },
+};
+
+/**
+ * The envelope both claiming routes answer with.
+ *
+ * The lease handle is lifted to the top level as `reservationId` — the name the
+ * {reservationId} path parameter uses — and the whole record is repeated under
+ * `reservation`, where the same value is called `id`. `gpu`, `card` and `pci` are lifted
+ * out too so a caller that only needs to set HIP_VISIBLE_DEVICES never has to open the
+ * nested record.
+ */
+const GPU_CLAIM_ENVELOPE_PROPERTIES = {
+  reservationId: { type: 'string', description: 'Lease handle, for example "res-1". Pass it to wait, renew and release as the {reservationId} path parameter. Inside the nested reservation record the same value is called `id`.' },
+  gpu: { type: 'string', description: 'Pool id the lease was taken against.' },
+  card: { type: ['string', 'null'], description: 'DRM node of the specific card this grant bound to, or null while the claim is still queued for capacity.' },
+  pci: { type: ['string', 'null'], description: 'PCI address of the bound card. Use it to set CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES yourself — never a positional index.' },
+  reservation: { ...GPU_RESERVATION_SCHEMA, description: 'The full lease record. Its handle is `id`, not `reservationId`.' },
 };
 
 /** Documentation overrides for the non-blocking reserve route. */
@@ -1096,7 +1131,15 @@ const GPU_RESERVE_OPTIONS = {
   ].join(' '),
   body: { holder: 'pods-agent', priority: 80, ttlSeconds: 300, reason: 'asset generation batch' },
   requestSchema: GPU_CLAIM_REQUEST_SCHEMA,
-  responseSchema: GPU_RESERVATION_SCHEMA,
+  responseSchema: {
+    type: 'object',
+    required: ['reservationId', 'state', 'gpu', 'reservation'],
+    properties: {
+      ...GPU_CLAIM_ENVELOPE_PROPERTIES,
+      state: { type: 'string', enum: ['pending'], description: 'Always "pending" here: reserve never returns a held lease. Call wait, or use lock, to find out when the card is genuinely yours.' },
+      expiresAt: { type: ['integer', 'null'], description: 'Unix epoch milliseconds at which the lease expires unless renewed.' },
+    },
+  },
 };
 
 /** Documentation overrides for the blocking reserve+wait route. */
@@ -1118,7 +1161,14 @@ const GPU_LOCK_OPTIONS = {
       timeoutSeconds: { type: 'integer', minimum: 1, default: DEFAULT_GPU_WAIT_SECONDS, description: 'How long to block before answering 408. A timeout does NOT cancel the lease.' },
     },
   },
-  responseSchema: GPU_RESERVATION_SCHEMA,
+  responseSchema: {
+    type: 'object',
+    required: ['reservationId', 'state', 'gpu', 'card', 'pci', 'reservation'],
+    properties: {
+      ...GPU_CLAIM_ENVELOPE_PROPERTIES,
+      state: { type: 'string', enum: ['held'], description: 'Always "held" on a 200: lock returns only once the card is genuinely yours. Any other outcome is a 408 or 409, not a different state here.' },
+    },
+  },
 };
 
 /** Documentation overrides for the pending-to-held wait route. */
@@ -1138,7 +1188,14 @@ const GPU_WAIT_OPTIONS = {
       timeoutSeconds: { type: 'integer', minimum: 1, default: DEFAULT_GPU_WAIT_SECONDS, description: 'How long to block before answering 408. A timeout does NOT cancel the lease.' },
     },
   },
-  responseSchema: GPU_RESERVATION_SCHEMA,
+  responseSchema: {
+    type: 'object',
+    required: ['reservation', 'state'],
+    properties: {
+      reservation: { ...GPU_RESERVATION_SCHEMA, description: 'The lease, now held. Its handle is `id`, not `reservationId`.' },
+      state: { type: 'string', enum: ['held'], description: 'Always "held" on a 200. The 408 and 409 bodies carry the lease under `reservation` instead, with its own state.' },
+    },
+  },
 };
 
 /** Documentation overrides for the lease heartbeat route. */
@@ -1150,7 +1207,14 @@ const GPU_RENEW_OPTIONS = {
     GPU_LOOPBACK_DESCRIPTION,
   ].join(' '),
   body: {},
-  responseSchema: GPU_RESERVATION_SCHEMA,
+  responseSchema: {
+    type: 'object',
+    required: ['reservation', 'expiresAt'],
+    properties: {
+      reservation: { ...GPU_RESERVATION_SCHEMA, description: 'The renewed lease. Its handle is `id`, not `reservationId`.' },
+      expiresAt: { type: ['integer', 'null'], description: 'The new expiry, in Unix epoch milliseconds. Lifted out of the record so a heartbeat loop can read it without opening the reservation.' },
+    },
+  },
 };
 
 /** Documentation overrides for the lease release route. */
@@ -1158,11 +1222,18 @@ const GPU_RELEASE_OPTIONS = {
   description: [
     'Releases a lease and returns the card to the pool. Release as soon as you are done — do not rely on TTL expiry, which exists only so a crashed holder cannot strand a card.',
     'On release llama-manager retakes the card: any internal pin on that pool re-acquires it, the pinned model reloads, and requests parked in the queue during the drain resume.',
-    'Idempotent: releasing an already-terminal lease returns 200 carrying its existing terminal state.',
-    'Status codes: 200 released, 403 non-loopback caller, 404 unknown reservation id.',
+    'Releasing is NOT idempotent: only the call that actually released the lease answers 200 with state:"released". A second release, or a release of a lease that already expired or was preempted, answers 409 RESERVATION_INACTIVE carrying the lease in its existing terminal state — which is a no-op, not a failure, and safe to ignore.',
+    'Status codes: 200 released, 403 non-loopback caller, 404 unknown reservation id, 409 the lease was already terminal.',
     GPU_LOOPBACK_DESCRIPTION,
   ].join(' '),
-  responseSchema: GPU_RESERVATION_SCHEMA,
+  responseSchema: {
+    type: 'object',
+    required: ['state', 'reservation'],
+    properties: {
+      state: { type: 'string', enum: ['released'], description: 'Always "released" on a 200, including the idempotent re-release of a lease that was already terminal.' },
+      reservation: { ...GPU_RESERVATION_SCHEMA, description: 'The lease in its terminal state. Its handle is `id`, not `reservationId`.' },
+    },
+  },
 };
 
 const ROUTES = [

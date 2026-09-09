@@ -14,6 +14,7 @@ import {
   renderLlmsFullReference,
 } from './api-spec.js';
 import { CONTEXT_CACHE_CONTRACT_VERSION } from './context-cache.js';
+import { GpuReservations, reservationView } from './gpu-reservations.js';
 import { buildOpenApiDocument } from '../scripts/gen-openapi.mjs';
 
 const CURRENT_ENDPOINT_KEYS = [
@@ -392,14 +393,15 @@ test('GPU routes document pools, live load, the priority scale, leases, and the 
     assert.ok(pool.properties[field], `pool readout needs ${field}`);
   }
   assert.equal(pool.properties.capacity.type, 'integer');
-  assert.equal(pool.properties.free.type, 'boolean');
-  assert.deepEqual(show.responseSchema, pool, 'one pool reads exactly like a pool in the list');
+  assert.deepEqual(show.responseSchema.properties.gpu, pool, 'one pool reads exactly like a pool in the list');
 
   // pending vs held is the thing integrators get wrong.
   assert.deepEqual(
-    reserve.responseSchema.properties.state.enum,
+    reserve.responseSchema.properties.reservation.properties.state.enum,
     ['pending', 'held', 'released', 'expired', 'preempted'],
   );
+  assert.deepEqual(reserve.responseSchema.properties.state.enum, ['pending'], 'reserve never returns a held lease');
+  assert.deepEqual(lock.responseSchema.properties.state.enum, ['held'], 'lock returns 200 only once the card is held');
   assert.match(reserve.description, /202 DOES NOT MEAN THE CARD IS FREE/);
   assert.match(reserve.description, /pending/);
   assert.match(reserve.description, /lock/);
@@ -461,6 +463,204 @@ test('GPU routes document pools, live load, the priority scale, leases, and the 
   assert.match(reference, /### DELETE \/api\/gpus\/reservations\/\{reservationId\}\n/);
   assert.match(reference, /202 DOES NOT MEAN THE CARD IS FREE/);
   assert.match(reference, /busyPercent/);
+});
+
+// ---------------------------------------------------------------------------
+// The GPU response schemas describe what api/server.js actually emits.
+//
+// Every divergence these tests pin was a real one: pool `free` documented as a
+// boolean when it is a COUNT, pool `softClaimed` documented as a boolean when it
+// is a list of DRM card names, a card schema carrying four fields the server has
+// never returned while omitting the per-card `free` it does, a reservation schema
+// REQUIRING `reservationId` when records carry `id` (unsatisfiable by any object
+// the server emits), and list/get schemas that forgot the `reservations` array
+// and the `gpu` nesting. A generated client inherits all of it, so the shapes are
+// pinned here rather than left to prose.
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal JSON-Schema subset validator: type (including union arrays), enum,
+ * required, object properties, and array items. Enough to prove a live object
+ * satisfies a declared schema without adding a validator dependency for one test.
+ *
+ * @param {unknown} value The value under test.
+ * @param {object} schema The declared schema.
+ * @param {string} [path] Dotted path used in failure messages.
+ * @returns {string[]} One message per violation; empty means valid.
+ */
+function schemaViolations(value, schema, path = '$') {
+  const problems = [];
+  const types = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
+  const actual = value === null ? 'null'
+    : Array.isArray(value) ? 'array'
+      : Number.isInteger(value) ? 'integer'
+        : typeof value;
+  const ok = types.length === 0
+    || types.includes(actual)
+    || (actual === 'integer' && types.includes('number'));
+  if (!ok) problems.push(`${path}: expected ${types.join('|')}, got ${actual}`);
+  if (schema.enum && !schema.enum.includes(value)) {
+    problems.push(`${path}: ${JSON.stringify(value)} is not one of ${JSON.stringify(schema.enum)}`);
+  }
+  if (actual === 'object' && schema.properties) {
+    for (const key of schema.required ?? []) {
+      if (!(key in value)) problems.push(`${path}.${key}: required but absent`);
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (!schema.properties[key]) {
+        problems.push(`${path}.${key}: returned by the server but NOT declared in the schema`);
+        continue;
+      }
+      problems.push(...schemaViolations(child, schema.properties[key], `${path}.${key}`));
+    }
+  }
+  if (actual === 'array' && schema.items) {
+    value.forEach((item, i) => problems.push(...schemaViolations(item, schema.items, `${path}[${i}]`)));
+  }
+  return problems;
+}
+
+/**
+ * The per-card object exactly as `gpuPoolView` in api/server.js builds it, with
+ * values taken from a live `GET /api/gpus` on this appliance.
+ *
+ * Kept as a literal because gpuPoolView is module-scoped and not importable. If
+ * that projection changes, change this with it — nine keys, no more.
+ */
+const LIVE_CARD_VIEW = {
+  card: 'card1',
+  pci: '0000:c6:00.0',
+  name: 'AMD Device 1586',
+  driver: 'amdgpu',
+  available: true,
+  vramBytes: 1073741824,
+  vramUsedBytes: 332312576,
+  busyPercent: 100,
+  free: false,
+};
+
+test('GPU pool and reservation schemas accept what the server actually returns', () => {
+  const byKey = new Map(ENDPOINTS.map(entry => [`${entry.method} ${entry.path}`, entry]));
+  const listSchema = byKey.get('GET /api/gpus').responseSchema;
+  const showSchema = byKey.get('GET /api/gpus/{gpu}').responseSchema;
+  const poolSchema = listSchema.properties.gpus.items;
+  const reservationSchema = poolSchema.properties.held.items;
+
+  // A real state machine, not a fixture: one pool with a card and one that
+  // matches nothing, which is the capacity-0 case an appliance really hits.
+  const reservations = new GpuReservations({
+    pools: [
+      { id: 'apu', label: 'APU', cards: [{ card: 'card1', pci: '0000:c6:00.0' }], warnings: [] },
+      { id: 'rtx3090', label: 'RTX 3090', cards: [], warnings: ['GPU pool "rtx3090" matches no card present in this machine'] },
+    ],
+  });
+  const granted = reservations.reserve({ gpu: 'apu', holder: 'pods-agent', priority: 80, ttlMs: 300_000, reason: 'tts batch' });
+  reservations.markHeld(granted.id);
+
+  // Item 5: the record's handle is `id`. A schema requiring `reservationId` here
+  // could not be satisfied by anything the server emits.
+  const record = reservationView(reservations.get(granted.id));
+  assert.ok('id' in record && !('reservationId' in record), 'reservation records are keyed by id');
+  assert.deepEqual(
+    schemaViolations(record, reservationSchema), [],
+    'a live reservation record must validate against the declared reservation schema',
+  );
+  assert.deepEqual(
+    Object.keys(record).sort(),
+    Object.keys(reservationSchema.properties).sort(),
+    'the reservation schema declares exactly the fields reservationView emits — no more, no fewer',
+  );
+  assert.ok(reservationSchema.properties.ttlSeconds, 'leases are published in seconds');
+  assert.equal(reservationSchema.properties.ttlMs, undefined, 'ttlMs is internal and never published');
+
+  // Items 1, 2 and 6: the list envelope, assembled the way gpuPoolView does.
+  const described = reservations.describe({ telemetry: null });
+  const body = {
+    gpus: described.map(pool => ({
+      ...pool,
+      held: pool.held.map(reservationView),
+      pending: pool.pending.map(reservationView),
+      pinnedModels: [],
+      defaultPriority: 0,
+      cards: pool.id === 'apu' ? [LIVE_CARD_VIEW] : [],
+    })),
+    reservations: reservations.list().map(reservationView),
+  };
+  assert.deepEqual(schemaViolations(body, listSchema), [], 'GET /api/gpus must validate against its declared schema');
+  assert.deepEqual(
+    schemaViolations({ gpu: body.gpus[0], reservations: body.reservations }, showSchema), [],
+    'GET /api/gpus/{gpu} nests the pool under "gpu" and carries that pool\'s reservations',
+  );
+
+  // Item 1: pool free is a COUNT, and it moved when the card was taken.
+  const [apu, rtx] = body.gpus;
+  assert.equal(poolSchema.properties.free.type, 'integer');
+  assert.equal(apu.capacity, 1);
+  assert.equal(apu.free, 0, 'the held card is spent capacity');
+  assert.equal(rtx.free, 0, 'a pool with no cards has none free');
+
+  // Item 2: pool softClaimed is a list of DRM card names.
+  assert.equal(poolSchema.properties.softClaimed.type, 'array');
+  assert.equal(poolSchema.properties.softClaimed.items.type, 'string');
+  assert.deepEqual(apu.softClaimed, []);
+
+  // Items 3 and 4: the card schema is exactly gpuPoolView's nine keys, and the
+  // per-card `free` boolean is documented as distinct from the pool-level count.
+  const cardSchema = poolSchema.properties.cards.items;
+  assert.deepEqual(
+    Object.keys(cardSchema.properties).sort(),
+    Object.keys(LIVE_CARD_VIEW).sort(),
+    'the card schema declares exactly the fields gpuPoolView emits',
+  );
+  for (const gone of ['pciId', 'gttBytes', 'temperatureC', 'softClaimed']) {
+    assert.equal(cardSchema.properties[gone], undefined, `the server never returns a per-card ${gone}`);
+  }
+  assert.equal(cardSchema.properties.free.type, 'boolean');
+  assert.match(cardSchema.properties.free.description, /BOOLEAN/);
+  assert.match(cardSchema.properties.free.description, /pool-level/i);
+  assert.match(poolSchema.properties.free.description, /COUNT/);
+  assert.match(poolSchema.properties.free.description, /per-card/i);
+});
+
+test('GPU claim and lease responses are documented as envelopes, not bare reservations', () => {
+  const byKey = new Map(ENDPOINTS.map(entry => [`${entry.method} ${entry.path}`, entry]));
+  const reserve = byKey.get('POST /api/gpus/{gpu}/reserve').responseSchema;
+  const lock = byKey.get('POST /api/gpus/{gpu}/lock').responseSchema;
+  const wait = byKey.get('POST /api/gpus/reservations/{reservationId}/wait').responseSchema;
+  const renew = byKey.get('POST /api/gpus/reservations/{reservationId}/renew').responseSchema;
+  const release = byKey.get('DELETE /api/gpus/reservations/{reservationId}').responseSchema;
+
+  const reservations = new GpuReservations({
+    pools: [{ id: 'apu', label: 'APU', cards: [{ card: 'card1', pci: '0000:c6:00.0' }], warnings: [] }],
+  });
+  const granted = reservations.reserve({ gpu: 'apu', holder: 'pods-agent', priority: 80, ttlMs: 300_000, reason: 'tts batch' });
+  const pending = reservationView(reservations.get(granted.id));
+  reservations.markHeld(granted.id);
+  const held = reservationView(reservations.get(granted.id));
+
+  // Each body below is assembled exactly as the matching handler in api/server.js
+  // writes it, so a projection change there that is not mirrored here fails.
+  const bodies = [
+    [reserve, { reservationId: pending.id, state: pending.state, gpu: pending.gpu, card: pending.card, pci: pending.pci, expiresAt: pending.expiresAt, reservation: pending }],
+    [lock, { reservationId: held.id, state: 'held', gpu: held.gpu, card: held.card, pci: held.pci, reservation: held }],
+    [wait, { reservation: held, state: held.state }],
+    [renew, { reservation: held, expiresAt: held.expiresAt }],
+  ];
+  for (const [schema, body] of bodies) {
+    assert.deepEqual(schemaViolations(body, schema), []);
+    assert.equal(body.reservationId ?? body.reservation.id, granted.id);
+  }
+
+  reservations.release(granted.id);
+  const released = reservationView(reservations.get(granted.id));
+  assert.equal(released.state, 'released');
+  assert.deepEqual(schemaViolations({ state: 'released', reservation: released }, release), []);
+
+  // The top-level handle is `reservationId`; inside the record it is `id`. Both
+  // names are live, and the spec has to say which is which.
+  assert.match(reserve.properties.reservationId.description, /`id`/);
+  assert.match(reserve.properties.reservation.description, /`id`/);
+  assert.equal(reserve.properties.reservation.properties.reservationId, undefined);
 });
 
 test('contracts 7 and 11: agent reference documents cursor-exclusive resumable background streaming', () => {
