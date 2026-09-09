@@ -9,9 +9,13 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 
 /** Settings tabs addressable as /settings/<tab>; 'general' is the bare /settings path. */
-const SETTINGS_TABS = ['general', 'hosts', 'aliases', 'duo'];
-import { API_BASE } from '../api.js';
-import { aliasesToRows, rowsToAliases, diffAliases, validateRows } from './alias-editor.js';
+const SETTINGS_TABS = ['general', 'hosts', 'aliases', 'gpus', 'duo'];
+import { API_BASE, formatBytes } from '../api.js';
+import { aliasesToRows, aliasGroups, rowsToAliases, diffAliases, validateRows } from './alias-editor.js';
+import {
+  poolsToRows, rowsToPools, validatePoolRows, poolLiveState, gpuPoolChoices,
+  GPU_MATCH_FIELDS,
+} from './gpu-config.js';
 import {
   duoConfigSections, defaultDuoSettings, validateDuoSettings,
 } from './duo-config.js';
@@ -354,6 +358,7 @@ function SettingsPage() {
         <button className={`tab-btn ${activeTab === 'general' ? 'active' : ''}`} onClick={() => setActiveTab('general')}>General</button>
         <button className={`tab-btn ${activeTab === 'hosts' ? 'active' : ''}`} onClick={() => setActiveTab('hosts')}>Remote Hosts</button>
         <button className={`tab-btn ${activeTab === 'aliases' ? 'active' : ''}`} onClick={() => setActiveTab('aliases')}>Aliases</button>
+        <button className={`tab-btn ${activeTab === 'gpus' ? 'active' : ''}`} onClick={() => setActiveTab('gpus')}>GPUs</button>
         <button className={`tab-btn ${activeTab === 'duo' ? 'active' : ''}`} onClick={() => setActiveTab('duo')}>Duo</button>
       </div>
 
@@ -716,6 +721,9 @@ function SettingsPage() {
         <AliasesSection setMessage={setMessage} />
       )}
 
+      {activeTab === 'gpus' && (
+        <GpusSection setMessage={setMessage} />
+      )}
       {activeTab === 'duo' && (
         <DuoSection setMessage={setMessage} />
       )}
@@ -902,23 +910,42 @@ function DuoSection({ setMessage }) {
 const LOCAL_HOST = 'local';
 
 /**
+ * Validation fields that describe the ALIAS rather than one of its targets. Their
+ * issues render once in the group header, beside the single control that produced
+ * them, instead of being repeated on every target row.
+ * @type {string[]}
+ */
+const GROUP_LEVEL_FIELDS = ['aliasName', 'gpu', 'gpuPriority'];
+
+/**
  * Normalizes the `GET /api/aliases` body into the keyed alias table the editor
  * works with. Accepts both the keyed-object and array-of-entries shapes and
  * ignores envelope fields such as `success`, so the tab keeps working whichever
  * shape the endpoint settles on.
  *
+ * The alias-level `gpu` and `gpuPriority` are carried through only when the entry
+ * actually has them, so an alias that has neither round-trips to a `{targets}`
+ * group and the save writes exactly the body it always did.
+ *
  * @param {object} payload The parsed JSON body of `GET /api/aliases`.
- * @returns {Object<string, {targets: Array<{host: string, model: string}>}>}
- *   The alias table, or `{}` when the payload carries none.
+ * @returns {Object<string, {targets: Array<{host: string, model: string}>,
+ *   gpu?: string, gpuPriority?: number}>} The alias table, or `{}` when the
+ *   payload carries none.
  */
 function normalizeAliasPayload(payload) {
   const raw = payload?.aliases ?? {};
   const aliases = {};
 
+  const withGpu = (group, entry) => {
+    if (entry?.gpu != null && entry.gpu !== '') group.gpu = entry.gpu;
+    if (entry?.gpuPriority != null && entry.gpuPriority !== '') group.gpuPriority = entry.gpuPriority;
+    return group;
+  };
+
   if (Array.isArray(raw)) {
     for (const entry of raw) {
       const name = entry?.name ?? entry?.id;
-      if (typeof name === 'string' && name) aliases[name] = { targets: entry?.targets || [] };
+      if (typeof name === 'string' && name) aliases[name] = withGpu({ targets: entry?.targets || [] }, entry);
     }
     return aliases;
   }
@@ -926,7 +953,7 @@ function normalizeAliasPayload(payload) {
   if (raw && typeof raw === 'object') {
     for (const [name, group] of Object.entries(raw)) {
       if (!name || !Array.isArray(group?.targets)) continue;
-      aliases[name] = { targets: group.targets };
+      aliases[name] = withGpu({ targets: group.targets }, group);
     }
   }
   return aliases;
@@ -945,7 +972,11 @@ function AliasesSection({ setMessage }) {
   const [localModels, setLocalModels] = React.useState([]); // bare local model ids
   const [presets, setPresets] = React.useState({}); // presetId -> preset
   const [remoteByBackend, setRemoteByBackend] = React.useState({}); // backendId -> string[]
-  const [rows, setRows] = React.useState([]); // { rowId, aliasName, host, model }
+  const [rows, setRows] = React.useState([]); // { rowId, aliasName, host, model, gpu, gpuPriority }
+  const [gpuPools, setGpuPools] = React.useState([]); // live pools from GET /api/gpus
+  // Null until the pool list has actually loaded. Validation must not accuse an
+  // alias of naming an unknown pool merely because the fetch has not landed.
+  const [gpuIds, setGpuIds] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(false);
@@ -976,6 +1007,12 @@ function AliasesSection({ setMessage }) {
         .filter(m => m.status !== 'alias').map(m => m.id).filter(Boolean);
     } catch { /* ignore */ }
     setLocalModels([...new Set(lm)].sort());
+
+    try {
+      const pools = (await (await fetch(`${API_BASE}/gpus`)).json())?.gpus || [];
+      setGpuPools(pools);
+      setGpuIds(pools.map(pool => pool.id).filter(Boolean));
+    } catch { /* leave the GPU checks disabled rather than guessing */ }
 
     const ps = {};
     try {
@@ -1013,21 +1050,27 @@ function AliasesSection({ setMessage }) {
     setRefreshing(false);
   };
 
-  // Alias names in first-appearance order, each with its target rows. Keyed on
-  // the first row's id rather than the name so renaming doesn't remount (and
-  // unfocus) the name input on every keystroke.
-  const groups = React.useMemo(() => {
-    const byName = new Map();
-    for (const r of rows) {
-      if (!byName.has(r.aliasName)) byName.set(r.aliasName, []);
-      byName.get(r.aliasName).push(r);
-    }
-    return [...byName.entries()].map(([name, groupRows]) => ({ key: groupRows[0].rowId, name, rows: groupRows }));
-  }, [rows]);
+  // Alias names in first-appearance order, each with its target rows and its ONE
+  // resolved GPU pool and priority — the per-alias settings render from the group,
+  // never from a row, so a three-target alias shows one GPU control and not three.
+  const groups = React.useMemo(() => aliasGroups(rows), [rows]);
+
+  // Every pool that can be chosen: the live ones, plus any an alias still names
+  // that no longer exists, so selecting it is not silently rewritten to
+  // "anywhere" the moment the operator edits an unrelated field.
+  const poolChoices = React.useMemo(
+    () => gpuPoolChoices(gpuPools, [], groups.map(g => g.gpu).filter(Boolean)),
+    [gpuPools, groups]
+  );
 
   const issues = React.useMemo(
-    () => validateRows(rows, { presets, localModels, backendIds: backends.map(b => b.id) }),
-    [rows, presets, localModels, backends]
+    () => validateRows(rows, {
+      presets,
+      localModels,
+      backendIds: backends.map(b => b.id),
+      ...(gpuIds ? { gpuIds } : {}),
+    }),
+    [rows, presets, localModels, backends, gpuIds]
   );
   const issuesByRow = React.useMemo(() => {
     const byRow = new Map();
@@ -1045,16 +1088,26 @@ function AliasesSection({ setMessage }) {
     setRows(rs => rs.map(r => r.aliasName === oldName ? { ...r, aliasName: newName } : r));
   const removeAlias = (name) => setRows(rs => rs.filter(r => r.aliasName !== name));
   const addAlias = () =>
-    setRows(rs => [...rs, { rowId: rowIdRef.current++, aliasName: '', host: LOCAL_HOST, model: '' }]);
+    setRows(rs => [...rs, { rowId: rowIdRef.current++, aliasName: '', host: LOCAL_HOST, model: '', gpu: '', gpuPriority: '' }]);
+
+  // The GPU pool and priority belong to the ALIAS, so an edit to either writes
+  // every row of that alias. Holding one value per row rather than a second store
+  // keeps rename, reorder and delete the one-liners they already are.
+  const updateAlias = (name, patch) =>
+    setRows(rs => rs.map(r => r.aliasName === name ? { ...r, ...patch } : r));
 
   // Append a target directly below the alias's last existing target so the
-  // authored order stays contiguous in the flat row list.
+  // authored order stays contiguous in the flat row list. The new row inherits the
+  // alias's GPU settings so every row of the alias keeps agreeing.
   const addTarget = (name) => setRows(rs => {
     let last = -1;
     rs.forEach((r, i) => { if (r.aliasName === name) last = i; });
+    const sibling = rs.find(r => r.aliasName === name);
     const next = [...rs];
-    next.splice(last < 0 ? next.length : last + 1, 0,
-      { rowId: rowIdRef.current++, aliasName: name, host: LOCAL_HOST, model: '' });
+    next.splice(last < 0 ? next.length : last + 1, 0, {
+      rowId: rowIdRef.current++, aliasName: name, host: LOCAL_HOST, model: '',
+      gpu: sibling?.gpu ?? '', gpuPriority: sibling?.gpuPriority ?? '',
+    });
     return next;
   });
 
@@ -1094,7 +1147,9 @@ function AliasesSection({ setMessage }) {
       try {
         const res = await fetch(`${API_BASE}/aliases/${encodeURIComponent(name)}`, {
           method: 'PUT', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targets: edited[name].targets })
+          // The group itself, so `gpu`/`gpuPriority` ride along when set — and an
+          // alias that has neither still PUTs exactly `{targets}`, as it always did.
+          body: JSON.stringify(edited[name])
         });
         const d = await res.json();
         if (d.success) {
@@ -1178,16 +1233,20 @@ function AliasesSection({ setMessage }) {
       ) : groups.length === 0 ? (
         <p className="setting-hint">No aliases yet — click “+ Add Alias”.</p>
       ) : groups.map(group => {
-        // Name issues repeat on every row of the group; show each message once.
+        // Issues about the alias itself — its name, its GPU pool and its priority —
+        // belong in the group header beside the controls that produced them, not on
+        // a target row. Name issues repeat on every row, so show each message once.
         const nameMessages = [];
         const seenNameMessages = new Set();
         for (const groupRow of group.rows) {
           for (const issue of issuesByRow.get(groupRow.rowId) || []) {
-            if (issue.field !== 'aliasName' || seenNameMessages.has(issue.message)) continue;
+            if (!GROUP_LEVEL_FIELDS.includes(issue.field) || seenNameMessages.has(issue.message)) continue;
             seenNameMessages.add(issue.message);
             nameMessages.push(issue);
           }
         }
+
+        const chosenPool = poolChoices.find(c => c.value === group.gpu);
 
         return (
           <div key={group.key} className="alias-group" style={{ border: '1px solid var(--glass-border)', borderRadius: 'var(--radius-sm)', padding: '10px', marginBottom: '10px' }}>
@@ -1203,6 +1262,44 @@ function AliasesSection({ setMessage }) {
               <button className="btn-secondary glass-btn" style={{ padding: '2px 10px', fontSize: '0.85em' }} onClick={() => addTarget(group.name)}>+ Target</button>
               <button className="btn-secondary glass-btn" style={{ padding: '2px 10px', fontSize: '0.85em' }} onClick={() => removeAlias(group.name)}>Remove alias</button>
             </div>
+
+            {/* GPU pool and priority are properties of the ALIAS, so they appear
+                once here rather than on each target row below. */}
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-end', flexWrap: 'wrap', marginTop: '8px' }}>
+              <label style={{ flex: '1 1 280px', fontSize: '0.8em', color: 'var(--text-secondary)' }}>
+                GPU pool
+                <select
+                  className="glass-input"
+                  value={group.gpu}
+                  aria-label={`GPU pool for alias ${group.name || 'unnamed'}`}
+                  onChange={e => updateAlias(group.name, { gpu: e.target.value })}
+                  style={{ width: '100%' }}
+                >
+                  {poolChoices.map(choice => (
+                    <option key={choice.value || 'anywhere'} value={choice.value}>{choice.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label style={{ flex: '0 1 150px', fontSize: '0.8em', color: 'var(--text-secondary)' }}>
+                Priority
+                <input
+                  className="glass-input"
+                  value={group.gpuPriority}
+                  inputMode="numeric"
+                  placeholder="pool default"
+                  aria-label={`GPU priority for alias ${group.name || 'unnamed'}`}
+                  onChange={e => updateAlias(group.name, { gpuPriority: e.target.value })}
+                  style={{ width: '100%' }}
+                />
+              </label>
+            </div>
+            <p className="setting-hint" style={{ margin: '4px 0 0', color: chosenPool?.problem ? 'var(--error, #f87171)' : undefined }}>
+              {group.gpu
+                ? `Local targets of this alias run only on "${group.gpu}". ${chosenPool?.hint || ''}`
+                : 'This alias may run anywhere — pick a pool to bind its local targets to one class of card.'}
+              {' '}Priority is a signed integer: <code>0</code> is llama-manager's baseline, negative
+              yields to ordinary work, positive preempts it. Blank inherits the pool's default.
+            </p>
 
             {nameMessages.map(issue => (
               <p key={issue.message} className="setting-hint" style={{ margin: '4px 0 0', color: issue.level === 'error' ? 'var(--error, #f87171)' : 'var(--warning, #fbbf24)' }}>
@@ -1223,7 +1320,7 @@ function AliasesSection({ setMessage }) {
                 </thead>
                 <tbody>
                   {group.rows.map((r, idx) => {
-                    const rowIssues = (issuesByRow.get(r.rowId) || []).filter(i => i.field !== 'aliasName');
+                    const rowIssues = (issuesByRow.get(r.rowId) || []).filter(i => !GROUP_LEVEL_FIELDS.includes(i.field));
                     return (
                       <React.Fragment key={r.rowId}>
                         <tr>
@@ -1273,6 +1370,278 @@ function AliasesSection({ setMessage }) {
                 </tbody>
               </table>
             </div>
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+// GPUs Section — editor for the named GPU pools in `settings.gpus`, with each
+// pool's live resolution shown beside it. A pool names a card CLASS (its PCI
+// vendor:device id or product name) rather than a DRM index, so the name survives
+// a kernel reorder or a re-plug; the "cards detected" table above the editor
+// exists so those class ids are CLICKED rather than typed from memory. Pools are
+// read from `GET /api/settings`, their live capacity, holders and warnings from
+// `GET /api/gpus`, and the whole array is written back with `POST /api/settings`.
+// A pool that resolved to no usable card is rendered as a problem with the
+// server's own warning text — the failure this tab exists to make visible.
+function GpusSection({ setMessage }) {
+  const [rows, setRows] = React.useState([]);
+  const [live, setLive] = React.useState([]); // pools as GET /api/gpus resolved them
+  const [cards, setCards] = React.useState([]); // every card in the machine
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+  const rowIdRef = React.useRef(1);
+
+  const loadAll = React.useCallback(async () => {
+    setLoading(true);
+
+    let pools = [];
+    try { pools = (await (await fetch(`${API_BASE}/settings`)).json())?.settings?.gpus || []; } catch { /* ignore */ }
+    const rs = poolsToRows(pools);
+    rowIdRef.current = rs.reduce((max, r) => Math.max(max, r.rowId), 0) + 1;
+    setRows(rs);
+
+    try { setLive((await (await fetch(`${API_BASE}/gpus`)).json())?.gpus || []); } catch { /* ignore */ }
+    try { setCards((await (await fetch(`${API_BASE}/stats`)).json())?.gpus || []); } catch { /* ignore */ }
+
+    setLoading(false);
+  }, []);
+
+  React.useEffect(() => { loadAll(); }, [loadAll]);
+
+  const issues = React.useMemo(() => validatePoolRows(rows), [rows]);
+  const issuesByRow = React.useMemo(() => {
+    const byRow = new Map();
+    for (const i of issues) {
+      if (!byRow.has(i.rowId)) byRow.set(i.rowId, []);
+      byRow.get(i.rowId).push(i);
+    }
+    return byRow;
+  }, [issues]);
+  const errorCount = issues.filter(i => i.level === 'error').length;
+
+  const updateRow = (rowId, patch) => setRows(rs => rs.map(r => r.rowId === rowId ? { ...r, ...patch } : r));
+  const removeRow = (rowId) => setRows(rs => rs.filter(r => r.rowId !== rowId));
+  const addPool = (seed = {}) => setRows(rs => [...rs, {
+    rowId: rowIdRef.current++, id: '', label: '', pciId: '', name: '', pci: '',
+    pinnedModels: '', defaultPriority: '', ...seed,
+  }]);
+
+  // Seed a pool from a card the machine actually reports, so its class id is
+  // never retyped. The id is a slug of the product name, which the operator can
+  // then rename — a blank id would only be an error to fix.
+  const addPoolFromCard = (card) => addPool({
+    id: String(card?.name || card?.card || 'gpu').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24),
+    label: card?.name || '',
+    pciId: card?.pciId || '',
+  });
+
+  const save = async () => {
+    if (errorCount > 0) {
+      setMessage({ type: 'error', text: 'Fix the highlighted errors before saving.' });
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await fetch(`${API_BASE}/settings`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gpus: rowsToPools(rows) })
+      });
+      const data = await res.json();
+      setMessage(data.success
+        ? { type: 'success', text: `GPU pools saved (${rows.length} pool${rows.length === 1 ? '' : 's'})` }
+        : { type: 'error', text: data.error || `HTTP ${res.status}` });
+      if (data.success) await loadAll();
+    } catch (err) {
+      setMessage({ type: 'error', text: `Failed to save GPU pools: ${err.message}` });
+    }
+    setSaving(false);
+  };
+
+  const statusColor = (status) =>
+    status === 'problem' ? 'var(--error, #f87171)'
+      : status === 'unsaved' ? 'var(--warning, #fbbf24)'
+        : 'var(--success, #4ade80)';
+
+  return (
+    <section className="page-section glass-panel">
+      <h3>GPUs</h3>
+      <p className="setting-hint" style={{ marginBottom: '12px' }}>
+        A <strong>GPU pool</strong> is a name for a class of card — its PCI <code>vendor:device</code>
+        {' '}id or its product name — rather than for a <code>card0</code> index, so the name survives a
+        kernel reorder or the card being re-plugged into another slot. Several cards of one class under
+        one name are capacity, not an ambiguity. Aliases and pinned models are bound to these names on
+        the <strong>Aliases</strong> tab. <strong>Priority</strong> is a signed integer:{' '}
+        <code>0</code> is llama-manager's own baseline, negative yields to ordinary work, positive
+        preempts it — and a claim takes a held card only if it is strictly higher.
+      </p>
+
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginBottom: '10px' }}>
+        <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={() => addPool()}>+ Add GPU pool</button>
+        <button className="btn-primary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={save} disabled={saving || loading || errorCount > 0} title={errorCount > 0 ? 'Fix the errors below first' : undefined}>
+          {saving ? 'Saving…' : 'Save GPUs'}
+        </button>
+      </div>
+
+      {errorCount > 0 && (
+        <p className="setting-hint" style={{ color: 'var(--error, #f87171)' }}>
+          {errorCount} error{errorCount === 1 ? '' : 's'} must be fixed before saving.
+        </p>
+      )}
+
+      <h4 style={{ margin: '4px 0 6px' }}>Cards detected in this machine</h4>
+      {cards.length === 0 ? (
+        <p className="setting-hint">No GPU reported by the host.</p>
+      ) : (
+        <div className="model-map-table-wrap">
+          <table className="model-map-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ textAlign: 'left', color: 'var(--text-secondary)', fontSize: '0.8em' }}>
+                <th style={{ padding: '4px 6px' }}>Card</th>
+                <th style={{ padding: '4px 6px' }}>Name</th>
+                <th style={{ padding: '4px 6px' }}>PCI class</th>
+                <th style={{ padding: '4px 6px' }}>Address</th>
+                <th style={{ padding: '4px 6px' }}>Driver</th>
+                <th style={{ padding: '4px 6px' }}>VRAM</th>
+                <th style={{ padding: '4px 6px' }}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {cards.map(card => (
+                <tr key={card.card || card.pci}>
+                  <td style={{ padding: '4px 6px' }}>{card.card}</td>
+                  <td style={{ padding: '4px 6px' }}>{card.name || '—'}</td>
+                  <td style={{ padding: '4px 6px' }}><code>{card.pciId || '—'}</code></td>
+                  <td style={{ padding: '4px 6px' }}><code>{card.pci || '—'}</code></td>
+                  <td style={{ padding: '4px 6px', color: card.driver ? undefined : 'var(--error, #f87171)' }}>
+                    {card.driver || 'none bound'}
+                  </td>
+                  <td style={{ padding: '4px 6px' }}>
+                    {card.vramBytes ? `${formatBytes(card.vramUsedBytes || 0)} / ${formatBytes(card.vramBytes)}` : '—'}
+                  </td>
+                  <td style={{ padding: '4px 6px' }}>
+                    <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => addPoolFromCard(card)}>
+                      + Pool for this card
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <h4 style={{ margin: '16px 0 6px' }}>Pools</h4>
+      {loading ? (
+        <p className="setting-hint">Loading GPU pools…</p>
+      ) : rows.length === 0 ? (
+        <p className="setting-hint">
+          No GPU pools yet — add one from a detected card above, and models and aliases can then be
+          bound to it by name.
+        </p>
+      ) : rows.map(row => {
+        const state = poolLiveState(row, live);
+        const rowIssues = issuesByRow.get(row.rowId) || [];
+        return (
+          <div key={row.rowId} className="alias-group" style={{ border: '1px solid var(--glass-border)', borderRadius: 'var(--radius-sm)', padding: '10px', marginBottom: '10px' }}>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <span aria-hidden="true" style={{ color: statusColor(state.status), fontSize: '1.2em', lineHeight: 1 }}>●</span>
+              <input
+                className="glass-input"
+                value={row.id}
+                aria-label="GPU pool id"
+                placeholder="pool id (e.g. rtx3090)"
+                onChange={e => updateRow(row.rowId, { id: e.target.value })}
+                style={{ flex: '0 1 200px' }}
+              />
+              <input
+                className="glass-input"
+                value={row.label}
+                aria-label="GPU pool label"
+                placeholder="label shown in readouts"
+                onChange={e => updateRow(row.rowId, { label: e.target.value })}
+                style={{ flex: '1 1 220px' }}
+              />
+              <button className="btn-secondary glass-btn" style={{ padding: '2px 10px', fontSize: '0.85em' }} onClick={() => removeRow(row.rowId)}>Remove pool</button>
+            </div>
+
+            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginTop: '8px' }}>
+              {GPU_MATCH_FIELDS.map(field => (
+                <label key={field.key} style={{ flex: '1 1 200px', fontSize: '0.8em', color: 'var(--text-secondary)' }}>
+                  {field.label}
+                  <input
+                    className="glass-input"
+                    value={row[field.key]}
+                    placeholder={field.placeholder}
+                    aria-label={`${field.label} for pool ${row.id || 'unnamed'}`}
+                    onChange={e => updateRow(row.rowId, { [field.key]: e.target.value })}
+                    style={{ width: '100%' }}
+                  />
+                  <span style={{ fontSize: '0.9em', color: 'var(--text-muted)' }}>{field.hint}</span>
+                </label>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginTop: '8px' }}>
+              <label style={{ flex: '0 1 160px', fontSize: '0.8em', color: 'var(--text-secondary)' }}>
+                Default priority
+                <input
+                  className="glass-input"
+                  value={row.defaultPriority}
+                  inputMode="numeric"
+                  placeholder="0"
+                  aria-label={`Default priority for pool ${row.id || 'unnamed'}`}
+                  onChange={e => updateRow(row.rowId, { defaultPriority: e.target.value })}
+                  style={{ width: '100%' }}
+                />
+                <span style={{ fontSize: '0.9em', color: 'var(--text-muted)' }}>0 = baseline</span>
+              </label>
+              <label style={{ flex: '1 1 320px', fontSize: '0.8em', color: 'var(--text-secondary)' }}>
+                Pinned models
+                <input
+                  className="glass-input"
+                  value={row.pinnedModels}
+                  placeholder="comma-separated model ids"
+                  aria-label={`Pinned models for pool ${row.id || 'unnamed'}`}
+                  onChange={e => updateRow(row.rowId, { pinnedModels: e.target.value })}
+                  style={{ width: '100%' }}
+                />
+                <span style={{ fontSize: '0.9em', color: 'var(--text-muted)' }}>a pin is a reservation on this pool</span>
+              </label>
+            </div>
+
+            {rowIssues.map(issue => (
+              <p key={`${issue.field}-${issue.message}`} className="setting-hint" style={{ margin: '6px 0 0', color: issue.level === 'error' ? 'var(--error, #f87171)' : 'var(--warning, #fbbf24)' }}>
+                {issue.message}
+              </p>
+            ))}
+
+            <p className="setting-hint" style={{ margin: '8px 0 0', color: state.status === 'problem' ? 'var(--error, #f87171)' : undefined }}>
+              <strong>{state.status === 'problem' ? 'Problem' : state.status === 'unsaved' ? 'Unsaved' : 'Resolved'}:</strong> {state.summary}
+            </p>
+            {state.warnings.map(warning => (
+              <p key={warning} className="setting-hint" style={{ margin: '2px 0 0', color: 'var(--error, #f87171)' }}>{warning}</p>
+            ))}
+            {state.cards.length > 0 && (
+              <ul className="setting-hint" style={{ margin: '4px 0 0', paddingLeft: '18px' }}>
+                {state.cards.map(card => (
+                  <li key={card.card || card.pci}>
+                    <code>{card.card}</code> {card.name || 'unnamed card'}
+                    {card.driver ? ` · ${card.driver}` : ' · no driver bound'}
+                    {card.vramBytes ? ` · ${formatBytes(card.vramUsedBytes || 0)} / ${formatBytes(card.vramBytes)} VRAM` : ''}
+                    {card.busyPercent == null ? '' : ` · ${card.busyPercent}% busy`}
+                    {card.free ? '' : ' · reserved'}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {state.holders.length > 0 && (
+              <p className="setting-hint" style={{ margin: '2px 0 0' }}>
+                Held by {state.holders.map(h => `${h.holder} @ priority ${h.priority}`).join(', ')}.
+              </p>
+            )}
           </div>
         );
       })}
