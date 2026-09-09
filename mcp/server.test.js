@@ -182,6 +182,9 @@ test('contract: GPU reservation MCP tools are listed with semantics-carrying sch
   assert.match(lock.description, /BLOCK/);
   assert.match(lock.description, /llama_reserve_gpu/);
   assert.match(lock.description, /pending/i);
+  assert.match(lock.description, /no-expiry leases are not available/i);
+  assert.match(lock.inputSchema.properties.timeoutSeconds.description, /default 30/i);
+  assert.equal(lock.inputSchema.properties.timeoutMs, undefined);
 
   const reserve = byName.get('llama_reserve_gpu');
   assert.deepEqual(reserve.inputSchema.required, ['gpu']);
@@ -189,6 +192,9 @@ test('contract: GPU reservation MCP tools are listed with semantics-carrying sch
   assert.match(reserve.description, /llama_lock_gpu/);
   assert.match(reserve.description, /pending/i);
   assert.match(reserve.description, /not yet yours/i);
+  assert.match(reserve.description, /no-expiry leases are not available/i);
+  assert.match(reserve.inputSchema.properties.noWait.description, /409/);
+  assert.match(reserve.inputSchema.properties.noWait.description, /never recorded/i);
 
   for (const name of ['llama_lock_gpu', 'llama_reserve_gpu']) {
     const tool = byName.get(name);
@@ -196,10 +202,15 @@ test('contract: GPU reservation MCP tools are listed with semantics-carrying sch
     assert.match(tool.inputSchema.properties.priority.description, /negative/i);
     assert.match(tool.inputSchema.properties.priority.description, /positive/i);
     assert.match(tool.inputSchema.properties.ttlSeconds.description, /expire/i);
+    assert.match(tool.inputSchema.properties.ttlSeconds.description, /default 300/i);
   }
 
   const wait = byName.get('llama_wait_gpu_reservation');
   assert.deepEqual(wait.inputSchema.required, ['reservationId']);
+  assert.match(wait.description, /does not cancel|not cancel/i);
+  assert.match(wait.description, /pending/i);
+  assert.match(wait.inputSchema.properties.timeoutSeconds.description, /default 30/i);
+  assert.equal(wait.inputSchema.properties.timeoutMs, undefined);
 
   const renew = byName.get('llama_renew_gpu_reservation');
   assert.deepEqual(renew.inputSchema.required, ['reservationId']);
@@ -218,7 +229,7 @@ test('contract: GPU reservation MCP tools map to the fixed HTTP contract', async
     gpu: 'rtx3090',
     priority: 80,
     ttlSeconds: 300,
-    timeoutMs: 60000,
+    timeoutSeconds: 60,
     holder: 'pods-agent',
     reason: 'tts burst',
   });
@@ -227,7 +238,7 @@ test('contract: GPU reservation MCP tools map to the fixed HTTP contract', async
   assert.deepEqual(locked.captured.body, {
     priority: 80,
     ttlSeconds: 300,
-    timeoutMs: 60000,
+    timeoutSeconds: 60,
     holder: 'pods-agent',
     reason: 'tts burst',
   });
@@ -250,10 +261,10 @@ test('contract: GPU reservation MCP tools map to the fixed HTTP contract', async
     noWait: true,
   });
 
-  const waited = await captureToolCall('llama_wait_gpu_reservation', { reservationId: 'res_123', timeoutMs: 5000 });
+  const waited = await captureToolCall('llama_wait_gpu_reservation', { reservationId: 'res_123', timeoutSeconds: 5 });
   assert.equal(waited.captured.url, 'http://localhost:5250/api/gpus/reservations/res_123/wait');
   assert.equal(waited.captured.method, 'POST');
-  assert.deepEqual(waited.captured.body, { timeoutMs: 5000 });
+  assert.deepEqual(waited.captured.body, { timeoutSeconds: 5 });
 
   const renewed = await captureToolCall('llama_renew_gpu_reservation', { reservationId: 'res_123' });
   assert.equal(renewed.captured.url, 'http://localhost:5250/api/gpus/reservations/res_123/renew');

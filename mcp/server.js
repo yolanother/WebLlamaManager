@@ -441,14 +441,14 @@ export const tools = [
   },
   {
     name: 'llama_lock_gpu',
-    description: 'Reserve a GPU pool and BLOCK until a card is actually free and bound to you — llama-manager has finished draining its own work off it before this returns. Use this when you need the card in hand before proceeding. For a non-blocking claim that returns immediately with a PENDING reservation you must separately wait on, use llama_reserve_gpu instead. The granted lease EXPIRES after ttlSeconds unless renewed with llama_renew_gpu_reservation; release it with llama_release_gpu when done.',
+    description: 'Reserve a GPU pool and BLOCK until a card is actually free and bound to you — llama-manager has finished draining its own work off it before this returns. Use this when you need the card in hand before proceeding. For a non-blocking claim that returns immediately with a PENDING reservation you must separately wait on, use llama_reserve_gpu instead. The granted lease EXPIRES after ttlSeconds unless renewed with llama_renew_gpu_reservation; release it with llama_release_gpu when done. No-expiry leases are not available over this surface — they are reserved for llama-manager\'s own internal model pins, so a remote holder that crashes can never strand a card.',
     inputSchema: {
       type: 'object',
       properties: {
         gpu: { type: 'string', description: 'GPU pool id to lock (see llama_list_gpus).' },
         priority: { type: 'integer', description: "Signed priority. 0 is llama-manager's own baseline; negative yields to llama-manager (a soft hold that blocks nobody); positive preempts llama-manager and, if the pool is full, its lowest-priority holder — only when strictly higher. Default 0." },
-        ttlSeconds: { type: 'number', description: 'Lease lifetime in seconds once held. The reservation EXPIRES and the card is returned automatically if not renewed before this elapses.' },
-        timeoutMs: { type: 'number', description: 'Maximum time to block waiting for the card to become free before giving up (default: manager default).' },
+        ttlSeconds: { type: 'number', description: 'Lease lifetime in seconds once held. The reservation EXPIRES and the card is returned automatically if not renewed before this elapses. Default 300; there is no no-expiry option on this surface.' },
+        timeoutSeconds: { type: 'number', description: 'Maximum time in seconds to block waiting for the card to become free before giving up. Default 30.' },
         holder: { type: 'string', description: 'Identifier for who holds this lease (e.g. agent/tool name), for observability.' },
         reason: { type: 'string', description: 'Human-readable reason for the reservation, for observability.' }
       },
@@ -457,28 +457,28 @@ export const tools = [
   },
   {
     name: 'llama_reserve_gpu',
-    description: "Claim a GPU pool WITHOUT blocking. Returns immediately with a PENDING reservation that is not yet yours to use — llama-manager may still be draining its own work off the card. Call llama_wait_gpu_reservation to block until the reservation reaches 'held' before using the card. For a call that blocks until the card is actually free, use llama_lock_gpu instead. The reservation EXPIRES after ttlSeconds unless renewed with llama_renew_gpu_reservation.",
+    description: "Claim a GPU pool WITHOUT blocking. Returns immediately with a PENDING reservation that is not yet yours to use — llama-manager may still be draining its own work off the card. Call llama_wait_gpu_reservation to block until the reservation reaches 'held' before using the card. For a call that blocks until the card is actually free, use llama_lock_gpu instead. The reservation EXPIRES after ttlSeconds unless renewed with llama_renew_gpu_reservation; no-expiry leases are not available over this surface — they are reserved for llama-manager's own internal model pins, so a remote holder that crashes can never strand a card.",
     inputSchema: {
       type: 'object',
       properties: {
         gpu: { type: 'string', description: 'GPU pool id to reserve (see llama_list_gpus).' },
         priority: { type: 'integer', description: "Signed priority. 0 is llama-manager's own baseline; negative yields to llama-manager (a soft hold that blocks nobody); positive preempts llama-manager and, if the pool is full, its lowest-priority holder — only when strictly higher. Default 0." },
-        ttlSeconds: { type: 'number', description: 'Lease lifetime in seconds once held. The reservation EXPIRES and the card is returned automatically if not renewed before this elapses.' },
+        ttlSeconds: { type: 'number', description: 'Lease lifetime in seconds once held. The reservation EXPIRES and the card is returned automatically if not renewed before this elapses. Default 300; there is no no-expiry option on this surface.' },
         holder: { type: 'string', description: 'Identifier for who holds this lease (e.g. agent/tool name), for observability.' },
         reason: { type: 'string', description: 'Human-readable reason for the reservation, for observability.' },
-        noWait: { type: 'boolean', description: 'If true, fail immediately when no capacity is free or preemptable instead of queuing a pending reservation.' }
+        noWait: { type: 'boolean', description: 'If true, fail immediately (HTTP 409 GPU_BUSY) rather than queue when no capacity is free or preemptable; a refused claim is never recorded as a reservation. If false/omitted, a pending reservation is queued instead.' }
       },
       required: ['gpu']
     }
   },
   {
     name: 'llama_wait_gpu_reservation',
-    description: "Block until a pending reservation from llama_reserve_gpu reaches 'held' (the card is genuinely yours), or until it is preempted, expires, or timeoutMs elapses.",
+    description: "Block until a pending reservation from llama_reserve_gpu reaches 'held' (the card is genuinely yours), or until it is preempted, expires, or timeoutSeconds elapses. A timeout does NOT cancel the reservation — it stays pending, and you may call this again or release it with llama_release_gpu.",
     inputSchema: {
       type: 'object',
       properties: {
         reservationId: { type: 'string', description: 'Reservation id returned by llama_reserve_gpu or llama_lock_gpu.' },
-        timeoutMs: { type: 'number', description: 'Maximum time to block before returning with the current (possibly still pending) state.' }
+        timeoutSeconds: { type: 'number', description: 'Maximum time in seconds to block before returning with the current (possibly still pending) state. Default 30. Timing out leaves the reservation pending rather than cancelling it.' }
       },
       required: ['reservationId']
     }
@@ -625,7 +625,7 @@ export async function handleTool(name, args) {
       const body = {};
       if (args.priority !== undefined) body.priority = args.priority;
       if (args.ttlSeconds !== undefined) body.ttlSeconds = args.ttlSeconds;
-      if (args.timeoutMs !== undefined) body.timeoutMs = args.timeoutMs;
+      if (args.timeoutSeconds !== undefined) body.timeoutSeconds = args.timeoutSeconds;
       if (args.holder !== undefined) body.holder = args.holder;
       if (args.reason !== undefined) body.reason = args.reason;
       return apiCall('POST', `/api/gpus/${encodeURIComponent(args.gpu)}/lock`, body);
@@ -643,7 +643,7 @@ export async function handleTool(name, args) {
 
     case 'llama_wait_gpu_reservation': {
       const body = {};
-      if (args.timeoutMs !== undefined) body.timeoutMs = args.timeoutMs;
+      if (args.timeoutSeconds !== undefined) body.timeoutSeconds = args.timeoutSeconds;
       return apiCall('POST', `/api/gpus/reservations/${encodeURIComponent(args.reservationId)}/wait`, body);
     }
 

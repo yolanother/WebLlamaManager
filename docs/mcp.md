@@ -280,17 +280,41 @@ work off the card and the card is genuinely yours. `llama_reserve_gpu` returns
 you must call `llama_wait_gpu_reservation` (or poll) until it reaches `held`
 before using the card. Use `llama_lock_gpu` when you just want the card and are
 happy to block for it; use `llama_reserve_gpu` + `llama_wait_gpu_reservation`
-when you want to do other work while the card drains, or want to give up with
-`noWait` instead of queuing.
+when you want to do other work while the card drains, or want to give up
+immediately with `noWait` instead of queuing.
+
+`noWait: true` fails immediately (HTTP 409, `GPU_BUSY`) when no capacity is
+free or preemptable, instead of queuing a pending reservation. A refused claim
+is never recorded — there is nothing to release afterward.
 
 Both accept `priority` — a **signed integer**: `0` is llama-manager's own
 baseline, **negative** yields to llama-manager (a soft hold that blocks
 nobody), and **positive** preempts llama-manager and, if the pool is full, its
 lowest-priority holder (only when strictly higher).
 
-Every granted lease **expires** after `ttlSeconds` unless renewed with
-`llama_renew_gpu_reservation` — an agent that locks or reserves a card and
-never renews will lose it automatically rather than stranding it.
+Every granted lease **expires** after `ttlSeconds` (default **300**) unless
+renewed with `llama_renew_gpu_reservation` — an agent that locks or reserves a
+card and never renews will lose it automatically rather than stranding it.
+**No-expiry leases are not available over this surface** — that is reserved
+for llama-manager's own internal model pins, so a remote holder that crashes
+can never strand a card indefinitely.
+
+`llama_lock_gpu`'s `timeoutSeconds` (default **30**) bounds how long the call
+blocks waiting for the card; `llama_wait_gpu_reservation`'s `timeoutSeconds`
+(also default **30**) bounds how long that call blocks on a pending
+reservation. In both cases, timing out does **not** cancel anything: a locked
+call that times out never created a reservation, and a pending reservation
+that a wait call times out on **stays pending** — call
+`llama_wait_gpu_reservation` again or release it with `llama_release_gpu`.
+
+### Error responses
+
+| Condition | Status |
+|---|---|
+| Unknown pool id | 404 |
+| Pool matches zero present cards | 503 |
+| Unknown or inactive reservation id | 404 / 409 |
+| `noWait` claim with no free/preemptable capacity | 409 (`GPU_BUSY`) |
 
 ### Worked example: hold, renew, release
 
@@ -333,11 +357,12 @@ For the non-blocking variant, reserve then wait:
 returns `{"reservationId": "res_abc123", "state": "pending"}` right away, then:
 
 ```json
-{"tool": "llama_wait_gpu_reservation", "arguments": {"reservationId": "res_abc123", "timeoutMs": 60000}}
+{"tool": "llama_wait_gpu_reservation", "arguments": {"reservationId": "res_abc123", "timeoutSeconds": 60}}
 ```
 
-blocks (up to `timeoutMs`) until the reservation reaches `held`, is preempted,
-expires, or the timeout is hit.
+blocks (up to `timeoutSeconds`) until the reservation reaches `held`, is
+preempted, expires, or the timeout is hit — a timeout leaves it `pending` for a
+later wait or release, it does not cancel it.
 
 ## Other available tools
 
