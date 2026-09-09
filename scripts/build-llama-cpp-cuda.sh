@@ -159,9 +159,10 @@ docker run --rm \
     # every architecture NVIDIA ships. nvprune would normally trim that to the
     # targeted arch, but it rejects these files as not relocatable -- CUDA 13
     # redistributable .so files are not prunable fatbinaries -- so there is no
-    # trimming to be had here. The packaging answer is to DEPEND on the distro
-    # cuda-cudart / libcublas packages instead of shipping these; see the
-    # packaging section of the doc.
+    # trimming to be had here, and no repository the appliance can reach offline
+    # carries CUDA 13 either (Ubuntu 24.04 multiverse stops at CUDA 12), so the
+    # bytes ship. scripts/package-cuda-rpc.sh puts them in their own package,
+    # apart from the engine, so an engine bump does not re-ship them.
     mkdir -p /src/$BUILD_SUBDIR/cudart
     cp -a /usr/local/cuda/lib64/libcudart.so.*  /src/$BUILD_SUBDIR/cudart/
     cp -a /usr/local/cuda/lib64/libcublas.so.*  /src/$BUILD_SUBDIR/cudart/

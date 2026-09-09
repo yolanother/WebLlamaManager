@@ -15,11 +15,14 @@ AMD half; read that one first for how the engine directory and the router work.
 > *runtime* libraries — see [What the target actually needs](#what-the-target-actually-needs),
 > which is the one place the obvious assumption is wrong.
 
-**Status (2026-09-08):** proven, not installed. A CUDA `ggml-rpc-server` built by
-this procedure loaded Qwen3-8B-Q4_K_M onto drakemore's RTX 3090 and served a
-completion at 132 tok/s — see [Verifying](#verifying) for the measurements. Nothing
-is packaged or wired yet, and the deployed b10752 HIP engine still cannot attach
-because it was built without `-DGGML_RPC=ON`.
+**Status (2026-09-09):** proven and packaged. A CUDA `ggml-rpc-server` built by this
+procedure loaded Qwen3-8B-Q4_K_M onto drakemore's RTX 3090 and served a completion at
+132 tok/s — see [Verifying](#verifying) for the measurements. It now also ships as two
+Debian packages built by `scripts/package-cuda-rpc.sh`, installed and verified on
+drakemore: see [Packaging](#packaging-how-this-reaches-an-installed-box). What is not
+done is the *release* integration — the private respin repo does not yet build these
+packages, so an ISO built today still does not carry them; the exact remaining changes
+are listed in that section.
 
 ## Why RPC and not a second engine
 
@@ -214,38 +217,61 @@ No GPU is needed to build. `nvcc` compiles for `sm_86` on any machine.
 
 ## Deploying
 
-Follow the engine directory convention the ROCm side already uses — a versioned
-directory plus a `current` symlink, so an upgrade is a symlink swap and a rollback is
-the reverse:
+### The normal route: install the packages
+
+`scripts/package-cuda-rpc.sh` builds them from a staged `dist/llama-cpp-cuda/` tree
+(see [Packaging](#packaging-how-this-reaches-an-installed-box)):
+
+```bash
+scripts/package-cuda-rpc.sh
+# on the appliance
+sudo dpkg -i llama-manager-cuda-runtime-13_<v>_amd64.deb \
+             llama-manager-cuda-rpc_<v>_amd64.deb
+```
+
+That lands the binary at the path llama-manager resolves:
+
+```
+/usr/lib/llama-manager/engine-cuda/current/ggml-rpc-server
+```
+
+`/usr/lib`, not `/var/lib`: this is package-owned, immutable content, unlike the ROCm
+engine directory, which the manager itself writes to. `current` is a `postinst`
+symlink to a revision-named directory, so an upgrade is a symlink swap and a rollback
+is the reverse — and a hand-staged engine can be tested by repointing `current`
+without dpkg fighting you for it (`postrm` leaves a repointed link alone).
+
+### Hand-staging, before a package exists for a new build
+
+`engine-cuda`, not `engine`: the CUDA artifacts must not be mixed into the HIP engine
+directory, whose contents are all on the router's `LD_LIBRARY_PATH`.
 
 ```bash
 # on the build host
 rsync -a dist/llama-cpp-cuda/ <appliance>:/tmp/engine-cuda-<ref>/
-
 # on the appliance, as root
-install -d -o llama-manager -g llama-manager /var/lib/llama-manager/engine-cuda
-mv /tmp/engine-cuda-<ref> /var/lib/llama-manager/engine-cuda/<ref>
-chown -R llama-manager:llama-manager /var/lib/llama-manager/engine-cuda/<ref>
-ln -sfn <ref> /var/lib/llama-manager/engine-cuda/current
+mv /tmp/engine-cuda-<ref> /usr/lib/llama-manager/engine-cuda/<ref>
+ln -sfn <ref> /usr/lib/llama-manager/engine-cuda/current
 ```
 
-`engine-cuda`, not `engine`: the CUDA artifacts must not be mixed into the HIP
-engine directory, whose contents are all on the router's `LD_LIBRARY_PATH`.
+### Running it
 
 The rpc-server runs **on the host**, not inside the ROCm distrobox — it needs
 `libcuda.so.1` and the `/dev/nvidia*` nodes, which is what the host has and the ROCm
 toolbox does not.
 
 ```bash
-LD_LIBRARY_PATH=/var/lib/llama-manager/engine-cuda/current \
-  /var/lib/llama-manager/engine-cuda/current/ggml-rpc-server \
-    --host 127.0.0.1 --port 50052
+/usr/lib/llama-manager/engine-cuda/current/ggml-rpc-server --host 127.0.0.1 --port 50052
 ```
 
-`LD_LIBRARY_PATH` is required even though the binary's own RUNPATH is `$ORIGIN`:
-that covers the `libggml*` siblings, but `libggml-cuda.so` resolves the CUDA runtime
-libraries through the normal search path. This mirrors how `container-start.sh` puts
-the ROCm engine directory on `LD_LIBRARY_PATH`.
+**No `LD_LIBRARY_PATH` is needed.** Every artifact is built with `RUNPATH = $ORIGIN`,
+which covers the `libggml*` siblings *and* — through the symlinks the engine package
+ships — the CUDA runtime libraries in the sibling `cuda-runtime-13` directory.
+Measured on drakemore against the installed tree with no environment set: `ldd`
+resolves `libcudart.so.13`, `libcublas.so.13` and `libcublasLt.so.13` out of
+`engine-cuda/current/`, and only `libcuda.so.1` comes from the system, which is
+correct — it belongs to the driver. (An earlier draft of this document said
+`LD_LIBRARY_PATH` was required. It is not; corrected against the measurement.)
 
 Bind to `127.0.0.1`. The RPC protocol is unauthenticated and lets a peer allocate
 buffers and run graphs; upstream says as much. Anything wider needs a deliberate
@@ -263,42 +289,115 @@ CUDA_VISIBLE_DEVICES=0000:65:00.0                               # PCI form
 
 Get the UUID with `nvidia-smi --query-gpu=uuid,pci.bus_id --format=csv`.
 
-## Packaging: how this should reach an installed box
+## Packaging: how this reaches an installed box
 
 The standing rule is that a fix which does not land in the ISO/installer is lost at
-the next install. The precedent already exists in the respin repo:
-`debian/llama-manager-cuda-gb10.*` packages a CUDA engine for the arm64 DGX Spark by
-staging a pinned archive and importing it in `postinst`.
+the next install. This is **implemented**, not merely recommended:
+`scripts/package-cuda-rpc.sh` turns a staged `dist/llama-cpp-cuda/` tree into two
+installable `.deb`s, and `packaging/llama-manager-cuda-rpc.{postinst,postrm}` are the
+maintainer scripts they carry.
 
-Recommended shape — **a new binary package, `llama-manager-cuda-rpc`** (amd64):
+### Two packages, split at the runtime boundary
 
-- **Contents:** the staged `dist/llama-cpp-cuda/` tree, installed to
-  `/usr/lib/llama-manager/engine-cuda/<llama.cpp-ref>/`, with `postinst` creating the
-  `/var/lib/llama-manager/engine-cuda/current` symlink. Mirrors how
-  `llama-manager-rocm-gfx1151` relates to the ROCm engine.
-- **Not in the base meta-package.** It is useless on a box with no NVIDIA card and it
-  carries a large CUDA-fat binary. Pull it in from an
-  `llama-manager-appliance-nvidia-*` meta-package, alongside the existing
-  `llama-manager-nvidia-runtime`, exactly as `-gb10` is pulled in for the Spark.
-- **Depend on the CUDA runtime, do not vendor it.** The three toolkit libraries are
-  ~595 MB and cannot be trimmed (see
-  [What the target actually needs](#what-the-target-actually-needs)). Putting them in
-  the `.deb` roughly doubles the appliance image for one optional card. Depend on
-  NVIDIA's own packages instead — `cuda-cudart-13-0` and `libcublas-13-0` from the
-  CUDA apt repository — plus the driver package that provides `libcuda.so.1`. The
-  NVIDIA appliance variant already configures NVIDIA apt sources for
-  `llama-manager-nvidia-runtime`, so this adds a dependency rather than a new
-  mechanism. Vendoring is the fallback if that repository is not acceptable offline;
-  the build stages the libraries either way, so the fallback needs no build change.
-- **Pin the CUDA major version in the dependency.** The libraries are `.so.13`; a
-  package built against CUDA 13 must not be satisfied by a CUDA 12 runtime.
-- **Do NOT ship a systemd unit for it.** The manager starts and stops the rpc-server
-  itself, because a card that is only usable while a unit is enabled is not shareable
-  — that is the whole point of `acceleratorPlan()` in `api/duo-accelerator.js`. The
-  package installs a binary and nothing that runs it.
-- **The ROCm engine package must be rebuilt too**, with the `-DGGML_RPC=ON` engine
-  from `scripts/build-llama-cpp.sh`, or the router on the installed box still cannot
-  attach. These two ship together or not at all.
+| Package | Arch | Size | Contents |
+|---|---|---|---|
+| `llama-manager-cuda-rpc` | amd64 | ~38 MB | `ggml-rpc-server` + the `libggml*` shared libraries, in `/usr/lib/llama-manager/engine-cuda/<ref>/` |
+| `llama-manager-cuda-runtime-13` | amd64 | ~394 MB | `libcudart` / `libcublas` / `libcublasLt` `.so.13`, in `/usr/lib/llama-manager/engine-cuda/cuda-runtime-13/` |
+
+`llama-manager-cuda-rpc` depends on `llama-manager` and on the exact version of
+`llama-manager-cuda-runtime-13`; the runtime package declares
+`Provides: llama-manager-cuda-runtime`.
+
+**Why split rather than one package.** "Depend on the CUDA runtime, do not vendor it"
+is the right instinct, but there is no repository an appliance can reach that
+provides these libraries. Ubuntu 24.04 `multiverse` ships only the CUDA **12**
+runtime (`libcudart12`, `libcublas12`, `libcublaslt12`); CUDA 13 lives in NVIDIA's own
+apt repository, which this appliance does not configure — `llama-manager-nvidia-runtime`
+pre-bakes driver **debs** and builds the kernel module with `dkms` at boot, and never
+performs a package operation against a network. (An earlier draft of this document
+claimed the NVIDIA appliance variant configures NVIDIA apt sources. It does not.
+Corrected.) And the libraries cannot be trimmed — see
+[What the target actually needs](#what-the-target-actually-needs).
+
+So the bytes ship either way. Splitting them buys the thing that actually matters:
+the engine follows `.llama-cpp-version` and turns over often, the CUDA runtime turns
+over almost never, so an engine bump is a **38 MB** APT update instead of a 633 MB
+one. That is the same "independently updatable" reasoning the rest of the package set
+is built on. A future box that does have NVIDIA's own packages can satisfy the
+dependency through the `Provides` instead.
+
+### How the CUDA libraries are found — no `LD_LIBRARY_PATH`, no `ld.so.conf`
+
+The engine package ships **relative symlinks** in the engine directory:
+
+```
+<ref>/libcudart.so.13   -> ../cuda-runtime-13/libcudart.so.13
+<ref>/libcublas.so.13   -> ../cuda-runtime-13/libcublas.so.13
+<ref>/libcublasLt.so.13 -> ../cuda-runtime-13/libcublasLt.so.13
+```
+
+`ggml-rpc-server` and every `libggml*.so` are built with `RUNPATH = $ORIGIN`, so the
+installed directory is self-contained and the launcher needs to set nothing. Only
+`libcuda.so.1` comes from outside, and that is the driver, already on the box.
+
+All **three** symlinks are shipped even though only `libcudart` and `libcublas` are
+direct `NEEDED`s of `libggml-cuda.so`. `libcublas` pulls `libcublasLt` in through its
+*own* `$ORIGIN` RUNPATH, and whether glibc expands that `$ORIGIN` to the directory the
+object was opened through or to its real location is not worth betting on; shipping
+all three makes it resolve either way. Verified on drakemore with `ldd` against the
+installed tree, with no environment set.
+
+### Where each piece belongs
+
+- **In this repo:** `scripts/build-llama-cpp-cuda.sh` (produces the artifacts),
+  `scripts/package-cuda-rpc.sh` (produces the `.deb`s), and
+  `packaging/llama-manager-cuda-rpc.{postinst,postrm}`. The maintainer scripts live
+  here on purpose: the respin packager already copies `$source_dir/packaging/*` out of
+  this repo for the sysusers, tmpfiles, polkit and service-environment policies, so
+  this follows the existing pattern rather than inventing one.
+- **In the private respin repo** (`.claude/worktrees/llama-manager-ubuntu-respin-src`
+  — note that `distribution/ubuntu-respin` is a stale decoy), to make a *release* carry
+  it. Nothing below has been done yet:
+  1. `config/assets.lock` — a pinned entry for the staged engine tarball, id
+     `llama-cuda-rpc-<ref>`, alongside `llama-rocm-7.2.4-oci` and `ds4-server-gfx1151`.
+     Packaging must never compile.
+  2. `debian/control` — the two stanzas above, with `Depends: llama-manager
+     (= ${binary:Version})` in place of the plain `llama-manager` the standalone script
+     emits.
+  3. `debian/rules` — two more `if [ -d build/package-root/<pkg> ]` copy lines.
+  4. `scripts/build-package-payload.sh` — stage both roots from the pinned tarball, in
+     the `amd` branch (a discrete card on an amd64 appliance; the arm64 Spark keeps
+     `llama-manager-cuda-gb10`).
+  5. `debian/llama-manager-cuda-rpc.postinst` / `.postrm` — copied from this repo's
+     `packaging/`. They are static and need no build-time substitution: the postinst
+     reads the ref from the `packaged-ref` file the package ships.
+  6. **Not** in `llama-manager-appliance`, and **not** in the live-layer pre-bake
+     (`CORE_PACKAGES` / `runtime_package` in `scripts/prebake-appliance-stack.sh`).
+     Keeping it out of the pre-bake means the ISO does not grow for the boxes that
+     have no NVIDIA card; a box that has one pulls it from the APT repo, or a future
+     `llama-manager-appliance-nvidia` meta-package depends on it the way
+     `-nvidia-spark` depends on `-gb10`.
+
+### Two things the packaging deliberately does not do
+
+- **No systemd unit.** The manager starts and stops the rpc-server itself as it
+  schedules work onto the card — see `acceleratorPlan()` in `api/duo-accelerator.js`.
+  A card usable only while a unit is enabled is not a shareable card, and shareability
+  is the entire reason this is an RPC server rather than a second linked engine. The
+  packages install files and nothing that runs them.
+- **No global linker configuration.** The CUDA 13 libraries stay in a private
+  directory under `/usr/lib/llama-manager` and never reach `/etc/ld.so.conf.d`, so they
+  cannot shadow anything else on the box.
+
+### The ROCm engine has to move with it
+
+The router on the installed box still cannot attach unless its engine was built with
+`-DGGML_RPC=ON` (`scripts/build-llama-cpp.sh` now passes it). These two ship together
+or not at all. Check any engine with:
+
+```bash
+ls /var/lib/llama-manager/engine/current/libggml-rpc.so*
+```
 
 ## Verifying
 
@@ -377,3 +476,45 @@ On teardown the card returned to exactly `1475 MiB, 0 %` with both pods-agent
 processes still resident and never signalled — which is also the first direct
 demonstration that the card is **borrowed and released**, the property the whole
 rpc-server design exists to get.
+
+### Measured result, packaged install on drakemore, 2026-09-09
+
+The above proved the *binary*; this proves the *packaged path*. Both packages were
+installed with `dpkg -i` onto drakemore while its llama-manager service stayed up and
+the pods agent stayed on the card.
+
+```
+dpkg -l | grep cuda
+  ii  llama-manager-cuda-rpc         0.0+b96806d9-1
+  ii  llama-manager-cuda-runtime-13  13.0.2.14-1
+
+/usr/lib/llama-manager/engine-cuda/
+  b96806d9/            cuda-runtime-13/     current -> b96806d9     packaged-ref
+
+ldd /usr/lib/llama-manager/engine-cuda/current/ggml-rpc-server      # no env set
+  libcudart.so.13   => .../engine-cuda/current/libcudart.so.13
+  libcublas.so.13   => .../engine-cuda/current/libcublas.so.13
+  libcublasLt.so.13 => .../engine-cuda/current/libcublasLt.so.13
+  libcuda.so.1      => /lib/x86_64-linux-gnu/libcuda.so.1      ← the driver, correctly
+```
+
+Run straight from the installed path with no `LD_LIBRARY_PATH`:
+
+```
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24123 MiB):
+  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes
+
+nvidia-smi --query-compute-apps:
+  3588616  /opt/speech/.venv/bin/python                              352 MiB  ← pods agent
+  3589311  python3                                                   352 MiB  ← pods agent
+  3738956  /usr/lib/llama-manager/engine-cuda/current/ggml-rpc-server 256 MiB  ← ours
+listening: 127.0.0.1:50053
+```
+
+Teardown returned the card to its exact `727 MiB, 0 %` baseline with both pods-agent
+processes untouched. `dpkg -V` on both packages is clean.
+
+Both `postrm` branches were exercised: removing the package deleted a `current` left
+dangling by the removal, and left a `current` that had been hand-repointed at another
+engine directory alone. `/var/lib/llama-manager/engine/current` and the running
+service were not touched at any point.
