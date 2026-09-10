@@ -12733,11 +12733,16 @@ const DUO_FORWARDED_CONTROLS = Object.freeze([
 /**
  * Extra review attempts allowed when the reviewer collapses to a minimal answer.
  *
- * Measured collapse rate at a 54,542-token review prompt is roughly 1 in 2, so a single
- * retry takes the residual to about 1 in 4. Each attempt costs a full reviewer pass
- * (~400s at that prompt size on drakemore), and it is only ever paid on the narrow
- * collapse signature, never on a healthy run. Raise this if the measured rate turns out
- * worse than 1 in 2; it buys diminishing returns against linear cost.
+ * A BACKSTOP, not a cure. The measured collapse rate at a 54,542-token review prompt is
+ * 4 in 5 (n=5 on drakemore), so one retry leaves ~64% and three leave ~41% — retries buy
+ * little against linear cost, since each is a full reviewer generation. They are kept
+ * because they cost nothing on the healthy path (the collapse signature is narrow and
+ * never fires on a good run) and occasionally rescue one.
+ *
+ * The lever that actually works is prompt size: the same reviewer collapsed 0 of 3 times
+ * at a 2,158-token prompt and returned better answers there than the large arm's one
+ * clean run. Fixing this properly means giving the reviewer less to read, not asking it
+ * more often — see docs/features/duo-chain-reliability.md.
  */
 const DUO_REVIEW_RETRIES = 1;
 

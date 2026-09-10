@@ -64,10 +64,16 @@ It reproduces calling the reviewer model directly, with no duo code in the path:
 
 | direct call | prompt tok | runs | collapsed |
 |---|---|---|---|
-| instructions only | 2,158 | 3 | 0 |
-| full corpus in the request | 54,542 | 2 | 1 |
+| instructions only | 2,158 | 3 | **0 of 3** |
+| full corpus in the request | 54,542 | 5 | **4 of 5** |
+| full corpus, duo's exact step body | 54,542 | 2 so far | 1 |
 
 So this is model behaviour at large prompts. The chain cannot prevent it.
+
+**Prompt size is the dominant lever, and it also improves answer quality.** The
+2,158-token arm did not merely avoid collapsing — it returned *better* answers than the
+large arm's single clean run (2 concerns including the plant, versus 1). Cutting what
+the reviewer has to read is worth more than any amount of retrying.
 
 ### What the chain does about it
 
@@ -83,8 +89,22 @@ severity — a worse failure than the one being fixed. Retrying is safe under th
 ambiguity: a genuine rejection repeats itself, a collapse usually does not, and if every
 attempt collapses the reviewer's answer stands.
 
-**This reduces the failure rate; it does not eliminate it.** At a measured ~1-in-2
-collapse rate, one retry leaves roughly 1 in 4.
+**This is a backstop, not a cure.** The measured collapse rate at a 54,542-token review
+prompt is **4 in 5**, so retrying the same prompt leaves:
+
+| retries | residual failure | cost |
+|---|---|---|
+| 0 | 80% | — |
+| 1 | 64% | up to 1 extra reviewer pass |
+| 2 | 51% | up to 2 |
+| 3 | 41% | up to 3 |
+
+Each pass costs a full reviewer generation, so retries buy little at linear cost. They
+are kept because they are cheap on the healthy path (never triggered) and occasionally
+rescue a run, **not** because they make large-corpus review reliable. They do not.
+
+The remedy that actually works is to keep the review prompt small — see the size table
+above, and "Practical guidance" below.
 
 ## Failure mode 2 — the reviewer answers in prose
 
