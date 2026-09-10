@@ -77,6 +77,33 @@ the reviewer has to read is worth more than any amount of retrying.
 
 ### What the chain does about it
 
+**The review prompt is bounded.** `buildReviewPrompt` embeds the original request on top
+of the plan and the work, so on a large corpus the reviewer's prompt is the biggest of the
+three steps — and that is exactly where it fails. It now carries at most
+`DUO_REVIEW_REQUEST_CHARS` (20,000) characters of the request, head-first because the
+required output shape lives at the top, with an explicit marker telling the reviewer the
+request was cut. Measured with identical plan and work, varying only this:
+
+| corpus in the request | review prompt | collapsed | wall per step |
+|---|---|---|---|
+| 197,244 ch | 54,542 tok | **4 of 5** | 380-1017s |
+| 20,000 ch | 7,063 tok | **0 of 5** | 8-59s |
+| 418 ch | 2,158 tok | **0 of 7** | 16-45s |
+
+Twelve bounded runs, zero collapses, and the planted defect survived in every one. It is
+also 10-40x faster.
+
+The plan and the work are never truncated — the work is the reviewer's actual subject, and
+losing it is the bug, not the fix. The planner and worker steps still receive the whole
+request; only the reviewer's copy is bounded.
+
+**The tradeoff, stated plainly:** the reviewer can no longer independently verify a claim
+against source that falls outside the slice. It can still check the work for internal
+consistency and against the plan. That is a real loss, accepted because at full size the
+reviewer destroyed correct findings 4 times in 5.
+
+### The retry backstop
+
 `reviewCollapsed` (`api/duo-chain.js`) detects the signature and the chain asks the
 reviewer again, up to `DUO_REVIEW_RETRIES` times.
 

@@ -116,6 +116,45 @@ export function buildExecutePrompt(userPrompt, plan) {
  * @param {string} work The worker's output.
  * @returns {string} Prompt for the reviewer.
  */
+/**
+ * How much of the original request the review prompt carries.
+ *
+ * The review step embeds the request on top of the plan and the work, so on a large
+ * corpus the reviewer's prompt is the biggest of the three steps — and that is exactly
+ * where it fails. Measured on drakemore with a planted defect, identical plan and work,
+ * varying ONLY this (no reasoning_effort, max_tokens 4000 throughout):
+ *
+ *   197,244 ch -> 54,542 tok prompt -> reviewer collapsed 4 of 5, 380-1017s per step
+ *    20,000 ch ->  7,063 tok prompt -> reviewer collapsed 0 of 5,    8-59s per step
+ *       418 ch ->  2,158 tok prompt -> reviewer collapsed 0 of 7,   16-45s per step
+ *
+ * "Collapsed" means it returned the minimal instance of the requested schema and threw
+ * the work away — see {@link reviewCollapsed}. 20,000 is the largest slice measured clean,
+ * chosen over the smaller one because it leaves the reviewer some source to check claims
+ * against. Lower it if collapses reappear; do not raise it without re-measuring.
+ *
+ * The head is kept rather than the tail because the request's OUTPUT SHAPE lives at the
+ * top — the schema the caller demanded. Losing that costs strict JSON, which is a second
+ * failure mode we already see.
+ */
+export const DUO_REVIEW_REQUEST_CHARS = 20000;
+
+/**
+ * The request as the reviewer should see it: whole when it is small, head-bounded when it
+ * is not, and explicitly marked when cut so the reviewer does not treat a partial corpus
+ * as the whole of it.
+ *
+ * @param {unknown} userPrompt The original request.
+ * @returns {string} The request text to embed in the review prompt.
+ */
+function boundedReviewRequest(userPrompt) {
+  const text = String(userPrompt ?? '');
+  if (text.length <= DUO_REVIEW_REQUEST_CHARS) return text;
+  return `${text.slice(0, DUO_REVIEW_REQUEST_CHARS)}\n\n[... request truncated for review; `
+    + `${text.length - DUO_REVIEW_REQUEST_CHARS} characters omitted. Judge the work against `
+    + `the instructions above and the plan; do not assume the omitted part is absent.]`;
+}
+
 export function buildReviewPrompt(userPrompt, plan, work) {
   return [
     'You are the reviewer. Judge the work against the ORIGINAL REQUEST, not against the plan.',
@@ -129,7 +168,7 @@ export function buildReviewPrompt(userPrompt, plan, work) {
     'for JSON, your entire reply must be that JSON.',
     '',
     'ORIGINAL REQUEST:',
-    String(userPrompt ?? ''),
+    boundedReviewRequest(userPrompt),
     '',
     'PLAN:',
     String(plan ?? ''),

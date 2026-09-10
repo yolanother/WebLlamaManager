@@ -28,6 +28,7 @@ import {
   DUO_STEP_CEILING,
   duoStepFailure,
   reviewCollapsed,
+  DUO_REVIEW_REQUEST_CHARS,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 
@@ -480,9 +481,53 @@ test('buildReviewPrompt asks for the ANSWER, corrected if needed — never a rep
   assert.match(p, /ORIGINAL REQUEST/); assert.match(p, /PLAN/); assert.match(p, /WORK PRODUCED/);
 });
 
-test('buildReviewPrompt carries the original request verbatim so the shape survives', () => {
+test('buildReviewPrompt carries a normal request verbatim so the shape survives', () => {
   const req = 'Answer as strict JSON matching {"state_machine_file":string} and nothing else.';
   assert.ok(buildReviewPrompt(req, 'p', 'w').includes(req));
+});
+
+// --- the review prompt is bounded ------------------------------------------------
+//
+// Measured on drakemore 2026-09-09 with a planted defect, identical plan and work,
+// varying ONLY how much of the request the review prompt carries (no reasoning_effort,
+// max_tokens 4000 throughout):
+//
+//   197,244 ch of corpus -> 54,542 tok prompt -> collapsed 4 of 5, 380-1017s
+//    20,000 ch of corpus ->  7,063 tok prompt -> collapsed 0 of 5,    8-59s
+//       418 ch of corpus ->  2,158 tok prompt -> collapsed 0 of 7,   16-45s
+//
+// "Collapsed" means the reviewer returned the minimal instance of the requested schema
+// and discarded the work. Bounding the request is the lever that removes it, and it also
+// makes the step 10-40x faster.
+
+test('buildReviewPrompt bounds a huge request but keeps its head, where the shape lives', () => {
+  const shape = 'Answer as strict JSON matching {"verdict":"pass"|"concerns"} and nothing else.';
+  const req = `${shape}\n${'x'.repeat(DUO_REVIEW_REQUEST_CHARS * 3)}`;
+  const p = buildReviewPrompt(req, 'the plan', 'the work');
+  assert.ok(!p.includes(req), 'the full request must not be embedded');
+  assert.ok(p.includes(shape), 'the head carries the required output shape and must survive');
+  assert.match(p, /truncated/i, 'the reviewer must be told the request was cut');
+});
+
+test('buildExecutePrompt carries the WHOLE request — only the review step is bounded', () => {
+  // The worker has to do the actual work, so it needs the whole corpus. Only the reviewer's
+  // prompt is bounded, and only because the reviewer measurably fails on a large one.
+  const req = 'x'.repeat(DUO_REVIEW_REQUEST_CHARS * 3);
+  assert.ok(buildExecutePrompt(req, 'plan').includes(req));
+});
+
+test('buildPlanPrompt carries the WHOLE request', () => {
+  const req = 'y'.repeat(DUO_REVIEW_REQUEST_CHARS * 3);
+  assert.ok(buildPlanPrompt(req).includes(req));
+});
+
+test('buildReviewPrompt never truncates the plan or the work', () => {
+  // The work is the reviewer's actual subject — losing it is the bug, not the fix.
+  const plan = 'P'.repeat(DUO_REVIEW_REQUEST_CHARS * 2);
+  const work = 'W'.repeat(DUO_REVIEW_REQUEST_CHARS * 2);
+  const p = buildReviewPrompt('x'.repeat(DUO_REVIEW_REQUEST_CHARS * 2), plan, work);
+  assert.ok(p.includes(plan));
+  assert.ok(p.includes(work));
 });
 
 // --- caller controls must reach the model ----------------------------------------
