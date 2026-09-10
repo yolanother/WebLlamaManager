@@ -639,3 +639,75 @@ export function duoStepFailure({ model, status, elapsedMs, body, cause } = {}) {
   }
   return parts.join(' ');
 }
+
+/**
+ * Parse text as a plain JSON object, or null when it is anything else.
+ *
+ * Deliberately strict: no fence-stripping, no repair. A reviewer that answers in prose
+ * with the JSON buried in a ```json fence is a DIFFERENT defect (observed as pl6) and
+ * must not be mistaken for the collapse this module detects.
+ *
+ * @param {unknown} text Candidate JSON text.
+ * @returns {Record<string, unknown>|null} The parsed object, or null.
+ */
+function plainJsonObject(text) {
+  if (typeof text !== 'string') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text.trim());
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  return parsed;
+}
+
+/**
+ * Keys whose value is a non-empty array.
+ *
+ * @param {Record<string, unknown>} obj Object to scan.
+ * @returns {string[]} Matching keys.
+ */
+function populatedArrayKeys(obj) {
+  return Object.keys(obj).filter((k) => Array.isArray(obj[k]) && obj[k].length > 0);
+}
+
+/**
+ * Whether the review step returned the minimal instance of the shape it was asked for,
+ * throwing away everything the work step had produced.
+ *
+ * Measured on drakemore 2026-09-09: handed a 54,542-token review prompt, the reviewer
+ * model returns exactly `{"verdict":"pass","concerns":[]}` — 12 completion tokens,
+ * `finish_reason: stop`, no reasoning content — roughly half the time, discarding a work
+ * step that had correctly identified a planted high-severity defect. It reproduces when
+ * the model is called directly with no duo code in the path, so this is model behaviour
+ * at large prompts, not a chain bug. The chain cannot prevent it; it can only notice it.
+ *
+ * This deliberately does NOT decide who is right. A reviewer emptying the work is
+ * sometimes CORRECT — in one measured run the work was eight fabricated findings
+ * referencing symbols that do not exist, and binning them was the right call. Nothing in
+ * the outputs distinguishes that from a collapse, which is why the caller's remedy is to
+ * ask the reviewer again rather than to override it: a genuine rejection repeats itself,
+ * a collapse usually does not.
+ *
+ * A collapse requires ALL of:
+ *  - both sides parse as plain JSON objects (prose is a different defect);
+ *  - the work populated at least one array;
+ *  - the review emptied every array the work had populated;
+ *  - the review offers no non-empty array of its own, so it added nothing in exchange.
+ *
+ * @param {unknown} reviewText The review step's answer.
+ * @param {unknown} workText The work step's answer.
+ * @returns {boolean} True when the review looks like a collapse worth retrying.
+ */
+export function reviewCollapsed(reviewText, workText) {
+  const review = plainJsonObject(reviewText);
+  const work = plainJsonObject(workText);
+  if (!review || !work) return false;
+
+  const workPopulated = populatedArrayKeys(work);
+  if (workPopulated.length === 0) return false;
+  // The reviewer kept something the work had, or contributed a list of its own: judging.
+  if (populatedArrayKeys(review).length > 0) return false;
+  return workPopulated.some((k) => Array.isArray(review[k]) && review[k].length === 0);
+}

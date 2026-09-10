@@ -190,6 +190,7 @@ import {
   duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID,
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
   duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText, duoStepBudget,
+  reviewCollapsed,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
   duoStepBody,
   duoStepFailure,
@@ -12729,12 +12730,34 @@ const DUO_FORWARDED_CONTROLS = Object.freeze([
   'response_format', 'chat_template_kwargs', 'reasoning_format',
 ]);
 
+/**
+ * Extra review attempts allowed when the reviewer collapses to a minimal answer.
+ *
+ * Measured collapse rate at a 54,542-token review prompt is roughly 1 in 2, so a single
+ * retry takes the residual to about 1 in 4. Each attempt costs a full reviewer pass
+ * (~400s at that prompt size on drakemore), and it is only ever paid on the narrow
+ * collapse signature, never on a healthy run. Raise this if the measured rate turns out
+ * worse than 1 in 2; it buys diminishing returns against linear cost.
+ */
+const DUO_REVIEW_RETRIES = 1;
+
 async function runDuoChainSteps(history, request, maxTokens, controls = null) {
   const started = Date.now();
   const stepStats = [];
   const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats, controls);
   const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats, controls);
-  const review = await duoChainStep('review', DUO_PLANNER_ID, duoStepMessages(history, buildReviewPrompt(request, plan, work)), maxTokens, stepStats, controls);
+  const reviewMessages = duoStepMessages(history, buildReviewPrompt(request, plan, work));
+  let review = await duoChainStep('review', DUO_PLANNER_ID, reviewMessages, maxTokens, stepStats, controls);
+  // On a large prompt the reviewer intermittently answers with the minimal instance of the
+  // shape it was asked for, discarding correct findings the worker had produced — see
+  // reviewCollapsed for the measurement. Asking again is the only safe remedy: the chain
+  // cannot tell a collapse from a reviewer legitimately binning fabricated work, and a
+  // genuine rejection simply repeats itself while a collapse usually does not. If every
+  // attempt collapses the reviewer's answer still stands, because overriding it would
+  // resurrect fabrications in the case where it was right.
+  for (let attempt = 0; attempt < DUO_REVIEW_RETRIES && reviewCollapsed(review, work); attempt += 1) {
+    review = await duoChainStep('review-retry', DUO_PLANNER_ID, reviewMessages, maxTokens, stepStats, controls);
+  }
   // `review` is now the ANSWER (the reviewer returns corrected work, not commentary),
   // so the envelope keeps plan and work for inspection. Nothing is lost: the caller
   // receives the answer it asked for, and both intermediate steps remain visible.

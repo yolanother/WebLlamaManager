@@ -27,6 +27,7 @@ import {
   DUO_REASONING_HEADROOM,
   DUO_STEP_CEILING,
   duoStepFailure,
+  reviewCollapsed,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 
@@ -568,4 +569,49 @@ test('duoStepFailure truncates a huge body rather than emitting it whole', () =>
   const msg = duoStepFailure({ model: 'm', status: 500, body: 'x'.repeat(5000) });
   assert.ok(msg.length < 1200, 'an error message is not a log dump');
   assert.match(msg, /x{50}/, 'but it must keep enough to be useful');
+});
+
+// --- reviewCollapsed: the reviewer emitting the minimal instance of the asked-for shape ---
+//
+// Measured on drakemore 2026-09-09: given a 54,542-token review prompt, the reviewer
+// model returns exactly `{"verdict":"pass","concerns":[]}` (12 completion tokens,
+// finish_reason stop) about half the time, discarding a work step that had found a real
+// high-severity defect. Reproduced with no duo code in the path, so the chain cannot
+// prevent it — it can only notice it and ask again.
+
+test('reviewCollapsed: flags an all-empty review against a populated work answer', () => {
+  const work = '{"verdict":"concerns","concerns":[{"file":"a.js","symbol":"f","issue":"x","severity":"high"}]}';
+  const review = '{"verdict":"pass","concerns":[]}';
+  assert.equal(reviewCollapsed(review, work), true);
+});
+
+test('reviewCollapsed: a review that keeps findings is not a collapse', () => {
+  const work = '{"verdict":"concerns","concerns":[{"file":"a.js","symbol":"f","issue":"x","severity":"high"}]}';
+  const review = '{"verdict":"concerns","concerns":[{"file":"a.js","symbol":"f","issue":"x","severity":"medium"}]}';
+  assert.equal(reviewCollapsed(review, work), false);
+});
+
+test('reviewCollapsed: an empty work answer cannot be collapsed away', () => {
+  // Nothing was lost, so there is nothing to retry for.
+  assert.equal(reviewCollapsed('{"verdict":"pass","concerns":[]}', '{"verdict":"pass","concerns":[]}'), false);
+});
+
+test('reviewCollapsed: non-JSON on either side is not a collapse', () => {
+  // pl6: the reviewer answered in prose. That is a different defect and must not be
+  // retried as though it were this one.
+  assert.equal(reviewCollapsed('The work is broken. Here is why...', '{"verdict":"concerns","concerns":[{"a":1}]}'), false);
+  assert.equal(reviewCollapsed('{"verdict":"pass","concerns":[]}', 'here is the corrected implementation'), false);
+});
+
+test('reviewCollapsed: only counts arrays the work actually populated', () => {
+  // The reviewer emptying a key the work never filled is not a loss.
+  const work = '{"verdict":"concerns","concerns":[],"notes":["kept"]}';
+  const review = '{"verdict":"pass","concerns":[],"notes":["kept"]}';
+  assert.equal(reviewCollapsed(review, work), false);
+});
+
+test('reviewCollapsed: a reviewer that empties one list but fills another is judging, not collapsing', () => {
+  const work = '{"concerns":[{"a":1}],"fixes":[]}';
+  const review = '{"concerns":[],"fixes":[{"b":2}]}';
+  assert.equal(reviewCollapsed(review, work), false);
 });
