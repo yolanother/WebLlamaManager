@@ -64,9 +64,13 @@ It reproduces calling the reviewer model directly, with no duo code in the path:
 
 | direct call | prompt tok | runs | collapsed |
 |---|---|---|---|
-| instructions only | 2,158 | 3 | **0 of 3** |
-| full corpus in the request | 54,542 | 5 | **4 of 5** |
-| full corpus, duo's exact step body | 54,542 | 2 so far | 1 |
+| instructions only | 2,158 | 10 | **0 of 10** |
+| full corpus in the request | 54,542 | **21** | **17 of 21 = 81%** |
+
+The 21 full-corpus runs pool five arms that varied `max_tokens` (4,000 vs 38,768) and
+`reasoning_effort` (none, `low`, `medium`, `high`). They are pooled because every one of
+them renders the SAME prompt — see the gotcha below — so none of those knobs changed
+anything. Collapse at this prompt size is ~81% regardless of sampling settings.
 
 So this is model behaviour at large prompts. The chain cannot prevent it.
 
@@ -132,6 +136,35 @@ rescue a run, **not** because they make large-corpus review reliable. They do no
 
 The remedy that actually works is to keep the review prompt small — see the size table
 above, and "Practical guidance" below.
+
+## Gotcha: `reasoning_effort` is inert when `enable_thinking: false`
+
+Do not reach for `reasoning_effort` to fix this. The model's own chat template gates the
+entire reasoning block on thinking being ON:
+
+```jinja
+{%- if enable_thinking is undefined or enable_thinking is true %}
+    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+    {%- if resolved_reasoning_effort == 'high' %}
+        {%- set resolved_reasoning_effort = 'xhigh' %}
+    {%- endif %}
+```
+
+With `enable_thinking: false` — which is exactly what a caller sends to get structured
+JSON — the kwarg changes nothing. Proven by sending `medium`, `high` and `low` against an
+identical corpus: all three produced **identical `prompt_tokens` (54,542)**. Had the
+template honoured the value, the rendered length would differ.
+
+**How to check whether any `chat_template_kwargs` value reached the model:** see whether
+`prompt_tokens` moves. Identical counts mean the template ignored it.
+
+The template's real contract: supported values are `xhigh` (the default), `medium` and
+`low`; `high` is silently remapped to `xhigh`; anything else raises inside the template.
+
+This also means `DUO_REASONING_EFFORT` is inert for non-thinking callers — tracked as
+T312aac392c8dc.
+
+Read the live template with `curl localhost:<engine-port>/props`.
 
 ## Failure mode 2 — the reviewer answers in prose
 
