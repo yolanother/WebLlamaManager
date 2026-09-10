@@ -660,3 +660,49 @@ test('reviewCollapsed: a reviewer that empties one list but fills another is jud
   const review = '{"concerns":[],"fixes":[{"b":2}]}';
   assert.equal(reviewCollapsed(review, work), false);
 });
+
+// --- step timing must expose where the time actually went -------------------------
+//
+// Measured on drakemore 2026-09-10: a 155k-token run's REVIEW step reported
+// elapsedMs 3,453,397 with generationMs 56,508 — 56.6 minutes unaccounted. A probe of the
+// same model with the same 6,314-token prompt, run straight after a 170k-token request,
+// completed in 51s with prompt_ms 48,411. So the missing time is neither generation nor
+// prompt processing, and nothing recorded said so. These fields make the next occurrence
+// diagnosable instead of a guessing exercise; the 3600s proxy ceiling (T312b27f4e5fa3)
+// trips on exactly this hidden time.
+
+test('duoStepStats records prompt processing separately from generation', () => {
+  const s = duoStepStats({
+    role: 'review', model: 'm', elapsedMs: 3453397,
+    body: { usage: { prompt_tokens: 6314, completion_tokens: 938 },
+            timings: { prompt_ms: 48411, predicted_ms: 56508, predicted_per_second: 16.6 } },
+  });
+  assert.equal(s.promptMs, 48411);
+  assert.equal(s.generationMs, 56508);
+});
+
+test('duoStepStats reports time the engine never accounted for', () => {
+  // elapsed minus (prompt + generation): the queueing/overhead the ceiling actually trips on.
+  const s = duoStepStats({
+    role: 'review', model: 'm', elapsedMs: 3453397,
+    body: { usage: { prompt_tokens: 6314, completion_tokens: 938 },
+            timings: { prompt_ms: 48411, predicted_ms: 56508 } },
+  });
+  assert.equal(s.unaccountedMs, 3453397 - 48411 - 56508);
+});
+
+test('duoStepStats never reports negative unaccounted time', () => {
+  // Engine timings can exceed the wall clock we measured around the fetch; clamp rather
+  // than emit a nonsense negative.
+  const s = duoStepStats({
+    role: 'plan', model: 'm', elapsedMs: 1000,
+    body: { timings: { prompt_ms: 900, predicted_ms: 900 } },
+  });
+  assert.equal(s.unaccountedMs, 0);
+});
+
+test('duoStepStats tolerates an engine that reports no timings', () => {
+  const s = duoStepStats({ role: 'plan', model: 'm', elapsedMs: 5000, body: null });
+  assert.equal(s.promptMs, 0);
+  assert.equal(s.unaccountedMs, 5000);
+});

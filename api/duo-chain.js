@@ -324,6 +324,11 @@ export function duoStepStats({ role, model, elapsedMs, body = null }) {
   const promptTokens = Number(body?.usage?.prompt_tokens ?? timings?.prompt_n ?? 0) || 0;
   const completionTokens = Number(body?.usage?.completion_tokens ?? timings?.predicted_n ?? 0) || 0;
   const generationMs = Number(timings?.predicted_ms ?? 0) || 0;
+  // Prompt processing is the OTHER half of a step's engine time, and leaving it out made a
+  // 56.6-minute stall invisible: a review step reported elapsedMs 3,453,397 against
+  // generationMs 56,508 and nothing said where the rest went. Recorded separately so the
+  // remainder below is genuinely unexplained rather than merely unmeasured.
+  const promptMs = Number(timings?.prompt_ms ?? 0) || 0;
   const engineRate = Number(timings?.predicted_per_second ?? 0) || 0;
   const wallMs = Math.max(0, Math.round(Number(elapsedMs) || 0));
   let tokensPerSecond = engineRate;
@@ -343,7 +348,13 @@ export function duoStepStats({ role, model, elapsedMs, body = null }) {
     elapsedMs: wallMs,
     promptTokens,
     completionTokens,
+    promptMs: Math.round(promptMs),
     generationMs: Math.round(generationMs),
+    // Wall time the engine did not account for: queueing, connection, transfer. This is
+    // what the 3600s proxy read timeout actually trips on — a measured 155k run spent 56.6
+    // minutes here while doing 105 seconds of engine work. Clamped at zero because engine
+    // timings can slightly exceed the wall clock measured around the fetch.
+    unaccountedMs: Math.max(0, wallMs - Math.round(promptMs) - Math.round(generationMs)),
     tokensPerSecond: round1(tokensPerSecond),
     tokensPerSecondSource,
   };
