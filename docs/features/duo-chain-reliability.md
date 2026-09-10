@@ -310,9 +310,28 @@ every check a structured-output pipeline can apply.
 
 - Prefer several small reviews over one large one. ~10k tokens is the regime with
   evidence behind it.
-- **If you need structured output over a large input, bound the prompt or ask for prose
-  and parse it yourself.** Prose survived 5 of 5 at a prompt size where the JSON schema
-  failed 17 of 21. Asking for JSON is what breaks, not asking the model to read a lot.
+- **Ask CLOSED questions, not open ones. The output format is not the problem.** A
+  controlled comparison at 247k tokens — same corpus, same closed question, once in prose
+  and once demanding strict JSON — passed both times. Every failure on record came from
+  open-ended requests ("find every defect"), regardless of format.
+
+  | | JSON schema | prose |
+  |---|---|---|
+  | **open** (find any defect) | fails often at scale | 5/5 @54k |
+  | **closed** (specific question) | **1/1 @247k** | **2/2 @247k** |
+
+  An earlier revision of this page said "ask for prose and parse it yourself". That was
+  wrong — it came from comparing open+JSON against closed+prose, which varies two things at
+  once. Structured output over a large corpus is fine; open-ended latitude is not.
+
+  An open request lets the model choose what to report and how much, and that latitude is
+  where the collapse to `{"verdict":"pass","concerns":[]}`, the prose wrapping, the silent
+  recall misses and the confident false positives all live. A closed request removes it.
+
+  The sharpest demonstration: asked open, duo twice claimed `reservationView` can return
+  `ttlSeconds: 0`, quoting `Math.round(ttlMs / 1000)` while dropping the `Math.max(1, ...)`
+  clamp beside it. Asked that exact question directly at 247k, it quoted the complete
+  expression and answered correctly.
 - Read `duo.work` when the final answer looks empty or surprising.
 - Treat a `pass` on a large corpus as "found nothing", not "there is nothing".
 - Verify any specific claim (symbol name, quoted code) against the source. duo's
