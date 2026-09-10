@@ -12733,18 +12733,25 @@ const DUO_FORWARDED_CONTROLS = Object.freeze([
 /**
  * Extra review attempts allowed when the reviewer collapses to a minimal answer.
  *
- * A BACKSTOP, not a cure. The measured collapse rate at a 54,542-token review prompt is
- * 4 in 5 (n=5 on drakemore), so one retry leaves ~64% and three leave ~41% — retries buy
- * little against linear cost, since each is a full reviewer generation. They are kept
- * because they cost nothing on the healthy path (the collapse signature is narrow and
- * never fires on a good run) and occasionally rescue one.
+ * A retry is nearly FREE, which is why this is not 1. The retry re-sends a byte-identical
+ * prompt, so it hits the engine's prompt cache: measured on drakemore, a review step that
+ * took 47,514ms cold was retried in 1,463ms — 32x cheaper, not the full reviewer pass an
+ * earlier revision of this comment assumed. Each additional attempt is therefore ~1.5s
+ * against the chance of rescuing an answer that would otherwise be silently empty.
  *
- * The lever that actually works is prompt size: the same reviewer collapsed 0 of 3 times
- * at a 2,158-token prompt and returned better answers there than the large arm's one
- * clean run. Fixing this properly means giving the reviewer less to read, not asking it
- * more often — see docs/features/duo-chain-reliability.md.
+ * Retries are independent draws: warm repeats of an identical prompt return different
+ * outputs (one arm gave 942/945/317/464 completion tokens across four repeats, another
+ * differed in outcome class), so a second attempt is a genuine second chance rather than a
+ * replay. Where the distribution is heavily peaked they all agree — a measured 65k-token
+ * run collapsed on both the review and the review-retry, returning 21 tokens each time —
+ * and the reviewer's answer then stands, because overriding it would resurrect fabricated
+ * work in the case where it was right to bin it.
+ *
+ * They are only ever paid on the narrow collapse signature, never on a healthy run.
+ * The lever that actually prevents this is keeping the reviewer's prompt small; see
+ * DUO_REVIEW_REQUEST_CHARS and docs/features/duo-chain-reliability.md.
  */
-const DUO_REVIEW_RETRIES = 1;
+const DUO_REVIEW_RETRIES = 3;
 
 async function runDuoChainSteps(history, request, maxTokens, controls = null) {
   const started = Date.now();
