@@ -72,6 +72,30 @@ The 21 full-corpus runs pool five arms that varied `max_tokens` (4,000 vs 38,768
 them renders the SAME prompt — see the gotcha below — so none of those knobs changed
 anything. Collapse at this prompt size is ~81% regardless of sampling settings.
 
+**It only happens when structured output is requested.** The same corpus, model and
+settings, changing ONLY the requested output shape:
+
+| requested shape | prompt tok | runs | collapsed |
+|---|---|---|---|
+| strict JSON schema | 54,542 | 21 | **17 (81%)** |
+| free prose | 54,511 | 5 | **0** |
+
+Every prose run named the planted defect correctly, in 179-274 tokens. One of them:
+
+> The single most serious defect is in the `_acquire` method... The JSDoc and inline
+> comments explicitly state that "equal priority never preempts." However, the
+> implementation uses `if (!lowest || priority < lowest.priority) return null;`... This
+> logic allows preemption when the new claim's priority is equal to the lowest occupant's
+> priority (since `5 < 5` is false, the code proceeds to preempt).
+
+So the model is NOT losing its grip on a long prompt in general — it reads the corpus fine
+and reasons about it correctly. What fails is producing a *structured* answer at that
+size: it emits the minimal instance of the schema instead. Free-form output over the same
+input is unaffected.
+
+That matters because structured extraction over large inputs is exactly the podcast
+pipeline's use case, and exactly where this bug was first seen.
+
 So this is model behaviour at large prompts. The chain cannot prevent it.
 
 **Prompt size is the dominant lever, and it also improves answer quality.** The
@@ -200,6 +224,9 @@ every check a structured-output pipeline can apply.
 
 - Prefer several small reviews over one large one. ~10k tokens is the regime with
   evidence behind it.
+- **If you need structured output over a large input, bound the prompt or ask for prose
+  and parse it yourself.** Prose survived 5 of 5 at a prompt size where the JSON schema
+  failed 17 of 21. Asking for JSON is what breaks, not asking the model to read a lot.
 - Read `duo.work` when the final answer looks empty or surprising.
 - Treat a `pass` on a large corpus as "found nothing", not "there is nothing".
 - Verify any specific claim (symbol name, quoted code) against the source. duo's
