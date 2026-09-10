@@ -96,23 +96,35 @@ settings, changing ONLY the requested output shape:
 | strict JSON schema | 54,542 | 21 | **17 (81%)** |
 | free prose | 54,511 | 5 | **0** |
 
-Every prose run named the planted defect correctly, in 179-274 tokens. One of them:
+Every prose run named the planted defect correctly, in 179-274 tokens.
 
-> The single most serious defect is in the `_acquire` method... The JSDoc and inline
-> comments explicitly state that "equal priority never preempts." However, the
-> implementation uses `if (!lowest || priority < lowest.priority) return null;`... This
-> logic allows preemption when the new claim's priority is equal to the lowest occupant's
-> priority (since `5 < 5` is false, the code proceeds to preempt).
+**But size alone does NOT determine it — three factors interact.** A controlled 2x2 at
+constant ~21k prompt size, varying whether the request's schema specification is present
+and whether the corpus slice contains the source file the WORK is arguing about:
 
-So the model is NOT losing its grip on a long prompt in general — it reads the corpus fine
-and reasons about it correctly. What fails is producing a *structured* answer at that
-size: it emits the minimal instance of the schema instead. Free-form output over the same
-input is unaffected.
+| corpus | schema spec | disputed source | runs | clean |
+|---|---|---|---|---|
+| offset 0 | **yes** | **yes** | 9 | **0/9** |
+| offset 0 (same content) | no | yes | 4 | 4/4 |
+| offset 40,000 | **yes** | no | 4 | 4/4 |
+| offsets 40k / 80k / 120k | no | no | 12 | 12/12 |
 
-That matters because structured extraction over large inputs is exactly the podcast
-pipeline's use case, and exactly where this bug was first seen.
+Only the arm with BOTH factors fails; remove either and it is clean. And size is a third
+term: a real chain run carrying both factors at a 7,309-token review prompt was clean
+(strict JSON, 8 concerns, planted defect delivered), where the same two factors at 20,562
+tokens failed 9 of 9.
 
-So this is model behaviour at large prompts. The chain cannot prevent it.
+**So the failure needs the schema spec, the disputed source, AND enough prompt size. No
+two of the three suffice.** Earlier revisions of this page claimed a size threshold, then
+a cut-position effect, then the schema spec as the cause. All three are retracted as sole
+explanations.
+
+Plausible mechanism, NOT demonstrated: the failing output opens by critiquing the work
+("The work produced contains significant errors and redundancies. 1. Incorrect Analysis of
+`_acquire` Sort Order...") rather than answering. The reviewer can see the source,
+disagrees with the work's reading of it, and explains instead of emitting the schema.
+
+So this is model behaviour at large prompts. The chain cannot prevent it.So this is model behaviour at large prompts. The chain cannot prevent it.
 
 **Prompt size is the dominant lever, and it also improves answer quality.** The
 2,158-token arm did not merely avoid collapsing — it returned *better* answers than the
@@ -150,6 +162,12 @@ reviewer destroyed correct findings 4 times in 5.
 
 `reviewCollapsed` (`api/duo-chain.js`) detects the signature and the chain asks the
 reviewer again, up to `DUO_REVIEW_RETRIES` times.
+
+**Note on `DUO_REVIEW_REQUEST_CHARS`:** it is NOT a principled threshold on a single
+variable. It works — verified end to end at the size the chain actually runs — but it does
+so by landing below the region where the three-factor combination bites, not because
+prompt size is the mechanism. Do not raise it on a size argument alone; re-measure the
+combination.
 
 The retry deliberately does **not** override the reviewer. A reviewer emptying the work
 is sometimes correct: in one measured run the work was eight fabricated findings citing
