@@ -8,19 +8,21 @@ what each step actually produced.
 This page records what the chain does and does not guarantee, measured on real repo
 source rather than toy prompts.
 
-> **⚠️ Sample-size caveat on every rate on this page (2026-09-10).** Repeated runs of an
-> identical prompt hit the engine's prompt cache: the first run is cold, and the warm
-> repeats reproduce its outcome verbatim — in one arm four warm repeats each returned
-> exactly 12 completion tokens. Those repeats are NOT independent samples, so the run
-> counts below overstate the evidence. Across every arm there were **11 cold runs, 4 of
-> which collapsed**; the rest were warm repeats. The direction of every finding here still
-> holds — large structured prompts collapse, small ones and prose do not — but treat the
-> rates as indicative, not measured. A cache-busted rerun (unique nonce as the first line,
-> forcing a cold prompt every time) is in progress and these numbers will be replaced with
-> independent ones.
+> **Note on repeated runs and the prompt cache (2026-09-10).** Repeating an identical
+> prompt hits the engine prompt cache (`usage.prompt_tokens_details.cached_tokens` goes
+> from 0 to the full prompt length, and `prompt_ms` drops from ~380,000 to ~200). That is a
+> COMPUTE optimisation only — the cached prefix KV is what recomputation would have
+> produced, and generation still samples fresh — so warm repeats ARE independent samples
+> and the counts on this page are legitimate.
 >
-> **When measuring this yourself, check `usage.prompt_tokens_details.cached_tokens`.**
-> Non-zero means you are re-reading one sample, not taking a new one.
+> Verified rather than assumed: warm repeats of a byte-identical prompt returned 4 distinct
+> completion lengths in one arm (942/945/317/464) and, in another, differed in OUTCOME —
+> 762, **12**, 762, 765, a collapse sitting among clean runs at identical prompt and cache
+> state. Only where the distribution is heavily peaked do repeats look identical (one arm
+> returned exactly 12 tokens five times).
+>
+> An earlier revision of this page claimed the opposite — that warm repeats were dependent
+> and the rates inflated. That was wrong and is retracted.
 
 ## The short version
 
