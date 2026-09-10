@@ -35,6 +35,58 @@ source rather than toy prompts.
 - **To review a large corpus, chunk it.** Several small reviews beat one large one, and
   the small regime is the one with evidence behind it.
 
+## How large a request can duo actually take?
+
+Measured end to end on real repository source with a planted defect, `default-big`,
+`temperature: 0.2`, `enable_thinking: false`:
+
+| request | prompt tok | total | result |
+|---|---|---|---|
+| 197k chars | 52,454 | 17 min | strict JSON, defect found |
+| 360k chars | 93,651 | 20 min | strict JSON, defect MISSED (see recall below) |
+| 480k chars | 125,652 | 32 min | strict JSON, defect found |
+| 620k chars | 163,596 | 43-99 min | strict JSON, defect found |
+| 800k chars | 212,600 | 60 min | strict JSON, defect found |
+| **907k chars** | **247,281** | **73 min** | **strict JSON, defect found** |
+| 961k chars | 262,532 | **0s — HTTP 400** | exceeds context size |
+
+**The practical ceiling is ~260,000 request tokens, and it is architectural.** Two of the
+three steps carry the request plus prior output:
+
+- plan prompt = instructions + request
+- **execute prompt = request + plan output** ← the binding constraint
+- review prompt = bounded request + plan + work
+
+At a 262,144-token request the execute step needs 263,760 and the engine refuses with
+`exceed_context_size_error`. So **the last ~6% of the model's window is unreachable by
+duo's design**, regardless of engine speed. A caller sizing to `n_ctx` will fail on step
+two even though step one fits.
+
+### Where the time goes
+
+Cost is prompt processing, and it is legitimate work. From per-step `promptMs` /
+`unaccountedMs` (recorded since 8a90315):
+
+| prompt size | prefill rate |
+|---|---|
+| 6k | 181 tok/s |
+| 54k | 144 tok/s |
+| 170k | 104 tok/s |
+| 213k | 84 tok/s |
+| 247k | 86 tok/s — decay has flattened |
+
+The execute step runs 3x faster (266 tok/s at 247k) because its prompt shares the request
+prefix with the plan step and hits the prompt cache. Only the first big step pays full
+price.
+
+Healthy `unaccountedMs` is **182ms to 15s** per step. One run showed 56.6 minutes there and
+has never reproduced; anything approaching the engine's 3600s per-step read timeout is a
+fault, not the expected cost of a large request.
+
+**Sizing a payload:** do not use `chars/4`. Measured density varies by file type — 3.77
+chars/token for `api/` + `ui/src`, 3.66 once tests and shell scripts are included. That 3%
+difference is what pushed one attempt 388 tokens over the window.
+
 ## How it was measured
 
 One unambiguous defect was planted in `api/gpu-reservations.js`:
