@@ -190,7 +190,7 @@ import {
   duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID,
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
   duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText, duoStepBudget,
-  reviewCollapsed, duoFailureContext,
+  reviewCollapsed, duoFailureContext, duoAnswer,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
   duoStepBody,
   duoStepFailure,
@@ -12784,7 +12784,10 @@ async function runDuoChainStepsInner(history, request, maxTokens, controls, star
   // `review` is now the ANSWER (the reviewer returns corrected work, not commentary),
   // so the envelope keeps plan and work for inspection. Nothing is lost: the caller
   // receives the answer it asked for, and both intermediate steps remain visible.
-  return { plan, work, review, duo: { plan, work, elapsedMs: Date.now() - started, stats: duoChainStats(stepStats) } };
+  // The reviewer is told to output ONLY the answer, and measurably does not always comply —
+  // see duoAnswer, which unwraps a prose-wrapped JSON reply when the request was JSON-shaped.
+  const answer = duoAnswer(review, request);
+  return { plan, work, review: answer, duo: { plan, work, elapsedMs: Date.now() - started, stats: duoChainStats(stepStats) } };
 }
 
 /**

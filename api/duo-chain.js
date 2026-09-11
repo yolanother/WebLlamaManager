@@ -23,6 +23,7 @@
 // requests.
 // Unit-tested in duo-chain.test.js.
 
+import { recoverJsonObject } from './json-recovery.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 import { degenerateOutputReason } from './degenerate-output.js';
 
@@ -815,4 +816,38 @@ export function duoFailureContext(stats) {
     return `${role}(${ptok} tok, prompt ${prompt}ms, gen ${gen}ms, unaccounted ${unacct}ms)`;
   });
   return `completed steps: ${parts.join('; ')}`;
+}
+
+/**
+ * duo's final answer, with a prose-wrapped JSON reply unwrapped.
+ *
+ * `buildReviewPrompt` tells the reviewer to "Output ONLY the answer, in exactly the form the
+ * ORIGINAL REQUEST asked for — no commentary, no verdict, no preamble". It does not always
+ * comply: a measured 68,826-char run returned a prose critique followed by a ```json block,
+ * and a direct-model run at 20,562 tokens did the same. In both, the JSON inside was
+ * complete and correct, but a caller parsing strictly got nothing.
+ *
+ * The REQUEST decides whether unwrapping is safe — not the work. An earlier revision keyed
+ * off "did the worker answer in JSON", which fails on exactly the run that motivated this:
+ * there the worker answered in prose (it began rewriting the file) while the reviewer still
+ * produced prose-then-JSON.
+ *
+ * Two conditions must both hold, so a genuinely prose answer is never mangled:
+ *   - the request asked for JSON, and
+ *   - the reply ENDS with a balanced object ({@link recoverJsonObject} requires the object
+ *     to be the final content, so an aside mentioned mid-sentence does not qualify).
+ *
+ * Nothing is repaired; truncated input is refused.
+ *
+ * @param {string} review The review step's answer.
+ * @param {unknown} request The caller's original request, used to infer the wanted shape.
+ * @returns {string} The answer to return to the caller.
+ */
+export function duoAnswer(review, request) {
+  const text = typeof review === 'string' ? review : '';
+  if (!text.trim()) return text;
+  if (plainJsonObject(text)) return text;              // already strict JSON
+  if (!/\bjson\b/i.test(String(request ?? ''))) return text;  // the caller did not ask for JSON
+  const recovered = recoverJsonObject(text);
+  return recovered ? JSON.stringify(recovered) : text;
 }

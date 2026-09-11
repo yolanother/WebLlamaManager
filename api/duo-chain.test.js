@@ -29,6 +29,7 @@ import {
   duoStepFailure,
   reviewCollapsed,
   duoFailureContext,
+  duoAnswer,
   DUO_REVIEW_REQUEST_CHARS,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
@@ -767,4 +768,39 @@ test('reviewCollapsed: unparseable work with a NON-minimal review is not a colla
 
 test('reviewCollapsed: a review with no array fields at all is not a minimal instance', () => {
   assert.equal(reviewCollapsed('{"answer":"no"}', 'x'.repeat(400)), false);
+});
+
+// --- duo must not hand back prose when the answer inside it is JSON ----------------
+//
+// Measured: a 68,826-char duo run returned a prose critique followed by a ```json block.
+// The answer was correct and complete; strict JSON.parse failed, so a caller asking for a
+// schema got nothing usable. duo's own review prompt demands "Output ONLY the answer, in
+// exactly the form the ORIGINAL REQUEST asked for" — this enforces that when the request
+// was clearly JSON-shaped.
+
+test('duoAnswer: unwraps a prose-wrapped JSON answer when the request asked for JSON', () => {
+  const request = 'Review the source. Answer as strict JSON matching {"verdict":string}.';
+  const review = 'The work is broadly right.\n\n```json\n{"verdict":"concerns","concerns":[{"symbol":"_acquire","severity":"high"}]}\n```';
+  assert.equal(JSON.parse(duoAnswer(review, request)).concerns[0].severity, 'high');
+});
+
+test('duoAnswer: leaves an already-strict JSON answer untouched', () => {
+  const review = '{"verdict":"pass","concerns":[]}';
+  assert.equal(duoAnswer(review, 'Answer as strict JSON.'), review);
+});
+
+test('duoAnswer: leaves prose alone when the request did NOT ask for JSON', () => {
+  // A prose request must come back as prose — unwrapping an aside would mangle the answer.
+  const review = 'The most serious defect is in `_acquire`. Consider {"aside":1} as illustration.';
+  assert.equal(duoAnswer(review, 'Describe the most serious defect in plain prose.'), review);
+});
+
+test('duoAnswer: leaves prose alone when nothing is recoverable', () => {
+  const review = 'I could not determine whether the code is correct.';
+  assert.equal(duoAnswer(review, 'Answer as strict JSON.'), review);
+});
+
+test('duoAnswer: does not unwrap an object mentioned mid-sentence', () => {
+  const review = 'It returns {"a":1} on success, but I cannot verify the rest.';
+  assert.equal(duoAnswer(review, 'Answer as strict JSON.'), review);
 });
