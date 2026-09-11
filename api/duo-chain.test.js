@@ -737,3 +737,34 @@ test('duoFailureContext: tolerates a missing or malformed stats array', () => {
   assert.match(duoFailureContext(null), /no steps completed/i);
   assert.match(duoFailureContext(undefined), /no steps completed/i);
 });
+
+// --- reviewCollapsed must also fire when the WORK is unparseable ------------------
+//
+// Measured on drakemore 2026-09-11: a 154,789-token run's worker ran away to its full
+// 38,768-token budget, emitting 119,704 chars that began as JSON and were cut mid-string.
+// The reviewer then collapsed to 12 tokens. No retry fired, because reviewCollapsed
+// required BOTH sides to parse — so the protection was absent in exactly the case where the
+// reviewer most needs to rebuild the answer from the plan (which it demonstrably can: a run
+// whose work was 2 characters still produced 10 correct concerns).
+
+test('reviewCollapsed: fires when substantial work is unparseable and the review is minimal', () => {
+  const work = '{"verdict":"concerns","concerns":[{"symbol":"reservationView","issue":"' + 'x'.repeat(400);
+  assert.equal(reviewCollapsed('{"verdict":"pass","concerns":[]}', work), true);
+});
+
+test('reviewCollapsed: a SHORT unparseable work is not a collapse', () => {
+  // Nothing substantial was lost, so there is nothing worth spending a retry on.
+  assert.equal(reviewCollapsed('{"verdict":"pass","concerns":[]}', 'here is the corrected implementation'), false);
+});
+
+test('reviewCollapsed: unparseable work with a NON-minimal review is not a collapse', () => {
+  // The reviewer produced findings of its own — it rebuilt the answer, which is the
+  // behaviour we want, not a collapse.
+  const work = 'runaway prose '.repeat(40);
+  const review = '{"verdict":"concerns","concerns":[{"symbol":"_acquire","issue":"inverted"}]}';
+  assert.equal(reviewCollapsed(review, work), false);
+});
+
+test('reviewCollapsed: a review with no array fields at all is not a minimal instance', () => {
+  assert.equal(reviewCollapsed('{"answer":"no"}', 'x'.repeat(400)), false);
+});

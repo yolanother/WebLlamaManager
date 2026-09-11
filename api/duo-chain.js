@@ -752,15 +752,38 @@ function populatedArrayKeys(obj) {
  */
 export function reviewCollapsed(reviewText, workText) {
   const review = plainJsonObject(reviewText);
-  const work = plainJsonObject(workText);
-  if (!review || !work) return false;
-
-  const workPopulated = populatedArrayKeys(work);
-  if (workPopulated.length === 0) return false;
-  // The reviewer kept something the work had, or contributed a list of its own: judging.
+  if (!review) return false;
+  // The reviewer contributed a list of its own, so it rebuilt rather than discarded.
   if (populatedArrayKeys(review).length > 0) return false;
-  return workPopulated.some((k) => Array.isArray(review[k]) && review[k].length === 0);
+  const emptyArrays = Object.keys(review).filter((k) => Array.isArray(review[k]));
+  if (emptyArrays.length === 0) return false; // no collection to have emptied
+
+  const work = plainJsonObject(workText);
+  if (work) {
+    const workPopulated = populatedArrayKeys(work);
+    if (workPopulated.length === 0) return false;
+    return workPopulated.some((k) => Array.isArray(review[k]) && review[k].length === 0);
+  }
+
+  // Work that does not parse at all. Measured on drakemore 2026-09-11: a worker ran away to
+  // its full 38,768-token budget and emitted 119,704 chars cut mid-string, the reviewer
+  // collapsed to 12 tokens, and no retry fired because this function used to require BOTH
+  // sides to parse. That left the protection absent in exactly the case where the reviewer
+  // most needs to rebuild from the plan — which it demonstrably can, having produced 10
+  // correct concerns on a run whose work was 2 characters.
+  //
+  // Only SUBSTANTIAL unparseable work counts: a short prose reply means little was lost, and
+  // a retry costs a reviewer pass (~1.5s warm) that buys nothing.
+  return String(workText ?? '').trim().length >= UNPARSEABLE_WORK_FLOOR;
 }
+
+/**
+ * How much unparseable work counts as "something was produced and then discarded".
+ *
+ * Set well above a one-line refusal and well below the runaway that motivated it (119,704
+ * chars). The cost of being wrong is one warm-cache retry.
+ */
+const UNPARSEABLE_WORK_FLOOR = 200;
 
 /**
  * One-line summary of the chain steps that completed before a step failed.
