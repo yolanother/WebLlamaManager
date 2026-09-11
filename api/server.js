@@ -190,7 +190,7 @@ import {
   duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID,
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
   duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText, duoStepBudget,
-  reviewCollapsed,
+  reviewCollapsed, duoFailureContext,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
   duoStepBody,
   duoStepFailure,
@@ -12756,6 +12756,17 @@ const DUO_REVIEW_RETRIES = 3;
 async function runDuoChainSteps(history, request, maxTokens, controls = null) {
   const started = Date.now();
   const stepStats = [];
+  try {
+    return await runDuoChainStepsInner(history, request, maxTokens, controls, started, stepStats);
+  } catch (cause) {
+    // A failing chain used to drop every per-step measurement it had already taken, so the
+    // one run that needed diagnosis reported the least. Re-throw with the completed steps
+    // attached — see duoFailureContext for the measurement that prompted this.
+    throw new Error(`${cause.message} — ${duoFailureContext(stepStats)}`, { cause });
+  }
+}
+
+async function runDuoChainStepsInner(history, request, maxTokens, controls, started, stepStats) {
   const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats, controls);
   const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats, controls);
   const reviewMessages = duoStepMessages(history, buildReviewPrompt(request, plan, work));

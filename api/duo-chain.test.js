@@ -28,6 +28,7 @@ import {
   DUO_STEP_CEILING,
   duoStepFailure,
   reviewCollapsed,
+  duoFailureContext,
   DUO_REVIEW_REQUEST_CHARS,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
@@ -705,4 +706,34 @@ test('duoStepStats tolerates an engine that reports no timings', () => {
   const s = duoStepStats({ role: 'plan', model: 'm', elapsedMs: 5000, body: null });
   assert.equal(s.promptMs, 0);
   assert.equal(s.unaccountedMs, 5000);
+});
+
+// --- a failed chain must not discard the steps that DID complete ------------------
+//
+// Measured on drakemore 2026-09-10: a 247k run failed with
+// "duo step ... failed with HTTP 500 after 60m0s (3600107ms)" — one millisecond from an
+// earlier failure's 3600106ms, so a hard 3600s timer. But the error carried NO per-step
+// stats, because runDuoChainSteps throws and drops the collected array. The promptMs /
+// unaccountedMs fields added to diagnose exactly this were therefore invisible on the one
+// run that needed them. This makes the completed steps survive the failure.
+
+test('duoFailureContext: summarises the steps completed before a failure', () => {
+  const stats = [
+    { role: 'plan', model: 'p', elapsedMs: 2760000, promptMs: 2745000, generationMs: 14000, unaccountedMs: 1000 },
+    { role: 'execute', model: 'w', elapsedMs: 1068000, promptMs: 1062000, generationMs: 5000, unaccountedMs: 1000 },
+  ];
+  const s = duoFailureContext(stats);
+  assert.match(s, /plan/);
+  assert.match(s, /execute/);
+  // The point of the line is where the time went, so the numbers must be in it.
+  assert.match(s, /2745000|2745s|45\.8/);
+});
+
+test('duoFailureContext: says so plainly when nothing completed', () => {
+  assert.match(duoFailureContext([]), /no steps completed/i);
+});
+
+test('duoFailureContext: tolerates a missing or malformed stats array', () => {
+  assert.match(duoFailureContext(null), /no steps completed/i);
+  assert.match(duoFailureContext(undefined), /no steps completed/i);
 });

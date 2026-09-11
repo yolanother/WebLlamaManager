@@ -761,3 +761,35 @@ export function reviewCollapsed(reviewText, workText) {
   if (populatedArrayKeys(review).length > 0) return false;
   return workPopulated.some((k) => Array.isArray(review[k]) && review[k].length === 0);
 }
+
+/**
+ * One-line summary of the chain steps that completed before a step failed.
+ *
+ * A failing chain throws, and the per-step stats collected up to that point were being
+ * dropped — so the run that most needs diagnosis is the one that reports nothing. Measured
+ * on drakemore 2026-09-10: a 247k-token request failed with `HTTP 500 after 60m0s
+ * (3600107ms)`, one millisecond from an earlier failure's 3600106ms, and the error carried
+ * no indication of which step stalled or where its time went. The `promptMs` /
+ * `unaccountedMs` fields exist precisely to answer that and were invisible on the only run
+ * that needed them.
+ *
+ * Kept to a single line because it is appended to an error message, and deliberately
+ * includes the raw millisecond figures: the diagnostic question is whether a step's time
+ * was prompt processing (legitimate work, the ceiling is too low) or unaccounted (a fault
+ * to chase), and that is only answerable from the numbers.
+ *
+ * @param {Array<object>|null|undefined} stats Per-step stats collected so far.
+ * @returns {string} Human-readable summary, never empty.
+ */
+export function duoFailureContext(stats) {
+  if (!Array.isArray(stats) || stats.length === 0) return 'no steps completed before the failure';
+  const parts = stats.map((s) => {
+    const role = String(s?.role ?? '?');
+    const ptok = Number(s?.promptTokens ?? 0) || 0;
+    const prompt = Math.round(Number(s?.promptMs ?? 0) || 0);
+    const gen = Math.round(Number(s?.generationMs ?? 0) || 0);
+    const unacct = Math.round(Number(s?.unaccountedMs ?? 0) || 0);
+    return `${role}(${ptok} tok, prompt ${prompt}ms, gen ${gen}ms, unaccounted ${unacct}ms)`;
+  });
+  return `completed steps: ${parts.join('; ')}`;
+}
