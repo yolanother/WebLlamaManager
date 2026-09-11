@@ -310,7 +310,28 @@ every check a structured-output pipeline can apply.
 
 - Prefer several small reviews over one large one. ~10k tokens is the regime with
   evidence behind it.
-- **Ask CLOSED questions, not open ones. The output format is not the problem.** A
+- **Bound the SEARCH SPACE — by scope or by question. That is the whole rule.**
+
+  | shape | search space | result at 247k |
+  |---|---|---|
+  | closed question (prose or JSON) | one fact | 3/3 correct |
+  | closed extraction (JSON) | named symbols | 6/6 and 8/8, no positional falloff |
+  | **open hunt (JSON)** | **one named file** | **defect found, 0 fabricated symbols** |
+  | open hunt (JSON) | whole corpus | the failure this page documents |
+
+  Open-ended review still works at 247k tokens **if you name the file to examine** and leave
+  the rest as context. The same open task, unscoped at 54k, collapsed 17 times in 21 and
+  invented `_public`, `MATCH_SELECTORS` and an `rpcServerCommand` that exists nowhere in the
+  repo. Scoped to one file at 4.5x the size it returned strict JSON with every symbol real.
+
+  So discovery workflows do not have to degrade to lookups — they have to say where to look.
+
+  **Scoping suppresses fabrication, not misreading.** A scoped run still reported that
+  `reservationView` can return `ttlSeconds: 0`, quoting `Math.round(ttlMs / 1000)` and
+  ignoring the `Math.max(1, ...)` around it. The symbols and paths can be trusted; the
+  assertions still need checking.
+
+- **Ask CLOSED questions when you can. The output format is not the problem.** A
   controlled comparison at 247k tokens — same corpus, same closed question, once in prose
   and once demanding strict JSON — passed both times. Every failure on record came from
   open-ended requests ("find every defect"), regardless of format.
