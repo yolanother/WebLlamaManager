@@ -79,9 +79,25 @@ The execute step runs 3x faster (266 tok/s at 247k) because its prompt shares th
 prefix with the plan step and hits the prompt cache. Only the first big step pays full
 price.
 
-Healthy `unaccountedMs` is **182ms to 15s** per step. One run showed 56.6 minutes there and
-has never reproduced; anything approaching the engine's 3600s per-step read timeout is a
-fault, not the expected cost of a large request.
+Healthy `unaccountedMs` is **182ms to 15s** per step, but it has been measured as high as
+**56.9 minutes** on a 7,469-token review prompt.
+
+**`unaccountedMs` is most likely ENGINE CONTENTION, not an engine fault.** duo's chain steps
+call the engine port directly and bypass the manager queue, but they still serialize at the
+engine. A run showing minutes of unaccounted time is probably waiting behind other work.
+
+This was missed for a long time because the box was assumed idle. It was not — the
+production podcast pipeline runs on the same engine, and `/api/status` reports
+`queue.pending` for exactly this reason. **Check `queue.active` / `queue.pending` before
+trusting any duo timing**, and read `/api/queue` to see whose request is actually running.
+
+Two hypotheses were tested against the engine and refuted before contention was considered:
+slot reuse after a large request (a 6k request cost 37s cold, 62s after a 170k fill) and
+model eviction (replaying the chain's own model sequence put the final step at 51s). Both
+were the wrong mechanism.
+
+The one path that IS explained is prefill: a 247k plan step needs 46-55 minutes of genuine
+prompt processing against a hard 3600s per-step cut, leaving ~5 minutes of margin.
 
 **Sizing a payload:** do not use `chars/4`. Measured density varies by file type — 3.77
 chars/token for `api/` + `ui/src`, 3.66 once tests and shell scripts are included. That 3%
