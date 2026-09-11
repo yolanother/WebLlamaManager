@@ -313,6 +313,41 @@ Read the live template with `curl localhost:<engine-port>/props`.
 
 ## Failure mode 2 — the reviewer answers in prose
 
+**Fixed for duo; the utility is available to any caller.**
+
+The final content is commentary followed by a fenced block, so a strict `JSON.parse` fails
+even though the answer is present and correct. Both the caller's request and
+`buildReviewPrompt` demand JSON and nothing else.
+
+`duoAnswer` (api/duo-chain.js) now unwraps this, gated so a genuinely prose answer is never
+mangled: the request must have asked for JSON, and the reply must END with a balanced object.
+`recoverJsonObject` (api/json-recovery.js) does the extraction — parse strictly, else take
+the last balanced `{...}`.
+
+**Fence syntax is irrelevant to it.** Real replies used ```json, a bare ```, and no fence at
+all; a fence-label matcher mis-scored the bare one. The extractor ignores fences entirely.
+
+**It refuses truncated input.** A 119,704-char worker reply cut mid-string still contained
+one complete concern object; returning that would hand the caller a single finding dressed
+as the whole answer. Requiring the object to be the reply's final content rejects it.
+
+### If you call a model directly, do this instead of retrying
+
+The production podcast pipeline calls Flash-Next directly and, on an unparseable reply,
+re-runs the whole request — its retry prompt reads "Return exactly one complete JSON object
+... with no markdown fences, analysis, or prose". Every prose-wrapped reply measured here
+contained a complete, recoverable object, so that retry is usually avoidable.
+
+On a `--parallel 1` engine a retry queues behind whatever is running — measured at up to 76
+minutes of pure wait for a 7,589-token request — so recovering an answer that is already
+present is a latency fix as much as a correctness one.
+
+```js
+import { recoverJsonObject } from './api/json-recovery.js';
+const answer = recoverJsonObject(reply);   // null only when nothing is recoverable
+if (!answer) { /* now a retry is justified */ }
+```
+
 The final content is commentary followed by a ```json fence, so a strict `JSON.parse`
 fails even though the answer is present and correct. Both the caller's request and
 `buildReviewPrompt` demand JSON and nothing else. This is not retried — it is a distinct
