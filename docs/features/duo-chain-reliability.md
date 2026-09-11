@@ -82,19 +82,38 @@ price.
 Healthy `unaccountedMs` is **182ms to 15s** per step, but it has been measured as high as
 **56.9 minutes** on a 7,469-token review prompt.
 
-**`unaccountedMs` is most likely ENGINE CONTENTION, not an engine fault.** duo's chain steps
-call the engine port directly and bypass the manager queue, but they still serialize at the
-engine. A run showing minutes of unaccounted time is probably waiting behind other work.
+**`unaccountedMs` IS engine contention. Reproduced on demand at 253,000x.** The identical
+7,589-token request, sent three times straight to the Flash-Next child engine:
 
-This was missed for a long time because the box was assumed idle. It was not — the
-production podcast pipeline runs on the same engine, and `/api/status` reports
-`queue.pending` for exactly this reason. **Check `queue.active` / `queue.pending` before
-trusting any duo timing**, and read `/api/queue` to see whose request is actually running.
+| condition | wall | prompt_ms | gen_ms | **unaccounted** |
+|---|---|---|---|---|
+| engine idle | 57,601 ms | 56,241 | 1,342 | **18 ms** |
+| **155k request in flight** | **4,620,191 ms** | 58,770 | 1,371 | **4,560,049 ms (76 min)** |
+| engine idle again | 2,670 ms | 184 | 1,237 | **1,249 ms** |
 
-Two hypotheses were tested against the engine and refuted before contention was considered:
-slot reuse after a large request (a 6k request cost 37s cold, 62s after a 170k fill) and
-model eviction (replaying the chain's own model sequence put the final step at 51s). Both
-were the wrong mechanism.
+Prefill and generation barely move; only the waiting changes. **The engine runs
+`--parallel 1` — one slot, no interleaving — so a small request blocks for the entire
+duration of any large request already running.**
+
+duo's chain is plan (Flash-Next) -> execute (Qwen3.6-35B) -> review (Flash-Next). The review
+step is small and lands last on Flash-Next, so it waits for anything else using that model —
+including the production podcast pipeline, which uses exactly that model. A competitor
+longer than 60 minutes pushes the waiting step past the 3600s proxy read timeout and the
+chain fails with `proxy error: Failed to read connection`.
+
+**Fixes, in order of directness:**
+
+1. Raise `--parallel` on the duo models so small steps interleave instead of blocking. Note
+   the context splits across slots, so size it against the ~250k architectural request
+   ceiling above.
+2. Raise the 3600s per-step ceiling — independently justified, since a 247k plan step needs
+   46-55 minutes of legitimate prefill against that cut.
+3. Do not run duo and the podcast pipeline on one engine concurrently, or accept that each
+   will intermittently stall the other.
+
+**Before trusting any duo timing, check who else is on the engine.** `queue.pending` is not
+enough: it does not count work issued directly to a child engine, which is how duo's own
+steps run. Read `/api/queue` to see the active request.
 
 The one path that IS explained is prefill: a 247k plan step needs 46-55 minutes of genuine
 prompt processing against a hard 3600s per-step cut, leaving ~5 minutes of margin.
