@@ -330,10 +330,20 @@ every check a structured-output pipeline can apply.
   Controlled at CONSTANT payload size (154,789 tokens both runs), same corpus, same scoped
   task, only the planted file's position moved:
 
-  | depth | the worker's verdict on the planted guard | final answer |
+  | depth (all at 154,789 tok) | runs | plant reported |
   |---|---|---|
-  | 61% | "the preemption condition `priority < lowest.priority` is **inverted**" — `high` | 5 concerns, plant reported |
-  | **90%** | "the subsequent check ... **correctly ensures** strict preemption" | **`{"verdict":"pass","concerns":[]}`** |
+  | 61% | 2 | **1 of 2** |
+  | 90% | 2 | **0 of 2** |
+
+  Judgement degrades with depth, and even at 61% it is roughly a coin flip. An earlier
+  revision of this page claimed the first ~60% was safe; that rested on a single success
+  which did not replicate.
+
+  The three failures each had a DIFFERENT internal cause — the worker quoted the planted
+  guard and called it "correctly ensures strict preemption"; the worker emitted 21 tokens;
+  the worker ran away to its full 38,768-token budget producing 119,704 chars of
+  unterminated JSON — and **all three surfaced identically** as
+  `{"verdict":"pass","concerns":[]}`.
 
   **At depth the defect is examined and CLEARED, not missed.** The worker located the exact
   guard line, quoted it, and reached the opposite conclusion. A check for "did it look at
@@ -346,8 +356,10 @@ every check a structured-output pipeline can apply.
   (An earlier revision compared 0% against 89% at *different* payload sizes and could not
   separate depth from size. The constant-size pair above settles it: depth is the driver.)
 
-  **Put the material you want JUDGED in the first ~60% of the corpus.** Retrieval of named
-  symbols holds at any depth (8/8 spread 0-95%); judgement does not.
+  **Put the material you want JUDGED as early as possible, and do not rely on depth alone.**
+  Retrieval of named symbols holds at any depth (8/8 spread 0-95%); judgement degrades, and
+  is unreliable well before the end of the corpus. If the answer matters, keep the judged
+  material in a small corpus rather than early in a large one.
 
   **Scoping suppresses fabrication, not misreading.** A scoped run still reported that
   `reservationView` can return `ttlSeconds: 0`, quoting `Math.round(ttlMs / 1000)` and
