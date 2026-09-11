@@ -326,22 +326,28 @@ every check a structured-output pipeline can apply.
 
   So discovery workflows do not have to degrade to lookups — they have to say where to look.
 
-  **But scoping alone is NOT enough: the scoped file's POSITION decides the outcome.** The
-  identical task, with the scoped file moved from the front of the corpus to 89% through it:
+  **But scoping alone is NOT enough: the scoped file's POSITION decides the outcome.**
+  Controlled at CONSTANT payload size (154,789 tokens both runs), same corpus, same scoped
+  task, only the planted file's position moved:
 
-  | scoped file position | plant found | claims |
+  | depth | the worker's verdict on the planted guard | final answer |
   |---|---|---|
-  | 0% (front) | **yes**, `high` | sound |
-  | 89% (deep) | **no** | 8/8 symbols real, **8/8 claims false** |
+  | 61% | "the preemption condition `priority < lowest.priority` is **inverted**" — `high` | 5 concerns, plant reported |
+  | **90%** | "the subsequent check ... **correctly ensures** strict preemption" | **`{"verdict":"pass","concerns":[]}`** |
 
-  At depth it named genuine methods and invented their contents — "`markHeld` calls
-  `this._now()` but `_now` is not defined in the class" when `_now(` is defined right there;
-  "`_drain` uses an undeclared variable `pool`" when the signature is `_drain(gpu)`. That is
-  worse than the shallow failure mode, because an existence check on the symbols passes all
-  eight.
+  **At depth the defect is examined and CLEARED, not missed.** The worker located the exact
+  guard line, quoted it, and reached the opposite conclusion. A check for "did it look at
+  the right code?" passes — it looked, and got the answer backwards. That is harder to
+  detect than an omission or an invented symbol.
 
-  **Put the material you care about EARLY in the corpus.** Retrieval of named symbols holds
-  at any depth (8/8 spread 0-95%), but JUDGEMENT about a file does not.
+  In the same run the reviewer then collapsed to `{"verdict":"pass","concerns":[]}` and all
+  three retries collapsed identically, so both failure modes can stack.
+
+  (An earlier revision compared 0% against 89% at *different* payload sizes and could not
+  separate depth from size. The constant-size pair above settles it: depth is the driver.)
+
+  **Put the material you want JUDGED in the first ~60% of the corpus.** Retrieval of named
+  symbols holds at any depth (8/8 spread 0-95%); judgement does not.
 
   **Scoping suppresses fabrication, not misreading.** A scoped run still reported that
   `reservationView` can return `ttlSeconds: 0`, quoting `Math.round(ttlMs / 1000)` and
