@@ -328,6 +328,20 @@ every check a structured-output pipeline can apply.
   where the collapse to `{"verdict":"pass","concerns":[]}`, the prose wrapping, the silent
   recall misses and the confident false positives all live. A closed request removes it.
 
+  **Closed extraction also scales to several items at once, and reports absence honestly.**
+  Asked for the defining file and parameter count of 6 named exports across a 247k-token
+  corpus, duo returned all 6 in strict JSON: correct for the 3 whose files were in the
+  corpus, and `"not found"` for the 3 whose files had been cut by truncation. It did not
+  invent file paths for the missing symbols — where the same model, asked OPEN questions,
+  had earlier fabricated `_public`, `MATCH_SELECTORS` and an `rpcServerCommand` that exists
+  nowhere in the repo.
+
+  That matters more than the accuracy figure: a fabricated field is indistinguishable from a
+  real one downstream, so a shape that reports absence as absence is what a structured
+  pipeline actually needs.
+
+  Closed questions at 247k tokens are 4/4 — prose and JSON, single-fact and multi-item.
+
   The sharpest demonstration: asked open, duo twice claimed `reservationView` can return
   `ttlSeconds: 0`, quoting `Math.round(ttlMs / 1000)` while dropping the `Math.max(1, ...)`
   clamp beside it. Asked that exact question directly at 247k, it quoted the complete
