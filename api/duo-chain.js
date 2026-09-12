@@ -786,55 +786,6 @@ export function reviewCollapsed(reviewText, workText) {
  */
 const UNPARSEABLE_WORK_FLOOR = 200;
 
-/**
- * Fewest words before a work product is judged for degeneracy.
- *
- * A runaway always runs to its full token budget — not stopping is what it IS — so it is
- * never short. The floor exists only so a brief, legitimately repetitive answer ("yes.
- * yes. yes.") is never scored. Set above the longest healthy work measured in the
- * drakemore campaign that still looked short (208 words).
- */
-const DEGENERATE_WORD_FLOOR = 500;
-
-/**
- * Unique-word ratio at or below which work is a repetition loop rather than an answer.
- *
- * Measured on drakemore 2026-09-12 across eight duo runs on real repo source:
- *
- *   healthy work    0.47 - 0.59   (8 runs, 208 - 1,704 words)
- *   repetition loop 0.0072        (126,123 chars, 10,533 words, 76 distinct)
- *
- * 0.15 sits 3x below the worst healthy run and 20x above the runaway, so neither bound is
- * close. Varied output cannot reach it: even minified JSON carries distinct keys and values.
- */
-const DEGENERATE_UNIQUE_RATIO = 0.15;
-
-/**
- * Whether a work step collapsed into a repetition loop instead of answering.
- *
- * The failure this exists for: on 2026-09-12 an execute step consumed its entire
- * 36,768-token budget (868s of generation) emitting one 125KB line of '`backend`,
- * `backendId`, ' repeated, then the review step turned that into 702 tokens of confident,
- * schema-valid JSON — four of its seven findings asserting that files present in the
- * request had not been provided. The caller received HTTP 200 and valid JSON with no
- * indication that the chain had produced nothing. A grammar constraint guarantees the
- * SHAPE of the review's output and can say nothing about its provenance, so the collapse
- * has to be caught on the work, before the reviewer launders it.
- *
- * {@link reviewCollapsed} cannot see this case: it tests work that is substantial but
- * unparseable, and a repetition loop is substantial AND parseable — merely meaningless.
- *
- * Deliberately a vocabulary test, not a length test. Mean line length separates these runs
- * too (25,225 vs 72 - 389) but would misjudge a legitimate single-line JSON answer.
- *
- * @param {unknown} workText The work step's output.
- * @returns {boolean} True when the work is a repetition loop and must not reach the reviewer.
- */
-export function workDegenerate(workText) {
-  const words = String(workText ?? '').split(/\s+/).filter(Boolean);
-  if (words.length < DEGENERATE_WORD_FLOOR) return false;
-  return new Set(words).size / words.length <= DEGENERATE_UNIQUE_RATIO;
-}
 
 /**
  * One-line summary of the chain steps that completed before a step failed.

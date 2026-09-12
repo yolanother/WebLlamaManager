@@ -59,6 +59,60 @@ export function degenerateOutputReason(text) {
 }
 
 /**
+ * Fewest words before an output is judged for looping. A loop always runs to its full
+ * token budget — not stopping is what it IS — so it is never short. The floor exists only
+ * so a brief, legitimately repetitive answer ("yes. yes. yes.") is never scored. Set above
+ * the longest healthy duo work measured that still looked short (208 words).
+ */
+const LOOP_WORD_FLOOR = 500;
+
+/**
+ * Unique-word ratio at or below which an output is a loop rather than an answer.
+ *
+ * Measured on drakemore 2026-09-12 across eight duo runs on real repo source:
+ *
+ *   healthy work  0.47 - 0.59   (8 runs, 208 - 1,704 words)
+ *   looping work  0.0072        (126,123 chars, 10,533 words, 76 distinct)
+ *
+ * 0.15 sits 3x below the worst healthy run and 20x above the loop, so neither bound is
+ * close. Varied output cannot reach it: even minified JSON carries distinct keys and values.
+ */
+const LOOP_UNIQUE_RATIO = 0.15;
+
+/**
+ * Why an output looks like a repetition LOOP, or null when it looks fine.
+ *
+ * The failure {@link degenerateOutputReason} deliberately does not cover: not one
+ * character repeated, but a phrase repeated with normal-looking syntax. Measured on
+ * drakemore 2026-09-12, a duo execute step consumed its entire 36,768-token budget (868s
+ * of generation) emitting one 125KB line of '`backend`, `backendId`, ' repeated. The
+ * single-character test passes it, because every character is ordinary.
+ *
+ * This matters most where a later step or a grammar constraint can launder the result:
+ * in the measured run the duo reviewer turned that output into 702 tokens of confident,
+ * schema-valid JSON, four of its seven findings asserting that files present in the
+ * request had not been provided, and the caller saw HTTP 200 with valid JSON.
+ *
+ * Deliberately a vocabulary test, not a length test. Mean line length separates the same
+ * runs (25,225 vs 72 - 389) but would misjudge a legitimate single-line JSON answer.
+ *
+ * Currently wired into the duo execute step only, which is where it was measured. It is
+ * NOT part of completion-output-guard: flagging every completion on this basis has not
+ * been measured, and a false positive rejects a real answer.
+ *
+ * @param {unknown} text Completion text to judge.
+ * @returns {string|null} Human-readable reason naming the ratio, or null.
+ */
+export function loopingTextReason(text) {
+  if (typeof text !== 'string') return null;
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length < LOOP_WORD_FLOOR) return null;
+  const distinct = new Set(words).size;
+  if (distinct / words.length > LOOP_UNIQUE_RATIO) return null;
+  return `output was ${words.length} words with only ${distinct} distinct — a repetition loop, not an answer`;
+}
+
+/**
  * Whether a completion is degenerate. Thin predicate over {@link degenerateOutputReason}
  * for call sites that only need the boolean.
  *

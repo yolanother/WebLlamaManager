@@ -237,3 +237,25 @@ test('very short lines are ignored, so a stray repeated token is not a loop', ()
 test('the line threshold is high enough that a false abort is implausible', () => {
   assert.ok(STREAM_LINE_REPEAT_LIMIT >= 25, 'too low risks discarding a real answer');
 });
+
+import { loopingTextReason } from './degenerate-output.js';
+
+test('loopingTextReason catches a phrase loop the single-character test passes', () => {
+  // Measured on drakemore 2026-09-12 (/tmp/p2_1.json): a duo execute step ran to its exact
+  // 36,768-token budget emitting one 125KB line of '`backend`, `backendId`, ' repeated.
+  // The reviewer then laundered it into 7 confident, schema-valid, mostly false findings
+  // and the caller saw HTTP 200 with valid JSON.
+  const loop = 'I reviewed the code.\n' + '`backend`, `backendId`, '.repeat(5000);
+  assert.match(loopingTextReason(loop), /repetition loop, not an answer/);
+  // The character test cannot see it — every character is ordinary.
+  assert.equal(degenerateOutputReason(loop), null);
+
+  // Healthy duo work measured in the same campaign ran 0.47-0.59 unique-word ratio.
+  const healthy = Array.from({ length: 600 }, (_, i) => `finding ${i} concerns symbol s${i}`).join('\n');
+  assert.equal(loopingTextReason(healthy), null);
+
+  // Short answers are never judged — a brief reply has nothing to have run away with.
+  assert.equal(loopingTextReason('yes. yes. yes. yes. yes.'), null);
+  assert.equal(loopingTextReason(''), null);
+  assert.equal(loopingTextReason(null), null);
+});
