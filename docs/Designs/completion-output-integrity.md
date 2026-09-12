@@ -152,3 +152,92 @@ Qwen3.6 is, by its `<tool_call>` / `<function=` / `<parameter=` markers). The
 handler gates on a non-empty schema object, and a bare `json_object` yields an
 empty one. Supply a real schema — either `{"type":"json_object","schema":{...}}`
 or `{"type":"json_schema","json_schema":{"schema":{...}}}` — to get a grammar.
+
+## Runtime incident: in-line phrase loop, 2026-09-12
+
+A third loop shape, and the first one that no existing detector saw.
+
+A duo execute step (Qwen3.6-35B-A3B, drakemore, reviewing 41,027 chars of real
+repo source) ran 883s and consumed **36,768** completion tokens — exactly
+`duoStepBudget(4000)` = `min(4000 + 32768, 49152)`, so it ran to the ceiling. The
+126,123-char output is five non-blank lines; the last is a single ~125KB line of
+`` `backend`, `backendId`, `` repeated. 10,533 words, **76 distinct** (0.0072).
+
+Replayed through every detector in this module:
+
+| detector | shape it looks for | result |
+|---|---|---|
+| `degenerateOutputReason` | the whole output is ONE punctuation character | missed |
+| `createRepetitionMonitor` character run | a run of one character in the stream | missed |
+| `createRepetitionMonitor` line repeat | the same LINE repeated `STREAM_LINE_REPEAT_LIMIT` times | missed |
+| `loopingTextReason` (new) | vocabulary collapse over the whole output | **caught** |
+
+The line detector missed it for the same structural reason the character detector
+missed the 2026-09-08 loop: the repetition is one level below what it measures.
+There the phrase repeated across lines; here it repeats *within* a single line, so
+there are only five lines and none repeats. The three detectors are complementary,
+not redundant — one per level: character, line, phrase.
+
+`loopingTextReason` is therefore a vocabulary test rather than a structural one:
+unique words over total words, judged only above 500 words because a loop always
+runs to its full budget and is never short. Measured across eight duo runs on real
+repo source, healthy work sits at 0.47 - 0.59 and this run at 0.0072, so the 0.15
+threshold sits 3x below the worst healthy run and 20x above the loop. Verified
+against all eight captured runs: 1/1 on the failure, 0/7 false positives.
+
+Mean line length separates the same runs too (25,225 vs 72 - 389) and was rejected
+as the signal: it would misjudge a legitimate single-line JSON answer, which
+vocabulary variety does not.
+
+Sampling matched the 2026-09-08 incident's finding that no repetition penalty is
+ever set, with a new wrinkle. The caller sent only `temperature: 0.2`;
+`duoCallerControls` forwarded it, and `injectModelSamplingDefaults` then filled
+every field the caller had left undefined from the Qwen3.6 **thinking** recipe. The
+step therefore ran temp 0.2 + top_p 0.95 + top_k 20 + min_p 0.0 + no
+`repeat_penalty` on a request with `enable_thinking: false` — a hybrid of two
+recipes that is neither, and near-greedy decoding with a narrow top_k and no
+repetition penalty is the textbook loop configuration. Recipes are applied
+per-field, so one caller-set knob is enough to produce it.
+
+### Why this one mattered more than a malformed response
+
+It was laundered. The duo reviewer, handed 126KB of that, did not fail: it emitted
+702 tokens of confident, schema-valid JSON with seven findings, four of them
+`severity: "high"` asserting that files "not provided in the source code snippet"
+could not be reviewed — for four files that were in the request all along, cut only
+by the review step's own 20,000-char request bound. The caller received HTTP 200,
+valid JSON, schema-conformant, with nothing to indicate the chain had produced
+nothing.
+
+Constrained decoding fixes the SHAPE of an output and can say nothing about its
+provenance. Validating the last step's output says nothing about whether any
+earlier step worked, which is why `loopingTextReason` runs on the duo execute
+step's work rather than on the answer. It is deliberately NOT wired into
+`completion-output-guard`: judging every completion on this basis has not been
+measured, and a false positive rejects a real answer.
+
+## Runtime incident: eviction loop on a caller-side failure, 2026-09-12
+
+Not an output-integrity failure — a recovery-action failure, found while watching
+for engine restart loops on Frostburn under production podcast load.
+
+Nine model evictions in 6.5 minutes, eight of them `REASONING_EXHAUSTED`. In a
+194-request window only 33% succeeded (502: 39%, 503 "Rerouted ... Retry.": 31%),
+and 62 of the 72 exhaustion errors were `max_tokens: 100` sent to a
+thinking-enabled Qwen3-8B — a request that cannot be satisfied as sent, arriving
+about nine times a minute.
+
+Every one of those evicted the model. Eviction exists to replace a child stuck
+producing garbage for every subsequent request; a healthy model that ran out of
+budget produces exactly the same result after a reload, so each eviction paid a
+full model reload to change nothing and the next request evicted again.
+
+`corruptionIsChildFault(code)` now gates it: `DEGENERATE_OUTPUT` and
+`QUESTION_MARK_ONLY_OUTPUT` evict, everything else does not, and unknown codes must
+opt in deliberately. The guard sits inside `recycleCorruptModel` so all four call
+sites are covered once. One genuine `DEGENERATE_OUTPUT` occurred in the same
+window and still evicts, as it should — it was 1 request in 194, previously buried
+in the exhaustion noise.
+
+The contract line above ("evicts the model so its next request loads a fresh
+child") applies to the degenerate and question-mark codes only.
