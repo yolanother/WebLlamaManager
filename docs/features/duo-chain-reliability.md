@@ -441,15 +441,96 @@ Note that duo owns `max_tokens` — a caller's value is an allowance for the ans
 each step gets `duoStepBudget()` (up to `DUO_STEP_CEILING`). A runaway step therefore
 burns the step ceiling regardless of what the caller asked for.
 
+## Failure mode 4 — the worker loops and the reviewer launders it
+
+The most dangerous one measured, because the caller sees a clean success.
+
+Measured on drakemore 2026-09-12, a 41,027-char (~11.2k token) code-review request
+against `default-big` with a findings-only schema, `max_tokens: 4000`, `temperature: 0.2`,
+`enable_thinking: false`:
+
+| step | model | wall | prompt ms | gen ms | prompt tok | completion tok |
+|---|---|---|---|---|---|---|
+| plan | Qwen3.8-Flash-Next | 148s | 60,437 | 87,549 | 10,566 | 1,302 |
+| execute | Qwen3.6-35B-A3B | 883s | 13,312 | **868,247** | 11,862 | **36,768** |
+| review | Qwen3.8-Flash-Next | 310s | 247,984 | 60,861 | 43,393 | 702 |
+
+The execute step's 126,123-char output is five non-blank lines; the last is a ~125KB
+single line of `` `backend`, `backendId`, `` repeated until the budget ran out. It never
+mentions any term the request was about. 36,768 is exactly `duoStepBudget(4000)` =
+`min(4000 + 32768, 49152)`, so the loop ran to the ceiling — 868 seconds of generation
+producing nothing.
+
+**The reviewer did not fail on that.** It emitted 702 tokens of confident, schema-valid
+JSON with seven findings. Four, all `severity: "high"`, stated that files "not provided in
+the source code snippet" could not be reviewed — for four files that *are* in the request,
+at offsets 16,361 / 34,573 / 36,934 / 38,206, cut only by `boundedReviewRequest`'s own
+20,000-char bound, whose marker explicitly says not to assume the omitted part is absent.
+A fifth flagged a design decision the inline comment three lines below it explains.
+
+The caller received HTTP 200, valid JSON, schema-conformant, with nothing to indicate the
+chain had produced nothing at all.
+
+### Why each existing guard missed it
+
+- `degenerateOutputReason` requires the whole output to be ONE punctuation character. Its
+  header names this case and declines it on purpose: a long run of a letter "is a
+  different failure (looping text)".
+- `reviewCollapsed` tests work that is substantial but *unparseable*. A repetition loop is
+  substantial AND parseable — merely meaningless.
+- The grammar constraint fixes the SHAPE of the review's output and can say nothing about
+  its provenance. Constrained decoding over garbage input yields well-formed garbage.
+
+### What the chain does about it
+
+`loopingTextReason` (api/degenerate-output.js) judges the execute step's output before the
+reviewer ever sees it, and the chain throws rather than letting a later step launder it.
+It is a vocabulary test, not a length test. Unique-word ratio across eight duo runs on
+real repo source:
+
+| | unique-word ratio | size |
+|---|---|---|
+| healthy work (8 runs) | 0.47 - 0.59 | 208 - 1,704 words |
+| repetition loop | **0.0072** | 10,533 words, 76 distinct |
+
+The 0.15 threshold sits 3x below the worst healthy run and 20x above the loop. Mean line
+length separates the same runs too (25,225 vs 72 - 389) but would misjudge a legitimate
+single-line JSON answer. Verified against all eight captured runs: 1/1 on the failure,
+0/7 false positives. It is wired into the duo execute step only, not into
+`completion-output-guard`, because that is the only place it has been measured.
+
+### Three contributing causes, not yet addressed
+
+1. **`duoStepBudget` grants 9.2x the requested `max_tokens`.** `DUO_REASONING_HEADROOM` is
+   32,768 and the comment calls it "free on the normal path" — true, but a looping model
+   consumes 100% of it, and 32,768 tokens at 42 tok/s is 13 minutes of waste per step on a
+   three-step chain.
+2. **Sampling recipes are applied per-field, so a caller gets a hybrid of two.**
+   `duoCallerControls` forwards `temperature`/`top_p`/`top_k`/`min_p`/`repeat_penalty`;
+   `injectModelSamplingDefaults` then fills every field the caller left undefined. Setting
+   only `temperature: 0.2` on a Qwen3.6 request therefore ran **temp 0.2 (caller) + top_p
+   0.95 + top_k 20 + min_p 0.0 (the Qwen3.6 THINKING recipe) + no repeat_penalty** on a
+   request with `enable_thinking: false`. Near-greedy sampling with a narrow top_k and no
+   repetition penalty is the textbook repetition-loop configuration, and it is neither
+   recipe.
+3. **`DUO_REVIEW_REQUEST_CHARS = 20000` manufactures false findings.** On any request over
+   20k chars the reviewer sees a cut corpus, and it asserted absence four times at high
+   severity despite the marker telling it not to.
+
 ## What the output guards do and do not catch
 
-`api/completion-output-guard.js` and `degenerateOutputReason` correctly pass all three
-failures above, because none of them are structurally malformed. `duoStepText` already
+`api/completion-output-guard.js` and `degenerateOutputReason` correctly pass failures 1-3
+above, because none of them are structurally malformed. `duoStepText` already
 runs the degenerate check on every step, so a corrupt engine emitting `/////` is caught —
 but a plausible-looking wrong answer is not, and cannot be.
 
 A schema-valid wrong answer is more dangerous than a malformed one, not less: it passes
 every check a structured-output pipeline can apply.
+
+Failure 4 is the same principle one step worse: there the answer was schema-valid and the
+step that produced its input had emitted nothing at all. Validating the last step's output
+says nothing about whether any earlier step worked, which is why `loopingTextReason` runs
+on the work rather than on the answer.
 
 ## Practical guidance
 
