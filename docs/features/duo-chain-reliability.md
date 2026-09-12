@@ -364,6 +364,33 @@ These are distinct modes. Use the schema for the first; for the second, read
 `duo.work` — the chain records it, and in that run the work was 5,332 tokens of real
 analysis while the answer was empty.
 
+**A schema cannot enforce CROSS-FIELD CONSISTENCY, and this model gets it wrong every
+time.** Six runs at ~11k tokens, two enum orderings, same corpus:
+
+| enum order | runs | `verdict` | concerns reported | consistent |
+|---|---|---|---|---|
+| `["pass","concerns"]` | 3 | `pass` x3 | 2, 1, 1 | **0/3** |
+| `["concerns","pass"]` | 3 | `pass` x3 | 1, 1, 2 | **0/3** |
+
+**6/6 said `pass` while listing defects**, four of them including the planted bug the model
+had correctly found and written down. Reversing the enum changed nothing, so it is not order
+bias — the verdict is produced independently of the findings and defaults to `pass`.
+
+This is the most dangerous shape on this page. Every structural check passes — valid JSON,
+legal enum value, conforming keys, non-empty array — so a consumer doing the obvious thing:
+
+```js
+if (result.verdict === 'pass') return;   // nothing to do
+```
+
+discards a real defect with no parse error and no signal. Prose-wrapping at least fails
+loudly at the parse step; a collapse returns an empty array so nothing is lost. This
+produces correct findings with an incorrect summary and invites you to trust the summary.
+
+**Trust the array, not the verdict** — or better, do not ask for a summary field at all. A
+schema containing only the findings array cannot contradict itself, and a verdict is
+derivable from it anyway.
+
 **Three things to get right:**
 
 | declaration | what it guarantees |
