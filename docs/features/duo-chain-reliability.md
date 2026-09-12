@@ -347,6 +347,23 @@ same 41k corpus): constrained decoding stops the model spending tokens on preamb
 deliberation. On a `--parallel 1` engine that also shortens the window in which the request
 blocks everything else.
 
+**An enforced schema does NOT prevent the collapse — it legitimises it.** Measured: a
+199,466-token duo run with an enum-constrained schema returned
+`{"verdict":"pass","concerns":[]}`, all three retries returned the same, and the planted
+defect was missed. `verdict: "pass"` is inside the enum, `concerns: []` satisfies the array
+type, every key conforms, strict parse succeeds. **Every structural check passes on an
+answer containing nothing** — and the grammar arguably makes a collapse HARDER to spot,
+because the output now conforms perfectly instead of looking malformed.
+
+| failure mode | enforced schema |
+|---|---|
+| prose-wrapped JSON | **prevents it** |
+| empty-verdict collapse | **no effect** — the empty answer conforms |
+
+These are distinct modes. Use the schema for the first; for the second, read
+`duo.work` — the chain records it, and in that run the work was 5,332 tokens of real
+analysis while the answer was empty.
+
 **Three things to get right:**
 
 | declaration | what it guarantees |
