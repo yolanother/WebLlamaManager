@@ -851,3 +851,29 @@ export function duoAnswer(review, request) {
   const recovered = recoverJsonObject(text);
   return recovered ? JSON.stringify(recovered) : text;
 }
+
+/**
+ * The caller's generation controls as one chain step should see them.
+ *
+ * `response_format` describes the ANSWER, and only the review step produces the answer. It
+ * used to reach every step, and because a `json_schema` is grammar-enforced the effect was
+ * severe: measured on a 41,235-char request, the planner emitted `{verdict, concerns}`
+ * instead of a plan, the worker did the same, and the reviewer — handed "PLAN: {an answer}"
+ * — returned output byte-identical to the work. Three model calls, one answer, and the
+ * chain's structure silently gone. The result still parsed and was correct, so nothing
+ * surfaced the loss.
+ *
+ * Every other control (temperature, seed, stop, sampling knobs) legitimately applies to all
+ * steps and is passed through untouched.
+ *
+ * @param {?Object} controls Caller-supplied controls, or null.
+ * @param {string} role Chain step role: 'plan', 'execute', 'review', 'review-retry'.
+ * @returns {?Object} Controls for that step.
+ */
+export function duoStepControls(controls, role) {
+  if (!controls || typeof controls !== 'object') return controls;
+  if (String(role).startsWith('review')) return controls;
+  if (!('response_format' in controls)) return controls;
+  const { response_format: _dropped, ...rest } = controls;
+  return rest;
+}

@@ -190,7 +190,7 @@ import {
   duoChainModelEntry, duoAliasTargets, DUO_CHAIN_ID,
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
   duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText, duoStepBudget,
-  reviewCollapsed, duoFailureContext, duoAnswer,
+  reviewCollapsed, duoFailureContext, duoAnswer, duoStepControls,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
   duoStepBody,
   duoStepFailure,
@@ -12682,7 +12682,10 @@ async function duoChainStepRequest(model, messages, maxTokens, controls = null) 
  */
 async function duoChainStep(role, model, messages, maxTokens, collected, controls = null) {
   const startedAt = Date.now();
-  const { text, body } = await duoChainStepRequest(model, messages, maxTokens, controls);
+  // response_format describes the ANSWER, and only the review step produces it — see
+  // duoStepControls for what forwarding it to the planner did.
+  const stepControls = duoStepControls(controls, role);
+  const { text, body } = await duoChainStepRequest(model, messages, maxTokens, stepControls);
   collected.push(duoStepStats({ role, model, elapsedMs: Date.now() - startedAt, body }));
   return text;
 }

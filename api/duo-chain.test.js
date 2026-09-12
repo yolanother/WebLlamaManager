@@ -30,6 +30,7 @@ import {
   reviewCollapsed,
   duoFailureContext,
   duoAnswer,
+  duoStepControls,
   DUO_REVIEW_REQUEST_CHARS,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
@@ -803,4 +804,37 @@ test('duoAnswer: leaves prose alone when nothing is recoverable', () => {
 test('duoAnswer: does not unwrap an object mentioned mid-sentence', () => {
   const review = 'It returns {"a":1} on success, but I cannot verify the rest.';
   assert.equal(duoAnswer(review, 'Answer as strict JSON.'), review);
+});
+
+// --- a caller's response_format belongs to the ANSWER, not to every step -----------
+//
+// Measured on drakemore: a duo request carrying an enforced json_schema produced
+// {verdict, concerns} from ALL THREE steps — the planner could not emit a plan, because the
+// grammar forbade anything but the answer object. The chain silently became three attempts
+// at the same answer, and the review step's output was byte-identical to the work.
+
+test('duoStepControls: strips response_format from the plan and execute steps', () => {
+  const controls = { response_format: { type: 'json_schema' }, temperature: 0.2 };
+  for (const role of ['plan', 'execute']) {
+    const out = duoStepControls(controls, role);
+    assert.equal(out.response_format, undefined, `${role} must not be schema-constrained`);
+    assert.equal(out.temperature, 0.2, `${role} must keep other controls`);
+  }
+});
+
+test('duoStepControls: keeps response_format for the review step, which produces the answer', () => {
+  const controls = { response_format: { type: 'json_schema' }, temperature: 0.2 };
+  for (const role of ['review', 'review-retry']) {
+    assert.deepEqual(duoStepControls(controls, role).response_format, { type: 'json_schema' });
+  }
+});
+
+test('duoStepControls: passes everything through untouched when no response_format is set', () => {
+  const controls = { temperature: 0.2, seed: 7 };
+  assert.deepEqual(duoStepControls(controls, 'plan'), controls);
+});
+
+test('duoStepControls: tolerates null controls', () => {
+  assert.equal(duoStepControls(null, 'plan'), null);
+  assert.equal(duoStepControls(undefined, 'review'), undefined);
 });
