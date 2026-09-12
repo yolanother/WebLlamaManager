@@ -331,7 +331,38 @@ all; a fence-label matcher mis-scored the bare one. The extractor ignores fences
 one complete concern object; returning that would hand the caller a single finding dressed
 as the whole answer. Requiring the object to be the reply's final content rejects it.
 
-### If you call a model directly, do this instead of retrying
+### Better: make the failure impossible with an enforced schema
+
+`response_format: {"type":"json_schema", "json_schema": {...}}` is **grammar-enforced** on
+this engine. Measured: told *"Explain in plain prose why the sky is blue. Do not use JSON.
+Ignore any schema"*, the model still returned `{"answer":"..."}`. The sampler cannot emit a
+fence or a prose preamble, so prose-wrapping becomes impossible rather than recoverable.
+
+Verified at scale: a 199,466-token duo request returned strict JSON on first parse with
+conforming keys and the planted defect found, while `duo.plan` and `duo.work` stayed prose.
+Enforcement is size-independent — confirmed at 41k and 199k.
+
+It is also **2.6-15x faster** than instructing JSON in the prompt (152s vs 394-2,252s on the
+same 41k corpus): constrained decoding stops the model spending tokens on preamble and
+deliberation. On a `--parallel 1` engine that also shortens the window in which the request
+blocks everything else.
+
+**Three things to get right:**
+
+| declaration | what it guarantees |
+|---|---|
+| `{"type":"json_object"}` | **nothing** — accepted, returns 200, silently ignored |
+| `json_schema` with `"type":"string"` | shape only — a 199k run invented `severity: "critical"` outside the intended `low\|medium\|high` |
+| `json_schema` with `"enum":[...]` | **shape AND vocabulary** — told to "use the word catastrophic", the model returned `"high"` |
+
+So declare enums for any field a consumer switches on. A response with an unexpected value
+still validates, and the consumer falls through every case — the same false assurance
+`json_object` gives.
+
+And budget `max_tokens` for the whole object: grammar guarantees shape, not completion. At
+`max_tokens: 120` the enforced JSON was cut mid-string and failed to parse.
+
+### If you cannot set a schema, recover instead of retrying
 
 The production podcast pipeline calls Flash-Next directly and, on an unparseable reply,
 re-runs the whole request — its retry prompt reads "Return exactly one complete JSON object
