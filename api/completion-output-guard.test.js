@@ -397,3 +397,22 @@ test('corrupt output still wins over the exhaustion classification', () => {
   });
   assert.equal(err.body.error.code, 'DEGENERATE_OUTPUT');
 });
+
+import { corruptionIsChildFault } from './completion-output-guard.js';
+
+test('only a broken child is worth evicting a model for', () => {
+  // The two original signatures: a child stuck emitting one character. A reload is the
+  // only thing that fixes those, so they must keep evicting.
+  assert.equal(corruptionIsChildFault('DEGENERATE_OUTPUT'), true);
+  assert.equal(corruptionIsChildFault('QUESTION_MARK_ONLY_OUTPUT'), true);
+
+  // Exhaustion is not the child's fault: it spent the budget it was given on reasoning,
+  // and a freshly loaded child does exactly the same on the same request. Measured on
+  // Frostburn 2026-09-12: four evictions in 112s, all REASONING_EXHAUSTED, each paying a
+  // full model reload to change nothing.
+  assert.equal(corruptionIsChildFault('REASONING_EXHAUSTED'), false);
+
+  // Unknown codes do not get to unload a model.
+  assert.equal(corruptionIsChildFault('SOMETHING_NEW'), false);
+  assert.equal(corruptionIsChildFault(undefined), false);
+});

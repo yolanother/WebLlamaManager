@@ -160,6 +160,7 @@ import {
   QUESTION_MARK_ONLY_OUTPUT_ERROR,
   createChatCompletionStreamGuard,
   validateChatCompletionPayload,
+  corruptionIsChildFault,
   DEGENERATE_OUTPUT_ERROR,
 } from './completion-output-guard.js';
 import {
@@ -12203,11 +12204,16 @@ function injectModelSamplingDefaults(body) {
  * what to tell the caller, and a failed eviction must not mask the original fault.
  *
  * @param {string} model Concrete model id whose child produced corrupt output.
- * @param {string} reason Human-readable corruption reason, for the operator log.
+ * @param {string} reason Corruption CODE, both for the operator log and to decide whether
+ *   eviction can help at all (see corruptionIsChildFault).
  * @returns {Promise<void>} Resolves once the eviction attempt has completed.
  */
 async function recycleCorruptModel(model, reason) {
   if (!model) return;
+  // Eviction replaces a child that would keep producing garbage. A code that is not the
+  // child's fault gets a reload that changes nothing and repeats on the next request —
+  // see corruptionIsChildFault for the loop this caused on Frostburn.
+  if (!corruptionIsChildFault(reason)) return;
   addLog('models', `[corrupt-output] evicting ${model} so the next request reloads it — ${reason}`);
   console.warn(`[corrupt-output] evicting ${model}: ${reason}`);
   try {

@@ -143,6 +143,39 @@ function chatCompletionText(payload) {
 }
 
 /**
+ * Codes that mean the llama.cpp CHILD is broken and a reload is the remedy.
+ *
+ * Only these are worth evicting a model for. Both are the same signature — a child stuck
+ * emitting one character at full speed, which persists for every subsequent request until
+ * it is replaced.
+ */
+const CHILD_FAULT_CODES = Object.freeze(['DEGENERATE_OUTPUT', 'QUESTION_MARK_ONLY_OUTPUT']);
+
+/**
+ * Whether a corruption code indicates a broken child rather than a bad request.
+ *
+ * Eviction exists to replace a child that will keep producing garbage no matter what is
+ * asked of it. REASONING_EXHAUSTED is not that: the child is healthy and spent the budget
+ * it was given on reasoning, so a freshly loaded child produces exactly the same result on
+ * the same request. Its own error message says as much, pointing the CALLER at max_tokens
+ * and enable_thinking.
+ *
+ * Evicting on it is therefore a reload that changes nothing, and the next request repeats
+ * it. Measured on Frostburn 2026-09-12: four evictions in 112 seconds, all
+ * REASONING_EXHAUSTED, three of Qwen3-8B and one of Qwen3.6-35B-A3B, while the podcast
+ * pipeline was running — a self-sustaining loop that thrashes the GPU and never converges.
+ *
+ * Unknown codes are treated as not-the-child's-fault: unloading a model is disruptive and
+ * a new code should have to opt in deliberately.
+ *
+ * @param {unknown} code Corruption code from one of the guard's error bodies.
+ * @returns {boolean} True when evicting the model can plausibly help.
+ */
+export function corruptionIsChildFault(code) {
+  return CHILD_FAULT_CODES.includes(code);
+}
+
+/**
  * Validate a complete OpenAI chat-completion payload.
  *
  * Tool-call-only messages are valid, and so is empty output EXCEPT when the model was cut
