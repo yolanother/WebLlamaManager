@@ -32,6 +32,7 @@ import {
   duoAnswer,
   duoStepControls,
   DUO_REVIEW_REQUEST_CHARS,
+  workDegenerate,
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 
@@ -837,4 +838,24 @@ test('duoStepControls: passes everything through untouched when no response_form
 test('duoStepControls: tolerates null controls', () => {
   assert.equal(duoStepControls(null, 'plan'), null);
   assert.equal(duoStepControls(undefined, 'review'), undefined);
+});
+
+test('workDegenerate catches a repetition runaway and clears healthy work', () => {
+  // Measured on drakemore 2026-09-12 (/tmp/p2_1.json): the execute step ran to its exact
+  // 36,768-token budget emitting one 125KB line of '`backend`, `backendId`, ' repeated.
+  // The reviewer then laundered it into 7 confident, schema-valid, mostly false findings,
+  // and the caller saw HTTP 200 with valid JSON. reviewCollapsed cannot see this: the work
+  // is long and parseable, just meaningless.
+  const runaway = 'I reviewed the code.\n' + '`backend`, `backendId`, '.repeat(5000);
+  assert.equal(workDegenerate(runaway), true);
+
+  // Healthy work measured in the same campaign ran 0.47-0.59 unique-word ratio; the
+  // runaway above ran 0.007. Anything with normal vocabulary variety must pass.
+  const healthy = Array.from({ length: 600 }, (_, i) => `finding ${i} concerns symbol s${i}`).join('\n');
+  assert.equal(workDegenerate(healthy), false);
+
+  // Short answers are never judged — a brief reply has nothing to have run away with.
+  assert.equal(workDegenerate('yes. yes. yes. yes. yes.'), false);
+  assert.equal(workDegenerate(''), false);
+  assert.equal(workDegenerate(null), false);
 });

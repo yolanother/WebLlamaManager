@@ -191,6 +191,7 @@ import {
   isDuoChainRequest, buildPlanPrompt, buildExecutePrompt, buildReviewPrompt,
   duoConversation, duoStepMessages, duoStepStats, duoChainStats, duoStepText, duoStepBudget,
   reviewCollapsed, duoFailureContext, duoAnswer, duoStepControls,
+  workDegenerate,
   duoResponsesInputMessages, duoResponsesEnvelope, duoResponsesStreamEvents,
   duoStepBody,
   duoStepFailure,
@@ -12772,6 +12773,12 @@ async function runDuoChainSteps(history, request, maxTokens, controls = null) {
 async function runDuoChainStepsInner(history, request, maxTokens, controls, started, stepStats) {
   const plan = await duoChainStep('plan', DUO_PLANNER_ID, duoStepMessages(history, buildPlanPrompt(request)), maxTokens, stepStats, controls);
   const work = await duoChainStep('execute', DUO_WORKER_ID, duoStepMessages(history, buildExecutePrompt(request, plan)), maxTokens, stepStats, controls);
+  // A worker that collapses into a repetition loop must not reach the reviewer: the
+  // reviewer answers anyway, in the exact shape asked for, and the caller cannot tell
+  // that from a real answer. Failing here is the only honest outcome — see workDegenerate.
+  if (workDegenerate(work)) {
+    throw new Error('duo execute step produced degenerate output (repetition loop, no answer)');
+  }
   const reviewMessages = duoStepMessages(history, buildReviewPrompt(request, plan, work));
   let review = await duoChainStep('review', DUO_PLANNER_ID, reviewMessages, maxTokens, stepStats, controls);
   // On a large prompt the reviewer intermittently answers with the minimal instance of the
