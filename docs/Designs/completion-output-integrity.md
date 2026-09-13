@@ -218,6 +218,39 @@ the engine, bypassing Express entirely. So a duo step gets exactly the sampling 
 caller set, plus engine defaults — never the model-card recipe, and never the
 temperature 1.0 that recipe carries.
 
+### Two loop shapes, and why one detector cannot cover both
+
+A loop repeats either ONE phrase contiguously or a SET of lines in rotation, and the
+tests for them are different:
+
+| shape | example | uniq-word | tile coverage | distinct-line ratio |
+|---|---|---|---|---|
+| one phrase, contiguous | `` `backend`, `backendId`, `` x5,000 | 0.007 | **0.96** | 1.00 |
+| one phrase, contiguous | one 125KB line | 0.022 | **0.74** | 1.00 |
+| a set of lines, scattered | "Defect confirmed." x51 among 142 distinct lines over 912 | 0.047 | 0.09 | **0.15** |
+
+The single-giant-line loops score a distinct-line ratio of **1.00** — there is only one
+line, and it is unique — so a line test cannot see them. The line-cycling loop tiles
+only 9% — its repeats are scattered and its lines vary at the end, so no tail candidate
+matches its siblings — so the tile test cannot see it. **Neither test subsumes the
+other**, and shipping only the tile test produced a false negative on the third shape
+within hours.
+
+Adding the line test needs one more thing. The false POSITIVE that motivated the tile
+test — a 120-entry findings array — has a low distinct-line ratio too, **0.177**, which
+sits between the two real line-cycling loops at 0.150 and 0.141. No threshold separates
+them.
+
+Parseable JSON is therefore exempt outright: structured output is legitimately
+repetitive, and a runaway ramble does not emit balanced JSON. With that exemption the
+line threshold sits at 0.30 — 2.3x below the worst healthy run and 2x above the worst
+loop — instead of being squeezed into a 0.03-wide window.
+
+Final shape of the check: **above 500 words, not parseable JSON, vocabulary collapsed
+below 0.15, AND (a tail phrase tiling 35%+ of the text OR 60+ lines with a distinct-line
+ratio at or below 0.30)**. Verified against 26 captured work products: 5 loops caught, 0
+missed, 21 healthy cleared, 0 false positives.
+
 ### A loop does not have to run to the budget
 
 Measured 2026-09-13 at ~245k prompt tokens, the largest request tested: the execute

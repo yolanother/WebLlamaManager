@@ -895,8 +895,9 @@ chain had produced nothing at all.
 
 `loopingTextReason` (api/degenerate-output.js) judges the execute step's output before the
 reviewer ever sees it, and the chain throws rather than letting a later step launder it.
-It requires TWO conditions, both measured over the whole output and judged only above
-500 words:
+It requires vocabulary collapse AND one of two repetition shapes, judged only above 500
+words and never applied to parseable JSON (structured output is legitimately repetitive
+and a runaway ramble does not emit balanced JSON):
 
 | | unique-word ratio | tile coverage |
 |---|---|---|
@@ -914,10 +915,15 @@ JSON keys plus the same file and symbol repeat on every entry while each `issue`
 genuinely differs — so a vocabulary-only guard would have discarded a correct answer.
 Compression is no better: that array gzips to 0.023, BELOW a real loop's 0.036.
 
-Requiring both leaves 6x margin on vocabulary and 1.9x on coverage. Verified against all
-17 captured runs: 3 loops caught, 14 healthy cleared, 0 mismatches. It is wired into the
-duo execute step only, not into `completion-output-guard`, because that is the only place
-it has been measured.
+A loop repeats either one phrase contiguously or a SET of lines in rotation, and neither
+test sees the other's shape: the single-giant-line loops have a distinct-line ratio of
+1.00, and the line-cycling loop tiles only 9%. Shipping the tile test alone produced a
+false negative within hours. See "Two loop shapes" in the completion-output-integrity
+design note for the thresholds and their margins.
+
+Verified against all 26 captured work products: **5 loops caught, 0 missed, 21 healthy
+cleared, 0 false positives.** It is wired into the duo execute step only, not into
+`completion-output-guard`, because that is the only place it has been measured.
 
 ### Three contributing causes, not yet addressed
 
@@ -1028,6 +1034,17 @@ on the work rather than on the answer.
   1,013-token plan that had enumerated every boundary case to check. Bounding the
   question did not make the worker better; it made the PLAN good enough that the worker
   was not needed. Do not read the shape rule as improving comprehension.
+
+  **And it does not prevent the loop.** Replicated twice more on the identical bounded
+  payload: run 2 was clean and found the plant, run 3 **looped** — 912 lines with 142
+  distinct, plant missed. 2 of 3, which is indistinguishable from the ~21% pooled loop
+  rate across every size and shape measured.
+
+  So the honest statement is that bounding the question improves the QUALITY of the
+  answer when the chain works — 1-2 concerns with zero non-finding entries, against the
+  open prompt's 3 concerns of which 2 affirmed the code correct — and does nothing for
+  reliability. It is worth doing for the first reason alone; do not expect it to stop a
+  collapse.
 
 
   | shape | search space | result at 247k |
