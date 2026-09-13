@@ -161,7 +161,9 @@ It is **not** any of the failures the output guards look for:
 - not reasoning exhaustion — no reasoning content, zero reasoning tokens
 - not context overflow — the reviewer model serves at `--ctx-size 262144` against a
   93,310-token prompt-plus-budget total
-- not `MODEL_SAMPLING_DEFAULTS` — temperature was explicit on every run
+- not `MODEL_SAMPLING_DEFAULTS` — it never applies to duo at all (the duo branch
+  returns before the injection, and duo's step requests bypass Express for the engine
+  port), and temperature was explicit on every run besides
 
 It reproduces calling the reviewer model directly, with no duo code in the path:
 
@@ -505,14 +507,15 @@ single-line JSON answer. Verified against all eight captured runs: 1/1 on the fa
    32,768 and the comment calls it "free on the normal path" — true, but a looping model
    consumes 100% of it, and 32,768 tokens at 42 tok/s is 13 minutes of waste per step on a
    three-step chain.
-2. **Sampling recipes are applied per-field, so a caller gets a hybrid of two.**
-   `duoCallerControls` forwards `temperature`/`top_p`/`top_k`/`min_p`/`repeat_penalty`;
-   `injectModelSamplingDefaults` then fills every field the caller left undefined. Setting
-   only `temperature: 0.2` on a Qwen3.6 request therefore ran **temp 0.2 (caller) + top_p
-   0.95 + top_k 20 + min_p 0.0 (the Qwen3.6 THINKING recipe) + no repeat_penalty** on a
-   request with `enable_thinking: false`. Near-greedy sampling with a narrow top_k and no
-   repetition penalty is the textbook repetition-loop configuration, and it is neither
-   recipe.
+2. **Nothing ever sets a repetition penalty on a duo step.** `duoCallerControls`
+   forwards only the sampling fields the caller actually set — here just
+   `temperature: 0.2` — and everything else falls to engine defaults, with
+   `repeat_penalty` disabled. Near-greedy decoding with no repetition penalty is the
+   textbook loop configuration. Note that `MODEL_SAMPLING_DEFAULTS` does **not**
+   apply to duo and cannot be relied on to supply the missing knobs: the duo branch
+   (server.js:12992) returns before `injectModelSamplingDefaults` runs
+   (server.js:13157), and duo's step requests go straight to the engine port,
+   bypassing Express altogether.
 3. **`DUO_REVIEW_REQUEST_CHARS = 20000` manufactures false findings.** On any request over
    20k chars the reviewer sees a cut corpus, and it asserted absence four times at high
    severity despite the marker telling it not to.

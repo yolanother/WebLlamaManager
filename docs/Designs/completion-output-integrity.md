@@ -190,14 +190,19 @@ as the signal: it would misjudge a legitimate single-line JSON answer, which
 vocabulary variety does not.
 
 Sampling matched the 2026-09-08 incident's finding that no repetition penalty is
-ever set, with a new wrinkle. The caller sent only `temperature: 0.2`;
-`duoCallerControls` forwarded it, and `injectModelSamplingDefaults` then filled
-every field the caller had left undefined from the Qwen3.6 **thinking** recipe. The
-step therefore ran temp 0.2 + top_p 0.95 + top_k 20 + min_p 0.0 + no
-`repeat_penalty` on a request with `enable_thinking: false` — a hybrid of two
-recipes that is neither, and near-greedy decoding with a narrow top_k and no
-repetition penalty is the textbook loop configuration. Recipes are applied
-per-field, so one caller-set knob is enough to produce it.
+ever set. The caller sent only `temperature: 0.2`; `duoCallerControls` forwarded
+that and nothing else, so every other knob fell to the ENGINE's defaults, including
+`repeat_penalty` disabled. Near-greedy decoding with no repetition penalty is the
+textbook loop configuration.
+
+Worth recording because it is easy to assume otherwise: **`MODEL_SAMPLING_DEFAULTS`
+never applies to a duo request at all**, by two independent routes. The duo branch
+(`isDuoChainRequest`, server.js:12992) returns before `injectModelSamplingDefaults`
+runs at server.js:13157; and duo's own step requests are posted by
+`duoChainStepRequest` straight to `http://localhost:${LLAMA_PORT}/v1/chat/completions`,
+the engine, bypassing Express entirely. So a duo step gets exactly the sampling the
+caller set, plus engine defaults — never the model-card recipe, and never the
+temperature 1.0 that recipe carries.
 
 ### Why this one mattered more than a malformed response
 
