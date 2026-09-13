@@ -52,11 +52,10 @@ Measured end to end on real repository source with a planted defect, `default-bi
 | **907k chars** | **247,281** | **73 min** | **strict JSON, defect found** |
 | 961k chars | 262,532 | **0s — HTTP 400** | exceeds context size |
 
-Every row above used a handful of files. A later controlled test showed **file count
-matters more than size** — six files at 41k chars failed where two files at 205k and three
-files at 153k succeeded — so read this table as "large requests work when the corpus is a
-few files", not as a licence to pass many. See "Split by FILE COUNT" under practical
-guidance.
+File count does **not** appear to matter: 59 files at ~204k tokens behaved the same as 2
+files at ~205k — plant found, no loop, no attribution errors. An earlier claim on this page
+that file count mattered more than size was refuted by that test; see the loop-rate table
+under practical guidance.
 
 **The practical ceiling is ~260,000 request tokens, and it is architectural.** Two of the
 three steps carry the request plus prior output:
@@ -310,17 +309,24 @@ Both healthy three-file runs named it correctly and cited the right contradictio
 So this defect class is not invisible to duo, and the caveat the recall figures need
 is about corpus shape rather than defect kind. Three things follow:
 
-1. **File count drives the loop rate and the attribution errors.** Three files looped
-   once in nine runs across all three-file corpora; six files looped two in three. The
-   "file not provided" and "this file is EMPTY of the logic" findings appeared ONLY in
-   the six-file batch. A later size step confirmed file count and not size is the
-   variable — see "Split by FILE COUNT" under practical guidance.
-2. **Reducing file count is not a fix.** One three-file run hit the identical
-   36,768-token ceiling as the six-file loops. The loop is a baseline hazard at this
-   size and `loopingTextReason` is what makes it visible; fewer files only improves
-   the odds.
-3. **Split a review by FILE COUNT, not only by token count.** At essentially constant
-   size, three files to six took this from found-in-218s to 0/3.
+1. **This looked like a file-count effect and is not one.** Six files looped two in
+   three while three files looped once in nine, which is why an earlier version of this
+   page told you to split by file count. A test built to falsify that — 59 files at the
+   same ~204k size that had just succeeded with 2 — came back clean, so the rule does
+   not hold. See the loop-rate table under practical guidance: 3 loops in 18 runs, and
+   no corpus property measured so far predicts which.
+2. **The loop is a baseline hazard, not a corpus property.** One three-file run hit the
+   identical 36,768-token ceiling as the six-file loops. `loopingTextReason` is what
+   makes it visible; no way of shaping the corpus has been shown to prevent it.
+3. **The "file not provided" findings have a different cause than they appear to.**
+   They came from the REVIEW step, which sees the request cut to
+   `DUO_REVIEW_REQUEST_CHARS` (20,000). On a 41k request in six files, four files
+   genuinely were absent from the reviewer's view, and it said so — at `severity:
+   "high"`, despite the truncation marker telling it not to assume absence. That is a
+   bound problem, not a file-count problem, and it will fire on ANY request over 20k
+   chars whose reviewer decides to comment on what it cannot see. The one genuine
+   attribution error from a step that saw the whole request ("this file is EMPTY of the
+   logic", from an EXECUTE step) remains a single observation.
 
 ### Recall and precision, measured on the healthy runs
 
@@ -826,20 +832,30 @@ on the work rather than on the answer.
 
 - Prefer several small reviews over one large one. ~10k tokens is the regime with
   evidence behind it.
-- **Split by FILE COUNT, not by token count. Size is secondary.** Same plant, same
-  offset, same settings, only the corpus varying:
+- **The loop is intermittent at ~17% and is NOT attributable to file count or size.**
+  An earlier version of this page said to "split by FILE COUNT, not by token count".
+  That was wrong, and a test designed to falsify it did:
 
   | corpus | files | chars | ~tok | loops | plant found |
   |---|---|---|---|---|---|
-  | three files | 3 | 39,534 | ~11k | 1/3 | 2/3 |
-  | **the same three, 3.9x bigger** | **3** | **152,975** | **~42k** | **0/3** | **2/3** |
-  | six files | 6 | 41,027 | ~11k | 2/3 | **0/3** |
+  | findings41k | 3 | 41,011 | ~11k | 0/3 | 3/3 |
+  | enum41 | 3 | ~41k | ~11k | 0/3 | — |
+  | plant2 | **6** | 41,027 | ~11k | **2/3** | 0/3 |
+  | plant2, three files | 3 | 39,534 | ~11k | 1/3 | 2/2 healthy |
+  | plant2, 3.9x bigger | 3 | 152,975 | ~42k | 0/3 | 2/3 |
+  | find200out | few | ~760k | ~200k | 0/1 | yes |
+  | plant2, two files | 2 | 758,457 | ~205k | 0/1 | **yes** |
+  | **plant2, fifty-nine files** | **59** | **743,821** | **~204k** | **0/1** | **yes** |
 
-  Quadrupling the size at constant file count degraded nothing — it was marginally
-  better. Doubling the file count at constant size was catastrophic: two total
-  collapses, and the one healthy run misattributed one file's contents to another.
-  Three files at 153k beat six files at 41k on every axis measured, so prefer few
-  files over small files.
+  The last row was run specifically to break the rule, with the prediction recorded
+  first: 59 files at the same size that had just succeeded with 2. It came back clean —
+  work ratio 0.3981, the plant found and correctly reasoned, and **zero** attribution
+  errors, which was the exact failure predicted ("not provided" 0, "EMPTY of" 0).
+
+  Three loops in 18 runs, 17%. Two of the three came from the six-file corpus, but at a
+  17% base rate 2-of-3 has a probability near 8% — uncommon, not extraordinary, and
+  n=3. **So no corpus property measured so far predicts the loop.** Prefer smaller
+  reviews for the reasons in the next bullet, not because file count causes collapse.
 - **Bound the SEARCH SPACE — by scope or by question. That is the whole rule.**
 
   | shape | search space | result at 247k |
