@@ -290,3 +290,36 @@ test('a loop that stops short of its token budget is still a loop', () => {
   const loop = 'Based on the review of the source code provided:\n' + sentence.repeat(347);
   assert.match(loopingTextReason(loop), /repetition loop, not an answer/);
 });
+
+test('a line-level loop is caught even when no single phrase tiles the output', () => {
+  // Measured on drakemore 2026-09-13 (bounded ~245k review, run 3 of 3): the execute step
+  // wrote 17,281 tokens cycling a small set of lines — "Defect confirmed." 51 times,
+  // "This matches \"Last Resort\"." 28 times — 912 lines with only 142 distinct.
+  // Vocabulary collapsed to 0.0465 but the tail phrase tiled only 9% of the text, so the
+  // tile test alone MISSED it. A false negative in shipped code, caught on real data.
+  //
+  // Two properties below make it faithful: the repeats are SCATTERED by a stride so no
+  // contiguous run forms, and each line VARIES at its end so the tail candidate does not
+  // match its siblings. Without either, the synthetic tiles and passes for the wrong
+  // reason — both mistakes were made while writing this test.
+  const distinct = Array.from({ length: 142 }, (_, i) =>
+    `This matches "Last Resort". Defect confirmed. The code falls through at case ${i}.`);
+  const loop = 'Reviewing the boundary conditions.\n'
+    + Array.from({ length: 912 }, (_, i) => distinct[(i * 7) % distinct.length]).join('\n');
+  assert.match(loopingTextReason(loop), /repetition loop, not an answer/);
+});
+
+test('a valid JSON document is never a loop, however repetitive', () => {
+  // The counter-example that makes a line-repetition test dangerous on its own: a
+  // 120-entry findings array repeats `"file": ...` on every entry, giving a line-unique
+  // ratio of 0.177 — between the two real line-level loops measured (0.150 and 0.141).
+  // No threshold separates them. Structured output is legitimately repetitive, and a
+  // runaway ramble does not emit balanced JSON, so parseable JSON is exempt outright.
+  const findings = Array.from({ length: 120 }, (_, i) => ({
+    file: 'api/queue-admission.js',
+    symbol: 'queueAdmissionDecision',
+    issue: `The documentation says X but the code does Y at line ${i}`,
+    severity: 'medium',
+  }));
+  assert.equal(loopingTextReason(JSON.stringify({ concerns: findings }, null, 2)), null);
+});

@@ -118,6 +118,29 @@ const TILE_LENGTHS = [8, 16, 32, 64, 128, 256];
 const LOOP_TILE_COVERAGE = 0.35;
 
 /**
+ * Fewest lines before the line-repetition test applies. A short answer with a couple of
+ * repeated lines is ordinary; the loops measured ran 412 to 2,942 lines.
+ */
+const LOOP_LINE_FLOOR = 60;
+
+/**
+ * Distinct-line ratio at or below which the output is a loop cycling a SET of lines.
+ *
+ * The tile test finds ONE phrase repeated contiguously. A loop can instead cycle many
+ * lines, scattered, so nothing tiles — measured on drakemore 2026-09-13, an execute step
+ * wrote 912 lines with 142 distinct ("Defect confirmed." 51 times) at only 9% tile
+ * coverage. The tile test alone missed it, which is why this exists.
+ *
+ *   healthy prose work (21 runs)   0.68 - 1.00
+ *   the three line-cycling loops   0.150, 0.141, 0.067
+ *
+ * 0.30 sits 2.3x below the worst healthy run and 2x above the worst loop. Note the two
+ * single-giant-line loops score 1.00 here and are caught by the tile test instead: the
+ * two tests cover different shapes and both are needed.
+ */
+const LOOP_LINE_RATIO = 0.30;
+
+/**
  * Why an output looks like a repetition LOOP, or null when it looks fine.
  *
  * The failure {@link degenerateOutputReason} deliberately does not cover: not one
@@ -147,10 +170,46 @@ export function loopingTextReason(text) {
   if (words.length < LOOP_WORD_FLOOR) return null;
   const distinct = new Set(words).size;
   if (distinct / words.length > LOOP_UNIQUE_RATIO) return null;
+  // Structured output is legitimately repetitive — a 120-entry findings array repeats the
+  // same keys on every entry — and a runaway ramble does not emit balanced JSON. Exempting
+  // parseable JSON outright is what lets the line test below use a safe threshold; without
+  // it, that array sits at 0.177 against real loops at 0.150 and 0.141, with no gap.
+  if (parsesAsJson(text)) return null;
+
   const coverage = tailTileCoverage(text);
-  if (coverage < LOOP_TILE_COVERAGE) return null;
-  return `output was ${words.length} words with only ${distinct} distinct, `
-    + `${Math.round(coverage * 100)}% of it one repeated phrase — a repetition loop, not an answer`;
+  if (coverage >= LOOP_TILE_COVERAGE) {
+    return `output was ${words.length} words with only ${distinct} distinct, `
+      + `${Math.round(coverage * 100)}% of it one repeated phrase — a repetition loop, not an answer`;
+  }
+
+  // A loop can cycle a SET of lines instead of repeating one phrase, which tiles nothing.
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines.length >= LOOP_LINE_FLOOR) {
+    const distinctLines = new Set(lines).size;
+    const ratio = distinctLines / lines.length;
+    if (ratio <= LOOP_LINE_RATIO) {
+      return `output was ${lines.length} lines with only ${distinctLines} distinct `
+        + `— a repetition loop, not an answer`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether the whole text is one parseable JSON value.
+ *
+ * @param {string} text Candidate output.
+ * @returns {boolean} True when it parses, false otherwise.
+ */
+function parsesAsJson(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return false;
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
