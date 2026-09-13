@@ -527,6 +527,38 @@ So declare enums for any field a consumer switches on. A response with an unexpe
 still validates, and the consumer falls through every case — the same false assurance
 `json_object` gives.
 
+But the ladder has a top rung nothing reaches. **A findings schema cannot stop a
+non-finding being filed as a finding.** In the looping run p3f#2, four of seven entries
+in `concerns` explicitly said the code was correct:
+
+> "The code sets `state: 'pending'` and binds the card. **This matches.**"
+> — `concerns[2].issue`, `severity: "low"`
+
+A fifth said `_acquire` could not be confirmed "without seeing" a file that was fully
+present. Zero of the seven were real defects, and the planted one was missed. Every
+structural check passes: valid JSON, legal enum, conforming keys, a non-empty array. A
+consumer reading `concerns.length` sees seven issues.
+
+That gives a **consumer-side** check worth applying, since it needs no server change.
+Counting entries whose `issue` affirms correctness ("this matches", "this works",
+"correctly implements") separates the runs perfectly:
+
+| | uniq-word ratio | concerns | affirmative entries |
+|---|---|---|---|
+| 10 healthy runs | 0.28 - 0.66 | 1 - 3 | **0, every time** |
+| p2_1 | 0.0072 | 7 | 2 |
+| p2_2 | 0.0223 | 1 | 1 |
+| p3f_2 | 0.0439 | 7 | 6 |
+
+Two signals measuring completely different things at different stages — vocabulary
+collapse in the WORK, affirmations-as-findings in the ANSWER — agree on all 13 runs.
+Note also that the looping runs returned MORE concerns than the healthy ones, so a long
+findings list is a weak warning sign rather than a reassuring one.
+
+This is also what settles whether failing the chain on a loop throws away a usable
+answer: it does not. The output is padded with affirmations of correctness, which is
+worse than empty.
+
 And budget `max_tokens` for the whole object: grammar guarantees shape, not completion. At
 `max_tokens: 120` the enforced JSON was cut mid-string and failed to parse.
 
