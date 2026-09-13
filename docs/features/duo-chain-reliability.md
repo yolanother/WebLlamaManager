@@ -350,6 +350,34 @@ nonsense beside them. Both halves are load-bearing when deciding how to consume 
 output: the array is worth reading, and no individual entry is worth acting on
 unverified.
 
+### How to triage a finding: read the five lines around it
+
+Every false positive verified in this campaign has its refutation within **four lines**
+of the code it cites:
+
+| the finding | cites | what refutes it | distance |
+|---|---|---|---|
+| `hasViableRemote` checked before `hardMax` contradicts the docs | `queue-admission.js:69` | the comment at :67 — "This takes precedence over the hard ceiling because offloading doesn't grow the local queue at all" | 2 lines above |
+| stall detection "fails to reject when `active === 0`" | `queue-admission.js:83` | the comment at :87 — "Deep but draining (or nothing active yet) — let the queue grow" | 4 lines below |
+| `Math.round` contradicts "a sub-second lease rounds UP" | `gpu-reservations.js:61` | the `Math.max(1, …)` clamp it is wrapped in | same line |
+| "`resolveDs4Config` references an undefined variable `ds4Config`" | `engines.js:195` | the signature at :193, `engineDescriptor(type, { ds4Config, llamaPort } = {})` | 2 lines above |
+| "`parseProcCpuJiffies` uses indices 11/12 but utime/stime are at 13/14" | `app-usage.js:42` | `const close = statText.lastIndexOf(')')` at :39, which shifts every index by two | 3 lines above |
+
+The shape is consistent: **the model reasons correctly about the line it is looking at
+and misses a qualifier immediately beside it** — a guard clause, a clamp, a destructuring
+in the signature, a comment stating the intent, a second clause in the same sentence. It
+is not hallucinating symbols (every symbol cited above is real) and it is not
+misunderstanding the language. It is reading too narrow a window.
+
+So the cheapest useful triage is mechanical: **for each finding, open the cited file at
+the cited symbol and read five lines either side.** That is where the refutation lives
+when there is one, and it takes seconds per finding. It caught every false positive in
+this campaign, including two filed at `severity: "high"`.
+
+The corollary matters too: a finding that still stands after reading its neighbourhood
+has been worth taking seriously every time — the planted defect, the `api-spec.js`
+snake_case/camelCase inconsistency, the `pending >= hardMax` boundary nit.
+
 ### False positives cluster on a code shape
 
 Both batches produced the same fabricated finding, at `severity: "high"`, on the same
