@@ -600,6 +600,30 @@ T312aac392c8dc.
 
 Read the live template with `curl localhost:<engine-port>/props`.
 
+### Temperature 0.2 is not the safe choice it looks like
+
+Every measurement on this page used `temperature: 0.2` until a paired comparison was run
+— same 6-file 41,027-char payload, 8 runs alternating 0.2 and 0.7, four each, alternating
+rather than blocked so thermal and contention drift hit both arms equally:
+
+| | loops | plant found | near-empty work | non-findings |
+|---|---|---|---|---|
+| temp 0.2 | 0/4 | 1/4 | **2/4** | 8 of 18 concerns |
+| temp 0.7 | 0/4 | **3/4** | **0/4** | 6 of 18 concerns |
+
+0.7 was not worse on any axis measured and better on two. The expected cost — higher
+temperature producing more fabricated findings — did not appear.
+
+Two caveats that matter more than the table. **This says nothing about loops**: neither
+arm produced one, on a payload that had looped 2 of 3 earlier, which is consistent with
+the ~19% pooled rate and an unlucky earlier draw. And nothing here is significant alone
+— 3/4 vs 1/4 is Fisher p ~= 0.49.
+
+The claim this supports is narrow: **stop treating 0.2 as the safe default for duo.** It
+does not support raising the default on four runs per arm. Settling it needs the same
+paired design at 12-16 runs per arm, with near-empty work as the primary endpoint rather
+than loops, which are too rare for this payload to power.
+
 ### A repetition penalty does not fix the loop, and costs something
 
 Nothing ever sets one — `duoCallerControls` forwards only the sampling fields the caller
@@ -963,6 +987,16 @@ rebuilt it from the plan. Failing hard would have discarded good output. The rig
 response is to record the condition so an operator can see the worker contributed
 nothing — the opposite of the repetition loop, where failing is correct because the
 answer is actively wrong.
+
+**Every occurrence has been at `temperature: 0.2`.** Six are now known — the original
+"read 127k tokens, wrote 2", a `'Hello!'` at 245k, a `'Hello!'` under `repeat_penalty`,
+and two more (3 and 4 completion tokens) in a paired temperature comparison. In that
+comparison, 2 of 4 runs at 0.2 produced a near-empty work step and 0 of 4 at 0.7 did,
+every one of the latter writing 310-2,432 tokens.
+
+Treat that as a lead rather than a cause: 2/4 against 0/4 is Fisher p ~= 0.43 on its
+own, and only four runs at any other temperature exist. The weight comes from six
+occurrences spread across five payloads and sizes, all sharing one setting.
 
 Tracked as T312c131dcc26c.
 
