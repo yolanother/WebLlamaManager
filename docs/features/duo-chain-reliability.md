@@ -600,6 +600,53 @@ T312aac392c8dc.
 
 Read the live template with `curl localhost:<engine-port>/props`.
 
+### What actually determines recall: the plan, and only the plan
+
+Four arms, identical payload, everything else held constant:
+
+| | plant found | non-findings |
+|---|---|---|
+| single call, no plan | 0/3 | 12 of 16 entries |
+| plan -> review, plan from a run that MISSED | 0/3 | 2 of 6 |
+| **plan -> review, plan from a run that FOUND** | **3/3** | **0** |
+| full three-step chain | 12/24 (50%) | 8 of 26, 19 of 56 |
+
+The worker is absent from the first three arms. With no plan it never finds the defect;
+with a plan from a failing run it still never finds it; with a plan from a successful run
+it finds it every time, in 125-231 completion tokens with nothing extraneous.
+
+**So recall is the planner's hit rate.** Everything downstream is reliable.
+
+What separates those plans is not correctness but **exhaustiveness**:
+
+| plan | chars | mentions of the soft-cap boundary | result |
+|---|---|---|---|
+| `ptemp_2_6` | 25,087 | **24** | 3/3 |
+| `ptemp_7_5` | 5,164 | 3, all restating policy | 0/3 |
+| `ptemp_2_5` | 4,889 | 0 | 0/3 |
+| `ptemp_2_7` | 3,092 | 0 | 0/3 |
+
+All four OPEN with the same false positive — the `hasViableRemote`-before-`hardMax`
+ordering the inline comment explains. The winning plan is 5-8x longer and keeps going,
+reaching *"15. Is there another defect? Look at `queueAdmissionDecision` again."* before
+working through the documented policy items until it hits the boundary.
+
+This explains several observations elsewhere on this page as one thing: the chain's 50%
+recall is the planner's hit rate rather than a reviewer failure; a near-empty worker does
+not hurt recall because the worker was never the mechanism; and the bounded-question
+shape worked by forcing the plan to enumerate boundary cases, which is why a run whose
+`duo.work` was the single word `'Hello!'` produced the cleanest answer measured.
+
+**Consequence for the 3,600s ceiling.** Capping the plan step's output to fit a 245k
+request inside the timeout would cut recall — plan length is what reaches the defect, and
+a shortened plan fails silently. If the ceiling needs managing, raise the timeout rather
+than shorten the plan.
+
+Caveat: one payload, one planted defect, one task shape, 12 experimental runs. An
+observational check across all 24 captured plans was inconclusive (58% vs 20%, Fisher
+p = 0.32) because a keyword proxy for "the plan names the check" is too crude to score
+plan quality. The controlled arms are the evidence.
+
 ### But the CHAIN earns its place — a single call finds nothing
 
 The obvious follow-up to the section below is whether the chain is worth three model
