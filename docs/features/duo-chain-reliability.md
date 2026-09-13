@@ -26,8 +26,10 @@ source rather than toy prompts.
 
 ## The short version
 
-- **At small payloads (~10k tokens) the chain is reliable.** Measured 2/2 correct, strict
-  JSON, on a corpus containing a planted defect.
+- **At small payloads (~10k tokens) the chain is reliable *for the defect it was measured
+  on*.** 2/2 correct and strict JSON on a corpus containing one planted defect — but a
+  SECOND plant at the same size went 0/3, so this is not a general recall claim. See
+  "One plant is not a measurement of recall".
 - **At large payloads it is not.** The review step intermittently discards the worker's
   answer and returns an empty one instead.
 - **When an answer looks wrong, read `duo.work` before believing `duo`'s final answer.**
@@ -147,6 +149,50 @@ sizes with identical prompt wording, model `default-big`, `temperature: 0.2`,
 | 197,242 ch | 12 | 54,467 | 357 | plant reported, strict JSON |
 
 Three of six runs delivered a usable answer.
+
+### One plant is not a measurement of recall
+
+Everything in the table above uses that ONE defect, always as the first file in the
+corpus. A second plant, run 2026-09-12, was missed 3 times out of 3:
+
+```js
+// api/queue-admission.js, real
+if (pending <  maxQueueDepth) { return { action: 'accept', reason: 'under-cap' }; }
+// planted — accepts AT the cap, contradicting the very next comment,
+// "Overflow zone (pending >= soft cap)"
+if (pending <= maxQueueDepth) { ... }
+```
+
+41,027 chars, 6 files, the recommended findings-only schema with a severity enum,
+plant at offset 3,825. Two of the three runs collapsed into the repetition loop
+described under failure mode 4 and produced nothing to judge. **The third generated
+healthy text and still missed it, for a different reason worth knowing about:**
+
+> "The code provided for `api/queue-admission.js` does NOT contain `pending`,
+> `maxQueueDepth`, `hasViableRemote`, `offload`, `active`, `msSinceLastCompletion`,
+> `stallMs`. **CRITICAL REALIZATION:** The code snippet provided for
+> `api/queue-admission.js` is **EMPTY** of the logic described in the plan. It only
+> contains `poolPinPlan` which is about pinning models."
+> — `duo.work`, run 3
+
+`poolPinPlan` is in `api/alias-gpu.js`. The admission logic was present, in the
+region the chain demonstrably read — the plan quoted that file's own comments back.
+It attributed one file's contents to another and concluded the target file was
+empty, then reported a fabricated `severity: "high"` defect in its place: that stall
+detection "fails to reject when `active === 0`", which the real code deliberately
+accepts as `deep-draining` because a deep queue with nothing active is DRAINING, not
+stuck — exactly what that file's documentation says. The model invented a contract
+and reported compliance with the real one as a violation.
+
+The same confusion produced run 1's four `severity: "high"` findings asserting that
+files "not provided in the source code snippet" could not be reviewed, for files
+that were in the request throughout.
+
+**So read every recall figure on this page as "for a defect of that kind, in a
+corpus of that shape".** They are not a general claim that duo finds planted
+defects. A second plant in a larger file set went 0/3, by three different
+mechanisms: two loops and one case of losing the file boundaries entirely.
+
 
 ## Failure mode 1 — the reviewer collapses to a minimal answer
 
