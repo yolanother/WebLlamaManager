@@ -80,6 +80,35 @@ const LOOP_WORD_FLOOR = 500;
 const LOOP_UNIQUE_RATIO = 0.15;
 
 /**
+ * Phrase lengths tried when measuring how much of the output one repeat covers.
+ *
+ * Spans the observed loops: the shortest repeated unit measured was 24 characters
+ * ('`backend`, `backendId`, ') and the longest ran to about 200.
+ */
+const TILE_LENGTHS = [8, 16, 32, 64, 128, 256];
+
+/**
+ * Fraction of the output one repeated phrase must cover before it is a loop.
+ *
+ * The vocabulary test alone is not enough, and shipping it alone was a mistake: a
+ * legitimate 120-entry findings array scores 0.057 unique-word ratio — under the 0.15
+ * threshold — because the JSON keys, file and symbol repeat on every entry while each
+ * `issue` genuinely differs. Compression does not separate them either; that array gzips
+ * to 0.023, BELOW a real loop's 0.036.
+ *
+ * What a loop has and structured redundancy does not is a single phrase tiling the
+ * output. Measured:
+ *
+ *   14 healthy runs          0.01 - 0.25
+ *   legitimate findings array      0.011
+ *   the three real loops     0.47, 0.74, 0.96
+ *
+ * Requiring BOTH conditions leaves 6x margin on vocabulary and 1.9x on coverage, and
+ * neither alone would do: the array fails only the second, and a loop fails both.
+ */
+const LOOP_TILE_COVERAGE = 0.35;
+
+/**
  * Why an output looks like a repetition LOOP, or null when it looks fine.
  *
  * The failure {@link degenerateOutputReason} deliberately does not cover: not one
@@ -109,7 +138,39 @@ export function loopingTextReason(text) {
   if (words.length < LOOP_WORD_FLOOR) return null;
   const distinct = new Set(words).size;
   if (distinct / words.length > LOOP_UNIQUE_RATIO) return null;
-  return `output was ${words.length} words with only ${distinct} distinct — a repetition loop, not an answer`;
+  const coverage = tailTileCoverage(text);
+  if (coverage < LOOP_TILE_COVERAGE) return null;
+  return `output was ${words.length} words with only ${distinct} distinct, `
+    + `${Math.round(coverage * 100)}% of it one repeated phrase — a repetition loop, not an answer`;
+}
+
+/**
+ * How much of the text is tiled by a phrase taken from its end.
+ *
+ * A loop never stops on its own, so whatever it is repeating is still being repeated at
+ * the very end. Taking the candidate from the tail needs no search: try a few phrase
+ * lengths, count non-overlapping occurrences of each, and report the largest fraction of
+ * the text any of them covers.
+ *
+ * @param {string} text Output to measure.
+ * @returns {number} Fraction of the text covered by the best tail phrase, 0 to 1.
+ */
+function tailTileCoverage(text) {
+  const s = text.trimEnd();
+  let best = 0;
+  for (const length of TILE_LENGTHS) {
+    if (s.length < length * 4) continue;
+    const phrase = s.slice(-length);
+    let hits = 0;
+    let at = 0;
+    // Non-overlapping: a phrase cannot tile the same characters twice.
+    while ((at = s.indexOf(phrase, at)) !== -1) {
+      hits += 1;
+      at += length;
+    }
+    best = Math.max(best, (hits * length) / s.length);
+  }
+  return best;
 }
 
 /**

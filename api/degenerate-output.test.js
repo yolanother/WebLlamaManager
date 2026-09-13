@@ -259,3 +259,23 @@ test('loopingTextReason catches a phrase loop the single-character test passes',
   assert.equal(loopingTextReason(''), null);
   assert.equal(loopingTextReason(null), null);
 });
+
+test('a large legitimate findings array is not a loop', () => {
+  // Regression: the first version of loopingTextReason tested vocabulary alone, and a
+  // 120-entry findings array trips it — 2,525 words, 144 distinct, ratio 0.057, under
+  // the 0.15 threshold. The redundancy is all scaffolding: the same four JSON keys and
+  // the same file and symbol on every entry, while each `issue` genuinely differs.
+  // Rejecting that would throw away a worker's real answer.
+  const findings = Array.from({ length: 120 }, (_, i) => ({
+    file: 'api/queue-admission.js',
+    symbol: 'queueAdmissionDecision',
+    issue: `The documentation says X but the code does Y at line ${i}`,
+    severity: 'medium',
+  }));
+  assert.equal(loopingTextReason(JSON.stringify({ concerns: findings }, null, 2)), null);
+
+  // The real loops must still be caught. A tiling repeat is what they have and the
+  // findings array does not: measured tile coverage 0.47-0.96 against 0.011.
+  const loop = 'I reviewed the code.\n' + '`backend`, `backendId`, '.repeat(5000);
+  assert.match(loopingTextReason(loop), /repetition loop, not an answer/);
+});
