@@ -48,9 +48,13 @@ Measured over 23 end-to-end runs on real repository source, 41k to 245k request 
   false positive measured had its refutation within four lines — a guard clause, a clamp,
   a destructuring in the signature, a comment stating the intent. Findings that survive
   their neighbourhood have been worth taking seriously every time.
-- **Size is not the constraint you think.** ~245k tokens works; the ceiling at ~260k is
-  architectural, not a speed limit. Large requests are slow, not unreliable — a 245k plan
-  step spends ~2,900s in prefill against a 3,600s per-step cut.
+- **Size is not the constraint you think, but the 3,600s cut is closer than it looks.**
+  ~245k tokens works and the ~260k ceiling is architectural. But a 244k plan step was
+  measured at 2,955s, 3,281s and **3,529s** against the 3,600s per-step timeout — the
+  last with only **71 seconds** of margin and no contention at all. Prefill on
+  byte-identical input varied 73.3 to 89.9 tok/s, a 23% spread, tracking thermal
+  throttling on the box. The cut is crossed by size PLUS an environmental term
+  (contention or thermal), not by size alone.
 - **Do not trust `duo.work` over the answer, or the reverse.** Either can be the good
   one: in one run the work was the single word `'Hello!'` and the answer was correct; in
   another the work held the defect and the reviewer discarded it. Read both when the
@@ -60,6 +64,12 @@ Measured over 23 end-to-end runs on real repository source, 41k to 245k request 
 
 Measured end to end on real repository source with a planted defect, `default-big`,
 `temperature: 0.2`, `enable_thinking: false`:
+
+**Read the "result" column as "this size is reachable", not "this size is reliable".**
+Every row below is a single run from one campaign with one plant and one prompt shape. A
+later 23-run campaign at 41k-245k found a **~21% repetition-loop rate at every size**,
+so any individual large run has roughly a one-in-five chance of returning a laundered
+non-answer. The table says the size works; it does not say the run will.
 
 | request | prompt tok | total | result |
 |---|---|---|---|
