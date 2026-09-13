@@ -1143,6 +1143,34 @@ step that produced its input had emitted nothing at all. Validating the last ste
 says nothing about whether any earlier step worked, which is why `loopingTextReason` runs
 on the work rather than on the answer.
 
+## Interventions tried, and what happened
+
+Five candidate fixes for the repetition loop and the near-empty worker have been tested
+with controlled comparisons. **None is demonstrated.** Recorded so nobody spends the box
+time again.
+
+| intervention | design | result |
+|---|---|---|
+| `repeat_penalty: 1.1` | 4 runs against a 2/3 baseline | 0 loops, but introduced a 3-token work step and two answers made entirely of commentary. Underpowered either way (p=0.39 against the pooled rate). |
+| `temperature: 0.7` | paired, 12 per arm, alternating | near-empty 3/12 vs 4/12, loops 1/12 vs 1/12, recall 6/12 vs 6/12. **Fisher p = 1.0.** More verbose at a similar non-finding rate. |
+| bounded question | 3 runs at ~245k | Improves answer QUALITY markedly — 1-2 concerns with zero non-finding entries against 3 concerns of which 2 affirmed the code. Does **not** prevent the loop: 2 of 3. |
+| limit file count | 59 files at 204k vs 6 files at 41k | Retracted. The 59-file run was clean; the rule did not survive the test built to falsify it. |
+| "be exhaustive" prompt nudge | paired, 8 per arm, alternating, plan step only | Plans naming the boundary: plain 7/8, nudged 8/8, **p = 1.0**. Plans got SHORTER, not longer. |
+
+Two methodological notes worth more than the table:
+
+**Pilots at four runs per arm have been wrong every time.** The temperature pilot showed
+2/4 vs 0/4 and died at twelve per arm. The nudge pilot showed 1/2 vs 3/3 and died at
+eight. With loop and near-empty rates around 9% and 14%, a four-run arm cannot
+distinguish anything.
+
+**Choose an endpoint with headroom.** The nudge test's binary endpoint — "does the plan
+mention the boundary" — sat at 87.5% in the control arm, so no intervention could have
+moved it. A depth measure over the same runs showed a 4x difference (2.75 vs 11.6
+mentions), which is hypothesis-generating only, since the threshold was picked after
+seeing the data. If the nudge is worth revisiting, the endpoint is end-to-end recall,
+not a plan proxy.
+
 ## Practical guidance
 
 - Prefer several small reviews over one large one. ~10k tokens is the regime with
