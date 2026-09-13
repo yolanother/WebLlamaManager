@@ -416,3 +416,20 @@ test('only a broken child is worth evicting a model for', () => {
   assert.equal(corruptionIsChildFault('SOMETHING_NEW'), false);
   assert.equal(corruptionIsChildFault(undefined), false);
 });
+
+test('the exhaustion remedy leads with the lever that always works', () => {
+  // Measured on Frostburn 2026-09-13, Qwen3-8B, same prompt, max_tokens 2000:
+  // thinking default -> 864 / 1563 / 1847 completion tokens, all answered.
+  // enable_thinking:false -> exhausted at 2000, then 953 / 1893 / 1959.
+  // The flag makes no measurable difference on that model, so an error that offers it
+  // as an equal alternative sends the caller in a circle. Raising max_tokens is the
+  // only lever that always works, and it must be stated as such.
+  const err = validateChatCompletionPayload(exhausted);
+  const msg = err.body.error.message;
+  assert.match(msg, /max_tokens/);
+  // If enable_thinking is mentioned at all it must be qualified, never offered as an
+  // equivalent fix.
+  if (/enable_thinking/.test(msg)) {
+    assert.match(msg, /some models|not every model|model-dependent|does not|may not/i);
+  }
+});

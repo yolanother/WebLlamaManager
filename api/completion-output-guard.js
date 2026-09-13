@@ -69,6 +69,14 @@ export const DEGENERATE_OUTPUT_ERROR = Object.freeze({
  * without knowing how many tokens were actually spent, and asking it to parse prose for
  * that would be a worse API than the empty 200 this replaces.
  *
+ * The remedy leads with max_tokens because that is the only lever that always works.
+ * `enable_thinking: false` was offered as an equal alternative and is not one — measured
+ * on Frostburn 2026-09-13 with Qwen3-8B, the same prompt at max_tokens 2000 ran 864 /
+ * 1563 / 1847 tokens with thinking left at its default and 953 / 1893 / 1959 (plus one
+ * full-budget exhaustion) with the flag set. Indistinguishable. An error that sends a
+ * caller to a flag which provably does nothing on the failing model sends them in a
+ * circle, and this error fires ~70 times per 13 minutes under the podcast pipeline.
+ *
  * @param {number} completionTokens Tokens the model spent producing nothing visible.
  * @param {string} finishReason The upstream finish reason, always 'length' here.
  * @returns {{status:number, body:object}} Error descriptor in the shape callers already use.
@@ -80,8 +88,10 @@ function reasoningExhaustedError(completionTokens, finishReason) {
       error: {
         message: `The model spent its entire ${completionTokens}-token output budget on `
           + 'reasoning and produced no visible content before being cut off. Raise max_tokens '
-          + 'to cover the reasoning as well as the answer, or disable thinking for this '
-          + 'request (chat_template_kwargs: {"enable_thinking": false}).',
+          + 'to cover the reasoning as well as the answer — that is the only lever that always '
+          + 'works. Disabling thinking (chat_template_kwargs: {"enable_thinking": false}) helps '
+          + 'on some models but does not suppress reasoning on every model, so it may change '
+          + 'nothing.',
         type: 'upstream_output_error',
         code: 'REASONING_EXHAUSTED',
         completion_tokens: completionTokens,
