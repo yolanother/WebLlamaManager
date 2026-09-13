@@ -928,6 +928,28 @@ it has been measured.
    20k chars the reviewer sees a cut corpus, and it asserted absence four times at high
    severity despite the marker telling it not to.
 
+### Failure mode 5 — the worker writes nothing and no guard notices
+
+Three times now the execute step has read a large corpus and produced essentially
+nothing: once reading 127k tokens and writing 2, and twice writing the single word
+`'Hello!'` (3 tokens). Two of the three were at completely default sampling, so this is
+not an artifact of any experimental setting.
+
+Nothing catches it. `loopingTextReason` requires at least 500 words, `reviewCollapsed`
+requires at least 200 characters of unparseable work, and `'Hello!'` is ordinary text by
+every structural test. For scale, the smallest execute output among healthy runs was
+**238 tokens**, so a floor anywhere in the 20-100 token range would separate the observed
+failures from all observed healthy work by two orders of magnitude.
+
+**But do not throw on it.** In both `'Hello!'` runs the chain still returned a correct
+answer, and in one of them the best answer of the entire campaign, because the reviewer
+rebuilt it from the plan. Failing hard would have discarded good output. The right
+response is to record the condition so an operator can see the worker contributed
+nothing — the opposite of the repetition loop, where failing is correct because the
+answer is actively wrong.
+
+Tracked as T312c131dcc26c.
+
 ## What the output guards do and do not catch
 
 `api/completion-output-guard.js` and `degenerateOutputReason` correctly pass failures 1-3
@@ -974,6 +996,29 @@ on the work rather than on the answer.
   file count, not size. Prefer smaller reviews for the reasons in the next bullet, not
   because any corpus shape has been shown to cause collapse.
 - **Bound the SEARCH SPACE — by scope or by question. That is the whole rule.**
+
+  The cleanest evidence is a single-variable comparison at the largest size tested. Same
+  82 files, same ~245k tokens, same planted defect, same settings — only the instruction
+  differed:
+
+  | prompt | result |
+  |---|---|
+  | "Review the source below... Report the defects you find." | repetition loop, 3 concerns, **2 affirming the code is correct**, plant missed |
+  | "In `api/queue-admission.js`, verify that `queueAdmissionDecision` implements the soft-cap and hard-ceiling boundary conditions EXACTLY as that file's own comments describe... Report only defects in that one function." | **1 concern, the plant, correctly reasoned, 0 affirmative, 0 input commentary** |
+
+  The bounded answer was the cleanest of the whole campaign:
+
+  > "Off-by-one error in soft-cap boundary check. The jsdoc and header comments state
+  > that the overflow zone begins 'at/over' the soft cap (meaning `pending ==
+  > maxQueueDepth` should trigger offload or stall-checking). However, the code uses
+  > `if (pending <= maxQueueDepth)` to return 'accept'."
+
+  **But note HOW it worked.** `duo.work` in that run was the single word `'Hello!'` —
+  the execute step wrote 3 tokens. The answer came from the reviewer working off a
+  1,013-token plan that had enumerated every boundary case to check. Bounding the
+  question did not make the worker better; it made the PLAN good enough that the worker
+  was not needed. Do not read the shape rule as improving comprehension.
+
 
   | shape | search space | result at 247k |
   |---|---|---|
