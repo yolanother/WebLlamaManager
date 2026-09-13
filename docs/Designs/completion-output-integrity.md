@@ -218,6 +218,31 @@ the engine, bypassing Express entirely. So a duo step gets exactly the sampling 
 caller set, plus engine defaults — never the model-card recipe, and never the
 temperature 1.0 that recipe carries.
 
+### A loop does not have to run to the budget
+
+Measured 2026-09-13 at ~245k prompt tokens, the largest request tested: the execute
+step repeated one sentence 347 times —
+
+> `*   **Defect:** The function `resolveAltPort` has a default `env = {}`. The JSDoc
+> says `@param {Record<string, string|undefined>} options.env`. Correct.`
+
+— and **stopped on its own at 18,097 completion tokens against a 36,768 budget**. Every
+loop before it had run to the ceiling exactly, which had been written down as though it
+were a property of loops ("not stopping is what it IS"). It is not; that comment has
+been corrected.
+
+The detector was unaffected, and this was its first out-of-sample test — the thresholds
+were fixed before this run existed. Ratio 0.054 and tile coverage 0.69, both well inside
+their bounds, 4 of 4 loops now caught.
+
+Two other things this run shows. The loop was repeating an **affirmation of
+correctness** ("... Correct.") rather than an identifier list, and the reviewer then
+emitted 3 concerns of which 2 affirm the code is correct — the same
+affirmations-as-findings signature, now traced to the work it came from. And the work
+opens by attributing `poolPinPlan` (which lives in `api/alias-gpu.js`) to
+`api/queue-admission.js`, so attribution errors are not confined to small corpora
+either.
+
 ### Why this one mattered more than a malformed response
 
 It was laundered. The duo reviewer, handed 126KB of that, did not fail: it emitted

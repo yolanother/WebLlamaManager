@@ -279,3 +279,14 @@ test('a large legitimate findings array is not a loop', () => {
   const loop = 'I reviewed the code.\n' + '`backend`, `backendId`, '.repeat(5000);
   assert.match(loopingTextReason(loop), /repetition loop, not an answer/);
 });
+
+test('a loop that stops short of its token budget is still a loop', () => {
+  // Measured at ~245k prompt tokens 2026-09-13: the execute step repeated one sentence
+  // 347 times and stopped on its own at 18,097 completion tokens against a 36,768
+  // budget. 7,945 words, 430 distinct (ratio 0.054), 69% tile coverage. Loops do
+  // self-terminate, so nothing may assume they always run to the ceiling.
+  const sentence = '*   **Defect:** The function `resolveAltPort` has a default `env = {}`. '
+    + 'The JSDoc says `@param {Record<string, string|undefined>} options.env`. Correct.\n';
+  const loop = 'Based on the review of the source code provided:\n' + sentence.repeat(347);
+  assert.match(loopingTextReason(loop), /repetition loop, not an answer/);
+});

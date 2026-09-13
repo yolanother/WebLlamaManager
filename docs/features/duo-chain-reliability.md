@@ -874,16 +874,18 @@ on the work rather than on the answer.
   | find200out | few | ~760k | ~200k | 0/1 | yes |
   | plant2, two files | 2 | 758,457 | ~205k | 0/1 | **yes** |
   | **plant2, fifty-nine files** | **59** | **743,821** | **~204k** | **0/1** | **yes** |
+  | plant2, eighty-two files | 82 | 922,816 | **~245k** | **1/1** | no |
 
-  The last row was run specifically to break the rule, with the prediction recorded
+  The 59-file row was run specifically to break the rule, with the prediction recorded
   first: 59 files at the same size that had just succeeded with 2. It came back clean —
   work ratio 0.3981, the plant found and correctly reasoned, and **zero** attribution
   errors, which was the exact failure predicted ("not provided" 0, "EMPTY of" 0).
 
-  Three loops in 18 runs, 17%. Two of the three came from the six-file corpus, but at a
-  17% base rate 2-of-3 has a probability near 8% — uncommon, not extraordinary, and
-  n=3. **So no corpus property measured so far predicts the loop.** Prefer smaller
-  reviews for the reasons in the next bullet, not because file count causes collapse.
+  Four loops in 19 runs, 21%, and they are spread across sizes from ~41k to ~245k. Two
+  of the four came from the six-file corpus, but at a 21% base rate 2-of-3 is
+  unremarkable, and n=3. **No corpus property measured so far predicts the loop** — not
+  file count, not size. Prefer smaller reviews for the reasons in the next bullet, not
+  because any corpus shape has been shown to cause collapse.
 - **Bound the SEARCH SPACE — by scope or by question. That is the whole rule.**
 
   | shape | search space | result at 247k |

@@ -59,10 +59,19 @@ export function degenerateOutputReason(text) {
 }
 
 /**
- * Fewest words before an output is judged for looping. A loop always runs to its full
- * token budget — not stopping is what it IS — so it is never short. The floor exists only
- * so a brief, legitimately repetitive answer ("yes. yes. yes.") is never scored. Set above
- * the longest healthy duo work measured that still looked short (208 words).
+ * Fewest words before an output is judged for looping.
+ *
+ * An earlier version of this comment said a loop "always runs to its full token budget —
+ * not stopping is what it IS". That is false: a loop measured at ~245k prompt tokens
+ * stopped on its own at 18,097 completion tokens against a 36,768 budget, after 347
+ * repeats of one sentence. Loops do self-terminate, so the floor cannot be justified by
+ * assuming they never do.
+ *
+ * It is justified by the other end instead: the floor exists so a brief, legitimately
+ * repetitive answer ("yes. yes. yes.") is never scored, and 500 sits above the longest
+ * healthy duo work measured that still looked short (208 words). The shortest loop
+ * observed was 7,945 words, 16x the floor, so there is ample room — but that is an
+ * observation about the loops seen, not a guarantee about loops in general.
  */
 const LOOP_WORD_FLOOR = 500;
 
