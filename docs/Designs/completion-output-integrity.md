@@ -170,7 +170,7 @@ Replayed through every detector in this module:
 | `degenerateOutputReason` | the whole output is ONE punctuation character | missed |
 | `createRepetitionMonitor` character run | a run of one character in the stream | missed |
 | `createRepetitionMonitor` line repeat | the same LINE repeated `STREAM_LINE_REPEAT_LIMIT` times | missed |
-| `loopingTextReason` (new) | vocabulary collapse over the whole output | **caught** |
+| `loopingTextReason` (new) | vocabulary collapse AND one phrase tiling the output | **caught** |
 
 The line detector missed it for the same structural reason the character detector
 missed the 2026-09-08 loop: the repetition is one level below what it measures.
@@ -178,16 +178,30 @@ There the phrase repeated across lines; here it repeats *within* a single line, 
 there are only five lines and none repeats. The three detectors are complementary,
 not redundant — one per level: character, line, phrase.
 
-`loopingTextReason` is therefore a vocabulary test rather than a structural one:
-unique words over total words, judged only above 500 words because a loop always
-runs to its full budget and is never short. Measured across eight duo runs on real
-repo source, healthy work sits at 0.47 - 0.59 and this run at 0.0072, so the 0.15
-threshold sits 3x below the worst healthy run and 20x above the loop. Verified
-against all eight captured runs: 1/1 on the failure, 0/7 false positives.
+`loopingTextReason` requires TWO conditions, judged only above 500 words because a
+loop always runs to its full budget and is never short:
 
-Mean line length separates the same runs too (25,225 vs 72 - 389) and was rejected
-as the signal: it would misjudge a legitimate single-line JSON answer, which
-vocabulary variety does not.
+1. **vocabulary collapse** — unique words over total words at or under 0.15. Healthy
+   work across 14 runs sits at 0.28 - 0.66; the three loops at 0.007, 0.022, 0.044.
+2. **one phrase tiling the output** — at least 35% of the text covered by a phrase
+   taken from its end. Healthy work 0.01 - 0.25; the loops 0.47, 0.74, 0.96.
+
+**The first condition alone is not enough, and shipping it alone was a mistake.** A
+legitimate 120-entry findings array scores 0.057 unique-word ratio — under the
+threshold — because the four JSON keys plus the same file and symbol repeat on every
+entry while each `issue` genuinely differs. Rejecting that would discard a correct
+answer, which is the one thing this guard must not do.
+
+Compression does not separate them either: that array gzips to 0.023, BELOW a real
+loop's 0.036. The redundancy in a findings array is real, it is just structural.
+
+Taking the tiling candidate from the END needs no search — a loop never stops on its
+own, so whatever it repeats is still being repeated there. Requiring both conditions
+leaves 6x margin on vocabulary and 1.9x on coverage, verified against all 17 captured
+runs: 3 loops caught, 14 healthy cleared, 0 mismatches.
+
+Mean line length separates the same runs too (25,225 vs 72 - 389) and was rejected as
+a signal: it would misjudge a legitimate single-line JSON answer.
 
 Sampling matched the 2026-09-08 incident's finding that no repetition penalty is
 ever set. The caller sent only `temperature: 0.2`; `duoCallerControls` forwarded

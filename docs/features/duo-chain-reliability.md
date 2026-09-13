@@ -764,19 +764,29 @@ chain had produced nothing at all.
 
 `loopingTextReason` (api/degenerate-output.js) judges the execute step's output before the
 reviewer ever sees it, and the chain throws rather than letting a later step launder it.
-It is a vocabulary test, not a length test. Unique-word ratio across eight duo runs on
-real repo source:
+It requires TWO conditions, both measured over the whole output and judged only above
+500 words:
 
-| | unique-word ratio | size |
+| | unique-word ratio | tile coverage |
 |---|---|---|
-| healthy work (8 runs) | 0.47 - 0.59 | 208 - 1,704 words |
-| repetition loop | **0.0072** | 10,533 words, 76 distinct |
+| healthy work (14 runs) | 0.28 - 0.66 | 0.01 - 0.25 |
+| a legitimate 120-entry findings array | **0.057** | 0.011 |
+| the three repetition loops | 0.007 / 0.022 / 0.044 | **0.47 / 0.74 / 0.96** |
 
-The 0.15 threshold sits 3x below the worst healthy run and 20x above the loop. Mean line
-length separates the same runs too (25,225 vs 72 - 389) but would misjudge a legitimate
-single-line JSON answer. Verified against all eight captured runs: 1/1 on the failure,
-0/7 false positives. It is wired into the duo execute step only, not into
-`completion-output-guard`, because that is the only place it has been measured.
+"Tile coverage" is the fraction of the text covered by a phrase taken from its end — a
+loop never stops on its own, so whatever it repeats is still being repeated there, and
+taking the candidate from the tail needs no search.
+
+**Vocabulary alone is not enough, and shipping it alone was a mistake.** The findings
+array in the middle row scores under the 0.15 vocabulary threshold, because the four
+JSON keys plus the same file and symbol repeat on every entry while each `issue`
+genuinely differs — so a vocabulary-only guard would have discarded a correct answer.
+Compression is no better: that array gzips to 0.023, BELOW a real loop's 0.036.
+
+Requiring both leaves 6x margin on vocabulary and 1.9x on coverage. Verified against all
+17 captured runs: 3 loops caught, 14 healthy cleared, 0 mismatches. It is wired into the
+duo execute step only, not into `completion-output-guard`, because that is the only place
+it has been measured.
 
 ### Three contributing causes, not yet addressed
 
