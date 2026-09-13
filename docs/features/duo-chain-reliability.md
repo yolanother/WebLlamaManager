@@ -216,15 +216,38 @@ So this defect class is not invisible to duo, and the caveat the recall figures 
 is about corpus shape rather than defect kind. Three things follow:
 
 1. **File count drives the loop rate and the attribution errors.** Three files looped
-   once in six runs across both three-file corpora; six files looped two in three. The
+   once in nine runs across all three-file corpora; six files looped two in three. The
    "file not provided" and "this file is EMPTY of the logic" findings appeared ONLY in
-   the six-file batch.
+   the six-file batch. A later size step confirmed file count and not size is the
+   variable — see "Split by FILE COUNT" under practical guidance.
 2. **Reducing file count is not a fix.** One three-file run hit the identical
    36,768-token ceiling as the six-file loops. The loop is a baseline hazard at this
    size and `loopingTextReason` is what makes it visible; fewer files only improves
    the odds.
 3. **Split a review by FILE COUNT, not only by token count.** At essentially constant
    size, three files to six took this from found-in-218s to 0/3.
+
+### Recall and precision, measured on the healthy runs
+
+Six healthy runs across all three corpora examined the planted file. **Four named the
+plant correctly (67%)**, e.g.:
+
+> "The code uses `pending <= maxQueueDepth` to accept requests, but the documentation
+> and comments define the 'Overflow zone' as `pending >= soft cap`."
+
+Precision is the weaker half, and the 153k run is the clearest illustration because
+two of its three findings were in files it had never been pointed at before:
+
+| finding | verdict |
+|---|---|
+| the plant | **true positive** |
+| `api-spec.js`: `TIMING_EVIDENCE_SCHEMA` uses `context_cache_contract` (snake_case) while the context-prepare response schema uses `contextCacheContract` (camelCase) | **real** — a genuine cross-schema inconsistency, accurately described, found unprompted in an 83KB file |
+| `engines.js`: "`resolveDs4Config` references an undefined variable `ds4Config`", `severity: "high"` | **false** — line 193 is `engineDescriptor(type, { ds4Config, llamaPort } = {})`; it is a destructured parameter, in scope where it is used |
+
+So it finds real defects in unfamiliar code, and files confident high-severity
+nonsense beside them. Both halves are load-bearing when deciding how to consume the
+output: the array is worth reading, and no individual entry is worth acting on
+unverified.
 
 ### False positives cluster on a code shape
 
@@ -243,10 +266,15 @@ return { action: 'accept', reason: 'deep-draining' };
 ```
 
 It invents a requirement the file's own comments contradict, then reports compliance
-with the real requirement as a violation — twice, across different corpora. So false
-positives are not random noise: they cluster on specific shapes, and a guard whose
-condition deliberately excludes a case is one of them. An enum constrains the
-vocabulary of `severity`; nothing constrains its accuracy.
+with the real requirement as a violation. **Three of the six healthy runs that read
+this file did it** — at severity high, high and medium, across three payloads (6
+files/41k, 3 files/39.5k, 3 files/153k).
+
+So false positives are not random noise. They attach to a specific code shape — a
+guard whose condition deliberately excludes a case — and reproduce across corpora,
+sizes and file counts. On this file the chain runs at roughly 67% recall on the real
+defect with a ~50% chance of this one fabricated defect filed beside it. An enum
+constrains the vocabulary of `severity`; nothing constrains its accuracy.
 
 
 ## Failure mode 1 — the reviewer collapses to a minimal answer
@@ -693,10 +721,20 @@ on the work rather than on the answer.
 
 - Prefer several small reviews over one large one. ~10k tokens is the regime with
   evidence behind it.
-- **Split by FILE COUNT, not only by token count.** At essentially constant size
-  (41,027 vs 39,534 chars) going from three files to six took a planted defect from
-  found-in-218s to 0/3, with two total collapses and one run that misattributed one
-  file's contents to another. Three files is the shape with evidence behind it.
+- **Split by FILE COUNT, not by token count. Size is secondary.** Same plant, same
+  offset, same settings, only the corpus varying:
+
+  | corpus | files | chars | ~tok | loops | plant found |
+  |---|---|---|---|---|---|
+  | three files | 3 | 39,534 | ~11k | 1/3 | 2/3 |
+  | **the same three, 3.9x bigger** | **3** | **152,975** | **~42k** | **0/3** | **2/3** |
+  | six files | 6 | 41,027 | ~11k | 2/3 | **0/3** |
+
+  Quadrupling the size at constant file count degraded nothing — it was marginally
+  better. Doubling the file count at constant size was catastrophic: two total
+  collapses, and the one healthy run misattributed one file's contents to another.
+  Three files at 153k beat six files at 41k on every axis measured, so prefer few
+  files over small files.
 - **Bound the SEARCH SPACE — by scope or by question. That is the whole rule.**
 
   | shape | search space | result at 247k |
