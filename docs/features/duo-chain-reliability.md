@@ -600,6 +600,53 @@ T312aac392c8dc.
 
 Read the live template with `curl localhost:<engine-port>/props`.
 
+### But the CHAIN earns its place — a single call finds nothing
+
+The obvious follow-up to the section below is whether the chain is worth three model
+calls at all. It is. Identical payload, same schema and settings, one call to the
+reviewer model directly against the three-step chain:
+
+| | plant found | non-findings |
+|---|---|---|
+| single Flash-Next call | **0/3** | 12 of 16 entries |
+| duo three-step chain | **12/24 (50%)** | 8 of 26, and 19 of 56 |
+
+Zero out of three. The single call is also more prolific and much less accurate — in one
+run **every one of its seven entries** either affirmed the code was correct or complained
+about the inputs.
+
+So the value sits in the **plan**, which enumerates the boundary cases to check, and the
+reviewer answering against it. A single call has no plan. That is consistent with the
+worker being dispensable while the chain is not, and it makes the two-step
+(plan -> review) experiment more interesting rather than less.
+
+Cost is 1.5-2x the wall time of a single call, not the 3x the model-call count suggests,
+because the plan and review steps are short and the worker runs on the faster model.
+
+### duo's token headroom is load-bearing, not just waste
+
+`duoStepBudget` grants `min(requested + 32768, 49152)` regardless of the caller's
+`max_tokens` — 36,768 tokens for a caller who asked for 4,000. This page criticised that
+as feeding the repetition loop, which it does: a looping worker consumes all of it.
+
+It is also what prevents truncated JSON. One of the three single-call runs above returned
+`finish_reason: length` at exactly 4,000 completion tokens with the enforced object cut
+mid-string:
+
+> `...`t.host === 'local'` is true. It skips. \nThis might be a bug if `{`
+
+**That is the first unparseable answer under an enforced schema in this campaign, and it
+came from honouring the caller's budget.** duo never hits it because duo ignores that
+budget.
+
+So the JSON-validity claim on this page is more precisely: zero unparseable answers
+*through duo*, because duo's budget is large enough to finish the object. A direct caller
+declaring the same schema at `max_tokens: 4000` truncated once in three attempts on an
+11k-token payload. The schema guarantees shape; only budget guarantees completion.
+
+Any fix that caps the step budget to bound loops must keep enough room to finish the
+answer, or it trades one failure for another.
+
 ### The execute step may not be earning its place, for review tasks
 
 A powered comparison (24 runs, one payload, one planted defect) turned up something it
