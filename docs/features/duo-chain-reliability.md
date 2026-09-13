@@ -52,6 +52,12 @@ Measured end to end on real repository source with a planted defect, `default-bi
 | **907k chars** | **247,281** | **73 min** | **strict JSON, defect found** |
 | 961k chars | 262,532 | **0s — HTTP 400** | exceeds context size |
 
+Every row above used a handful of files. A later controlled test showed **file count
+matters more than size** — six files at 41k chars failed where two files at 205k and three
+files at 153k succeeded — so read this table as "large requests work when the corpus is a
+few files", not as a licence to pass many. See "Split by FILE COUNT" under practical
+guidance.
+
 **The practical ceiling is ~260,000 request tokens, and it is architectural.** Two of the
 three steps carry the request plus prior output:
 
@@ -178,6 +184,36 @@ steps run. Read `/api/queue` to see the active request.
 
 The one path that IS explained is prefill: a 247k plan step needs 46-55 minutes of genuine
 prompt processing against a hard 3600s per-step cut, leaving ~5 minutes of margin.
+
+**The marginal rate predicts that boundary; the cumulative rate does not.** A clean
+measurement on an idle drakemore — 2 files, 200,467 prompt tokens, `unaccountedMs` 0 on
+every step:
+
+| step | wall | prefill | rate | completion |
+|---|---|---|---|---|
+| plan | 2,340s | 2,257s | 89 tok/s | 446 |
+| execute | 711s | 647s | 310 tok/s | 1,475 |
+| review | 88s | 43s | 171 tok/s | 681 |
+
+Extrapolating the plan step to 247k with the marginal rate (declining from ~63 tok/s at
+200k toward ~47 at 247k, so ~55 average over that stretch), the extra 46,533 tokens cost
+~846s:
+
+```
+plan prefill at 247k ≈ 2,257 + 846 ≈ 3,103s
+plus generation                    ≈   100s
+                                     3,203s   against a 3,600s ceiling
+```
+
+~400s of headroom — which any contention consumes. So the 247k runs that failed with
+`proxy error: Failed to read connection` at exactly 3600xxx ms were not stalls: they were
+legitimate prefill plus a little contention crossing a hard limit. Note this run had a
+completely idle box; the 32.8-to-60+ minute variance recorded on an identical payload
+elsewhere on this page is what happens when it is not.
+
+That also means the 3600s cut and the contention problem are the same failure at large
+sizes, not two independent ones: below ~200k there is enough margin to absorb contention,
+above it there is not.
 
 **Sizing a payload:** do not use `chars/4`. Measured density varies by file type — 3.77
 chars/token for `api/` + `ui/src`, 3.66 once tests and shell scripts are included. That 3%
