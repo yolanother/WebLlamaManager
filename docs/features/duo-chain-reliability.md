@@ -190,8 +190,63 @@ that were in the request throughout.
 
 **So read every recall figure on this page as "for a defect of that kind, in a
 corpus of that shape".** They are not a general claim that duo finds planted
-defects. A second plant in a larger file set went 0/3, by three different
-mechanisms: two loops and one case of losing the file boundaries entirely.
+defects.
+
+### The corpus was the variable, not the defect
+
+The 0/3 above confounded two changes: a new defect AND six files instead of three.
+A control isolated it — same plant, same offset 3,825, same settings, but the
+known-healthy three-file corpus with `gpu-drain.js` swapped out for the planted
+`queue-admission.js` (39,534 chars, within 4% of the six-file payload):
+
+| corpus | files | chars | loops | plant found |
+|---|---|---|---|---|
+| plant in `gpu-reservations.js` | 3 | 41,011 | 0/3 | 3/3 |
+| plant in `queue-admission.js` | 3 | 39,534 | 1/3 | **2/2 healthy runs** |
+| same plant, more files | 6 | 41,027 | 2/3 | 0/1 healthy run |
+
+Both healthy three-file runs named it correctly and cited the right contradiction:
+
+> "Boundary condition mismatch for soft cap. The documentation states 'At/over the
+> soft cap... offload', implying that if `pending == maxQueueDepth`, the request
+> should be offloaded or stall-checked. However, the code uses
+> `if (pending <= maxQueueDepth)` to accept..."
+
+So this defect class is not invisible to duo, and the caveat the recall figures need
+is about corpus shape rather than defect kind. Three things follow:
+
+1. **File count drives the loop rate and the attribution errors.** Three files looped
+   once in six runs across both three-file corpora; six files looped two in three. The
+   "file not provided" and "this file is EMPTY of the logic" findings appeared ONLY in
+   the six-file batch.
+2. **Reducing file count is not a fix.** One three-file run hit the identical
+   36,768-token ceiling as the six-file loops. The loop is a baseline hazard at this
+   size and `loopingTextReason` is what makes it visible; fewer files only improves
+   the odds.
+3. **Split a review by FILE COUNT, not only by token count.** At essentially constant
+   size, three files to six took this from found-in-218s to 0/3.
+
+### False positives cluster on a code shape
+
+Both batches produced the same fabricated finding, at `severity: "high"`, on the same
+symbol — that stall detection "fails to reject wedged models when active count is zero
+but queue is deep and stalled". The code deliberately does the opposite and says so two
+lines apart:
+
+```js
+// …if something is actively being served but nothing has completed within stallMs,
+// the model is wedged/stuck — reject as a last resort.
+if (active > 0 && msSinceLastCompletion >= stallMs) { /* reject 'stalled' */ }
+// Deep but draining (or nothing active yet) — let the queue grow; requests wait,
+// they don't fail.
+return { action: 'accept', reason: 'deep-draining' };
+```
+
+It invents a requirement the file's own comments contradict, then reports compliance
+with the real requirement as a violation — twice, across different corpora. So false
+positives are not random noise: they cluster on specific shapes, and a guard whose
+condition deliberately excludes a case is one of them. An enum constrains the
+vocabulary of `severity`; nothing constrains its accuracy.
 
 
 ## Failure mode 1 — the reviewer collapses to a minimal answer
@@ -358,6 +413,27 @@ This also means `DUO_REASONING_EFFORT` is inert for non-thinking callers — tra
 T312aac392c8dc.
 
 Read the live template with `curl localhost:<engine-port>/props`.
+
+### And on some models `enable_thinking: false` is itself inert
+
+The flag gates the template, but whether the template gates the *model* is a separate
+question, and on `Qwen_Qwen3-8B-GGUF` it does not. Measured on Frostburn 2026-09-13,
+identical prompt (a question whose correct answer is one word), `temperature: 0.2`:
+
+| max_tokens | thinking default | `enable_thinking: false` |
+|---|---|---|
+| 350 | exhausted | exhausted |
+| 2000 | 864 / 1563 / 1847 tok, answered | **exhausted at 2000**, then 953 / 1893 / 1959 |
+
+The distributions overlap completely, and the only full-budget exhaustion at 2000
+happened *with* the flag set. So on that model the flag suppresses nothing and the
+only working lever is `max_tokens` — with a high floor: ~850-2000 tokens to answer a
+question whose correct output is one word.
+
+This is why `REASONING_EXHAUSTED` no longer offers the flag as an equal remedy. Under
+the podcast pipeline that error fires about 70 times per 13 minutes, and every
+exhausted budget observed (80, 100, 160, 200, 250, 350, 600, 1000) is below what the
+model needs for a trivial answer.
 
 ## Failure mode 2 — the reviewer answers in prose
 
@@ -585,6 +661,10 @@ on the work rather than on the answer.
 
 - Prefer several small reviews over one large one. ~10k tokens is the regime with
   evidence behind it.
+- **Split by FILE COUNT, not only by token count.** At essentially constant size
+  (41,027 vs 39,534 chars) going from three files to six took a planted defect from
+  found-in-218s to 0/3, with two total collapses and one run that misattributed one
+  file's contents to another. Three files is the shape with evidence behind it.
 - **Bound the SEARCH SPACE — by scope or by question. That is the whole rule.**
 
   | shape | search space | result at 247k |
