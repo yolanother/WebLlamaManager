@@ -1074,11 +1074,27 @@ on the work rather than on the answer.
   work ratio 0.3981, the plant found and correctly reasoned, and **zero** attribution
   errors, which was the exact failure predicted ("not provided" 0, "EMPTY of" 0).
 
-  Four loops in 19 runs, 21%, and they are spread across sizes from ~41k to ~245k. Two
-  of the four came from the six-file corpus, but at a 21% base rate 2-of-3 is
-  unremarkable, and n=3. **No corpus property measured so far predicts the loop** — not
-  file count, not size. Prefer smaller reviews for the reasons in the next bullet, not
-  because any corpus shape has been shown to cause collapse.
+  Across **97 captured runs** spanning 10,700 to 247,308 prompt tokens, the loop runs at
+  **9%** and the near-empty worker at **14%**, and neither varies with size:
+
+  | plan prompt | runs | loops | near-empty |
+  |---|---|---|---|
+  | <25k | 57 | 11% | 18% |
+  | 25-60k | 8 | 0% | 13% |
+  | 60-120k | 5 | 0% | 0% |
+  | 120-180k | 8 | 13% | 25% |
+  | >180k | 19 | 11% | 5% |
+
+  Loops under 25k against 25k-and-over: 6/57 vs 3/40, Fisher **p = 0.73**. Split at 60k
+  instead: 6/65 vs 3/32, **p = 1.00**. The 0% middle bins hold 8 and 5 runs and are
+  noise — the 60-120k bin would need a loop rate above 45% before one loop became likely.
+
+  **Four candidate predictors have now been tested and rejected**: size (above), file
+  count (59 files at 204k ran clean where 6 files at 41k looped 2/3), prompt shape (the
+  bounded question replicated 2 of 3), and temperature (1/12 loops in each arm of a
+  paired comparison). Nothing about the REQUEST has been shown to change the rate, which
+  points at the model and sampler rather than anything a caller controls — and means the
+  mitigation is detection rather than avoidance.
 - **Bound the SEARCH SPACE — by scope or by question. That is the whole rule.**
 
   The cleanest evidence is a single-variable comparison at the largest size tested. Same
