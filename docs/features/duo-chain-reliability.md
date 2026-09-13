@@ -600,29 +600,64 @@ T312aac392c8dc.
 
 Read the live template with `curl localhost:<engine-port>/props`.
 
+### The execute step may not be earning its place, for review tasks
+
+A powered comparison (24 runs, one payload, one planted defect) turned up something it
+was not looking for. Near-empty execute steps — the worker writing 2-5 tokens — occurred
+in **7 of 24 runs, 29%**. With loops at 2/24, **the worker contributed nothing usable in
+roughly 37% of runs.** And it did not hurt the answer:
+
+| execute step | plant found |
+|---|---|
+| wrote < 20 tokens | **4/7 (57%)** |
+| wrote real work | 7/15 (47%) |
+
+A no-op worker produced the plant slightly MORE often than a working one. Not a
+significant difference — but decisively not a worse one.
+
+That is consistent with three things recorded elsewhere on this page: the bounded 245k
+run whose `duo.work` was the single word `'Hello!'` produced the cleanest answer of the
+whole campaign; the reviewer routinely rebuilds from the plan when the work is garbage;
+and the review step is what names the defect in nearly every successful run.
+
+So for **code review against a findings schema**, the plan enumerates what to check and
+the reviewer reads the source and answers, while the worker's output is largely passed
+over. Failure mode 5 may therefore not be an output failure at all — it is a wasted
+model call, about a third of the chain's cost, buying nothing measurable.
+
+**Do not act on this yet.** One task shape, one defect, one payload, 22 scored runs. A
+worker that adds nothing to a review the reviewer can do itself may still be essential
+where the answer requires producing something — code, a transformation, a long document.
+The test that would settle it is a two-step chain (plan -> review) against the three-step
+chain on the same payloads.
+
 ### Temperature 0.2 is not the safe choice it looks like
 
 Every measurement on this page used `temperature: 0.2` until a paired comparison was run
 — same 6-file 41,027-char payload, 8 runs alternating 0.2 and 0.7, four each, alternating
 rather than blocked so thermal and contention drift hit both arms equally:
 
-| | loops | plant found | near-empty work | non-findings |
+A pilot of four runs per arm suggested 0.7 was better. **It was not.** A confirmation at
+twelve per arm, pre-registered with near-empty work as the primary endpoint:
+
+| | near-empty work | loops | plant found | non-findings |
 |---|---|---|---|---|
-| temp 0.2 | 0/4 | 1/4 | **2/4** | 8 of 18 concerns |
-| temp 0.7 | 0/4 | **3/4** | **0/4** | 6 of 18 concerns |
+| temp 0.2 | 4/12 | 1/12 | 6/12 | 8 of 26 concerns |
+| temp 0.7 | 3/12 | 1/12 | 6/12 | 19 of 56 concerns |
 
-0.7 was not worse on any axis measured and better on two. The expected cost — higher
-temperature producing more fabricated findings — did not appear.
+Fisher exact on the primary: **p = 1.0**. Recall identical, loop rate identical. Pooling
+the pilot gives 6/16 against 3/16, p ~= 0.43 — still nothing. The pilot's apparent 3/4
+versus 1/4 recall advantage vanished at 6/12 versus 6/12.
 
-Two caveats that matter more than the table. **This says nothing about loops**: neither
-arm produced one, on a payload that had looped 2 of 3 earlier, which is consistent with
-the ~19% pooled rate and an unlucky earlier draw. And nothing here is significant alone
-— 3/4 vs 1/4 is Fisher p ~= 0.49.
+**Temperature does not explain any failure measured here.** The only real difference runs
+against 0.7: it produced more than twice as many concern entries at a similar
+non-finding rate, so it is more verbose without being more accurate.
 
-The claim this supports is narrow: **stop treating 0.2 as the safe default for duo.** It
-does not support raising the default on four runs per arm. Settling it needs the same
-paired design at 12-16 runs per arm, with near-empty work as the primary endpoint rather
-than loops, which are too rare for this payload to power.
+The general lesson is worth more than the parameter. Four successive explanations of the
+near-empty execute step were written on this page's evidence — penalty-specific, then
+not, then temperature-linked, then neither — and each was a pattern read into a handful
+of runs. Loop and near-empty rates here run 8% and 29%, so four-run batches cannot
+distinguish anything.
 
 ### A repetition penalty does not fix the loop, and costs something
 
@@ -970,10 +1005,15 @@ cleared, 0 false positives.** It is wired into the duo execute step only, not in
 
 ### Failure mode 5 — the worker writes nothing and no guard notices
 
-Three times now the execute step has read a large corpus and produced essentially
-nothing: once reading 127k tokens and writing 2, and twice writing the single word
-`'Hello!'` (3 tokens). Two of the three were at completely default sampling, so this is
-not an artifact of any experimental setting.
+**This happens in about 29% of runs.** A 24-run comparison found the execute step
+writing 2-5 tokens in 7 of them, at both temperatures tested. Earlier occurrences —
+reading 127k tokens and writing 2, and twice writing the single word `'Hello!'` — looked
+like anomalies; they are routine.
+
+And it does not hurt the answer: runs whose execute step wrote under 20 tokens found the
+planted defect 4/7, against 7/15 for runs where it wrote real work. See "The execute step
+may not be earning its place" — this may be a wasted model call rather than an output
+failure.
 
 Nothing catches it. `loopingTextReason` requires at least 500 words, `reviewCollapsed`
 requires at least 200 characters of unparseable work, and `'Hello!'` is ordinary text by
@@ -988,15 +1028,9 @@ response is to record the condition so an operator can see the worker contribute
 nothing — the opposite of the repetition loop, where failing is correct because the
 answer is actively wrong.
 
-**Every occurrence has been at `temperature: 0.2`.** Six are now known — the original
-"read 127k tokens, wrote 2", a `'Hello!'` at 245k, a `'Hello!'` under `repeat_penalty`,
-and two more (3 and 4 completion tokens) in a paired temperature comparison. In that
-comparison, 2 of 4 runs at 0.2 produced a near-empty work step and 0 of 4 at 0.7 did,
-every one of the latter writing 310-2,432 tokens.
-
-Treat that as a lead rather than a cause: 2/4 against 0/4 is Fisher p ~= 0.43 on its
-own, and only four runs at any other temperature exist. The weight comes from six
-occurrences spread across five payloads and sizes, all sharing one setting.
+A pilot suggested every occurrence was at `temperature: 0.2`. **A twelve-per-arm
+confirmation killed that**: 4/12 at 0.2 against 3/12 at 0.7, Fisher p = 1.0. No sampler
+setting tested explains it.
 
 Tracked as T312c131dcc26c.
 
