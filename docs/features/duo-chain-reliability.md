@@ -69,7 +69,7 @@ two even though step one fits.
 Cost is prompt processing, and it is legitimate work. From per-step `promptMs` /
 `unaccountedMs` (recorded since 8a90315):
 
-| prompt size | prefill rate |
+| prompt size | prefill rate (cumulative) |
 |---|---|
 | 6k | 181 tok/s |
 | 54k | 144 tok/s |
@@ -77,9 +77,68 @@ Cost is prompt processing, and it is legitimate work. From per-step `promptMs` /
 | 213k | 84 tok/s |
 | 247k | 86 tok/s — decay has flattened |
 
-The execute step runs 3x faster (266 tok/s at 247k) because its prompt shares the request
-prefix with the plan step and hits the prompt cache. Only the first big step pays full
-price.
+**Those are CUMULATIVE averages — the engine's running mean over the whole prefill — and
+they understate what another token costs.** Differencing consecutive samples from one
+continuous 200k-token prefill gives the marginal rate:
+
+| n_tokens | cumulative tok/s | marginal tok/s |
+|---|---|---|
+| 16,384 | 153.7 | — |
+| 32,768 | 140.5 | 130.9 |
+| 49,152 | 131.5 | 120.5 |
+| 65,536 | 109.4 | 104.5 |
+| 98,304 | 105.4 | 95.0 |
+| 131,072 | 100.1 | 82.8 |
+| 163,840 | 94.7 | 73.9 |
+| 190,464 | 90.7 | **65.0** |
+
+At 190k the cumulative rate is 90.7 and the marginal rate is 65.0 — 30% worse. Adding 50k
+tokens to a 190k prompt costs ~770s, not the ~550s the cumulative figure implies, and the
+error grows with context. The marginal decay is roughly linear in `n` (about -0.31 tok/s
+per 1,000 tokens between 65k and 190k), which puts it near 47 tok/s at 247k. **Size a
+request from the marginal column, not the cumulative one.**
+
+### The execute step is faster because it is a different MODEL, not a cache hit
+
+An earlier version of this page said the execute step runs 3x faster "because its prompt
+shares the request prefix with the plan step and hits the prompt cache". That is wrong.
+The two steps run on **different child processes with separate KV caches** — `ps` on
+drakemore shows Flash-Next and Qwen3.6-35B-A3B as two `llama-server` children, and the
+engine log shows the plan on slot 0 of one process and the execute on slot 1 of another.
+A prefix cannot be shared between them.
+
+The difference is the model. Cold measurements, where neither step had seen the payload
+before:
+
+| run | plan prompt | plan tok/s | execute prompt | execute tok/s | ratio |
+|---|---|---|---|---|---|
+| enum41_1 | 10,638 | 168 | 12,359 | 850 | 5.1x |
+| p2_1 | 10,566 | 175 | 11,862 | 891 | 5.1x |
+| p3f_1 | 10,317 | 141 | 11,122 | 829 | 5.9x |
+| p150k_1 | 40,607 | 128 | 44,750 | 666 | 5.2x |
+
+`p150k_1` is the decisive one: it was the FIRST run of that payload, so the execute step
+had never seen its prompt either, and it was still 5.2x faster. Flash-Next is a
+`UD-IQ3_XXS` quant of a much larger hybrid-attention model; Qwen3.6-35B-A3B is a
+`Q4_K_XL` MoE with ~3B active parameters per token.
+
+**So the Flash-Next steps dominate the chain's cost at large context.** On the 200k run the
+plan step's prefill alone was 2,210s against the execute step's 540s. If large-request duo
+is ever optimised, the plan step is where the time is.
+
+### The prompt cache is real, but it is across RUNS of the same payload
+
+Re-sending an identical payload makes the plan step's prefill effectively free:
+
+| run of the same 153k payload | plan promptTokens | plan promptMs |
+|---|---|---|
+| first (cold) | 40,607 | 317,456 |
+| second | 40,607 | **195** |
+| third | 40,607 | **200** |
+
+A 1,600x difference. This matters when reading any batch timing on this page: **run 1 of a
+batch is cold and runs 2-3 are warm**, so their wall times are not independent samples of
+cost. It does not affect any conclusion drawn from output CONTENT, only from timing.
 
 Healthy `unaccountedMs` is **182ms to 15s** per step, but it has been measured as high as
 **56.9 minutes** on a 7,469-token review prompt.
