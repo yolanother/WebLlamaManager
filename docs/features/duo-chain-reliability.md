@@ -571,6 +571,42 @@ T312aac392c8dc.
 
 Read the live template with `curl localhost:<engine-port>/props`.
 
+### A repetition penalty does not fix the loop, and costs something
+
+Nothing ever sets one — `duoCallerControls` forwards only the sampling fields the caller
+set, so `repeat_penalty` falls to the engine default of 1.0 (disabled). It is the textbook
+remedy for a repetition loop, it is already plumbed (`repeat_penalty` is in
+`DUO_FORWARDED_CONTROLS`), and the loops repeat phrases of ~6-35 tokens, inside llama.cpp's
+64-token `repeat_last_n` window. So it was worth testing.
+
+Four runs of the payload with the highest observed loop rate (6 files, 41,027 chars, 2/3
+loops without the penalty), unchanged except `repeat_penalty: 1.1`:
+
+| run | work | execute tok | loop | outcome |
+|---|---|---|---|---|
+| 1 | **6 chars** | **3** | no | work was the word `'Hello!'`; the reviewer rebuilt from the plan and found the plant anyway |
+| 2 | 13,607 ch | 3,349 | no | answer is entirely commentary on the work; plant missed and **certified correct** |
+| 3 | 4,416 ch | 1,015 | no | clean — plant found |
+| 4 | 12,091 ch | 3,103 | no | answer is entirely commentary on the work; plant missed |
+
+**0 of 4 looped, and that settles nothing.** P(0 in 4) is 1.2% if the payload's true rate
+is 2/3, but 39% against the pooled 21% across 19 runs, and the 2/3 rests on n=3.
+
+What it cost is clearer than what it bought. Two failure shapes appeared that 19 runs
+without the penalty never produced: a work step returning a 3-token greeting, and answers
+made entirely of commentary about the work. Recall went 0/3 to 2/4, not meaningful at this
+n.
+
+**Do not set a default `repeat_penalty` for duo on this evidence.** Settling it needs a
+paired comparison — the same payload alternating with and without, 8+ runs — which is
+about three hours of a dedicated box for one parameter value.
+
+Worth noting the `'Hello!'` work passes every guard there is: too short for
+`loopingTextReason` (500-word floor), too short for `reviewCollapsed` (200-char floor),
+and not degenerate output. A work step that returns a greeting is a clear failure that
+nothing sees — though in that run the chain still answered correctly, so failing hard on
+it would have discarded a good answer.
+
 ### And on some models `enable_thinking: false` is itself inert
 
 The flag gates the template, but whether the template gates the *model* is a separate
@@ -715,6 +751,38 @@ findings list is a weak warning sign rather than a reassuring one.
 This is also what settles whether failing the chain on a loop throws away a usable
 answer: it does not. The output is padded with affirmations of correctness, which is
 worse than empty.
+
+#### Two kinds of non-finding, and what they mean together
+
+Affirmations are one of two recognizable ways a `concerns` entry can fail to be a
+finding. The other is **commentary about the inputs**: an entry that says the reviewer
+could not see the code rather than judging it.
+
+| kind | what it looks like |
+|---|---|
+| affirmation | "The code sets `state: 'pending'` and binds the card. **This matches.**" |
+| input commentary | "The file `api/alt-port.js` is not provided in the source code snippet. The review cannot be completed for this file." |
+| input commentary, extreme | "The **'WORK PRODUCED'** claims this file is missing from the source. It IS present in the ORIGINAL REQUEST." |
+
+The third row is the reviewer quoting its own prompt's section headers back to the
+caller — it has stopped answering the request and started reviewing the worker. Note
+that its own prompt already says "no commentary, no verdict, no preamble, nothing
+else"; the instruction does not hold when the work is badly wrong.
+
+Across 23 runs and 67 concern entries, **27 entries (40%) are one of these two and not
+findings at all.** They are concentrated rather than spread: 17 runs have none, and the
+6 affected runs are mostly contaminated — 4 of 7, 1 of 1, 6 of 7, 6 of 6, 6 of 6.
+
+**So the consumer rule is: if any entry affirms correctness or complains about the
+inputs, distrust the whole answer, not just that entry.** In every affected run the
+planted defect was either missed or, in one case, explicitly certified as correct:
+
+> "The code implements the documented policy correctly (accept below cap, offload if
+> remote available at cap...)" — about the code containing the plant.
+
+Input commentary is not an artifact of any experimental setting: 3 of the 19 runs with
+default sampling produced it. It gets much worse with a repetition penalty (2 of 4), for
+which see the note under sampling.
 
 And budget `max_tokens` for the whole object: grammar guarantees shape, not completion. At
 `max_tokens: 120` the enforced JSON was cut mid-string and failed to parse.
