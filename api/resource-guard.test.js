@@ -547,3 +547,29 @@ test('the server tells the guard whether weights are mmap-backed', async () => {
   const sites = source.match(/mmapped: modelUsesMmap\(\)/g) || [];
   assert.ok(sites.length >= 2, `expected both admission sites to pass mmapped, found ${sites.length}`);
 });
+
+test('thermalDecision: external heat still releases once the die is genuinely cool', () => {
+  // The case attribution exists for, and which the fix must not break: an unrelated
+  // process heating the die while llama is idle. Once the die is at or below resumeC
+  // there is nothing to hold the throttle for.
+  const d = thermalDecision({
+    tempC: 78, prevState: 'throttled',
+    warnC: 90, resumeC: 80, criticalC: 96,
+    gpuC: 60, appCpuPct: 3, gpuWarnC: 85, appCpuHeatPct: 25,
+  });
+  assert.equal(d.state, 'normal');
+  assert.equal(d.pauseDispatch, false);
+});
+
+test('thermalDecision: external heat below warn from a normal state still serves', () => {
+  // Frostburn 2026-09-13: an orch sync-knowledge job at 250% CPU heated the die while
+  // llama sat at 3-6%. Throttling llama cannot cool that, and from a NORMAL state there
+  // is no throttle to hold, so it must keep serving.
+  const d = thermalDecision({
+    tempC: 88, prevState: 'normal',
+    warnC: 90, resumeC: 80, criticalC: 96,
+    gpuC: 69, appCpuPct: 6.2, gpuWarnC: 85, appCpuHeatPct: 25,
+  });
+  assert.equal(d.state, 'normal');
+  assert.equal(d.pauseDispatch, false);
+});

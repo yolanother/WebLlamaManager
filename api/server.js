@@ -16550,11 +16550,19 @@ setInterval(async () => {
       } else if (decision.state === 'throttled') {
         addLog('system', `[thermal] throttling: ${maxTempC.toFixed(1)}C (gpu=${gpuC}, cpu=${cpuC}, llamaCpu=${appCpuPct}%) >= ${cfg.warnC}C — pausing new requests until <= ${cfg.resumeC}C`);
       } else if (decision.state === 'normal') {
-        // Coming down from a throttle, or heat that was attributed to external load.
-        const external = maxTempC >= cfg.warnC;
-        addLog('system', external
-          ? `[thermal] die ${maxTempC.toFixed(1)}C but heat is EXTERNAL (gpu=${gpuC} < ${cfg.gpuWarnC}C, llamaCpu=${appCpuPct}% < ${cfg.appCpuHeatPct}%) — not throttling llama`
-          : `[thermal] recovered: ${maxTempC.toFixed(1)}C <= ${cfg.resumeC}C — resuming normal dispatch`);
+        // Three ways to reach 'normal', and they are NOT interchangeable in a log an
+        // operator reads during a thermal incident:
+        //   - the die actually cooled to resumeC — a real recovery;
+        //   - the die is above warnC but the heat is attributed elsewhere;
+        //   - the die is BETWEEN resumeC and warnC and attribution released the throttle.
+        // The third case used to print "recovered: 84.9C <= 80C", asserting a comparison
+        // that is false. Measured on both boxes 2026-09-13 at 81.6C, 82.9C, 84.9C, 89.1C
+        // and 92.6C, every one claiming to be at or below an 80C threshold.
+        const cooled = maxTempC <= cfg.resumeC;
+        const attribution = `gpu=${gpuC} < ${cfg.gpuWarnC}C, llamaCpu=${appCpuPct}% < ${cfg.appCpuHeatPct}%`;
+        addLog('system', cooled
+          ? `[thermal] recovered: ${maxTempC.toFixed(1)}C <= ${cfg.resumeC}C — resuming normal dispatch`
+          : `[thermal] resuming at ${maxTempC.toFixed(1)}C, ABOVE the ${cfg.resumeC}C resume threshold — heat attributed elsewhere (${attribution}); llama is not being throttled`);
       }
     }
     // NOTE: the thermal path deliberately performs NO unload. Models stay loaded so
