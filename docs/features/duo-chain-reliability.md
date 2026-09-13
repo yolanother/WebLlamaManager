@@ -26,16 +26,35 @@ source rather than toy prompts.
 
 ## The short version
 
-- **At small payloads (~10k tokens) the chain is reliable *for the defect it was measured
-  on*.** 2/2 correct and strict JSON on a corpus containing one planted defect — but a
-  SECOND plant at the same size went 0/3, so this is not a general recall claim. See
-  "One plant is not a measurement of recall".
-- **At large payloads it is not.** The review step intermittently discards the worker's
-  answer and returns an empty one instead.
-- **When an answer looks wrong, read `duo.work` before believing `duo`'s final answer.**
-  The signal is usually there and correct; the last step is what loses it.
-- **To review a large corpus, chunk it.** Several small reviews beat one large one, and
-  the small regime is the one with evidence behind it.
+Measured over 23 end-to-end runs on real repository source, 41k to 245k request tokens,
+`default-big`, findings-only `json_schema` with a severity enum, `temperature: 0.2`,
+`enable_thinking: false`.
+
+- **The JSON itself is not the problem — once a schema is enforced.** 0 empty 200s, 0
+  unparseable replies, 0 truncated replies, across all 23 runs. Not "rare": zero. A
+  `json_schema` `response_format` constrains decoding, so a non-JSON reply cannot be
+  emitted. `{"type":"json_object"}` gives you none of this — the engine accepts it,
+  returns 200, and applies no grammar at all.
+- **The real failure is a repetition loop in the worker: ~21%, at every size.** Four in
+  19 default-sampling runs, spread from 41k to 245k tokens. **No corpus property
+  predicts it** — not size, not file count, not shape; several plausible rules were
+  tested and refuted. `loopingTextReason` now catches it before the reviewer can turn it
+  into confident prose.
+- **Recall is roughly 2 in 3; precision is worse.** Among healthy runs that read the
+  planted file, about two thirds named the defect. But **40% of all concern entries are
+  not findings at all** — they affirm the code is correct, or complain about the inputs.
+  They cluster: 17 runs have none, and affected runs are mostly contaminated.
+- **Triage each finding by reading five lines either side of the code it cites.** Every
+  false positive measured had its refutation within four lines — a guard clause, a clamp,
+  a destructuring in the signature, a comment stating the intent. Findings that survive
+  their neighbourhood have been worth taking seriously every time.
+- **Size is not the constraint you think.** ~245k tokens works; the ceiling at ~260k is
+  architectural, not a speed limit. Large requests are slow, not unreliable — a 245k plan
+  step spends ~2,900s in prefill against a 3,600s per-step cut.
+- **Do not trust `duo.work` over the answer, or the reverse.** Either can be the good
+  one: in one run the work was the single word `'Hello!'` and the answer was correct; in
+  another the work held the defect and the reviewer discarded it. Read both when the
+  result matters.
 
 ## How large a request can duo actually take?
 
