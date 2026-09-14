@@ -224,10 +224,24 @@ depth.**
 | cool box | 100.1 tok/s | ~300,000 |
 | hot box | 38.5 tok/s | ~138,600 |
 
-A 2.6x throughput collapse, with no thermal-governor events during the run — the hardware
-clocks down below the governor's 90C threshold. So **the usable context is thermally
-dependent** and the same payload that clears the cut with 645s to spare on a cool box
-fails at 55% on a hot one.
+A 2.6x throughput collapse, with no thermal-governor events during the run. **The usable
+context therefore depends on the rate the box happens to be achieving**, and the same
+payload that clears the cut with 645s to spare on one attempt fails at 55% on another.
+
+**The CAUSE is not established.** A thermal explanation was the obvious one and it does
+not survive testing:
+
+| check | result |
+|---|---|
+| rerun the same payload after 28 minutes idle | **50.3 tok/s — no recovery** (127.9 cold that morning) |
+| is the degradation box-wide? | no — Qwen3.6-35B ran 619 tok/s against its usual 666-891, while Flash-Next fell 2.5x |
+| is a child spinning? | no — 0.0% CPU measured from `/proc` deltas while idle (`ps pcpu` shows a lifetime average and is misleading here) |
+| GPU state | idle and cool: 53C, 210MHz of 2100, 21W of 420, 0% utilisation |
+| CPU clock at idle | 5.0GHz against a 5.19GHz maximum, so 96% |
+
+So the collapse is **model-specific, persists across idle, and is not explained by GPU
+thermals or a busy process**. Cooling is not a demonstrated mitigation. What does cause it
+is open.
 
 This accounts for a variance recorded on this page for weeks without explanation —
 "prefill on an identical 199,466-token payload varied 32.8 to >60 minutes" — and for why
