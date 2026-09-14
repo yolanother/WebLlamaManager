@@ -213,6 +213,37 @@ steps run. Read `/api/queue` to see the active request.
 The one path that IS explained is prefill: a 247k plan step needs 46-55 minutes of genuine
 prompt processing against a hard 3600s per-step cut, leaving ~5 minutes of margin.
 
+**The 3,600s cut is a THROUGHPUT limit, not a size limit.** Measured 2026-09-14: a
+249,567-token request failed at exactly 3600248ms having prefilled only **137,216 tokens,
+55% of the way**, because the box was running at **38.4 tok/s instead of the 83-100
+measured hours earlier on the same box, same model, same corpus type at the same context
+depth.**
+
+| | n=131k cumulative rate | tokens the 3,600s cut covers |
+|---|---|---|
+| cool box | 100.1 tok/s | ~300,000 |
+| hot box | 38.5 tok/s | ~138,600 |
+
+A 2.6x throughput collapse, with no thermal-governor events during the run — the hardware
+clocks down below the governor's 90C threshold. So **the usable context is thermally
+dependent** and the same payload that clears the cut with 645s to spare on a cool box
+fails at 55% on a hot one.
+
+This accounts for a variance recorded on this page for weeks without explanation —
+"prefill on an identical 199,466-token payload varied 32.8 to >60 minutes" — and for why
+244-245k runs cleared the cut by 645s on one attempt and 71s on another. Same payloads,
+different die temperatures.
+
+It is also invisible where you would look for it: `unaccountedMs` stays 0 because the time
+is spent inside prefill rather than waiting, the thermal log is silent because no throttle
+decision was taken, and the only symptom is a large `promptMs` that looks like a large
+request.
+
+**Consequence for sizing:** do not read the table above as "N tokens works". Read it as "N
+tokens works at the rate that box was achieving that day". Anything above ~138k tokens can
+fail on a thermally stressed box, and nothing in the response distinguishes that from the
+request simply being big.
+
 **The marginal rate predicts that boundary; the cumulative rate does not.** A clean
 measurement on an idle drakemore — 2 files, 200,467 prompt tokens, `unaccountedMs` 0 on
 every step:
