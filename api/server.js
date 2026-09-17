@@ -70,6 +70,7 @@ import {
   resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries, expandGlob,
   BIG_ALIAS, SMALL_ALIAS, RESERVED_ALIAS_NAMES,
 } from './model-aliases.js';
+import { remoteModelWindows } from './remote-model-windows.js';
 import { migrateModelMappings, synthesizeModelMapping, foldModelMapping } from './alias-migration.js';
 import { injectBaseChatPrompt, routeAutoModel } from './chat-router.js';
 import { readCompletionText,
@@ -870,15 +871,43 @@ function localModelNames(force = false) {
 const remoteModelsCache = new Map();
 
 /**
+ * Advertised context window per model, per backend, from the same probe that fills
+ * {@link remoteModelsCache}. Kept separately so the name-only cache keeps its shape
+ * and its glob-expansion behaviour.
+ * @type {Map<string, Object<string, number>>}
+ */
+const remoteModelWindowsCache = new Map();
+
+/**
+ * Every remote window this box has been told, flattened across backends.
+ *
+ * A model id served by two backends resolves to the SMALLEST window between them,
+ * for the same reason an alias takes the smallest of its targets: a request may
+ * reach either, so only the smaller is safe to promise.
+ *
+ * @returns {Object<string, number>} model id to window.
+ */
+function knownRemoteWindows() {
+  const merged = {};
+  for (const windows of remoteModelWindowsCache.values()) {
+    for (const [id, window] of Object.entries(windows || {})) {
+      merged[id] = merged[id] === undefined ? window : Math.min(merged[id], window);
+    }
+  }
+  return merged;
+}
+
+/**
  * Record a backend's advertised model list for alias glob expansion.
  *
  * @param {string} backendId backend the list belongs to.
  * @param {string[]|undefined} models model names reported by the backend.
  * @returns {void}
  */
-function cacheRemoteModels(backendId, models) {
+function cacheRemoteModels(backendId, models, windows) {
   if (!backendId || !Array.isArray(models)) return;
   remoteModelsCache.set(backendId, models.filter(m => typeof m === 'string' && m));
+  if (windows && typeof windows === 'object') remoteModelWindowsCache.set(backendId, windows);
 }
 
 /**
@@ -6058,7 +6087,9 @@ async function probeBackendModels({ url, apiKeyEnvVar, extraHeaders }) {
       .map(m => (typeof m === 'string' ? m : m.id || m.name || ''))
       .filter(Boolean)
       .sort();
-    return { success: true, status: r.status, latencyMs, remoteModels };
+    // The windows are in this same payload. Dropping them is what leaves an alias
+    // whose target lives on this backend permanently unable to state one.
+    return { success: true, status: r.status, latencyMs, remoteModels, remoteWindows: remoteModelWindows(data) };
   } catch (err) {
     clearTimeout(timeout);
     return { success: false, status: 0, latencyMs: Date.now() - startTime, remoteModels: [],
@@ -6077,7 +6108,7 @@ app.post('/api/backends/:id/refresh-models', async (req, res) => {
     extraHeaders: req.body?.extraHeaders ?? backend?.extraHeaders
   });
   // Feed the alias inventory so glob targets on this backend can expand.
-  if (probe.success && backend) cacheRemoteModels(backend.id, probe.remoteModels);
+  if (probe.success && backend) cacheRemoteModels(backend.id, probe.remoteModels, probe.remoteWindows);
   res.json(probe);
 });
 
@@ -11125,11 +11156,17 @@ async function handleModels(req, res) {
 
     // Advertise the configured default-big/default-small aliases so clients can
     // discover them (only those with a configured target are listed).
-    const contextByModelId = Object.fromEntries(
-      [...byId.entries()]
-        .filter(([, entry]) => Number.isFinite(entry?.n_ctx) && entry.n_ctx > 0)
-        .map(([id, entry]) => [id, entry.n_ctx]),
-    );
+    // Local models first, then anything a remote backend has told us. An alias
+    // target on another host is invisible to the local catalogue, and that is the
+    // ordinary case for a chained alias such as default-big.
+    const contextByModelId = {
+      ...knownRemoteWindows(),
+      ...Object.fromEntries(
+        [...byId.entries()]
+          .filter(([, entry]) => Number.isFinite(entry?.n_ctx) && entry.n_ctx > 0)
+          .map(([id, entry]) => [id, entry.n_ctx]),
+      ),
+    };
     for (const entry of aliasListEntries(config, Math.floor(Date.now() / 1000), contextByModelId)) {
       const aliasTarget = byId.get(entry.aliasTarget);
       data.data.push({
