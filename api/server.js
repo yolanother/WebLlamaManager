@@ -21,6 +21,7 @@
 // mirror port ALT_PORT (default 80) when the process is allowed to bind it.
 
 import express from 'express';
+import { reasoningEffortMatchNames } from './reasoning-effort-targets.js';
 import cors from 'cors';
 import { spawn, exec, execSync, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync, unlinkSync, realpathSync, readlinkSync } from 'fs';
@@ -12185,10 +12186,19 @@ function injectReasoningEffort(body) {
   const perModel = config.modelReasoningEffort || {};
   let effort = null;
 
+  // Match the CONCRETE model(s) the request will actually be served by, not only the
+  // name the client typed. Patterns here name model families (`*qwen3.6-35b*`), but a
+  // client normally asks for an ALIAS (`default-big`), which matches no family pattern
+  // — so the bound that family needs was silently skipped for exactly the callers that
+  // go through aliases. Observed on Frostburn 2026-09-17: `default-big` requests reached
+  // Qwen3.6-35B-A3B with no reasoning bound and burned their whole output budget on
+  // reasoning, returning empty content on `length`.
+  const names = reasoningEffortMatchNames(model, resolveAliasRouting);
+
   for (const [pattern, value] of Object.entries(perModel)) {
     // Glob wildcards only; every other character is literal and matching ignores case.
     // Both of those were silent bugs here — see modelPatternMatches.
-    if (modelPatternMatches(pattern, model)) {
+    if (names.some(n => modelPatternMatches(pattern, n))) {
       effort = value;
       break;
     }
