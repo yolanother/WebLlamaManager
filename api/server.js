@@ -10974,7 +10974,12 @@ async function handleModels(req, res) {
     if (ds4List) {
       const ds4Capabilities = contextCapabilities('ds4');
       const out = { object: 'list', data: ds4List.map(entry => ({ ...entry, context_management: ds4Capabilities })) };
-      for (const entry of aliasListEntries(config, Math.floor(Date.now() / 1000))) {
+      // An alias can only advertise a window it can prove, so it is resolved from the
+      // windows this response already reports for the real models behind it.
+      const ds4Contexts = Object.fromEntries(
+        ds4List.filter(entry => Number.isFinite(entry.n_ctx) && entry.n_ctx > 0).map(entry => [entry.id, entry.n_ctx]),
+      );
+      for (const entry of aliasListEntries(config, Math.floor(Date.now() / 1000), ds4Contexts)) {
         out.data.push({
           ...entry,
           context_management: contextCapabilities(entry.engine, { slotCacheEnabled: slotCacheCfg().enabled }),
@@ -11120,7 +11125,12 @@ async function handleModels(req, res) {
 
     // Advertise the configured default-big/default-small aliases so clients can
     // discover them (only those with a configured target are listed).
-    for (const entry of aliasListEntries(config, Math.floor(Date.now() / 1000))) {
+    const contextByModelId = Object.fromEntries(
+      [...byId.entries()]
+        .filter(([, entry]) => Number.isFinite(entry?.n_ctx) && entry.n_ctx > 0)
+        .map(([id, entry]) => [id, entry.n_ctx]),
+    );
+    for (const entry of aliasListEntries(config, Math.floor(Date.now() / 1000), contextByModelId)) {
       const aliasTarget = byId.get(entry.aliasTarget);
       data.data.push({
         ...entry,

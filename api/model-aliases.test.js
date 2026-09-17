@@ -491,6 +491,47 @@ test('aliasListEntries: one row per alias with targets, in config key order', ()
   assert.equal(first.alias, null);
 });
 
+test('aliasListEntries: an alias advertises the SMALLEST window among its targets', () => {
+  // A request routed to this alias can land on ANY target, so the window a caller
+  // may rely on is the smallest one. Advertising the largest would let a caller
+  // size a request that cannot fit the target it actually reaches.
+  const config = configWith({
+    mixed: { targets: [{ host: 'local', model: 'big' }, { host: 'local', model: 'small' }] },
+  });
+
+  const rows = aliasListEntries(config, 1, { big: 262144, small: 65536 });
+
+  assert.equal(rows.find(r => r.id === 'mixed').n_ctx, 65536);
+});
+
+test('aliasListEntries: a single-target alias advertises that target\'s window', () => {
+  const config = configWith({ solo: { targets: [{ host: 'local', model: 'big' }] } });
+
+  const rows = aliasListEntries(config, 1, { big: 262144 });
+
+  assert.equal(rows.find(r => r.id === 'solo').n_ctx, 262144);
+});
+
+test('aliasListEntries: an unknown target window leaves n_ctx null rather than guessing', () => {
+  // One unresolved target means no safe lower bound exists: the unknown one could be
+  // smaller than every known target, and a bound that might be wrong is worse than
+  // none, because a caller trusts it.
+  const config = configWith({
+    partial: { targets: [{ host: 'local', model: 'big' }, { host: 'remote', model: 'mystery' }] },
+  });
+
+  const rows = aliasListEntries(config, 1, { big: 262144 });
+
+  assert.equal(rows.find(r => r.id === 'partial').n_ctx, null);
+});
+
+test('aliasListEntries: without a context map every alias keeps its previous null window', () => {
+  const rows = aliasListEntries(CONFIG, 1717171717);
+
+  assert.ok(rows.length > 0);
+  assert.ok(rows.every(r => r.n_ctx === null));
+});
+
 test('aliasListEntries: an alias with zero targets is omitted', () => {
   const rows = aliasListEntries(CONFIG, 1717171717);
   assert.equal(rows.find(r => r.id === 'empty-alias'), undefined);

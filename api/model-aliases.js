@@ -320,6 +320,24 @@ export function validateAlias(config, name, targets, localModels = []) {
 }
 
 /**
+ * The smallest window among an alias's targets, or null when any one is unknown.
+ *
+ * @param {Array<{host:string, model:string}>} targets resolved alias targets
+ * @param {Object<string, number>|null|undefined} contextByModelId resolved window per model id
+ * @returns {number|null} the window every target can satisfy, or null when unknowable
+ */
+function smallestTargetContext(targets, contextByModelId) {
+  if (!contextByModelId || typeof contextByModelId !== 'object') return null;
+  let smallest = null;
+  for (const target of targets) {
+    const window = contextByModelId[target.model];
+    if (!Number.isFinite(window) || window <= 0) return null;
+    smallest = smallest === null ? window : Math.min(smallest, window);
+  }
+  return smallest;
+}
+
+/**
  * Build the synthetic `/v1/models` rows advertising every configured alias, one row per
  * alias holding at least one usable target, in `Object.keys(config.aliases)` order.
  *
@@ -328,11 +346,20 @@ export function validateAlias(config, name, targets, localModels = []) {
  * `/v1/models` consumers keep working; `targets` is additive and carries the full group.
  * `engine` is 'ds4' only when the FIRST target is a local ds4 preset.
  *
+ * `n_ctx` is the SMALLEST window among the alias's targets. A request to an alias can
+ * land on any one of them, so the smallest is the only window a caller may rely on;
+ * advertising the largest would invite a request that cannot fit the target it reaches.
+ * When any target's window is unknown the entry stays null, because an unknown target
+ * could be smaller than every known one, and a bound that might be wrong is worse than
+ * no bound at all — a caller trusts what it is told.
+ *
  * @param {{aliases?: Object<string, AliasGroup>, presets?: Object<string, object>}|null|undefined} config server config
  * @param {number} nowSeconds current unix time in seconds (passed in to keep this pure)
+ * @param {Object<string, number>|null} [contextByModelId] resolved window per model id;
+ *   omitted by callers that cannot resolve one, which keeps every alias's window null
  * @returns {Array<object>} OpenAI-style model entries (possibly empty)
  */
-export function aliasListEntries(config, nowSeconds) {
+export function aliasListEntries(config, nowSeconds, contextByModelId = null) {
   const aliases = config?.aliases;
   if (!aliases || typeof aliases !== 'object') return [];
 
@@ -356,7 +383,7 @@ export function aliasListEntries(config, nowSeconds) {
       created: nowSeconds,
       owned_by: 'llamacpp',
       meta: null,
-      n_ctx: null,
+      n_ctx: smallestTargetContext(targets, contextByModelId),
       displayName: name,
       status: 'alias',
       alias: null,
