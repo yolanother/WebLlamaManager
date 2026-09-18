@@ -12181,6 +12181,20 @@ function injectReasoningEffort(body) {
     return body;
   }
 
+  // 2b. The caller explicitly asked for NO thinking → honour it and inject nothing.
+  //
+  // `enable_thinking: false` and a seeded `reasoning_effort` are contradictory
+  // instructions, and sending both let the model reason anyway. Measured on Frostburn
+  // 2026-09-17: a strict-JSON podcast stage sent enable_thinking:false, this function
+  // merged reasoning_effort "medium" alongside it, and the model spent its ENTIRE
+  // 12,000-token budget on hidden reasoning to emit 1,320 characters of JSON that were
+  // then truncated mid-array. The per-model default exists to BOUND a model that would
+  // otherwise reason without limit; a caller that has switched reasoning off needs no
+  // bound, and overriding that choice silently is worse than having no default at all.
+  if (body.chat_template_kwargs?.enable_thinking === false) {
+    return body;
+  }
+
   // 3. Look up per-model pattern match, fall back to global default
   const model = body.model || '';
   const perModel = config.modelReasoningEffort || {};
