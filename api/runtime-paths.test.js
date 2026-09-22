@@ -28,6 +28,7 @@ test('packaged installations use FHS locations for every mutable resource', () =
     ds4ModelsDir: '/var/lib/llama-manager/models/ds4',
     ds4StateDir: '/var/lib/llama-manager/ds4',
     slotCacheDir: '/var/cache/llama-manager/slots',
+    decisionDir: '/var/lib/llama-manager/decision',
   });
 });
 
@@ -49,6 +50,7 @@ test('source installations retain checkout and user-home defaults', () => {
     ds4ModelsDir: '/home/alice/models-ds4/deepseek-v4-gguf',
     ds4StateDir: '/home/alice/.local/share/ds4',
     slotCacheDir: '/home/alice/.cache/llama-slots',
+    decisionDir: '/home/alice/src/llama-manager/data/decision',
   });
 });
 
@@ -86,4 +88,9 @@ test('the node name store lives beside the rest of the mutable state', () => {
     { projectRoot: '/src/llama' },
   );
   assert.equal(overridden.nodeNamePath, '/run/somewhere/name');
+});
+
+test('DECISION_CACHE_DIR overrides the decision weights cache', () => {
+  const paths = resolveRuntimePaths({ DECISION_CACHE_DIR: '/fast/decision' }, { projectRoot: '/p', home: '/h' });
+  assert.equal(paths.decisionDir, '/fast/decision');
 });

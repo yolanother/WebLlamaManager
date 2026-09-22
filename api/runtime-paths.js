@@ -16,8 +16,8 @@ import { join } from 'path';
  * @param {{projectRoot:string, home?:string}} context Immutable application root and user home.
  * @returns {{packaged:boolean, configDir:string, configPath:string, dataDir:string,
  *   cacheDir:string, modelsDir:string, ds4ModelsDir:string, ds4StateDir:string,
- *   nodeNamePath:string, fleetPinPath:string, slotCacheDir:string}} Resolved absolute or
- *   caller-supplied paths.
+ *   nodeNamePath:string, fleetPinPath:string, slotCacheDir:string, decisionDir:string}} Resolved
+ *   absolute or caller-supplied paths.
  */
 export function resolveRuntimePaths(env = {}, { projectRoot, home = env.HOME || '/root' } = {}) {
   if (!projectRoot) throw new TypeError('projectRoot is required');
@@ -41,5 +41,7 @@ export function resolveRuntimePaths(env = {}, { projectRoot, home = env.HOME || 
     // appliance's identity that must outlive a restart.
     fleetPinPath: env.FLEET_PIN_PATH || join(dataDir, 'fleet-pin'),
     slotCacheDir: env.SLOT_SAVE_PATH || (packaged ? join(cacheDir, 'slots') : join(home, '.cache', 'llama-slots')),
+    // Laya decision engine weights (HF cache mounted at the container's /data).
+    decisionDir: env.DECISION_CACHE_DIR || join(dataDir, 'decision'),
   };
 }

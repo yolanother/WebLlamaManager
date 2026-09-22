@@ -1455,3 +1455,27 @@ test('the worker keeps everything else it already had', () => {
   assert.equal(s.name, 'unsloth_Qwen3.6-35B-A3B-GGUF');
   assert.equal(s.options.threads, '16');
 });
+
+test('buildLocalServerRegistry: decision entry only when passed, same uniform shape', () => {
+  const base = {
+    llama: { running: true, healthy: true, port: 5251, models: [] },
+    embed: { running: false, healthy: false, port: 5252, models: [] },
+    ds4: { ds4Config: resolveDs4Config({}, {}), running: false, freeMemBytes: 10 * 1024 ** 3 },
+  };
+  assert.equal(buildLocalServerRegistry(base).some((s) => s.id === 'decision'), false);
+
+  const idle = buildLocalServerRegistry({ ...base, decision: { running: false, runnable: true, reason: null, port: 5254, models: ['typed-decisions'] } })
+    .find((s) => s.id === 'decision');
+  assert.equal(idle.type, ENGINE_TYPES.DECISION);
+  assert.equal(idle.state, 'idle');
+  assert.deepEqual(Object.keys(idle).sort(), Object.keys(buildLocalServerRegistry(base)[0]).sort());
+
+  const off = buildLocalServerRegistry({ ...base, decision: { running: false, runnable: false, reason: 'disabled in config', port: 5254 } })
+    .find((s) => s.id === 'decision');
+  assert.equal(off.state, 'down');
+  assert.deepEqual(off.enable, { eligible: false, reason: 'disabled in config' });
+
+  const up = buildLocalServerRegistry({ ...base, decision: { running: true, healthy: true, runnable: true, port: 5254 } })
+    .find((s) => s.id === 'decision');
+  assert.equal(up.state, 'running');
+});

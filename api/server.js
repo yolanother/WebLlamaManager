@@ -55,6 +55,8 @@ const PROJECT_ROOT = dirname(__dirname);
 // Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
+import { resolveDecisionConfig } from './decision.js';
+import { createDecisionSupervisor } from './decision-supervisor.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes } from './resource-guard.js';
@@ -3920,6 +3922,10 @@ async function getSystemStats() {
       weightsPresent: ds4WeightsPresent(ds4DescriptorConfig.ggufDir),
       models: ds4Stats?.model ? [ds4Stats.model] : [],
     },
+    decision: (() => {
+      const dc = decisionConfig();
+      return { ...decisionSupervisor.status(), runnable: dc.runnable, reason: dc.reason, port: dc.port, models: [`laya-${dc.checkpoint}`] };
+    })(),
   });
 
   return {
@@ -8270,6 +8276,29 @@ async function getEmbedHealth() {
     return { status: 'unavailable', model: ec.model, port: ec.port };
   }
 }
+
+// ── System 1 decision engine (laya-server container) ─────────────────────
+/** Current decision engine config (config.json `decision` + DECISION_* env). */
+function decisionConfig() {
+  return resolveDecisionConfig(config, process.env);
+}
+
+/** Run a one-shot podman command (rm/stop); rejects on non-zero exit. */
+function runPodman(args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn('podman', args, { stdio: 'ignore' });
+    p.on('error', reject);
+    p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`podman ${args[0]} exited ${code}`))));
+  });
+}
+
+const decisionSupervisor = createDecisionSupervisor({
+  spawn,
+  runPodman,
+  getConfig: decisionConfig,
+  cacheDir: RUNTIME_PATHS.decisionDir,
+  log: (msg) => addLog('decision', msg),
+});
 
 // ── ds4-server supervisor (DeepSeek V4 Flash engine) ─────────────────────────
 // A second supervised process alongside llama-server/embed. ds4-server is a
@@ -16868,6 +16897,7 @@ function shutdownWithTimeout(signal) {
   Promise.allSettled([
     stopLlamaServer({ explicitReclaim: false }),
     stopEmbedServer(),
+    decisionSupervisor.stop(),
     stopDs4Server(),
   // Last, and only after the engine is down: the rpc-server outlives an abrupt manager
   // exit otherwise, holding VRAM on a card whose owner is gone.

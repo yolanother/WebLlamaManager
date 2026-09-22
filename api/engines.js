@@ -1,24 +1,25 @@
 // Llama Manager — engine abstraction helpers (llama.cpp + ds4-server).
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 //
-// Pure, side-effect-free helpers that describe the two inference engines this
-// manager can supervise — the default llama.cpp router/preset engine and the
-// ds4-server (DeepSeek V4 Flash) engine — behind one seam so the rest of the
-// server can branch on an engine descriptor instead of scattering `if (ds4)`
-// checks. Responsibilities: normalize a preset's declared engine, resolve the
-// top-level `config.ds4` block (+ DS4_* env overrides), produce an engine
-// descriptor ({ type, binPath, port, startScript, supportsSlots, supportsRouter,
-// healthPath, modelsShape }), validate ds4 preset fields, resolve a ds4 GGUF
-// model path under the dedicated ds4 gguf dir, shape the OpenAI `/v1/models`
-// entry/list for an active ds4 model, and build pure llama.cpp router preset
-// descriptors for model-specific speculative acceleration. It also decides
-// whether silence is a true generation stall or legitimate DS4 admission wait,
-// and extracts the progress-bearing text (including reasoning/thinking output)
-// from ds4-server's streamed chat and Responses deltas. Kept out of server.js
-// so these policies are unit-testable without booting the server.
+// Pure, side-effect-free helpers that describe the inference engines this
+// manager can supervise — the default llama.cpp router/preset engine, the
+// ds4-server (DeepSeek V4 Flash) engine, and the laya decision sidecar's
+// registry entry — behind one seam so the rest of the server can branch on an
+// engine descriptor instead of scattering `if (ds4)` checks. Responsibilities:
+// normalize a preset's declared engine, resolve the top-level `config.ds4`
+// block (+ DS4_* env overrides), produce an engine descriptor ({ type, binPath,
+// port, startScript, supportsSlots, supportsRouter, healthPath, modelsShape }),
+// validate ds4 preset fields, resolve a ds4 GGUF model path under the dedicated
+// ds4 gguf dir, shape the OpenAI `/v1/models` entry/list for an active ds4
+// model, and build pure llama.cpp router preset descriptors for model-specific
+// speculative acceleration. It also decides whether silence is a true
+// generation stall or legitimate DS4 admission wait, and extracts the
+// progress-bearing text (including reasoning/thinking output) from
+// ds4-server's streamed chat and Responses deltas. Kept out of server.js so
+// these policies are unit-testable without booting the server.
 
 /** Canonical engine type identifiers. */
-export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4' };
+export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4', DECISION: 'decision' };
 
 /**
  * `comm` values (as reported by /proc/<pid>/comm) of the local inference-engine
@@ -278,10 +279,12 @@ export function ds4EnableGate({ freeMemBytes = 0, ds4Config, weightsPresent = tr
  * 'idle' (not running but ready to serve), 'available' (ds4 off but eligible to
  * enable), 'insufficient-memory' (ds4 off and cannot fit), 'down'.
  *
- * @param {{llama:object, embed:object, ds4:object}} params
+ * @param {{llama:object, embed:object, ds4:object, decision:(object|null)}} params
+ * @param {object} [params.decision] Optional: `{running, healthy, runnable, reason, port,
+ *   models}` from the decision supervisor; omitted ⇒ no entry.
  * @returns {Array<object>} uniform server descriptors, id-sorted
  */
-export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {} } = {}) {
+export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {}, decision = null } = {}) {
   /** Shape a plain (llama-family) local server entry into the uniform record. */
   const entry = (id, type, displayName, role, src, supports) => {
     const running = !!src.running;
@@ -336,7 +339,15 @@ export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {} } = 
       : (gate.weightsPresent ? 'insufficient-memory' : 'model-missing');
   }
 
-  return [llamaEntry, embedEntry, ds4Entry].sort((a, b) => a.id.localeCompare(b.id));
+  const entries = [llamaEntry, embedEntry, ds4Entry];
+  if (decision) {
+    const decisionEntry = entry('decision', ENGINE_TYPES.DECISION, 'Decision (Laya)', 'decision',
+      { ...decision, idleReady: !!decision.runnable },
+      { router: false, slots: false, vision: false, speculative: false });
+    if (!decision.runnable) decisionEntry.enable = { eligible: false, reason: decision.reason };
+    entries.push(decisionEntry);
+  }
+  return entries.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 /**
