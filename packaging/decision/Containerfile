@@ -1,0 +1,76 @@
+# Llama Manager — pinned Containerfile for the Laya DECISION engine image.
+# Copyright (c) Llama Manager project. See the LICENSE file in the repository
+# root for license terms.
+#
+# Builds laya-server (pinned commit 819fa065dce72b3c117a2364bb4839c02a0abcb3,
+# https://github.com/noahbclarkson/laya-server) for the AMD Strix Halo iGPU
+# (gfx1151) ROCm variant that backs llama-manager's System 1 DECISION engine.
+# Wraps upstream's own Dockerfile with two Frostburn-specific fixes: (1) installs
+# libatomic1, which upstream's python:3.13-slim base lacks and which the ROCm
+# torch wheel needs at import time (`ImportError: libatomic.so.1` otherwise);
+# (2) strips every hipBLASLt/rocBLAS tuning kernel that is not gfx1151 or a
+# fallback from the torch install, in the SAME RUN layer as the pip install
+# (stripping in a later layer keeps the deleted bytes in the image's layer
+# history and saves nothing) — this cuts the image from ~16GB to a few GB.
+# Everything else (env, user, volume, expose, healthcheck, CMD) mirrors upstream
+# exactly. The base image is pinned by digest. laya-server's `server.py`,
+# `check_gpu.py` and `requirements.txt` are NOT fetched here: they are supplied
+# by the build context that scripts/decision-build-image.sh prepares (a
+# checksum-verified extract of the pinned source tarball), so this build needs no
+# network access to GitHub and is reproducible from the same context every time.
+# Built only on Frostburn by scripts/decision-build-image.sh — never on drakemore
+# (AMENDMENT A1 of docs/plans/2026-09-22-laya-decision-engine.md).
+
+FROM python:3.13-slim@sha256:37134a49d21d2120e4c4d73bb76f8a4ab9aef31f096f7ec2ead48c2feead4332
+
+# Which of PyTorch's wheel indexes to install from: https://download.pytorch.org/whl/<index>
+ARG TORCH_INDEX=rocm7.2
+ARG TORCH_VERSION=2.14.0
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/data/huggingface \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+    LAYA_SERVER_HOST=0.0.0.0 \
+    LAYA_SERVER_PORT=8765 \
+    LAYA_SERVER_JEV_ALIAS=1
+
+# libatomic1: the ROCm torch wheel dlopens libatomic.so.1; python:3.13-slim does
+# not carry it, so `import torch` fails with ImportError without this.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# PyTorch first, from the hardware-specific index, so laya's `torch` requirement
+# is already met and pip does not replace it — then, in this same layer, delete
+# every hipBLASLt/rocBLAS tuning kernel whose name names a GPU arch other than
+# gfx1151, keeping the arch-generic "*fallback*" kernels and TensileManifest.txt
+# (both are needed regardless of which arch actually loads).
+RUN pip install --index-url "https://download.pytorch.org/whl/${TORCH_INDEX}" "torch==${TORCH_VERSION}" \
+    && TORCH_LIB="$(python -c 'import torch, os; print(os.path.dirname(torch.__file__))')/lib" \
+    && for dir in "$TORCH_LIB/hipblaslt/library" "$TORCH_LIB/rocblas/library"; do \
+         find "$dir" -type f -name '*gfx*' ! -name '*gfx1151*' ! -name '*fallback*' ! -name 'TensileManifest.txt' -delete; \
+       done
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# `video` and `render` membership is granted at run time for AMD GPUs (--group-add keep-groups).
+RUN useradd --create-home --uid 1000 laya \
+    && mkdir -p /data \
+    && chown laya /data
+COPY server.py check_gpu.py ./
+
+USER laya
+# Checkpoints are downloaded here on first start; keep it on a volume.
+VOLUME /data
+EXPOSE 8765
+
+# The first start downloads about 850 MB per checkpoint, hence the long start period.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30m --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=4)"]
+
+CMD ["python", "server.py"]
