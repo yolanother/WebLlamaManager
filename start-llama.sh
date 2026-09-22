@@ -57,6 +57,9 @@ export FLASH_ATTN="${FLASH_ATTN:-}"
 export GPU_LAYERS="${GPU_LAYERS:-99}"
 export HF_TOKEN="${HF_TOKEN:-}"
 export SLOT_SAVE_PATH="${SLOT_SAVE_PATH:-$HOME/.cache/llama-slots}"
+# See container-start.sh: 0 disables llama.cpp's fuzzy slot reuse, which served
+# requests from other requests' KV caches at its 0.10 default.
+export SLOT_PROMPT_SIMILARITY="${SLOT_PROMPT_SIMILARITY:-0}"
 
 if [ "${1:-}" = "--print-cmd" ]; then
     printf 'container=%s launcher=%s llama_server=%s\n' \
@@ -103,6 +106,7 @@ exec env -u HF_TOKEN "$DISTROBOX" enter --additional-flags "--env-file=$CREDENTI
     "FLASH_ATTN=$FLASH_ATTN" \
     "GPU_LAYERS=$GPU_LAYERS" \
     "SLOT_SAVE_PATH=$SLOT_SAVE_PATH" \
+    "SLOT_PROMPT_SIMILARITY=$SLOT_PROMPT_SIMILARITY" \
     "LLAMA_SERVER_BIN=$LLAMA_SERVER_BIN" \
     "LLAMA_GPU_PCI=${LLAMA_GPU_PCI:-}" \
     "LLAMA_GPU_UUID=${LLAMA_GPU_UUID:-}" \

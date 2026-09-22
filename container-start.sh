@@ -41,6 +41,24 @@ set -euo pipefail
 # reload doesn't force a cold re-prefill. distrobox shares $HOME, so this same path
 # is visible to the manager on the host. Empty disables slot persistence.
 : "${SLOT_SAVE_PATH:=$HOME/.cache/llama-slots}"
+# How closely a request's prompt must match a slot's cached prompt before the
+# router will REUSE that slot's KV cache. llama.cpp defaults this to 0.10, which
+# means a request can be served from a slot it shares only a tenth of a prefix
+# with -- and the continuation it generates then belongs to the OTHER prompt.
+#
+# Measured on this box 2026-09-22 while debugging the podcast pipeline: the
+# server logged
+#   selected slot by LCP similarity, f_sim_best = 0.450 (> 0.100 thold), f_keep = 0.036
+# and a prompt whose text contained the substring "session:" ZERO times came back
+# as {"assignments":[{"id":"session:01a0b18a-b072-70d0-adc3-5c07197addbc",...}]}.
+# A second oversized prompt came back describing TypeScript, which likewise
+# appeared nowhere in it. Stage prompts that share a long instruction preamble --
+# which every agent pipeline here writes -- are exactly the shape that collides.
+#
+# 0 disables similarity-based slot selection (llama.cpp's own documented "off"),
+# leaving ordinary longest-common-prefix reuse WITHIN a slot intact. Overridable
+# for anyone who wants the old behaviour back.
+: "${SLOT_PROMPT_SIMILARITY:=0}"
 
 # AMD GPU settings
 export HSA_OVERRIDE_GFX_VERSION=11.5.1
@@ -91,6 +109,7 @@ echo "GPU_LAYERS=$GPU_LAYERS"
 [ -n "$NO_WARMUP" ] && echo "NO_WARMUP=enabled"
 [ -n "$FLASH_ATTN" ] && echo "FLASH_ATTN=enabled"
 [ -n "$SLOT_SAVE_PATH" ] && echo "SLOT_SAVE_PATH=$SLOT_SAVE_PATH"
+[ -n "$SLOT_PROMPT_SIMILARITY" ] && echo "SLOT_PROMPT_SIMILARITY=$SLOT_PROMPT_SIMILARITY"
 echo
 echo "Available models:"
 find "$MODELS_DIR" -name "*.gguf" -type f 2>/dev/null | head -20 || echo "  (none yet)"
@@ -151,6 +170,8 @@ esac
 # --slot-save-path is propagated by the router to every per-model child server,
 # enabling POST /slots/{id}?action=save|restore for conversation KV persistence.
 [ -n "$SLOT_SAVE_PATH" ] && CMD+=(--slot-save-path "$SLOT_SAVE_PATH")
+# Propagated by the router to every per-model child, same as --slot-save-path.
+[ -n "$SLOT_PROMPT_SIMILARITY" ] && CMD+=(--slot-prompt-similarity "$SLOT_PROMPT_SIMILARITY")
 # Per-model overrides the router cannot auto-detect (e.g. the gemma-4 MTP draft
 # model). The manager writes this INI; each [model] section merges onto the
 # router's auto-generated preset (--model/--mmproj/--ctx-size preserved).
