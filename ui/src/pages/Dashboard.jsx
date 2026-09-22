@@ -16,6 +16,7 @@ import { API_BASE, formatBytes, formatUptime, formatModelName } from '../api.js'
 import { isLocalKioskHost, requestSystemLogin } from '../kiosk-control.js';
 import { resolveGpuPanel } from '../gpu-panel.js';
 import { resolveDrivePanel, resolveDriveAlerts, resolveLastCrash } from '../drive-panel.js';
+import { decisionCardAction } from './decision-card.js';
 import { useVisiblePolling } from '../hooks/useVisiblePolling.js';
 import {
   StatCard,
@@ -1192,7 +1193,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 const status = srv.state === 'running' ? 'success'
                   : (srv.state === 'down' || srv.state === 'degraded' || srv.state === 'insufficient-memory') ? 'error'
                   : 'warning';
-                const icon = srv.type === 'ds4' ? '\u{1F9EC}' : srv.role === 'embeddings' ? '\u{1F9EE}' : '\u{1F680}';
+                const icon = srv.type === 'ds4' ? '\u{1F9EC}' : srv.role === 'embeddings' ? '\u{1F9EE}' : srv.id === 'decision' ? '\u{2696}\u{FE0F}' : '\u{1F680}';
                 const models = Array.isArray(srv.models) ? srv.models : [];
                 const modelSummary = models.length
                   ? `${models.slice(0, 3).map((m) => formatModelName({ id: m })).join(', ')}${models.length > 3 ? ` +${models.length - 3}` : ''}`
@@ -1224,10 +1225,21 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                     ? `${srv.enable?.reason || ''} Pick a DS4 model in the chat model list to load it — it runs exclusively and unloads the others.`.trim()
                     : (srv.id === 'ds4' && srv.enable && !srv.running)
                       ? srv.enable.reason
-                      : `${modelSummary}${srv.port ? ` :${srv.port}` : ''}`;
+                      : (srv.id === 'decision' && srv.enable && !srv.running)
+                        ? srv.enable.reason
+                        : `${modelSummary}${srv.port ? ` :${srv.port}` : ''}`;
+                const action = decisionCardAction(srv);
                 return (
-                  <StatCard key={srv.id} label={srv.displayName} value={stateLabel}
-                    subValue={sub} icon={icon} status={status} />
+                  <div key={srv.id} className="server-registry-item">
+                    <StatCard label={srv.displayName} value={stateLabel}
+                      subValue={sub} icon={icon} status={status} />
+                    {action && (
+                      <button className="btn-secondary glass-btn"
+                        onClick={() => fetch(`${API_BASE}${action.path}`, { method: 'POST' }).catch((err) => console.error('decision action failed:', err))}>
+                        {action.label}
+                      </button>
+                    )}
+                  </div>
                 );
               })}
             </div>
