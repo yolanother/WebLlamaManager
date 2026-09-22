@@ -57,6 +57,7 @@ import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
 import { resolveDecisionConfig } from './decision.js';
 import { createDecisionSupervisor } from './decision-supervisor.js';
+import { createDecisionRouter } from './decision-router.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes } from './resource-guard.js';
@@ -8299,6 +8300,19 @@ const decisionSupervisor = createDecisionSupervisor({
   cacheDir: RUNTIME_PATHS.decisionDir,
   log: (msg) => addLog('decision', msg),
 });
+
+app.use(createDecisionRouter({
+  supervisor: decisionSupervisor,
+  getConfig: decisionConfig,
+  updateConfig: (patch) => {
+    config.decision = { ...(config.decision || {}), ...patch };
+    saveConfig(config);
+    if (patch.enabled === false) decisionSupervisor.stop().catch(() => {});
+  },
+  nodeName: () => describeNodeIdentity().name,
+  memAvailableBytes,
+  isLoopback: isLoopbackRequest,
+}));
 
 // ── ds4-server supervisor (DeepSeek V4 Flash engine) ─────────────────────────
 // A second supervised process alongside llama-server/embed. ds4-server is a
