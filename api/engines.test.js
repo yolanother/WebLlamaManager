@@ -22,6 +22,7 @@ import {
   remoteStallMs,
   DS4_ZERO_TOKEN_STALL_MS,
   remoteStallCeilingMs,
+  REMOTE_ZERO_TOKEN_STALL_MS,
   remoteStallVerdict,
   largestContextBesideDs4,
   buildLocalServerRegistry,
@@ -876,14 +877,50 @@ test('remoteStallCeilingMs: a ds4-backed entry always gets the fixed ds4 ceiling
   assert.equal(remoteStallCeilingMs({ backend: 'ds4' }, 900_000), DS4_ZERO_TOKEN_STALL_MS);
 });
 
-test('remoteStallCeilingMs: any other remote backend keeps the generic (context-scaled) ceiling', () => {
-  assert.equal(remoteStallCeilingMs({ backend: 'drakemore-mtj8prpy' }, 393_216), 393_216);
-  assert.equal(remoteStallCeilingMs({ backend: 'dahaka-ollama-mngx88pk' }, 120_000), 120_000);
+test('remoteStallCeilingMs: a GENERATING remote backend keeps the generic (context-scaled) ceiling', () => {
+  // Once tokens are flowing, silence really is a mid-stream stall.
+  assert.equal(remoteStallCeilingMs({ backend: 'drakemore-mtj8prpy', tokens: 12 }, 393_216), 393_216);
+  assert.equal(remoteStallCeilingMs({ backend: 'dahaka-ollama-mngx88pk', tokens: 1 }, 120_000), 120_000);
+});
+
+test('remoteStallCeilingMs: a remote that has produced NOTHING yet gets the admission-wait ceiling', () => {
+  // A remote backend is frequently another llama-manager running at
+  // concurrency 1, so a relayed request can sit in ITS queue producing nothing.
+  // That is admission wait, not a stall -- the same distinction the ds4 branch
+  // of remoteStallVerdict already makes. Measured 2026-09-22: the podcast's
+  // evidence-preservation re-author was killed at "0 tokens, idle 395s >= 393s"
+  // on backend drakemore-mtj8prpy while that backend was healthy (probed
+  // directly it answered the same shape of request in 105s, prefilling at
+  // ~890 tok/s), and the episode failed with "Podcast script author correction
+  // did not return JSON".
+  assert.equal(
+    remoteStallCeilingMs({ backend: 'drakemore-mtj8prpy', tokens: 0 }, 393_216),
+    REMOTE_ZERO_TOKEN_STALL_MS,
+  );
+  assert.equal(
+    remoteStallCeilingMs({ backend: 'drakemore-mtj8prpy' }, 393_216),
+    REMOTE_ZERO_TOKEN_STALL_MS,
+  );
+});
+
+test('REMOTE_ZERO_TOKEN_STALL_MS clears the measured admission wait with real margin', () => {
+  const measuredKillMs = 403_248; // firstTokenMs == latencyMs on the killed request
+  assert.ok(
+    REMOTE_ZERO_TOKEN_STALL_MS > measuredKillMs * 1.5,
+    `must clear the measured wait with margin, got ${REMOTE_ZERO_TOKEN_STALL_MS}`,
+  );
+});
+
+test('remoteStallCeilingMs: never returns LESS than the generic ceiling for a silent remote', () => {
+  // A generous generic ceiling must not be narrowed by the admission-wait rule.
+  assert.equal(remoteStallCeilingMs({ backend: 'x', tokens: 0 }, 1_800_000), 1_800_000);
 });
 
 test('remoteStallCeilingMs: missing backend falls back to the generic ceiling', () => {
-  assert.equal(remoteStallCeilingMs({}, 120_000), 120_000);
-  assert.equal(remoteStallCeilingMs(undefined, 120_000), 120_000);
+  // The guarantee here is that the ds4 ceiling never leaks to a non-ds4 entry.
+  assert.equal(remoteStallCeilingMs({ tokens: 3 }, 120_000), 120_000);
+  assert.notEqual(remoteStallCeilingMs({}, 120_000), DS4_ZERO_TOKEN_STALL_MS);
+  assert.notEqual(remoteStallCeilingMs(undefined, 120_000), DS4_ZERO_TOKEN_STALL_MS);
 });
 
 // ── remoteStallVerdict (ownership-aware ds4 ceiling) ────────────────────────
@@ -947,7 +984,10 @@ test('remoteStallVerdict: a ds4 entry that never recorded slot acquisition falls
 
 test('remoteStallVerdict: a non-ds4 remote backend keeps the generic ceiling and the arrival-based clock', () => {
   const now = 1_000_000_000;
-  const entry = { backend: 'drakemore-mtj8prpy', startTime: now - 200_000, lastActivityAt: now - 200_000 };
+  // Tokens have arrived, so silence is a genuine mid-stream stall and the
+  // generic ceiling applies (a request that produced NOTHING gets the
+  // admission-wait ceiling instead — covered separately).
+  const entry = { backend: 'drakemore-mtj8prpy', tokens: 7, startTime: now - 200_000, lastActivityAt: now - 200_000 };
   assert.equal(remoteStallVerdict({ entry, holdsDs4Slot: false, now, genericRemoteStallMs: 393_216 }).action, 'skip');
   const stalled = remoteStallVerdict({ entry, holdsDs4Slot: false, now, genericRemoteStallMs: 120_000 });
   assert.equal(stalled.action, 'stalled');
@@ -957,7 +997,7 @@ test('remoteStallVerdict: a non-ds4 remote backend keeps the generic ceiling and
 test('remoteStallVerdict: ds4 slot ownership does not leak to other backends', () => {
   // holdsDs4Slot is meaningless for a remote backend id; it must not exempt it.
   const now = 1_000_000_000;
-  const entry = { backend: 'dahaka-ollama-mngx88pk', startTime: now - 500_000, lastActivityAt: now - 500_000 };
+  const entry = { backend: 'dahaka-ollama-mngx88pk', tokens: 4, startTime: now - 500_000, lastActivityAt: now - 500_000 };
   assert.equal(remoteStallVerdict({ entry, holdsDs4Slot: false, now, genericRemoteStallMs: 120_000 }).action, 'stalled');
 });
 

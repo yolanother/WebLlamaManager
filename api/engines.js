@@ -1027,6 +1027,31 @@ export function remoteStallMs({ contextTokens = 0, floorMs = 120000, safetyFacto
 export const DS4_ZERO_TOKEN_STALL_MS = 480_000;
 
 /**
+ * Idle ceiling for a remote-backed request that has produced NOTHING yet.
+ *
+ * A remote backend is frequently another llama-manager, and those run at
+ * concurrency 1 — so a relayed request routinely sits in THAT backend's queue
+ * emitting nothing until it is admitted. From this side that is
+ * indistinguishable from a stall, which is exactly the distinction the ds4
+ * branch of remoteStallVerdict already draws ("silence here is admission wait,
+ * not a stall"). Generic remotes never got the same treatment, and there is no
+ * cross-manager probe to ask with, so — as with ds4 — they get a fixed, generous
+ * zero-token ceiling instead.
+ *
+ * Measured 2026-09-22: the diary podcast's evidence-preservation re-author was
+ * killed as "aborting remote request (backend: drakemore-mtj8prpy, model:
+ * default-big, 0 tokens, idle 395s >= 393s)" and the episode failed with
+ * "Podcast script author correction did not return JSON". Drakemore was healthy
+ * throughout: probed directly with the same shape of request (22k-token prompt,
+ * whole-dialogue grammar, 20k output budget) it answered in 105s and prefilled at
+ * ~890 tok/s. Nothing was wrong except that this side counted queue wait as idle.
+ *
+ * Once ANY token has arrived the generic, context-scaled ceiling applies again —
+ * silence after generation has started is a real mid-stream stall.
+ */
+export const REMOTE_ZERO_TOKEN_STALL_MS = 900_000;
+
+/**
  * Choose the idle-time ceiling the stall watchdog applies to a non-local
  * (remote or ds4) activeRequests entry.
  *
@@ -1041,7 +1066,9 @@ export const DS4_ZERO_TOKEN_STALL_MS = 480_000;
  * @returns {number} Idle milliseconds to allow before declaring the entry stalled.
  */
 export function remoteStallCeilingMs(entry, genericRemoteStallMs) {
-  return entry?.backend === 'ds4' ? DS4_ZERO_TOKEN_STALL_MS : genericRemoteStallMs;
+  if (entry?.backend === 'ds4') return DS4_ZERO_TOKEN_STALL_MS;
+  if (!entry?.tokens) return Math.max(genericRemoteStallMs, REMOTE_ZERO_TOKEN_STALL_MS);
+  return genericRemoteStallMs;
 }
 
 /**
