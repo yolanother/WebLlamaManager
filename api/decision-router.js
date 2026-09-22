@@ -17,7 +17,10 @@
 // injected for route tests.
 
 import { createRequire } from 'node:module';
-import { LAYA_HOST_HEADER, isDecisionModel, pickDecisionPatch, resolveForwardModel } from './decision.js';
+import {
+  LAYA_HOST_HEADER, LAYA_HOP_HEADER, isDecisionModel, pickDecisionPatch, resolveForwardModel,
+  resolvePeers, planDecisionRoute,
+} from './decision.js';
 
 // Load the server's existing dependency only when a router is actually built,
 // keeping pure-helper tests runnable before npm dependencies are installed
@@ -45,6 +48,7 @@ async function readBody(response) {
  * @param {() => string} deps.nodeName This node's name (x-laya-host).
  * @param {() => number} deps.memAvailableBytes Current MemAvailable in bytes.
  * @param {(req:object) => boolean} deps.isLoopback Loopback-caller check.
+ * @param {() => Array<{name:string,url:string}>} [deps.fleetPeers] Fleet peers advertising system_one.
  * @param {() => number} [deps.now]
  * @returns {object} Express router.
  */
@@ -57,17 +61,40 @@ export function createDecisionRouter({
   nodeName,
   memAvailableBytes,
   isLoopback,
+  fleetPeers = () => [],
   now = () => Date.now(),
 }) {
   const express = expressImpl || require('express');
   const router = express.Router();
-  /** url → {available, checkedAt}; filled by T3's peer health checks. */
+  /** url → {available, checkedAt}; peer health cache, refreshed every peerHealthTtlMs. */
   const peerHealth = new Map();
 
-  /** Ordered targets for one request. T2: local only; T3 prepends configured peers. */
+  /** Refresh one peer's cached availability when older than peerHealthTtlMs. */
+  async function refreshPeer(url, cfg) {
+    const h = peerHealth.get(url);
+    if (h && now() - h.checkedAt < cfg.peerHealthTtlMs) return;
+    let available = false;
+    try {
+      const r = await fetchImpl(`${url}/api/decision/status`, { signal: AbortSignal.timeout(1500) });
+      available = r.ok && (await r.json()).available === true;
+    } catch {
+      // unreachable peer reads as unavailable
+    }
+    peerHealth.set(url, { available, checkedAt: now() });
+  }
+
+  /** Ordered targets: configured peers (unless forwarded) → local (memory guard) → none. */
   async function planTargets(req, cfg) {
+    const forwarded = Boolean(req.headers?.[LAYA_HOP_HEADER]);
+    const peers = forwarded ? [] : resolvePeers(cfg.peers, fleetPeers());
+    await Promise.all(peers.map((p) => refreshPeer(p.url, cfg)));
     const local = supervisor.status();
-    return cfg.runnable && (local.running || memAvailableBytes() >= cfg.minFreeMemBytes) ? [{ kind: 'local' }] : [];
+    return planDecisionRoute({
+      peers,
+      forwarded,
+      peerAvailable: (url) => peerHealth.get(url)?.available === true,
+      local: { runnable: cfg.runnable, running: local.running, availableBytes: memAvailableBytes(), minFreeMemBytes: cfg.minFreeMemBytes },
+    });
   }
 
   /** Forward to the local container, starting it lazily. */
@@ -86,10 +113,24 @@ export function createDecisionRouter({
     }
   }
 
-  /** Call one target. T3 adds the peer branch. */
-  const callTarget = (target, body, cfg) => callLocal(body, cfg);
-  /** Record a failed target. T3 marks peers down in peerHealth. */
-  function markDown() {}
+  /** Forward to a peer llama-manager's proxy, marking the hop to prevent loops. */
+  async function callPeer(target, body, cfg) {
+    const r = await fetchImpl(`${target.url}/api/v1/systemone`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [LAYA_HOP_HEADER]: nodeName() },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(cfg.forwardTimeoutMs),
+    });
+    return { status: r.status, body: await readBody(r), host: r.headers.get(LAYA_HOST_HEADER) || target.name };
+  }
+
+  /** Call one planned target. */
+  const callTarget = (target, body, cfg) => (target.kind === 'peer' ? callPeer(target, body, cfg) : callLocal(body, cfg));
+
+  /** A failed peer is unavailable until its cache entry ages out. */
+  function markDown(target) {
+    if (target.kind === 'peer') peerHealth.set(target.url, { available: false, checkedAt: now() });
+  }
 
   /** POST /v1/systemone handler. */
   async function handleSystemOne(req, res) {

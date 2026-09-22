@@ -185,3 +185,87 @@ test('start: not runnable → 409 with the reason', async () => {
   assert.equal(res.statusCode, 409);
   assert.match(res.body.error, /disabled in config/);
 });
+
+// W6-T3: laya alias routing — configured peers (ordered), then local, then 503.
+/** fetch fake: peer status + peer/local systemone, recording calls. */
+function peerFetch({ peerAvailable = true, peerStatus = 200, peerHost = 'drakemore' } = {}) {
+  const calls = [];
+  const fn = async (url, init = {}) => {
+    calls.push({ url, init });
+    if (url === 'http://d:3001/api/decision/status') return new Response(JSON.stringify({ available: peerAvailable }), { status: 200 });
+    if (url === 'http://d:3001/api/v1/systemone') {
+      return new Response(JSON.stringify({ model: 'laya-typed-decisions', answers: {}, usage: { input_tokens: 1, output_tokens: 0 } }),
+        { status: peerStatus, headers: { 'x-laya-host': peerHost } });
+    }
+    if (url === 'http://127.0.0.1:5254/v1/systemone') return new Response(JSON.stringify({ model: 'local', answers: {}, usage: { input_tokens: 1, output_tokens: 0 } }), { status: 200 });
+    throw new Error(`unexpected ${url}`);
+  };
+  return { fn, calls };
+}
+
+const WITH_PEER = { decision: { enabled: true, image: PINNED, port: 5254, peers: [{ name: 'drakemore', url: 'http://d:3001' }] } };
+
+test('alias: healthy drakemore serves first; hop header sent; x-laya-host from the peer', async () => {
+  const f = peerFetch();
+  const { routes, state } = harness({ state: WITH_PEER, fetchImpl: f.fn });
+  const res = await invoke(routes, 'POST /v1/systemone', { body: Q });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['x-laya-host'], 'drakemore');
+  const fwd = f.calls.find((c) => c.url.endsWith('/api/v1/systemone'));
+  assert.equal(fwd.init.headers['x-laya-hop'], 'frostburn');
+  assert.equal(state.starts, 0, 'local engine not started when the peer serves');
+});
+
+test('alias: peer health is cached within peerHealthTtlMs', async () => {
+  const f = peerFetch();
+  const { routes } = harness({ state: WITH_PEER, fetchImpl: f.fn });
+  await invoke(routes, 'POST /v1/systemone', { body: Q });
+  await invoke(routes, 'POST /v1/systemone', { body: Q });
+  assert.equal(f.calls.filter((c) => c.url.endsWith('/api/decision/status')).length, 1);
+});
+
+test('alias: peer unavailable → local serves with x-laya-host = this node', async () => {
+  const f = peerFetch({ peerAvailable: false });
+  const { routes, state } = harness({ state: WITH_PEER, fetchImpl: f.fn });
+  const res = await invoke(routes, 'POST /v1/systemone', { body: Q });
+  assert.equal(res.headers['x-laya-host'], 'frostburn');
+  assert.equal(state.starts, 1);
+});
+
+test('alias: peer 503 → falls over to local and marks the peer down', async () => {
+  const f = peerFetch({ peerStatus: 503 });
+  const { routes } = harness({ state: WITH_PEER, fetchImpl: f.fn });
+  const res = await invoke(routes, 'POST /v1/systemone', { body: Q });
+  assert.equal(res.body.model, 'local');
+  const status = await invoke(routes, 'GET /api/decision/status');
+  assert.equal(status.body.peers[0].available, false);
+});
+
+test('alias: peer down and local memory too low → 503 no_decision_host', async () => {
+  const f = peerFetch({ peerAvailable: false });
+  const { routes } = harness({ state: { ...WITH_PEER, availableBytes: 1 }, fetchImpl: f.fn });
+  const res = await invoke(routes, 'POST /v1/systemone', { body: Q });
+  assert.equal(res.statusCode, 503);
+  // A7: 503 no_decision_host also carries host in the body, consistent with
+  // the disabled-engine 503 case above.
+  assert.deepEqual(res.body, { error: 'no_decision_host', host: 'frostburn' });
+});
+
+test('alias: a forwarded request (x-laya-hop) is served locally only', async () => {
+  const f = peerFetch();
+  const { routes } = harness({ state: WITH_PEER, fetchImpl: f.fn });
+  const res = await invoke(routes, 'POST /v1/systemone', { body: Q, headers: { 'x-laya-hop': 'drakemore' } });
+  assert.equal(res.body.model, 'local');
+  assert.equal(f.calls.some((c) => c.url.startsWith('http://d:3001')), false);
+});
+
+test('alias: a name-only peer resolves through fleetPeers', async () => {
+  const f = peerFetch();
+  const { routes } = harness({
+    state: { decision: { enabled: true, image: PINNED, port: 5254, peers: [{ name: 'drakemore' }] } },
+    fetchImpl: f.fn,
+    fleetPeers: () => [{ name: 'drakemore', url: 'http://d:3001' }],
+  });
+  const res = await invoke(routes, 'POST /v1/systemone', { body: Q });
+  assert.equal(res.headers['x-laya-host'], 'drakemore');
+});

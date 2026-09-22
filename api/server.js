@@ -55,7 +55,7 @@ const PROJECT_ROOT = dirname(__dirname);
 // Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
-import { resolveDecisionConfig } from './decision.js';
+import { resolveDecisionConfig, peerOffersDecision } from './decision.js';
 import { createDecisionSupervisor } from './decision-supervisor.js';
 import { createDecisionRouter } from './decision-router.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
@@ -8312,6 +8312,15 @@ app.use(createDecisionRouter({
   nodeName: () => describeNodeIdentity().name,
   memAvailableBytes,
   isLoopback: isLoopbackRequest,
+  // W6-T3: only operator-configured decision.peers are tried before local;
+  // this resolves a name-only peer entry against the fleet peers currently
+  // advertising system_one. Read lazily — lastKnownPeers is declared with
+  // `let` further below and refreshed on an interval; by the time a request
+  // reaches this router the module has finished loading, so the closure sees
+  // its current value rather than hitting the temporal dead zone.
+  fleetPeers: () => lastKnownPeers
+    .filter((peer) => peer.address && peerOffersDecision(peer))
+    .map((peer) => ({ name: peer.txt?.name || peer.instance, url: `http://${peer.address}:${peer.port}` })),
 }));
 
 // ── ds4-server supervisor (DeepSeek V4 Flash engine) ─────────────────────────
