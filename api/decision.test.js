@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DECISION_DEFAULTS, DECISION_CONTAINER_NAME, resolveDecisionConfig, isPinnedImage,
-  podmanRunArgs, isDecisionModel, pickDecisionPatch,
+  podmanRunArgs, isDecisionModel, pickDecisionPatch, resolveForwardModel,
 } from './decision.js';
 
 const DIGEST = 'a'.repeat(64);
@@ -97,4 +97,28 @@ test('isDecisionModel: laya, laya-*, jev-* and omitted are accepted; chat models
 test('pickDecisionPatch: keeps only decision config keys', () => {
   assert.deepEqual(pickDecisionPatch({ enabled: true, port: 5254, rm: '-rf', __proto__x: 1 }), { enabled: true, port: 5254 });
   assert.deepEqual(pickDecisionPatch(null), {});
+});
+
+// A6: llama-manager rewrites `model` to the loaded checkpoint for laya, laya-*
+// (unless it already names the loaded checkpoint) and jev-*, since laya-server
+// 422s `laya` against an unloaded `laya-english` alias.
+test('resolveForwardModel: A6 rewrites laya/jev-* to the loaded checkpoint', () => {
+  const cfg = { checkpoint: 'typed-decisions' };
+  assert.equal(resolveForwardModel('laya', cfg), 'laya-typed-decisions');
+  assert.equal(resolveForwardModel('jev-latest', cfg), 'laya-typed-decisions');
+  assert.equal(resolveForwardModel('jev-1.13.0', cfg), 'laya-typed-decisions');
+});
+
+test('resolveForwardModel: A6 leaves a model already naming the loaded checkpoint untouched', () => {
+  assert.equal(resolveForwardModel('laya-typed-decisions', { checkpoint: 'typed-decisions' }), 'laya-typed-decisions');
+  assert.equal(resolveForwardModel('laya-multilingual', { checkpoint: 'multilingual' }), 'laya-multilingual');
+});
+
+test('resolveForwardModel: A6 rewrites a laya-<other checkpoint> name that is not loaded', () => {
+  assert.equal(resolveForwardModel('laya-multilingual', { checkpoint: 'typed-decisions' }), 'laya-typed-decisions');
+});
+
+test('resolveForwardModel: an omitted model passes through unchanged', () => {
+  assert.equal(resolveForwardModel(undefined, { checkpoint: 'typed-decisions' }), undefined);
+  assert.equal(resolveForwardModel('', { checkpoint: 'typed-decisions' }), '');
 });

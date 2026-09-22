@@ -120,6 +120,25 @@ export function isDecisionModel(model) {
 }
 
 /**
+ * Rewrite a request's `model` to the checkpoint laya-server actually has
+ * loaded (A6). laya-server itself routes `laya` to `laya-english` and 422s
+ * when that checkpoint isn't loaded, so llama-manager rewrites `laya`,
+ * `jev-*`, and any `laya-*` name that isn't the loaded checkpoint to
+ * `laya-<cfg.checkpoint>`. A name that already matches the loaded checkpoint,
+ * or an omitted/empty model, passes through unchanged.
+ * @param {string|undefined} model
+ * @param {{checkpoint:string}} cfg Result of resolveDecisionConfig.
+ * @returns {string|undefined}
+ */
+export function resolveForwardModel(model, cfg) {
+  if (model === undefined || model === null || model === '') return model;
+  const loaded = `laya-${cfg.checkpoint}`;
+  if (model === loaded) return model;
+  if (model === 'laya' || /^laya-/.test(model) || /^jev-/.test(model)) return loaded;
+  return model;
+}
+
+/**
  * Keep only known `config.decision` keys from an API body.
  * @param {object|null} body
  * @returns {object}
