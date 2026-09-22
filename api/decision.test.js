@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   DECISION_DEFAULTS, DECISION_CONTAINER_NAME, resolveDecisionConfig, isPinnedImage,
   podmanRunArgs, isDecisionModel, pickDecisionPatch, resolveForwardModel,
+  resolvePeers, planDecisionRoute, peerOffersDecision,
 } from './decision.js';
 
 const DIGEST = 'a'.repeat(64);
@@ -121,4 +122,39 @@ test('resolveForwardModel: A6 rewrites a laya-<other checkpoint> name that is no
 test('resolveForwardModel: an omitted model passes through unchanged', () => {
   assert.equal(resolveForwardModel(undefined, { checkpoint: 'typed-decisions' }), undefined);
   assert.equal(resolveForwardModel('', { checkpoint: 'typed-decisions' }), '');
+});
+
+// W6-T3: laya alias routing — configured peers (ordered) → local → none.
+const LOCAL_OK = { runnable: true, running: false, availableBytes: 64 * 1024 ** 3, minFreeMemBytes: 4 * 1024 ** 3 };
+
+test('resolvePeers: static urls kept in order, names resolved against the fleet, duplicates dropped', () => {
+  const fleet = [{ name: 'drakemore', url: 'http://192.168.1.79:3001' }, { name: 'other', url: 'http://10.0.0.2:3001' }];
+  assert.deepEqual(resolvePeers([{ name: 'drakemore' }, { name: 'static', url: 'http://h:1/' }, { name: 'ghost' }, { name: 'drakemore' }], fleet), [
+    { name: 'drakemore', url: 'http://192.168.1.79:3001' },
+    { name: 'static', url: 'http://h:1' },
+  ]);
+});
+
+test('planDecisionRoute: healthy peer first, then local', () => {
+  const peers = [{ name: 'drakemore', url: 'http://d:3001' }];
+  assert.deepEqual(planDecisionRoute({ peers, peerAvailable: () => true, local: LOCAL_OK }),
+    [{ kind: 'peer', name: 'drakemore', url: 'http://d:3001' }, { kind: 'local' }]);
+});
+
+test('planDecisionRoute: unhealthy peer skipped; low memory drops local; nothing → empty', () => {
+  const peers = [{ name: 'drakemore', url: 'http://d:3001' }];
+  assert.deepEqual(planDecisionRoute({ peers, peerAvailable: () => false, local: LOCAL_OK }), [{ kind: 'local' }]);
+  assert.deepEqual(planDecisionRoute({ peers, peerAvailable: () => false, local: { ...LOCAL_OK, availableBytes: 1 } }), []);
+  assert.deepEqual(planDecisionRoute({ peers, peerAvailable: () => false, local: { ...LOCAL_OK, availableBytes: 1, running: true } }), [{ kind: 'local' }]);
+});
+
+test('planDecisionRoute: a forwarded request never goes back out to peers', () => {
+  const peers = [{ name: 'frostburn', url: 'http://f:5250' }];
+  assert.deepEqual(planDecisionRoute({ peers, forwarded: true, peerAvailable: () => true, local: LOCAL_OK }), [{ kind: 'local' }]);
+});
+
+test('peerOffersDecision: reads the system_one token from the advertised engines TXT', () => {
+  assert.equal(peerOffersDecision({ txt: { engines: 'llama,ds4,system_one' } }), true);
+  assert.equal(peerOffersDecision({ txt: { engines: 'llama' } }), false);
+  assert.equal(peerOffersDecision({}), false);
 });

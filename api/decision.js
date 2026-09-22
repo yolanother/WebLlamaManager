@@ -7,8 +7,10 @@
 // env overrides) into a config with a `runnable` verdict, refuses images not
 // pinned by digest, builds the `podman run` argv (loopback port map, keep-id
 // weights cache mount, checkpoint/device env, GPU passthrough flags), decides
-// which request model names the proxy accepts, and whitelists config patches.
-// Kept out of server.js so it is unit-testable.
+// which request model names the proxy accepts, whitelists config patches, and
+// plans the `laya` alias route (configured peers, in order, then the local
+// engine when the memory guard allows a cold start). Kept out of server.js so
+// it is unit-testable.
 
 /** Name of the single supervised laya-server container. */
 export const DECISION_CONTAINER_NAME = 'llama-manager-decision';
@@ -145,4 +147,49 @@ export function resolveForwardModel(model, cfg) {
  */
 export function pickDecisionPatch(body) {
   return Object.fromEntries(Object.entries(body || {}).filter(([k]) => Object.hasOwn(DECISION_DEFAULTS, k)));
+}
+
+/**
+ * Resolve the operator's ordered `decision.peers` into concrete {name,url}
+ * targets. Entries with a url are used as-is (trailing slash trimmed); entries
+ * with only a name are looked up among fleet peers advertising system_one.
+ * Unknown names and duplicate urls are dropped.
+ * @param {Array<{name?:string,url?:string}>} configured
+ * @param {Array<{name:string,url:string}>} fleet
+ * @returns {Array<{name:string,url:string}>}
+ */
+export function resolvePeers(configured = [], fleet = []) {
+  const byName = new Map(fleet.map((p) => [p.name, p]));
+  const seen = new Set();
+  const out = [];
+  for (const c of configured) {
+    const p = c?.url ? { name: c.name || c.url, url: c.url.replace(/\/+$/, '') } : byName.get(c?.name);
+    if (p && !seen.has(p.url)) { seen.add(p.url); out.push(p); }
+  }
+  return out;
+}
+
+/**
+ * Plan the laya alias route for one request: available configured peers in
+ * order (skipped when the request was already forwarded), then the local
+ * engine when it is runnable and either already running or MemAvailable
+ * covers a cold start. An empty plan means 503 no_decision_host.
+ * @param {{peers?:Array<{name:string,url:string}>, forwarded?:boolean,
+ *   peerAvailable?:(url:string)=>boolean,
+ *   local:{runnable:boolean, running:boolean, availableBytes:number, minFreeMemBytes:number}}} input
+ * @returns {Array<{kind:'peer',name:string,url:string}|{kind:'local'}>}
+ */
+export function planDecisionRoute({ peers = [], forwarded = false, peerAvailable = () => false, local }) {
+  const targets = forwarded ? [] : peers.filter((p) => peerAvailable(p.url)).map((p) => ({ kind: 'peer', name: p.name, url: p.url }));
+  if (local.runnable && (local.running || local.availableBytes >= local.minFreeMemBytes)) targets.push({ kind: 'local' });
+  return targets;
+}
+
+/**
+ * Whether a discovered fleet peer advertises the system_one capability.
+ * @param {{txt?:{engines?:string}}} peer mdns-discovery peer record.
+ * @returns {boolean}
+ */
+export function peerOffersDecision(peer) {
+  return String(peer?.txt?.engines || '').split(',').includes(SYSTEM_ONE_CAPABILITY);
 }
