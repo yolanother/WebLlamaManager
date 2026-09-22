@@ -16479,6 +16479,17 @@ setInterval(async () => {
       watchdogStats.lastKillAt = now;
       watchdogStats.lastKillModel = entry.model;
       watchdogStats.lastKillStallMs = verdict.idleMs;
+      // A remote backend that ACCEPTED this request and then produced nothing is
+      // a failing backend, so tell the circuit breaker — otherwise the same dead
+      // host is selected again on the very next request. Measured 2026-09-22:
+      // drakemore accepted default-big, emitted 0 tokens for 393s, was aborted
+      // here, and nothing marked it unhealthy; the caller just saw an empty body.
+      // Only REMOTE stalls count: a local engine stall is not a backend fault and
+      // there is no other backend to blame it on.
+      if (entry.backend) {
+        const stalledBackend = (config?.backends?.directory || []).find(b => b.id === entry.backend);
+        recordBackendFailure(entry.backend, stalledBackend?.name || entry.backend);
+      }
       try { entry.abortController?.abort(); } catch { /* ignore */ }
     }
   }
