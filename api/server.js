@@ -1898,11 +1898,17 @@ function enrichLlamaManagerMeta(meta, opts = {}) {
   return meta;
 }
 
-function recordBackendFailure(backendId, backendName) {
+function recordBackendFailure(backendId, backendName, { trip = false } = {}) {
   const cb = backendCircuitBreakers.get(backendId) || { failures: 0, lastFailure: 0, trippedAt: null };
   cb.failures++;
   cb.lastFailure = Date.now();
-  if (cb.failures >= CIRCUIT_BREAKER_THRESHOLD && !cb.trippedAt) {
+  // `trip` is for failures that prove the backend is unusable RIGHT NOW rather
+  // than merely flaky — a stall that produced ZERO tokens, for instance. Waiting
+  // for CIRCUIT_BREAKER_THRESHOLD strikes there costs one stall timeout per
+  // strike (~394s each, measured 2026-09-22) and every one of them kills the
+  // request that drew the dead host. The CIRCUIT_BREAKER_RESET_MS half-open
+  // retry still applies, so a backend that recovers comes back on its own.
+  if ((trip || cb.failures >= CIRCUIT_BREAKER_THRESHOLD) && !cb.trippedAt) {
     cb.trippedAt = Date.now();
     console.log(`[circuit-breaker] Backend ${backendName} tripped after ${cb.failures} consecutive failures — pausing for ${CIRCUIT_BREAKER_RESET_MS / 1000}s`);
     addLog('backends', `Circuit breaker tripped for ${backendName} — ${cb.failures} consecutive failures, pausing ${CIRCUIT_BREAKER_RESET_MS / 1000}s`);
@@ -16488,7 +16494,15 @@ setInterval(async () => {
       // there is no other backend to blame it on.
       if (entry.backend) {
         const stalledBackend = (config?.backends?.directory || []).find(b => b.id === entry.backend);
-        recordBackendFailure(entry.backend, stalledBackend?.name || entry.backend);
+        // ZERO tokens means it accepted the work and produced nothing at all, so
+        // trip on the first occurrence instead of burning two more stall timeouts
+        // to reach the 3-strike threshold. A partial response is only flaky and
+        // still counts normally.
+        recordBackendFailure(
+          entry.backend,
+          stalledBackend?.name || entry.backend,
+          { trip: entry.tokens === 0 },
+        );
       }
       try { entry.abortController?.abort(); } catch { /* ignore */ }
     }

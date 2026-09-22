@@ -21,7 +21,9 @@ const SRC = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
 function watchdogAbortBlock() {
   const i = SRC.indexOf('Stall watchdog: aborting remote request');
   assert.ok(i > -1, 'watchdog abort message must exist');
-  return SRC.slice(i, i + 1400);
+  // Generous window: the branch carries explanatory comments and a multi-line
+  // call, and a tight slice fails for formatting rather than for behaviour.
+  return SRC.slice(i, i + 3000);
 }
 
 test('watchdog kill records a backend failure for the circuit breaker', () => {
@@ -43,4 +45,29 @@ test('watchdog kill is attributed to the backend it stalled on', () => {
 test('circuit breaker still resets itself so a recovered backend returns', () => {
   // Dahaka comes back on its own; nothing here may require manual re-enabling.
   assert.ok(SRC.includes('CIRCUIT_BREAKER_RESET_MS'), 'reset window must exist');
+});
+
+test('a ZERO-token stall trips the breaker immediately, not after 3 strikes', () => {
+  // CIRCUIT_BREAKER_THRESHOLD is 3, and each stall costs ~394s. Measured
+  // 2026-09-22: drakemore stalled twice in a row at 393s/394s with 0 tokens and
+  // never tripped, so it kept being selected and killed an episode each time.
+  // A backend that ACCEPTED work and produced literally nothing is not "flaky" —
+  // it is unusable right now, which the 60s reset window already un-does safely.
+  const block = watchdogAbortBlock();
+  assert.ok(
+    /entry\.tokens === 0/.test(block),
+    'the zero-token case must be distinguished from a partial/slow response',
+  );
+  assert.ok(
+    /trip:\s*true|tripImmediately|{\s*trip/.test(block),
+    'a zero-token stall must trip the breaker on the first occurrence',
+  );
+});
+
+test('immediate trip still honours the automatic reset window', () => {
+  // Nothing may require a human to re-enable a recovered backend.
+  assert.ok(
+    SRC.includes('Date.now() - cb.trippedAt > CIRCUIT_BREAKER_RESET_MS'),
+    'half-open retry after the reset window must remain',
+  );
 });
