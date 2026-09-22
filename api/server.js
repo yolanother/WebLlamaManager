@@ -13531,8 +13531,23 @@ async function handleChatCompletions(req, res) {
                     const data = JSON.parse(line.slice(6));
                     const delta = data.choices?.[0]?.delta;
                     if (delta) {
-                      const text = delta.content || delta.reasoning_content || delta.reasoning || '';
+                      // Same liveness rule as the local parser: a thinking-mode
+                      // model streams its reasoning in fields beyond OpenAI's
+                      // canonical `content`, and remote backends are no
+                      // different. Miss one and entry.tokens stays 0 while the
+                      // backend generates, so the stall watchdog tears down a
+                      // live request (and now trips its circuit breaker).
+                      const text = delta.content || delta.reasoning_content ||
+                                   delta.reasoning || delta.thinking ||
+                                   delta.text || '';
                       if (text) { completionTokens++; responseText += text; updateActiveRequest(activeReqId, text); }
+                      else if (Object.keys(delta).length > 0) {
+                        // tool_calls, a bare role, or an unrecognised shape:
+                        // still proof the backend is alive. Refresh
+                        // lastActivityAt so "no text field matched" is not
+                        // read as "model is wedged".
+                        updateActiveRequest(activeReqId, '');
+                      }
                     }
                     if (data.usage) { promptTokens = data.usage.prompt_tokens || promptTokens; completionTokens = data.usage.completion_tokens || completionTokens; }
                     if (data.model && data.model !== requestedModel) {
