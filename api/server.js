@@ -55,7 +55,7 @@ const PROJECT_ROOT = dirname(__dirname);
 // Load .env from project root (optional) to make DISTROBOX_CONTAINER configurable
 import dotenv from 'dotenv';
 import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogEntry } from './embeddings.js';
-import { resolveDecisionConfig, peerOffersDecision } from './decision.js';
+import { resolveDecisionConfig, peerOffersDecision, advertisedEngines } from './decision.js';
 import { createDecisionSupervisor } from './decision-supervisor.js';
 import { createDecisionRouter } from './decision-router.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
@@ -10147,7 +10147,7 @@ function advertiseToFleet() {
         ...designationTxt(describeDesignation()),
         engine,
         model,
-        capability: capabilityFrom({ ...hardware, engines: installedEngines() }),
+        capability: capabilityFrom({ ...hardware, engines: advertisedEngines(installedEngines(), decisionConfig()) }),
       }),
     });
     if (!contents) return false;

@@ -192,4 +192,16 @@ export function planDecisionRoute({ peers = [], forwarded = false, peerAvailable
  */
 export function peerOffersDecision(peer) {
   return String(peer?.txt?.engines || '').split(',').includes(SYSTEM_ONE_CAPABILITY);
+
+}
+
+/**
+ * Engines to advertise over mDNS: the installed list plus `system_one` when the
+ * decision engine is runnable here, so peers can find a Laya host by capability.
+ * @param {string[]} engines installedEngines() result.
+ * @param {object} cfg resolveDecisionConfig(...) result.
+ * @returns {string[]}
+ */
+export function advertisedEngines(engines, cfg) {
+  return cfg?.runnable ? [...engines, SYSTEM_ONE_CAPABILITY] : engines;
 }

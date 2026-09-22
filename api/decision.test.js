@@ -4,8 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DECISION_DEFAULTS, DECISION_CONTAINER_NAME, resolveDecisionConfig, isPinnedImage,
-  podmanRunArgs, isDecisionModel, pickDecisionPatch, resolveForwardModel,
-  resolvePeers, planDecisionRoute, peerOffersDecision,
+  podmanRunArgs, isDecisionModel, pickDecisionPatch, resolveForwardModel, resolvePeers, planDecisionRoute, peerOffersDecision, advertisedEngines,
 } from './decision.js';
 
 const DIGEST = 'a'.repeat(64);
@@ -157,4 +156,11 @@ test('peerOffersDecision: reads the system_one token from the advertised engines
   assert.equal(peerOffersDecision({ txt: { engines: 'llama,ds4,system_one' } }), true);
   assert.equal(peerOffersDecision({ txt: { engines: 'llama' } }), false);
   assert.equal(peerOffersDecision({}), false);
+});
+
+test('advertisedEngines: appends system_one only when the engine is runnable', () => {
+  const on = resolveDecisionConfig({ decision: { enabled: true, image: PINNED } }, {});
+  assert.deepEqual(advertisedEngines(['llama', 'ds4'], on), ['llama', 'ds4', 'system_one']);
+  assert.deepEqual(advertisedEngines(['llama'], resolveDecisionConfig({}, {})), ['llama']);
+  assert.deepEqual(advertisedEngines(['llama'], resolveDecisionConfig({ decision: { enabled: true, image: 'x:latest' } }, {})), ['llama']);
 });
