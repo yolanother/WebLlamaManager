@@ -65,6 +65,54 @@
 
 ---
 
+## AMENDMENTS (2026-09-22, coordinator; BINDING — override the tasks below where they differ)
+
+Operator rules and W6-T0 spike results (orch task T316bcaa0b5805):
+
+- **A1 Frostburn builds everything.** Nothing is built on drakemore. There is no `podman build` or `pip` there, ever.
+  drakemore can be reimaged from Frostburn's ISO at any time, so the engine must arrive via deb/ISO/APT.
+  T0 steps 4–6 as written (building and running on drakemore) are **void**. The spike ran on Frostburn, which has the same
+  gfx1151 iGPU.
+- **A2 ROCm (gfx1151) is the default and only v1 variant.** The CUDA 3090 is overloaded. A GPU selector plus a CUDA variant is
+  follow-up T316bce193f81c. Winning values:
+  - `LAYA_SERVER_DEVICE=cuda:0`
+  - `HSA_OVERRIDE_GFX_VERSION=11.5.1`
+  - devices `--device /dev/kfd --device /dev/dri --group-add keep-groups --security-opt seccomp=unconfined`
+- **A3 Our own pinned Containerfile.** It lives at `packaging/decision/Containerfile` in this repo and builds laya-server @
+  `819fa065dce72b3c117a2364bb4839c02a0abcb3`.
+  - Upstream's ROCm image is broken: `ImportError: libatomic.so.1`. The Containerfile must
+    `apt-get install -y --no-install-recommends libatomic1`.
+  - To shrink the image, strip every non-gfx1151 kernel file from `torch/lib/hipblaslt/library` and
+    `torch/lib/rocblas/library`. Keep `*fallback*`, `TensileManifest.txt`, and all `gfx1151` files.
+    Measured before stripping: 16.18 GB image, 6.30 GB zstd archive. The target is ≈4 GB compressed.
+  - Base images are pinned by digest.
+- **A4 Shipping follows the `llama-manager-rocm-gfx1151` precedent exactly.**
+  - A pinned `oci-image` row in `distribution/ubuntu-respin/assets.lock`, archive in the NAS asset mirror
+    `/volumes/llama-manager/assets/laya/`.
+  - A new split deb `llama-manager-laya-rocm` carrying `/usr/lib/llama-manager/offline/laya-server.oci.tar`.
+  - Its postinst runs `run_manager podman load` plus an image-ID check (copy `debian/llama-manager-rocm-gfx1151.postinst:39-59`).
+  - Add it to the appliance `Depends` and to the loop in `tests/test-maintainer-scripts.sh`.
+  - The zstd archive must stay < 9 GB (dpkg ar member limit).
+  - The operator was asked about the size (orch question X-vaLtPSr_G4vT1MiFtxj). The coordinator default is "strip, then ship via deb".
+- **A5 `DEFAULT_DECISION_IMAGE`** is the image ID (`sha256:<64 hex>`) loaded from that archive. It is not a registry reference,
+  and there is no ghcr push.
+- **A6 Model mapping.** laya-server routes the model name `laya` to `laya-english` (HTTP 422 when that checkpoint isn't loaded).
+  llama-manager must rewrite `model` to `laya-typed-decisions` for `laya`, `laya-*` (unless it names a loaded checkpoint) and
+  `jev-*` before proxying.
+- **A7** `/v1/systemone` responses also carry `"host": "<node-name>"` in the JSON body, because node-proxy drops headers
+  (orchestrator master plan R27).
+- **A8 Measured on Frostburn while busy:**
+  - p50: 1 question 94.5 ms, 5 questions 206.7 ms, 10 questions 332.3 ms (≈25 ms per extra question)
+  - RSS 2.7 GB, VRAM 1.68 GB, first weight load 46 s
+  - `DECISION_DEFAULTS.minFreeMemBytes` = **6 GiB**
+  - laya-server serializes requests (global lock).
+- **A9 Deploying to drakemore** (T6) means installing the built deb from Frostburn (`scp` the deb, then `apt install ./…deb`,
+  or through the release APT repo). The `api/*.js` hot-patch is fine for code iteration, but the image only ever arrives via the deb.
+- **A10** `LastChange.md` is a **tracked** file in this repo. Write commit messages to a scratch file outside the repo and
+  run `git commit -F <that file>`.
+
+---
+
 ## File Structure
 
 | File | Status | Responsibility |
