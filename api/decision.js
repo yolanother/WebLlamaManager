@@ -27,11 +27,10 @@ export const LAYA_CHECKPOINTS = ['english', 'multilingual', 'typed-decisions'];
 
 // SPIKE (W6-T0, orch task T316bcaa0b5805): device + GPU passthrough flags for
 // the winning ROCm gfx1151 variant, measured on Frostburn.
-// SPIKE (W6-T1a, orch task T316bf9b05a817): still in progress at the time this
-// task landed, so DEFAULT_DECISION_IMAGE ships unpinned ('') and
-// resolveDecisionConfig() refuses to run until the coordinator pastes in the
-// built image's `sha256:<64 hex>` id.
-const DEFAULT_DECISION_IMAGE = '';
+// W6-T1a (orch task T316bf9b05a817): id of localhost/laya-server:rocm-4f5c0f0,
+// built on Frostburn from packaging/decision/Containerfile and shipped as the
+// OCI archive inside the llama-manager-laya-rocm deb (loaded by its postinst).
+const DEFAULT_DECISION_IMAGE = 'sha256:3b6dd0d5cb3cfd4b72176f6973d4079c85052156c112658154f8d53365864769';
 const DEFAULT_DECISION_PODMAN_ARGS = [
   '--device', '/dev/kfd', '--device', '/dev/dri',
   '--group-add', 'keep-groups', '--security-opt', 'seccomp=unconfined',

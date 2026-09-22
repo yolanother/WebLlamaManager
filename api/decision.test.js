@@ -18,19 +18,19 @@ test('resolveDecisionConfig: ships disabled on port 5254 with the typed-decision
   assert.equal(c.idleTimeoutSec, 600);
   assert.equal(c.runnable, false);
   assert.equal(c.reason, 'disabled in config');
-  // DEVIATION (W6-T1, 2026-09-22): W6-T1a (image build) had not yet recorded a
-  // digest-pinned image id at the time this task landed, so DEFAULT_DECISION_IMAGE
-  // ships as '' and the canary below asserts the un-pinned state instead of a
-  // pinned one. The coordinator fills DEFAULT_DECISION_IMAGE in api/decision.js
-  // once T1a records `sha256:<64 hex>`; flip this assertion back to
-  // `assert.ok(isPinnedImage(...))` at that point.
-  assert.equal(isPinnedImage(DECISION_DEFAULTS.image), false, 'DEFAULT_DECISION_IMAGE is still unfilled (T1a pending)');
+  // The default image is the id of the Frostburn-built laya-server archive shipped
+  // by the llama-manager-laya-rocm deb (W6-T1a).
+  assert.ok(isPinnedImage(DECISION_DEFAULTS.image), 'DEFAULT_DECISION_IMAGE must be a pinned image id');
+  assert.equal(DECISION_DEFAULTS.image, 'sha256:3b6dd0d5cb3cfd4b72176f6973d4079c85052156c112658154f8d53365864769');
 });
 
-test('resolveDecisionConfig: enabling with the still-unpinned default image refuses to run', () => {
-  // Documents the unpinned-refusal path this task's DEFAULT_DECISION_IMAGE=='' takes
-  // until W6-T1a records the built image id.
+test('resolveDecisionConfig: enabling with the default image is runnable', () => {
   const c = resolveDecisionConfig({ decision: { enabled: true } }, {});
+  assert.equal(c.runnable, true);
+});
+
+test('resolveDecisionConfig: an unpinned image override refuses to run', () => {
+  const c = resolveDecisionConfig({ decision: { enabled: true, image: 'laya-server:latest' } }, {});
   assert.equal(c.runnable, false);
   assert.equal(c.reason, 'image is not pinned by digest');
 });
