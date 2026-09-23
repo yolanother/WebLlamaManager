@@ -652,3 +652,43 @@ test('target-level validation is unaffected by the alias-level fields', () => {
   assert.equal(hostWarnings[0].level, 'warning');
   assert.deepEqual(issues.filter(i => i.field === 'model'), [], 'no duplicate targets in the fixture');
 });
+
+// ---------------------------------------------------------------------------
+// Smart alias type, System 1 provider, and per-target domain/sizeB.
+// ---------------------------------------------------------------------------
+
+test('smart alias fields round-trip through rows', () => {
+  const aliases = {
+    smart: { type: 'smart', system1: 'jev', targets: [{ host: 'local', model: 'a' }, { host: 'local', model: 'b', domain: 'code', sizeB: 30 }] },
+    plain: { targets: [{ host: 'local', model: 'c' }] },
+  };
+  const rows = aliasesToRows(aliases);
+  assert.equal(rows[1].domain, 'code');
+  assert.equal(rows[1].sizeB, '30');
+  assert.equal(rows[0].type, 'smart');
+  assert.equal(rows[2].type, '');
+  assert.deepEqual(rowsToAliases(rows), aliases);
+});
+
+test('diffAliases sees a type, system1, domain or sizeB change', () => {
+  const before = { s: { type: 'smart', targets: [{ host: 'local', model: 'a' }] } };
+  assert.deepEqual(diffAliases(before, { s: { targets: [{ host: 'local', model: 'a' }] } }).changed, ['s']);
+  assert.deepEqual(diffAliases(before, { s: { type: 'smart', system1: 'jev', targets: [{ host: 'local', model: 'a' }] } }).changed, ['s']);
+  assert.deepEqual(diffAliases(before, { s: { type: 'smart', targets: [{ host: 'local', model: 'a', domain: 'code' }] } }).changed, ['s']);
+});
+
+test('aliasGroups exposes type and system1 per alias', () => {
+  const g = aliasGroups(aliasesToRows({ s: { type: 'smart', system1: 'laya', targets: [{ host: 'local', model: 'a' }] } }));
+  assert.equal(g[0].type, 'smart');
+  assert.equal(g[0].system1, 'laya');
+});
+
+test('validateRows rejects a bad sizeB and an unknown domain on smart rows', () => {
+  const rows = [
+    { rowId: 1, aliasName: 's', host: 'local', model: 'a', type: 'smart', sizeB: '-2', domain: '' },
+    { rowId: 2, aliasName: 's', host: 'local', model: 'b', type: 'smart', sizeB: '', domain: 'poetry' },
+  ];
+  const issues = validateRows(rows);
+  assert.ok(issues.some(i => i.rowId === 1 && i.field === 'sizeB' && i.level === 'error'));
+  assert.ok(issues.some(i => i.rowId === 2 && i.field === 'domain' && i.level === 'error'));
+});

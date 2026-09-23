@@ -8,8 +8,10 @@
 // rather than once per target; folds edited rows back into alias groups; computes
 // which aliases a save must PUT and which it must DELETE; and validates rows
 // against the local inventory using the same rules the server's validateAlias()
-// applies. Contains no React and performs no I/O — the Settings component owns
-// every fetch and all component state.
+// applies. Also covers the smart alias type: an alias-level `type`/`system1` and
+// per-target `domain`/`sizeB`, used by System 1 (Laya/Jev) to pick a target by
+// task shape rather than static priority. Contains no React and performs no I/O —
+// the Settings component owns every fetch and all component state.
 //
 // The shape problem this module solves: targets are per-ROW but `gpu` and
 // `gpuPriority` are per-ALIAS, and an alias with three targets must show one GPU
@@ -28,6 +30,11 @@ const RESERVED_ALIAS_NAMES = ['auto', 'default-router'];
 
 /** Host value that means "this manager", as opposed to a backend id. */
 const LOCAL_HOST = 'local';
+
+/** Mirrors SMART_DOMAINS in api/model-aliases.js (UI cannot import server code). */
+export const SMART_DOMAINS = ['code', 'math_or_logic', 'writing', 'factual_lookup', 'data_analysis', 'chitchat'];
+/** Mirrors SYSTEM1_PROVIDERS in api/decision.js. */
+export const SYSTEM1_PROVIDERS = ['laya', 'jev', 'jev-then-laya'];
 
 /**
  * Coerces an inventory list into a set of names. Accepts an array of strings or
@@ -67,23 +74,30 @@ function presetIdSet(presets) {
  * order is authored intent (it is the ranking tiebreak), so a reorder is a
  * genuine change and the signature reflects it.
  *
- * The alias-level `gpu` and `gpuPriority` are part of the signature too: changing
- * only which pool an alias runs on, without touching a target, is a real change and
- * a save that ignored it would silently discard the operator's edit.
+ * The alias-level `gpu`, `gpuPriority`, `type` and `system1` are part of the
+ * signature too: changing only which pool an alias runs on, or its smart-alias
+ * type or provider, without touching a target, is a real change and a save that
+ * ignored it would silently discard the operator's edit. Per-target `domain` and
+ * `sizeB` are folded into each target's part of the signature for the same reason.
  *
- * @param {{targets?: Array<{host?: string, model?: string}>, gpu?: string,
- *   gpuPriority?: number}|null|undefined} group The alias group to fingerprint.
+ * @param {{targets?: Array<{host?: string, model?: string, domain?: string,
+ *   sizeB?: number}>, gpu?: string, gpuPriority?: number, type?: string,
+ *   system1?: string}|null|undefined} group The alias group to fingerprint.
  * @returns {string} A signature that is equal iff the ordered targets and the
- *   alias-level GPU settings are equal.
+ *   alias-level settings are equal.
  */
 function groupSignature(group) {
   const targets = Array.isArray(group?.targets) ? group.targets : [];
   const gpu = group?.gpu == null ? '' : String(group.gpu);
   const priority = group?.gpuPriority == null ? '' : String(group.gpuPriority);
+  const type = group?.type ?? '';
+  const system1 = group?.system1 ?? '';
   return [
-    targets.map(t => `${t?.host ?? ''}\u0000${t?.model ?? ''}`).join('\u0001'),
+    targets.map(t => `${t?.host ?? ''}\u0000${t?.model ?? ''}\u0000${t?.domain ?? ''}\u0000${t?.sizeB ?? ''}`).join('\u0001'),
     gpu,
     priority,
+    type,
+    system1,
   ].join('\u0002');
 }
 
@@ -98,18 +112,22 @@ function groupSignature(group) {
  * React keys need. The component allocates ids above the returned maximum for
  * rows the user adds.
  *
- * The alias-level `gpu` and `gpuPriority` are copied onto EVERY row of the alias.
- * They are one value per alias, not per target, and {@link aliasGroups} is what
- * reads them back out — carrying them on the rows keeps the editor's state a
- * single flat list, which is what makes rename, reorder and delete one-liners.
- * Both are held as strings because they are edited in inputs, and both are `''`
- * when the stored alias has no such field.
+ * The alias-level `gpu`, `gpuPriority`, `type` and `system1` are copied onto
+ * EVERY row of the alias. They are one value per alias, not per target, and
+ * {@link aliasGroups} is what reads them back out — carrying them on the rows
+ * keeps the editor's state a single flat list, which is what makes rename,
+ * reorder and delete one-liners. All are held as strings because they are
+ * edited in inputs/selects, and all are `''` when the stored alias has no such
+ * field. `domain` and `sizeB` are per-TARGET, so they are read from each target
+ * rather than copied from the group.
  *
- * @param {Object<string, {targets?: Array<{host?: string, model?: string}>,
- *   gpu?: string, gpuPriority?: number}>|null|undefined} aliases
+ * @param {Object<string, {targets?: Array<{host?: string, model?: string,
+ *   domain?: string, sizeB?: number}>, gpu?: string, gpuPriority?: number,
+ *   type?: string, system1?: string}>|null|undefined} aliases
  *   The alias table, as stored in `config.aliases`.
  * @returns {Array<{rowId: number, aliasName: string, host: string, model: string,
- *   gpu: string, gpuPriority: string}>} One row per alias target, in authored order.
+ *   gpu: string, gpuPriority: string, type: string, system1: string, domain: string,
+ *   sizeB: string}>} One row per alias target, in authored order.
  */
 export function aliasesToRows(aliases) {
   if (!aliases || typeof aliases !== 'object') return [];
@@ -120,6 +138,8 @@ export function aliasesToRows(aliases) {
     const targets = Array.isArray(group?.targets) ? group.targets : [];
     const gpu = group?.gpu == null ? '' : String(group.gpu);
     const gpuPriority = group?.gpuPriority == null ? '' : String(group.gpuPriority);
+    const type = group?.type === 'smart' ? 'smart' : '';
+    const system1 = group?.system1 == null ? '' : String(group.system1);
     for (const target of targets) {
       rows.push({
         rowId: nextRowId++,
@@ -127,7 +147,11 @@ export function aliasesToRows(aliases) {
         host: String(target?.host ?? ''),
         model: String(target?.model ?? ''),
         gpu,
-        gpuPriority
+        gpuPriority,
+        type,
+        system1,
+        domain: String(target?.domain ?? ''),
+        sizeB: target?.sizeB == null ? '' : String(target.sizeB)
       });
     }
   }
@@ -148,10 +172,11 @@ export function aliasesToRows(aliases) {
  * does not remount (and unfocus) its name input on every keystroke.
  *
  * @param {Array<{rowId?: number|string, aliasName?: string, gpu?: string,
- *   gpuPriority?: string}>|null|undefined} rows The editor rows.
+ *   gpuPriority?: string, type?: string, system1?: string}>|null|undefined} rows
+ *   The editor rows.
  * @returns {Array<{key: (number|string|undefined), name: string, rows: object[],
- *   gpu: string, gpuPriority: string}>} One entry per alias name, in
- *   first-appearance order, each with its rows in row order.
+ *   gpu: string, gpuPriority: string, type: string, system1: string}>} One entry
+ *   per alias name, in first-appearance order, each with its rows in row order.
  */
 export function aliasGroups(rows) {
   if (!Array.isArray(rows)) return [];
@@ -177,6 +202,8 @@ export function aliasGroups(rows) {
     rows: groupRows,
     gpu: firstNonBlank(groupRows, 'gpu'),
     gpuPriority: firstNonBlank(groupRows, 'gpuPriority'),
+    type: firstNonBlank(groupRows, 'type'),
+    system1: firstNonBlank(groupRows, 'system1'),
   }));
 }
 
@@ -196,15 +223,20 @@ export function aliasGroups(rows) {
  * {@link validateRows}'s job, and a save is expected to be blocked before this
  * runs.
  *
- * `gpu` and `gpuPriority` are emitted ONLY when set, resolved once per alias by
- * {@link aliasGroups}. An alias the operator never gave a GPU therefore produces
- * exactly `{targets}` — the same object this function has always produced — so the
- * body a save PUTs for such an alias is byte-identical to the pre-GPU one.
+ * `gpu`, `gpuPriority` and `system1` are emitted ONLY when set, resolved once per
+ * alias by {@link aliasGroups}. An alias the operator never gave a GPU therefore
+ * produces exactly `{targets}` — the same object this function has always
+ * produced — so the body a save PUTs for such an alias is byte-identical to the
+ * pre-GPU one. `type: 'smart'` and each target's `domain`/`sizeB` are likewise
+ * only included when the alias group's type is `'smart'`, so a failover alias's
+ * PUT body is unaffected by the smart-alias fields entirely.
  *
  * @param {Array<{aliasName?: string, host?: string, model?: string, gpu?: string,
- *   gpuPriority?: string}>|null|undefined} rows The editor rows to fold.
- * @returns {Object<string, {targets: Array<{host: string, model: string}>,
- *   gpu?: string, gpuPriority?: number}>} The alias table the API accepts.
+ *   gpuPriority?: string, type?: string, system1?: string, domain?: string,
+ *   sizeB?: string}>|null|undefined} rows The editor rows to fold.
+ * @returns {Object<string, {type?: 'smart', targets: Array<{host: string, model: string,
+ *   domain?: string, sizeB?: number}>, gpu?: string, gpuPriority?: number,
+ *   system1?: string}>} The alias table the API accepts.
  */
 export function rowsToAliases(rows) {
   const aliases = {};
@@ -213,13 +245,21 @@ export function rowsToAliases(rows) {
   for (const group of aliasGroups(rows)) {
     const aliasName = group.name.trim();
     if (!aliasName) continue;
+    const isSmart = group.type === 'smart';
 
     for (const row of group.rows) {
       const host = String(row?.host ?? '').trim();
       const model = String(row?.model ?? '').trim();
       if (!host || !model) continue;
-      if (!aliases[aliasName]) aliases[aliasName] = { targets: [] };
-      aliases[aliasName].targets.push({ host, model });
+      if (!aliases[aliasName]) aliases[aliasName] = { ...(isSmart ? { type: 'smart' } : {}), targets: [] };
+      const domain = String(row?.domain ?? '').trim();
+      const sizeB = String(row?.sizeB ?? '').trim();
+      aliases[aliasName].targets.push({
+        host,
+        model,
+        ...(isSmart && domain ? { domain } : {}),
+        ...(isSmart && sizeB !== '' ? { sizeB: Number(sizeB) } : {})
+      });
     }
 
     const alias = aliases[aliasName];
@@ -228,6 +268,7 @@ export function rowsToAliases(rows) {
     if (group.gpuPriority !== '' && Number.isInteger(Number(group.gpuPriority))) {
       alias.gpuPriority = Number(group.gpuPriority);
     }
+    if (isSmart && group.system1) alias.system1 = group.system1;
   }
   return aliases;
 }
@@ -280,11 +321,18 @@ export function diffAliases(original, edited) {
  * unless `gpuIds` is supplied, so an alias is not accused of naming an unknown pool
  * merely because the pool list has not finished loading.
  *
+ * On a smart-alias row (`row.type === 'smart'`), the per-target `sizeB` and
+ * `domain` are also checked: a non-blank `sizeB` that is not a finite number
+ * above 0 is an error, and a non-blank `domain` outside {@link SMART_DOMAINS} is
+ * an error. Both are skipped on a failover row — those fields have no meaning
+ * there.
+ *
  * Alias-level issues are returned first, in alias order; the per-target issues
  * follow in row order, and within a row in alias-name, host, model order.
  *
  * @param {Array<{rowId?: number|string, aliasName?: string, host?: string,
- *          model?: string, gpu?: string, gpuPriority?: string}>|null|undefined} rows
+ *          model?: string, gpu?: string, gpuPriority?: string, type?: string,
+ *          domain?: string, sizeB?: string}>|null|undefined} rows
  *   The editor rows to validate.
  * @param {{presets?: (Object<string, object>|Array<string|{id?: string}>),
  *          localModels?: Array<string|{id?: string}>,
@@ -294,7 +342,7 @@ export function diffAliases(original, edited) {
  *   ids, and configured GPU pool ids. Omitted fields are treated as empty, except
  *   `gpuIds`, whose absence disables the GPU checks.
  * @returns {Array<{rowId: (number|string|undefined),
- *          field: ('aliasName'|'gpu'|'gpuPriority'|'host'|'model'),
+ *          field: ('aliasName'|'gpu'|'gpuPriority'|'host'|'model'|'domain'|'sizeB'),
  *          level: ('error'|'warning'), message: string}>}
  *   Every issue found, in row order.
  */
@@ -389,6 +437,27 @@ export function validateRows(rows, inventory = {}) {
         });
       } else {
         seenTargets.add(key);
+      }
+    }
+
+    if (row?.type === 'smart') {
+      const sizeB = String(row?.sizeB ?? '').trim();
+      if (sizeB !== '' && !(Number.isFinite(Number(sizeB)) && Number(sizeB) > 0)) {
+        issues.push({
+          rowId,
+          field: 'sizeB',
+          level: 'error',
+          message: `Size must be a number of billions of parameters greater than 0, got "${sizeB}".`
+        });
+      }
+      const domain = String(row?.domain ?? '').trim();
+      if (domain !== '' && !SMART_DOMAINS.includes(domain)) {
+        issues.push({
+          rowId,
+          field: 'domain',
+          level: 'error',
+          message: `"${domain}" is not a known task domain.`
+        });
       }
     }
   }

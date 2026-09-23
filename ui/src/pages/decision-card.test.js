@@ -8,7 +8,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decisionCardAction, parseGpuList, decisionConfigPatch } from './decision-card.js';
+import { decisionCardAction, parseGpuList, decisionConfigPatch, decisionProviderPatch } from './decision-card.js';
 
 test('running decision engine offers Stop', () => {
   assert.deepEqual(decisionCardAction({ id: 'decision', state: 'running', running: true }), { label: 'Stop', path: '/decision/stop' });
@@ -35,4 +35,9 @@ test('parseGpuList: splits on commas and/or whitespace, trims, drops empties', (
 test('decisionConfigPatch: builds a {variant, gpus} patch body, falling back to rocm for an unknown variant', () => {
   assert.deepEqual(decisionConfigPatch({ variant: 'cuda', gpus: '0,1' }), { variant: 'cuda', gpus: ['0', '1'] });
   assert.deepEqual(decisionConfigPatch({ variant: 'nvidia', gpus: '' }), { variant: 'rocm', gpus: [] });
+});
+
+test('decisionProviderPatch: unknown provider → laya, blank key omitted', () => {
+  assert.deepEqual(decisionProviderPatch({ provider: 'x', jevModel: ' jev-latest ', jevApiKey: '' }), { provider: 'laya', jevModel: 'jev-latest' });
+  assert.deepEqual(decisionProviderPatch({ provider: 'jev', jevModel: '', jevApiKey: ' k ' }), { provider: 'jev', jevModel: 'jev-latest', jevApiKey: 'k' });
 });

@@ -16,7 +16,7 @@ import { API_BASE, formatBytes, formatUptime, formatModelName } from '../api.js'
 import { isLocalKioskHost, requestSystemLogin } from '../kiosk-control.js';
 import { resolveGpuPanel } from '../gpu-panel.js';
 import { resolveDrivePanel, resolveDriveAlerts, resolveLastCrash } from '../drive-panel.js';
-import { decisionCardAction, decisionConfigPatch } from './decision-card.js';
+import { decisionCardAction, decisionConfigPatch, decisionProviderPatch } from './decision-card.js';
 import { useVisiblePolling } from '../hooks/useVisiblePolling.js';
 import {
   StatCard,
@@ -103,15 +103,24 @@ function ModelMetricTooltip({ active, payload, label, dataKey, unit = '', color 
 // card. Posts straight to the existing loopback-only /api/decision/config
 // route (decisionConfigPatch whitelists variant/gpus); this is a standalone
 // component, not inline in the servers .map(), so its useState calls are
-// legal (React hooks may not run inside a loop body).
+// legal (React hooks may not run inside a loop body). Also carries the System 1
+// provider controls (Laya / Jev / Jev → Laya, the Jev model name, and its API
+// key) via decisionProviderPatch, posted to the same route.
 function DecisionGpuControls() {
   const [variant, setVariant] = useState('rocm');
   const [gpus, setGpus] = useState('');
+  const [provider, setProvider] = useState('laya');
+  const [jevModel, setJevModel] = useState('');
+  const [jevApiKey, setJevApiKey] = useState('');
+  const [jevApiKeySet, setJevApiKeySet] = useState(false);
   // Seed from the saved config so a reload never shows (and then re-saves) defaults.
   useEffect(() => {
     fetch(`${API_BASE}/decision/status`).then((r) => r.json()).then((s) => {
       if (s.variant) setVariant(s.variant);
       if (Array.isArray(s.gpus)) setGpus(s.gpus.join(','));
+      if (s.provider) setProvider(s.provider);
+      if (s.jevModel) setJevModel(s.jevModel);
+      setJevApiKeySet(!!s.jevApiKeySet);
     }).catch(() => {});
   }, []);
   const submit = (patch) => fetch(`${API_BASE}/decision/config`, {
@@ -119,6 +128,12 @@ function DecisionGpuControls() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
   }).catch((err) => console.error('decision config update failed:', err));
+  const submitProvider = (next) => {
+    const merged = { provider, jevModel, jevApiKey, ...next };
+    submit(decisionProviderPatch(merged));
+    if (merged.jevApiKey.trim()) setJevApiKeySet(true);
+    setJevApiKey('');
+  };
   return (
     <div className="decision-gpu-controls">
       <select
@@ -140,6 +155,38 @@ function DecisionGpuControls() {
         onChange={(e) => setGpus(e.target.value)}
         onBlur={() => submit(decisionConfigPatch({ variant, gpus }))}
       />
+      <select
+        className="glass-input"
+        value={provider}
+        aria-label="System 1 provider"
+        onChange={(e) => { setProvider(e.target.value); submitProvider({ provider: e.target.value }); }}
+      >
+        <option value="laya">Laya</option>
+        <option value="jev">Jev</option>
+        <option value="jev-then-laya">Jev → Laya</option>
+      </select>
+      <input
+        className="glass-input"
+        type="text"
+        placeholder="Jev model (e.g. jev-latest)"
+        aria-label="Jev model"
+        value={jevModel}
+        onChange={(e) => setJevModel(e.target.value)}
+        onBlur={() => submitProvider({ jevModel })}
+      />
+      <input
+        className="glass-input"
+        type="password"
+        autoComplete="off"
+        placeholder={jevApiKeySet ? 'key set — type to replace' : 'TypeSafe API key'}
+        aria-label="Jev API key"
+        value={jevApiKey}
+        onChange={(e) => setJevApiKey(e.target.value)}
+        onBlur={() => { if (jevApiKey.trim()) submitProvider({}); }}
+      />
+      {provider !== 'laya' && (
+        <small>Jev sends the start of each prompt to TypeSafe (api.typesafe.ai).</small>
+      )}
     </div>
   );
 }

@@ -11,7 +11,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 /** Settings tabs addressable as /settings/<tab>; 'general' is the bare /settings path. */
 const SETTINGS_TABS = ['general', 'hosts', 'aliases', 'gpus', 'duo'];
 import { API_BASE, formatBytes } from '../api.js';
-import { aliasesToRows, aliasGroups, rowsToAliases, diffAliases, validateRows } from './alias-editor.js';
+import { aliasesToRows, aliasGroups, rowsToAliases, diffAliases, validateRows, SMART_DOMAINS } from './alias-editor.js';
 import {
   poolsToRows, rowsToPools, validatePoolRows, poolLiveState, gpuPoolChoices,
   GPU_MATCH_FIELDS,
@@ -915,7 +915,7 @@ const LOCAL_HOST = 'local';
  * them, instead of being repeated on every target row.
  * @type {string[]}
  */
-const GROUP_LEVEL_FIELDS = ['aliasName', 'gpu', 'gpuPriority'];
+const GROUP_LEVEL_FIELDS = ['aliasName', 'gpu', 'gpuPriority', 'type', 'system1'];
 
 /**
  * Normalizes the `GET /api/aliases` body into the keyed alias table the editor
@@ -923,13 +923,17 @@ const GROUP_LEVEL_FIELDS = ['aliasName', 'gpu', 'gpuPriority'];
  * ignores envelope fields such as `success`, so the tab keeps working whichever
  * shape the endpoint settles on.
  *
- * The alias-level `gpu` and `gpuPriority` are carried through only when the entry
- * actually has them, so an alias that has neither round-trips to a `{targets}`
- * group and the save writes exactly the body it always did.
+ * The alias-level `gpu`, `gpuPriority`, `type` and `system1` are carried through
+ * only when the entry actually has them, so an alias that has none of them
+ * round-trips to a `{targets}` group and the save writes exactly the body it
+ * always did. `GET /api/aliases` always reports `type` as `'smart'|'failover'`
+ * (never absent), so only `'smart'` is kept — a `'failover'` entry is the same
+ * as no `type` at all to the rest of the editor.
  *
  * @param {object} payload The parsed JSON body of `GET /api/aliases`.
- * @returns {Object<string, {targets: Array<{host: string, model: string}>,
- *   gpu?: string, gpuPriority?: number}>} The alias table, or `{}` when the
+ * @returns {Object<string, {targets: Array<{host: string, model: string,
+ *   domain?: string, sizeB?: number}>, gpu?: string, gpuPriority?: number,
+ *   type?: 'smart', system1?: string}>} The alias table, or `{}` when the
  *   payload carries none.
  */
 function normalizeAliasPayload(payload) {
@@ -939,6 +943,8 @@ function normalizeAliasPayload(payload) {
   const withGpu = (group, entry) => {
     if (entry?.gpu != null && entry.gpu !== '') group.gpu = entry.gpu;
     if (entry?.gpuPriority != null && entry.gpuPriority !== '') group.gpuPriority = entry.gpuPriority;
+    if (entry?.type === 'smart') group.type = 'smart';
+    if (entry?.system1 != null && entry.system1 !== '') group.system1 = entry.system1;
     return group;
   };
 
@@ -972,7 +978,7 @@ function AliasesSection({ setMessage }) {
   const [localModels, setLocalModels] = React.useState([]); // bare local model ids
   const [presets, setPresets] = React.useState({}); // presetId -> preset
   const [remoteByBackend, setRemoteByBackend] = React.useState({}); // backendId -> string[]
-  const [rows, setRows] = React.useState([]); // { rowId, aliasName, host, model, gpu, gpuPriority }
+  const [rows, setRows] = React.useState([]); // { rowId, aliasName, host, model, gpu, gpuPriority, type, system1, domain, sizeB }
   const [gpuPools, setGpuPools] = React.useState([]); // live pools from GET /api/gpus
   // Null until the pool list has actually loaded. Validation must not accuse an
   // alias of naming an unknown pool merely because the fetch has not landed.
@@ -1088,7 +1094,10 @@ function AliasesSection({ setMessage }) {
     setRows(rs => rs.map(r => r.aliasName === oldName ? { ...r, aliasName: newName } : r));
   const removeAlias = (name) => setRows(rs => rs.filter(r => r.aliasName !== name));
   const addAlias = () =>
-    setRows(rs => [...rs, { rowId: rowIdRef.current++, aliasName: '', host: LOCAL_HOST, model: '', gpu: '', gpuPriority: '' }]);
+    setRows(rs => [...rs, {
+      rowId: rowIdRef.current++, aliasName: '', host: LOCAL_HOST, model: '',
+      gpu: '', gpuPriority: '', type: '', system1: '', domain: '', sizeB: ''
+    }]);
 
   // The GPU pool and priority belong to the ALIAS, so an edit to either writes
   // every row of that alias. Holding one value per row rather than a second store
@@ -1107,6 +1116,7 @@ function AliasesSection({ setMessage }) {
     next.splice(last < 0 ? next.length : last + 1, 0, {
       rowId: rowIdRef.current++, aliasName: name, host: LOCAL_HOST, model: '',
       gpu: sibling?.gpu ?? '', gpuPriority: sibling?.gpuPriority ?? '',
+      type: sibling?.type ?? '', system1: sibling?.system1 ?? '', domain: '', sizeB: '',
     });
     return next;
   });
@@ -1273,6 +1283,36 @@ function AliasesSection({ setMessage }) {
             {/* GPU pool and priority are properties of the ALIAS, so they appear
                 once here rather than on each target row below. */}
             <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-end', flexWrap: 'wrap', marginTop: '8px' }}>
+              <label style={{ flex: '0 1 180px', fontSize: '0.8em', color: 'var(--text-secondary)' }}>
+                Alias type
+                <select
+                  className="glass-input"
+                  value={group.type}
+                  aria-label="Alias type"
+                  onChange={e => updateAlias(group.name, { type: e.target.value })}
+                  style={{ width: '100%' }}
+                >
+                  <option value="">Failover</option>
+                  <option value="smart">Smart</option>
+                </select>
+              </label>
+              {group.type === 'smart' && (
+                <label style={{ flex: '0 1 200px', fontSize: '0.8em', color: 'var(--text-secondary)' }}>
+                  System 1 provider
+                  <select
+                    className="glass-input"
+                    value={group.system1}
+                    aria-label="System 1 provider"
+                    onChange={e => updateAlias(group.name, { system1: e.target.value })}
+                    style={{ width: '100%' }}
+                  >
+                    <option value="">Inherit</option>
+                    <option value="laya">Laya</option>
+                    <option value="jev">Jev</option>
+                    <option value="jev-then-laya">Jev → Laya</option>
+                  </select>
+                </label>
+              )}
               <label style={{ flex: '1 1 280px', fontSize: '0.8em', color: 'var(--text-secondary)' }}>
                 GPU pool
                 <select
@@ -1317,8 +1357,10 @@ function AliasesSection({ setMessage }) {
                 <thead>
                   <tr style={{ textAlign: 'left', color: 'var(--text-secondary)', fontSize: '0.8em' }}>
                     <th style={{ padding: '4px 6px', width: '5%' }}>#</th>
-                    <th style={{ padding: '4px 6px', width: '27%' }}>Host</th>
-                    <th style={{ padding: '4px 6px', width: '48%' }}>Model (name or glob)</th>
+                    <th style={{ padding: '4px 6px', width: group.type === 'smart' ? '18%' : '27%' }}>Host</th>
+                    <th style={{ padding: '4px 6px', width: group.type === 'smart' ? '32%' : '48%' }}>Model (name or glob)</th>
+                    {group.type === 'smart' && <th style={{ padding: '4px 6px', width: '15%' }}>Domain</th>}
+                    {group.type === 'smart' && <th style={{ padding: '4px 6px', width: '13%' }}>Size (B)</th>}
                     <th style={{ padding: '4px 6px', width: '12%' }}>Order</th>
                     <th style={{ width: '8%' }}></th>
                   </tr>
@@ -1326,6 +1368,7 @@ function AliasesSection({ setMessage }) {
                 <tbody>
                   {group.rows.map((r, idx) => {
                     const rowIssues = (issuesByRow.get(r.rowId) || []).filter(i => !GROUP_LEVEL_FIELDS.includes(i.field));
+                    const colCount = group.type === 'smart' ? 7 : 5;
                     return (
                       <React.Fragment key={r.rowId}>
                         <tr>
@@ -1349,7 +1392,33 @@ function AliasesSection({ setMessage }) {
                               onChange={e => updateRow(r.rowId, { model: e.target.value })}
                               style={{ width: '100%' }}
                             />
+                            {idx === 0 && group.type === 'smart' && (
+                              <span className="badge info" style={{ marginLeft: '6px' }} title="Used when System 1 is unavailable; order = priority">fallback</span>
+                            )}
                           </td>
+                          {group.type === 'smart' && (
+                            <td style={{ padding: '4px 6px' }}>
+                              <select className="glass-input" value={r.domain} aria-label="Target domain" onChange={e => updateRow(r.rowId, { domain: e.target.value })} style={{ width: '100%' }}>
+                                <option value="">(any)</option>
+                                {SMART_DOMAINS.map(d => <option key={d} value={d}>{d}</option>)}
+                              </select>
+                            </td>
+                          )}
+                          {group.type === 'smart' && (
+                            <td style={{ padding: '4px 6px' }}>
+                              <input
+                                className="glass-input"
+                                type="number"
+                                min="0"
+                                step="0.1"
+                                value={r.sizeB}
+                                placeholder="auto"
+                                aria-label="Size (B params)"
+                                onChange={e => updateRow(r.rowId, { sizeB: e.target.value })}
+                                style={{ width: '100%' }}
+                              />
+                            </td>
+                          )}
                           <td style={{ padding: '4px 6px', whiteSpace: 'nowrap' }}>
                             <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => moveTarget(r.rowId, -1)} disabled={idx === 0} title="Move up">↑</button>{' '}
                             <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }} onClick={() => moveTarget(r.rowId, 1)} disabled={idx === group.rows.length - 1} title="Move down">↓</button>
@@ -1360,7 +1429,7 @@ function AliasesSection({ setMessage }) {
                         </tr>
                         {rowIssues.length > 0 && (
                           <tr>
-                            <td colSpan={5} style={{ padding: '0 6px 6px' }}>
+                            <td colSpan={colCount} style={{ padding: '0 6px 6px' }}>
                               {rowIssues.map(i => (
                                 <span key={`${i.field}-${i.message}`} style={{ marginRight: '12px', fontSize: '0.8em', color: i.level === 'error' ? 'var(--error, #f87171)' : 'var(--warning, #fbbf24)' }}>
                                   {i.message}

@@ -8,7 +8,9 @@
 // engine or any other server card — and, for the card's GPU variant/selection
 // controls (W6-F1), parses the free-text GPU index field and builds the
 // `{variant, gpus}` patch body POSTed to the existing loopback
-// /api/decision/config route.
+// /api/decision/config route. Also builds the patch body for the card's System 1
+// provider controls (Laya / Jev / Jev then Laya), including the Jev model name
+// and API key.
 
 /** GPU stacks the decision engine can run under; anything else falls back to 'rocm'. */
 const DECISION_VARIANTS = ['rocm', 'cuda'];
@@ -42,4 +44,22 @@ export function parseGpuList(text) {
  */
 export function decisionConfigPatch({ variant, gpus } = {}) {
   return { variant: DECISION_VARIANTS.includes(variant) ? variant : 'rocm', gpus: parseGpuList(gpus) };
+}
+
+/** Mirrors SYSTEM1_PROVIDERS in api/decision.js. */
+const SYSTEM1_PROVIDERS = ['laya', 'jev', 'jev-then-laya'];
+
+/**
+ * Build the decision.config patch for the card's System 1 provider controls.
+ * A blank key is omitted so saving the provider never clears a stored key.
+ * @param {{provider?:string, jevModel?:string, jevApiKey?:string}} form Current control values.
+ * @returns {{provider:string, jevModel:string, jevApiKey?:string}}
+ */
+export function decisionProviderPatch({ provider, jevModel, jevApiKey } = {}) {
+  const key = String(jevApiKey || '').trim();
+  return {
+    provider: SYSTEM1_PROVIDERS.includes(provider) ? provider : 'laya',
+    jevModel: String(jevModel || '').trim() || 'jev-latest',
+    ...(key ? { jevApiKey: key } : {}),
+  };
 }
