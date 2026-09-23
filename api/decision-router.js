@@ -13,8 +13,8 @@
 // Also serves GET /api/decision/status (config, supervisor state, peer
 // health), POST /api/decision/start|stop for the dashboard card, and a
 // loopback-only POST /api/decision/config that persists whitelisted
-// `decision` keys (used by scripts/decision-enable.sh). All collaborators are
-// injected for route tests.
+// `decision` keys (used by the dashboard card's ROCm/CUDA + GPU controls). All
+// collaborators are injected for route tests.
 
 import { createRequire } from 'node:module';
 import {

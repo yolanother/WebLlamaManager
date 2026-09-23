@@ -20,6 +20,9 @@ When you hit a new one: add an entry below, drop a script under
 | gfx1151 GPU faults: `Illegal opcode in command stream` (under inference) or `MES failed to respond to msg=SUSPEND` → `GPU reset` (on a model swap), ending in a hard freeze | See also: [`strix-halo-gpu-stability.md`](strix-halo-gpu-stability.md) — the two failure modes, the known-good kernel 6.18.4+/ROCm 7.2.x/firmware stack, and why the hardware watchdog won't save you | [`scripts/gpu-stability-setup.sh`](../scripts/gpu-stability-setup.sh) |
 | `node --test api/` hangs forever with no output (or dies with `ERR_MODULE_NOT_FOUND: express`), and stray `node api` processes pile up | The bare directory arg spawns `node api` → `api/server.js` → a **real server**. Run [`node --test api/*.test.js`](#node---test-api-boots-a-real-server-and-hangs-forever) instead | n/a — invocation |
 | Every model download on an appliance fails with `Download failed (exit code 1). Check the output for details (network or model-path issue)` — including with a valid HuggingFace token set | The image ships **no downloader**: no `.venv`, no pip, `python3-venv` not installed. Nothing is wrong with the network or the token | [see below](#an-appliance-ships-no-model-downloader-and-blames-your-network) |
+| The Laya container exits 126 at start with `mount proc … Operation not permitted` / `ping_group_range: Read-only file system` | Rootless podman on the appliance can't create a private proc/net namespace; run it `--pid=host --network=host` bound to 127.0.0.1 (already in `podmanRunArgs`) | [see below](#laya-decision-engine) |
+| Laya answers 422 for `model: "laya"` | laya-server maps bare `laya` to the unloaded `laya-english`; llama-manager rewrites laya/jev-* to the loaded checkpoint — call llama-manager, not laya-server directly | [see below](#laya-decision-engine) |
+| `ImportError: libatomic.so.1` inside the laya-server image | Upstream's python slim base lacks it; `packaging/decision/Containerfile` installs `libatomic1` | [see below](#laya-decision-engine) |
 
 ---
 
@@ -501,3 +504,45 @@ mount /dev/disk/by-label/writable /run/llama-manager/writable
 # ... read/write /run/llama-manager/writable/<your state> ...
 umount /run/llama-manager/writable
 ```
+
+---
+
+## Laya decision engine
+
+Full feature doc: [features/laya-decision-engine.md](features/laya-decision-engine.md).
+
+- **Exit 126 from crun (proc mount / `ping_group_range`).** The appliance's rootless
+  podman cannot give a container its own proc or network namespace. The DECISION
+  container therefore runs `--pid=host --network=host` like the ROCm distrobox,
+  and laya-server binds `127.0.0.1:<port>` itself; peers reach it only through
+  llama-manager's `/v1/systemone` proxy.
+- **`laya` → 422.** laya-server's own alias table sends a bare `laya` to
+  `laya-english`, which isn't loaded when the `typed-decisions` checkpoint is.
+  llama-manager rewrites `laya`, `laya-*` and `jev-*` to
+  `laya-<loaded checkpoint>`; never point a client straight at port 5254.
+- **`libatomic.so.1` missing.** The ROCm torch wheel needs it and upstream's
+  `python:3.13-slim` base doesn't have it; our Containerfile installs it.
+- **Stripping ROCm kernels saves nothing in a later layer.** Deleting
+  hipBLASLt/rocBLAS kernels in a separate `RUN` keeps the bytes in layer history;
+  strip in the same `RUN` as the pip install (≈16 GB → a few GB).
+- **`podman load` in a deb postinst breaks the ISO build.** The ISO is built in a
+  chroot with no working rootless podman. `llama-manager-laya-rocm` ships the
+  archive and loads it from a first-boot `llama-manager-laya-setup.service`.
+- **Reimaged host serves nothing until someone enables it.** Fixed:
+  the package's `llama-manager.service` drop-in sets
+  `DECISION_DEFAULT_ENABLED=true`, which only replaces the shipped default, so
+  an explicit `decision.enabled:false` still wins.
+- **Never build on drakemore.** Frostburn builds images, debs and the ISO and
+  pushes them; drakemore can be reimaged from Frostburn's ISO at any time, so
+  anything built or hand-installed there is lost.
+- **First call after 10 idle minutes takes ~25 s.** The container stops after
+  `idleTimeoutSec` (600 s); a cold start reloads the weights. Batch jobs (the
+  orchestrator's eval) should warm it first or tolerate the first calls timing out.
+- **`pkill -f laya` over SSH kills your own shell.** The pattern matches the
+  remote command line itself. Kill by PID from `podman ps`/`pgrep -a` instead.
+- **From the production orchestrator, Laya is slow even when drakemore is fast.**
+  Prod reaches Frostburn only via node-proxy, which was heartbeat-polled
+  (~6.6 s/call). The node long-poll (orchestrator `GET /api/v1/nodes/:id/proxy-requests`)
+  fixes it once the Frostburn node runs the new `headless-node.mjs`. A direct
+  connect from prod to a LAN URL hangs rather than failing, so the orchestrator
+  caps that probe at 300 ms.

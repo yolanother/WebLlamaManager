@@ -380,6 +380,7 @@ appliance behaves exactly as it did. See
 | Offload / protect-resident | `api/protect-resident.js` |
 | DS4 engine | `api/ds4-supervisor.js`, `api/ds4-exclusive.js`, `api/ds4-adaptive.js`, `api/ds4-updater.js`, `start-ds4.sh` |
 | Guards | `api/mem-watchdog.js`, `resource-guard.js`, `restart-governor.js`, `queue-admission.js`, `slot-reaper.js`, `engine-kill.js`, `upstream-retry.js` |
+| System 1 DECISION engine (Laya) | `api/decision.js`, `api/decision-router.js`, `api/decision-supervisor.js`, `packaging/decision/Containerfile`, `scripts/decision-build-image.sh`, `scripts/decision-bench.mjs` |
 | GPU pools, reservations, drain, accelerator | `api/gpu-pools.js`, `api/gpu-reservations.js`, `api/gpu-drain.js`, `api/duo-accelerator.js` |
 | Slot KV cache | `api/slot-cache.js` |
 | Embeddings / HF token / app usage | `api/embeddings.js`, `api/hf-token.js`, `api/app-usage.js` |
@@ -391,6 +392,7 @@ appliance behaves exactly as it did. See
 
 - [`features/model-alias-groups.md`](features/model-alias-groups.md) — alias groups: config shape, the warm gate, migration from `modelMapping`
 - [`features/gpu-reservations.md`](features/gpu-reservations.md) — GPU pools, priorities, leases, drain, the loopback rule
+- [`features/laya-decision-engine.md`](features/laya-decision-engine.md) — Laya / System 1: `/v1/systemone`, the `laya` alias, config, packaging, latency
 - [`Designs/GpuReservations.md`](Designs/GpuReservations.md) — GPU reservation design decisions and their reasons
 - [`ds4-engine.md`](ds4-engine.md) — DeepSeek V4 Flash engine (this feature set's centerpiece)
 - [`ds4-build.md`](ds4-build.md) / [`ds4-auto-update.md`](ds4-auto-update.md) — build + self-updater
