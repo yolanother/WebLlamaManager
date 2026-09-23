@@ -11,6 +11,13 @@
 // plans the `laya` alias route (configured peers, in order, then the local
 // engine when the memory guard allows a cold start). Kept out of server.js so
 // it is unit-testable.
+//
+// W6-F1: the engine also supports a GPU `variant` — `rocm` (default, today's
+// gfx1151 device passthrough) or `cuda` (nvidia-ctk CDI `--device
+// nvidia.com/gpu=<n>` passthrough, no built-in ROCm/HSA flags) — and an
+// optional `gpus` device-index list scoping which device(s) are exposed.
+// Each variant pins its own image (`imageRocm`/`imageCuda`); a config still
+// using the legacy `image` key keeps selecting the rocm image.
 
 /** Name of the single supervised laya-server container. */
 export const DECISION_CONTAINER_NAME = 'llama-manager-decision';
@@ -41,7 +48,11 @@ const DEFAULT_DECISION_DEVICE = 'cuda:0';
 /** Defaults for `config.decision`; every key here is also a settable config key. */
 export const DECISION_DEFAULTS = Object.freeze({
   enabled: false,
-  image: DEFAULT_DECISION_IMAGE,
+  image: DEFAULT_DECISION_IMAGE, // legacy key; a config still writing it keeps selecting the rocm image
+  variant: 'rocm', // 'rocm' | 'cuda' — which GPU stack laya-server runs under
+  gpus: [], // device indices/ids to expose; [] = every device for the variant
+  imageRocm: DEFAULT_DECISION_IMAGE,
+  imageCuda: '', // operator must pin a digest before cuda is runnable
   checkpoint: 'typed-decisions',
   gpu: '',
   device: DEFAULT_DECISION_DEVICE,
@@ -70,24 +81,54 @@ export function isPinnedImage(image) {
  * DECISION_DEFAULT_ENABLED ('true') replaces the shipped `enabled:false` default
  * when config.json says nothing (set by the llama-manager-laya-rocm drop-in, so
  * a reimaged appliance serves Laya without a config call). DECISION_ENABLED
- * ('true'/'false') and DECISION_PORT override the block.
+ * ('true'/'false') and DECISION_PORT override the block. `variant` selects
+ * which per-variant image (`imageRocm`/`imageCuda`) resolves onto `image`; an
+ * unrecognized variant falls back to `rocm`. The legacy `image` key (configs
+ * written before variants existed) still sets the rocm image unless
+ * `imageRocm` is also given, in which case `imageRocm` wins.
  * @param {object} config Parsed config.json.
  * @param {object} env Environment (e.g. process.env).
- * @returns {object} DECISION_DEFAULTS shape plus `runnable` (safe to start) and
- *   `reason` (why not, or null).
+ * @returns {object} DECISION_DEFAULTS shape plus the resolved `image` for the
+ *   active variant, `runnable` (safe to start), and `reason` (why not, or null).
  */
 export function resolveDecisionConfig(config = {}, env = {}) {
   const defaults = { ...DECISION_DEFAULTS, enabled: env.DECISION_DEFAULT_ENABLED === 'true' };
-  const d = { ...defaults, ...(config.decision || {}) };
+  const raw = config.decision || {};
+  const d = { ...defaults, ...raw };
   if (env.DECISION_ENABLED !== undefined) d.enabled = env.DECISION_ENABLED === 'true';
   if (env.DECISION_PORT) d.port = Number(env.DECISION_PORT);
   d.enabled = Boolean(d.enabled);
   d.port = Number(d.port);
+  d.variant = d.variant === 'cuda' ? 'cuda' : 'rocm';
+  d.gpus = Array.isArray(d.gpus) ? d.gpus.map(String) : [];
+  if (raw.image !== undefined && raw.imageRocm === undefined) d.imageRocm = raw.image;
+  // cuda carries no built-in device/HSA flags (those are rocm-only); only an
+  // explicit operator override applies unless one was given.
+  if (d.variant === 'cuda' && raw.podmanArgs === undefined) d.podmanArgs = [];
+  d.image = d.variant === 'cuda' ? d.imageCuda : d.imageRocm;
   const reason = !d.enabled ? 'disabled in config'
+    : d.variant === 'cuda' && !d.imageCuda ? 'no pinned CUDA image'
     : !isPinnedImage(d.image) ? 'image is not pinned by digest'
     : !LAYA_CHECKPOINTS.includes(d.checkpoint) ? `unknown checkpoint ${d.checkpoint}`
     : null;
   return { ...d, runnable: reason === null, reason };
+}
+
+/**
+ * GPU-selection argv for the container: on `rocm`, `HIP_VISIBLE_DEVICES=<gpus>`
+ * when a GPU list was given (no flag otherwise — the default `podmanArgs`
+ * already grant every ROCm device); on `cuda`, one CDI `--device
+ * nvidia.com/gpu=<n>` per selected gpu, or `nvidia.com/gpu=all` when none was
+ * selected.
+ * @param {{variant?:string, gpus?:string[]}} cfg Result of resolveDecisionConfig.
+ * @returns {string[]}
+ */
+function gpuSelectionArgs(cfg) {
+  const gpus = Array.isArray(cfg.gpus) ? cfg.gpus : [];
+  if (cfg.variant === 'cuda') {
+    return (gpus.length ? gpus : ['all']).flatMap((g) => ['--device', `nvidia.com/gpu=${g}`]);
+  }
+  return gpus.length ? ['-e', `HIP_VISIBLE_DEVICES=${gpus.join(',')}`] : [];
 }
 
 /**
@@ -115,6 +156,7 @@ export function podmanRunArgs(cfg, { cacheDir }) {
     '-e', `LAYA_SERVER_MODELS=${cfg.checkpoint}`,
     '-e', 'LAYA_SERVER_JEV_ALIAS=1',
     ...(cfg.device ? ['-e', `LAYA_SERVER_DEVICE=${cfg.device}`] : []),
+    ...gpuSelectionArgs(cfg),
     ...(Array.isArray(cfg.podmanArgs) ? cfg.podmanArgs : []),
     cfg.image,
   ];

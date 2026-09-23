@@ -16,7 +16,7 @@ import { API_BASE, formatBytes, formatUptime, formatModelName } from '../api.js'
 import { isLocalKioskHost, requestSystemLogin } from '../kiosk-control.js';
 import { resolveGpuPanel } from '../gpu-panel.js';
 import { resolveDrivePanel, resolveDriveAlerts, resolveLastCrash } from '../drive-panel.js';
-import { decisionCardAction } from './decision-card.js';
+import { decisionCardAction, decisionConfigPatch } from './decision-card.js';
 import { useVisiblePolling } from '../hooks/useVisiblePolling.js';
 import {
   StatCard,
@@ -95,6 +95,44 @@ function ModelMetricTooltip({ active, payload, label, dataKey, unit = '', color 
         <span className="chart-tooltip-label">{label}:</span>
         <span className="chart-tooltip-value">{datum[dataKey]}{unit}</span>
       </div>
+    </div>
+  );
+}
+
+// W6-F1: variant + GPU list controls shown only on the Decision (Laya) server
+// card. Posts straight to the existing loopback-only /api/decision/config
+// route (decisionConfigPatch whitelists variant/gpus); this is a standalone
+// component, not inline in the servers .map(), so its useState calls are
+// legal (React hooks may not run inside a loop body).
+function DecisionGpuControls() {
+  const [variant, setVariant] = useState('rocm');
+  const [gpus, setGpus] = useState('');
+  const submit = (patch) => fetch(`${API_BASE}/decision/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  }).catch((err) => console.error('decision config update failed:', err));
+  return (
+    <div className="decision-gpu-controls">
+      <select
+        className="glass-input"
+        value={variant}
+        onChange={(e) => {
+          setVariant(e.target.value);
+          submit(decisionConfigPatch({ variant: e.target.value, gpus }));
+        }}
+      >
+        <option value="rocm">ROCm</option>
+        <option value="cuda">CUDA</option>
+      </select>
+      <input
+        className="glass-input"
+        type="text"
+        placeholder="GPUs (e.g. 0,1; blank = all)"
+        value={gpus}
+        onChange={(e) => setGpus(e.target.value)}
+        onBlur={() => submit(decisionConfigPatch({ variant, gpus }))}
+      />
     </div>
   );
 }
@@ -1233,6 +1271,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                   <div key={srv.id} className="server-registry-item">
                     <StatCard label={srv.displayName} value={stateLabel}
                       subValue={sub} icon={icon} status={status} />
+                    {srv.id === 'decision' && <DecisionGpuControls />}
                     {action && (
                       <button className="btn-secondary glass-btn"
                         onClick={() => fetch(`${API_BASE}${action.path}`, { method: 'POST' }).catch((err) => console.error('decision action failed:', err))}>

@@ -68,6 +68,85 @@ test('resolveDecisionConfig: refuses an unknown checkpoint', () => {
   assert.match(c.reason, /unknown checkpoint/);
 });
 
+// W6-F1: selectable GPUs + a CUDA variant. Defaults stay ROCm-only so every
+// test above (written before variants existed) keeps passing unmodified.
+test('resolveDecisionConfig: defaults to the rocm variant, no GPU selection, empty imageCuda', () => {
+  const c = resolveDecisionConfig({}, {});
+  assert.equal(c.variant, 'rocm');
+  assert.deepEqual(c.gpus, []);
+  assert.equal(c.imageRocm, DECISION_DEFAULTS.image);
+  assert.equal(c.imageCuda, '');
+});
+
+test('resolveDecisionConfig: an unknown variant value falls back to rocm', () => {
+  assert.equal(resolveDecisionConfig({ decision: { variant: 'nvidia' } }, {}).variant, 'rocm');
+});
+
+test('resolveDecisionConfig: the legacy `image` key still selects the rocm image, and imageRocm wins if both are set', () => {
+  const a = resolveDecisionConfig({ decision: { enabled: true, image: PINNED } }, {});
+  assert.equal(a.imageRocm, PINNED);
+  assert.equal(a.image, PINNED);
+  assert.equal(a.runnable, true);
+  const OTHER = `ghcr.io/x/y@sha256:${'b'.repeat(64)}`;
+  const b = resolveDecisionConfig({ decision: { enabled: true, image: PINNED, imageRocm: OTHER } }, {});
+  assert.equal(b.imageRocm, OTHER);
+  assert.equal(b.image, OTHER);
+});
+
+test('resolveDecisionConfig: a cuda variant with no imageCuda is refused with a specific reason', () => {
+  const c = resolveDecisionConfig({ decision: { enabled: true, variant: 'cuda' } }, {});
+  assert.equal(c.runnable, false);
+  assert.equal(c.reason, 'no pinned CUDA image');
+});
+
+test('resolveDecisionConfig: a cuda variant with an unpinned imageCuda is refused', () => {
+  const c = resolveDecisionConfig({ decision: { enabled: true, variant: 'cuda', imageCuda: 'laya-server:cuda' } }, {});
+  assert.equal(c.runnable, false);
+  assert.equal(c.reason, 'image is not pinned by digest');
+});
+
+test('resolveDecisionConfig: a cuda variant with a pinned imageCuda is runnable and resolves image to it', () => {
+  const c = resolveDecisionConfig({ decision: { enabled: true, variant: 'cuda', imageCuda: PINNED } }, {});
+  assert.equal(c.runnable, true);
+  assert.equal(c.reason, null);
+  assert.equal(c.image, PINNED);
+});
+
+test('podmanRunArgs: rocm variant with selected gpus adds HIP_VISIBLE_DEVICES on top of the default device set', () => {
+  const cfg = resolveDecisionConfig({ decision: { enabled: true, image: PINNED, gpus: ['0', '1'] } }, {});
+  const args = podmanRunArgs(cfg, { cacheDir: '/data' });
+  assert.ok(args.includes('/dev/kfd'), 'default rocm device args stay unless overridden');
+  assert.ok(args.includes('HIP_VISIBLE_DEVICES=0,1'));
+  assert.ok(!args.some((a) => String(a).startsWith('nvidia.com/gpu=')));
+});
+
+test('podmanRunArgs: rocm variant with no gpus selected adds no GPU-selection env', () => {
+  const cfg = resolveDecisionConfig({ decision: { enabled: true, image: PINNED } }, {});
+  const args = podmanRunArgs(cfg, { cacheDir: '/data' });
+  assert.ok(!args.some((a) => String(a).startsWith('HIP_VISIBLE_DEVICES')));
+});
+
+test('podmanRunArgs: cuda variant drops the rocm device/HSA defaults and adds CDI device flags per gpu', () => {
+  const cfg = resolveDecisionConfig({ decision: { enabled: true, variant: 'cuda', imageCuda: PINNED, gpus: ['0', '1'] } }, {});
+  const args = podmanRunArgs(cfg, { cacheDir: '/data' });
+  assert.ok(!args.includes('/dev/kfd'));
+  assert.ok(!args.includes('HSA_OVERRIDE_GFX_VERSION=11.5.1'));
+  assert.deepEqual(args.filter((a) => String(a).startsWith('nvidia.com/gpu=')), ['nvidia.com/gpu=0', 'nvidia.com/gpu=1']);
+  assert.equal(args.at(-1), PINNED);
+});
+
+test('podmanRunArgs: cuda variant with no gpus selected requests all CDI devices', () => {
+  const cfg = resolveDecisionConfig({ decision: { enabled: true, variant: 'cuda', imageCuda: PINNED } }, {});
+  const args = podmanRunArgs(cfg, { cacheDir: '/data' });
+  assert.deepEqual(args.filter((a) => String(a).startsWith('nvidia.com/gpu=')), ['nvidia.com/gpu=all']);
+});
+
+test('podmanRunArgs: an explicit podmanArgs override is still appended for either variant', () => {
+  const cfg = resolveDecisionConfig({ decision: { enabled: true, variant: 'cuda', imageCuda: PINNED, podmanArgs: ['--foo'] } }, {});
+  const args = podmanRunArgs(cfg, { cacheDir: '/data' });
+  assert.ok(args.includes('--foo'));
+});
+
 test('isPinnedImage: accepts repo digests and full image ids only', () => {
   assert.equal(isPinnedImage(PINNED), true);
   assert.equal(isPinnedImage(`sha256:${DIGEST}`), true);
@@ -117,6 +196,13 @@ test('isDecisionModel: laya, laya-*, jev-* and omitted are accepted; chat models
 test('pickDecisionPatch: keeps only decision config keys', () => {
   assert.deepEqual(pickDecisionPatch({ enabled: true, port: 5254, rm: '-rf', __proto__x: 1 }), { enabled: true, port: 5254 });
   assert.deepEqual(pickDecisionPatch(null), {});
+});
+
+test('pickDecisionPatch: accepts the new variant/gpus/per-variant-image keys', () => {
+  assert.deepEqual(
+    pickDecisionPatch({ variant: 'cuda', gpus: ['0'], imageRocm: 'a', imageCuda: 'b', rm: '-rf' }),
+    { variant: 'cuda', gpus: ['0'], imageRocm: 'a', imageCuda: 'b' },
+  );
 });
 
 // A6: llama-manager rewrites `model` to the loaded checkpoint for laya, laya-*
