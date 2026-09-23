@@ -108,6 +108,7 @@ import { upstreamRetryPlan } from './upstream-retry.js';
 import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watchdog.js';
 import { slotCacheFilename, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
+import { remoteOnlyAliasFallback } from './remote-only-alias.js';
 import {
   annotateModelResidency,
   modelResidencyDecision,
@@ -1239,9 +1240,29 @@ function estimateLocalProcessingMs(inputTokens) {
  *   alias name differs from `requestedModel`, since it cannot be re-derived from the
  *   resolved name. Omit it and it is derived from `requestedModel`.
  * @returns {object} a routing decision: `{remote:false}` for local, a remote routing
- *   envelope from `buildRemoteRouting()`, or a blocked-residency marker.
+ *   envelope from `buildRemoteRouting()`, or a blocked marker (residency conflict, or a
+ *   remote-only alias with no member available — see remoteOnlyAliasRouting()). A
+ *   remote-only alias never gets a local routing: the raw alias would 400 in llama.cpp.
  */
-function resolveBackend(requestedModel, endpoint, body, { localOnly = false, aliasRouting, inboundRelay = null } = {}) {
+function resolveBackend(requestedModel, endpoint, body, options = {}) {
+  const aliasRouting = options.aliasRouting !== undefined ? options.aliasRouting : resolveAliasRouting(requestedModel);
+  const routing = resolveBackendRoute(requestedModel, endpoint, body, { ...options, aliasRouting });
+  if (routing.remote || routing.blocked) return routing;
+  return remoteOnlyAliasRouting(routing, aliasRouting, endpoint, options);
+}
+
+/**
+ * The routing policy behind resolveBackend(): offload checks, candidate ranking, and the
+ * local fallback. It may return a local routing for a remote-only alias (every member
+ * full or tripped); resolveBackend() corrects that, so call resolveBackend(), not this.
+ *
+ * @param {string} requestedModel see resolveBackend().
+ * @param {string} endpoint see resolveBackend().
+ * @param {object|null} body see resolveBackend().
+ * @param {{localOnly?: boolean, aliasRouting?: AliasRouting|null, inboundRelay?:object|null}} [options] see resolveBackend().
+ * @returns {object} a routing decision, as resolveBackend() documents.
+ */
+function resolveBackendRoute(requestedModel, endpoint, body, { localOnly = false, aliasRouting, inboundRelay = null } = {}) {
   const alias = aliasRouting !== undefined ? aliasRouting : resolveAliasRouting(requestedModel);
   const backends = config.backends || {};
   const desiredModels = desiredResidentModels();
@@ -1526,6 +1547,57 @@ function resolveBackend(requestedModel, endpoint, body, { localOnly = false, ali
   return buildRemoteRouting(chosen, remoteTargetModel(chosen, alias), endpoint, inboundRelay);
 }
 
+/**
+ * Stop a remote-only alias from reaching the local engine under its raw alias name.
+ *
+ * resolveBackendRoute() falls back to local when no remote member has free capacity (or
+ * none offloads at all), but an alias with no local member has nothing llama.cpp can
+ * load, so forwarding it yields 400 "model not found". Per remoteOnlyAliasFallback(),
+ * queue on a reachable-but-full member instead, or reject with a retryable 503 when every
+ * member is down or tripped.
+ *
+ * @param {object} routing the local routing resolveBackendRoute() returned.
+ * @param {AliasRouting|null} alias the request's alias routing tiers, or null.
+ * @param {string} endpoint the OpenAI endpoint path, e.g. 'chat/completions'.
+ * @param {{localOnly?: boolean, inboundRelay?: object|null}} [options] resolveBackend() options.
+ * @returns {object} `routing` unchanged, a remote routing envelope, or a blocked rejection
+ *   (`{remote:false, blocked:true, status, code, type, message}`) for sendBlockedResidency().
+ */
+function remoteOnlyAliasRouting(routing, alias, endpoint, { localOnly = false, inboundRelay = null } = {}) {
+  if (!alias || alias.localTarget) return routing;
+  const backends = config.backends || {};
+  const reachable = (backends.enabled ? backends.directory || [] : []).filter(b =>
+    b.enabled && b.tested && !isBackendCircuitOpen(b.id) &&
+    (!b.supportedEndpoints || b.supportedEndpoints.includes(endpoint)) &&
+    remoteTargetModel(b, alias));
+  const decision = remoteOnlyAliasFallback({
+    alias,
+    localOnly,
+    members: reachable.map(b => ({
+      id: b.id,
+      priority: b.priority ?? 50,
+      active: backendQueues.get(b.id)?.active || 0,
+      pending: backendQueues.get(b.id)?.pending || 0,
+    })),
+  });
+  if (decision.action === 'local') return routing;
+  if (decision.action === 'queue') {
+    const backend = reachable.find(b => b.id === decision.backendId);
+    console.log(`[routing] remote-only alias '${alias.name}': every member is busy; queueing on ${backend.name} rather than forwarding the alias locally`);
+    return buildRemoteRouting(backend, remoteTargetModel(backend, alias), endpoint, inboundRelay);
+  }
+  console.log(`[routing] remote-only alias '${alias.name}': ${decision.message} (${decision.status})`);
+  addLog('backends', `remote-only alias '${alias.name}' rejected ${decision.status} ${decision.code}`);
+  return {
+    remote: false,
+    blocked: true,
+    status: decision.status,
+    code: decision.code,
+    type: decision.status === 503 ? 'model_unavailable' : 'invalid_request_error',
+    message: decision.message,
+  };
+}
+
 /** Return a stable routing rejection for a local load that would evict a desired model. */
 function blockedResidencyRouting(decision) {
   return {
@@ -1538,12 +1610,12 @@ function blockedResidencyRouting(decision) {
   };
 }
 
-/** Send the stable exact-residency conflict response returned by resolveBackend. */
+/** Send a blocked routing returned by resolveBackend (residency conflict or unavailable alias). */
 function sendBlockedResidency(res, routing) {
   return res.status(routing.status || 409).json({
     error: {
       message: routing.message,
-      type: 'model_residency_conflict',
+      type: routing.type || 'model_residency_conflict',
       code: routing.code || 'RESIDENT_MODEL_PROTECTED',
     },
     protected_model: routing.protectedModel,
@@ -14943,6 +15015,7 @@ async function handleEmbeddings(req, res) {
 
   // Route to a remote backend if configured (e.g. an Ollama host).
   const routing = resolveBackend(requestedModel, 'embeddings', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
+  if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;
     return res.status(409).json({ error: { message: 'local_only conflicts with an explicit remote backend prefix', code: 'LOCAL_ONLY_REMOTE_CONFLICT' } });

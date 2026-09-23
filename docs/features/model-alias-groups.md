@@ -174,6 +174,23 @@ only ever *sets* `shouldOffload`, so an explicitly desired resident model still
 wins. Use aliases for "serve this from whatever is warm", and `desiredModels` for
 "this must not be unloaded".
 
+### A remote-only alias never falls back to the local engine
+
+An alias with no `local` member (e.g. `default-big` → Drakemore / Dahaka) has nothing
+llama.cpp can load. When no member has free capacity, `resolveBackend()` used to fall
+back to local anyway and forward the raw alias name, which llama.cpp answers with
+**400 "model not found"** — read by callers as a permanent config error (observed
+2026-09-23: Drakemore breaker-open, Dahaka queue full). `remoteOnlyAliasRouting()`
+(`api/remote-only-alias.js`) now replaces that local fallback:
+
+- a member is reachable but at capacity → the request **queues on the least-loaded
+  member** (log: `[routing] remote-only alias '<name>': every member is busy; queueing on …`);
+- no member is reachable (all disabled, untested, or circuit-open) → **503
+  `model_unavailable`**, retryable;
+- the request is `local_only` → **409 `ALIAS_REMOTE_ONLY`**.
+
+Aliases with a local member are unaffected.
+
 ### `acceptsAny` is a host policy, NOT an alias fallback
 
 `backend.acceptsAny` (a model name string, migrated from the old
@@ -433,6 +450,7 @@ the local engine *would* serve, not a claim that it is being served.
 |---|---|
 | Alias request behaves like an unknown model | `GET /api/aliases` — `resolvable: false`, or the name is missing. A miss is a **no-op**: the name is passed through unchanged as a literal model, exactly as before aliases existed. |
 | A target never appears in `candidates` | Its backend is missing, `enabled: false`, or `tested: false` — those are dropped silently. Or its glob matched nothing in that host's cached `remoteModels`. |
+| Remote-only alias returns 503 `model_unavailable` | Every member is disabled, untested, or circuit-open. Check `[routing] remote-only alias` in the logs and the backends' breaker state. |
 | Alias keeps going remote | Working as designed. Look for `[routing] alias warm-gate:` in the logs — the local member is cold. |
 | Alias cold-loaded locally and evicted something | The warm gate could not fire: no remote member had queue capacity. See [the soft-protection caveat](#the-warm-gate-is-soft-protection-not-a-residency-guarantee); use `config.modelResidency.desiredModels` for a hard pin. |
 | A real local model became unreachable after adding an alias | The alias shadows it. Add `{host: 'local', model: <thatName>}` as the first target — that is what migration step 4 does automatically. |
