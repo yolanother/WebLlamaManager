@@ -1,11 +1,14 @@
-// Llama Manager — HuggingFace token helpers.
+// Llama Manager — HuggingFace token + generic config redaction helpers.
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 //
 // Pure, side-effect-free helpers for resolving and protecting the HuggingFace
 // token. The token may be stored in config.json (preferred, set via Settings) or
 // supplied via the HF_TOKEN environment variable (fallback). These helpers keep
 // the raw token out of API responses/logs and turn download failures into
-// actionable operator messages. Kept separate from server.js for unit testing.
+// actionable operator messages. `redactConfig` also strips `decision.jevApiKey`
+// (the TypeSafe/Jev API key), since GET/POST /api/config and POST /api/settings
+// return the whole config through it. Kept separate from server.js for unit
+// testing, and deliberately import-free so it stays trivial to reuse.
 
 /**
  * Resolve the effective HuggingFace token. A non-blank `config.hfToken` wins;
@@ -32,13 +35,20 @@ export function maskToken(token) {
 }
 
 /**
- * Return a shallow copy of config with the raw `hfToken` removed, so config can
- * be returned to clients/logged without leaking the secret. Non-mutating.
+ * Return a shallow copy of config with secrets removed, so config can be
+ * returned to clients/logged without leaking them. Strips the raw `hfToken`
+ * and, when present, `decision.jevApiKey` (replaced with a `decision.jevApiKeySet`
+ * boolean so callers can still tell whether one is configured). Non-mutating —
+ * neither `config` nor its nested `decision` object is modified.
  * @param {object} config
  * @returns {object}
  */
 export function redactConfig(config = {}) {
   const { hfToken, ...rest } = config;
+  if (rest.decision && typeof rest.decision === 'object') {
+    const { jevApiKey, ...decisionRest } = rest.decision;
+    rest.decision = { ...decisionRest, jevApiKeySet: Boolean(jevApiKey) };
+  }
   return rest;
 }
 

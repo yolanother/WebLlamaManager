@@ -41,6 +41,20 @@ test('redactConfig: handles missing hfToken', () => {
   assert.deepEqual(redactConfig({ a: 1 }), { a: 1 });
 });
 
+test('redactConfig: strips decision.jevApiKey, adds jevApiKeySet, non-mutating', () => {
+  const cfg = { decision: { jevApiKey: 'sekret', provider: 'jev' } };
+  const r = redactConfig(cfg);
+  assert.equal(JSON.stringify(r).includes('sekret'), false);
+  assert.equal(r.decision.jevApiKeySet, true);
+  assert.equal(r.decision.provider, 'jev');
+  assert.equal('jevApiKey' in r.decision, false);
+  assert.equal(cfg.decision.jevApiKey, 'sekret'); // original untouched
+});
+
+test('redactConfig: config with no decision block is unaffected', () => {
+  assert.deepEqual(redactConfig({ a: 1 }), { a: 1 });
+});
+
 test('actionableDownloadError: a plain failure with NO token configured names the token', () => {
   // The common fresh-appliance case: nothing is gated, the CLI just exits 1,
   // and the operator is left with "check the output". If no token is configured
