@@ -249,10 +249,23 @@ near the "System 1 decision engine" section.
   `POST /api/decision/config`.
 - **Fleet:** nodes advertise the `system_one` capability
   (`SYSTEM_ONE_CAPABILITY`, `advertisedEngines`, `peerOffersDecision`).
-- **Not on the chat path:** Laya is not reachable through
-  `/v1/chat/completions`. It is only an evaluation endpoint.
-- **Tests:** `api/decision.test.js`, `api/decision-router.test.js` and
-  `api/decision-supervisor.test.js`.
+- **Now IS on the chat path, indirectly, via smart aliases.** `/v1/systemone`
+  itself is still an evaluation endpoint a client calls directly — but
+  `askSystem1` (`api/system1.js`) drives `askLaya` (exported off
+  `createDecisionRouter` as `router.askLaya`) from `api/smart-alias.js`'s
+  `routeSmartAlias`, called from `/v1/chat/completions`, `/v1/completions`,
+  `/v1/responses` and `/v1/messages` whenever the requested alias has
+  `type: 'smart'`. That call passes `allowColdStart: false`, so a smart-alias
+  request never waits for Laya's container to cold-start — a cold or
+  unreachable Laya falls back to the alias's first target and fires a
+  background `supervisor.ensureStarted()` to warm it for next time. See
+  [`../../features/smart-aliases.md`](../../features/smart-aliases.md).
+- **Provider setting:** `config.decision.provider` (`laya` | `jev` |
+  `jev-then-laya`, `SYSTEM1_PROVIDERS` in `api/decision.js`) chooses which
+  System 1 backend both `/v1/systemone` and smart-alias routing use by
+  default; a smart alias's own `system1` field overrides it per alias.
+- **Tests:** `api/decision.test.js`, `api/decision-router.test.js`,
+  `api/decision-supervisor.test.js` and `api/smart-alias.test.js`.
 
 ## Relevance to routing / smart alias
 

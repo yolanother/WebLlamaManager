@@ -441,6 +441,9 @@ the local engine *would* serve, not a claim that it is being served.
 
 ## Related
 
+- **See also: [`smart-aliases.md`](smart-aliases.md)** — the `type: 'smart'` alias
+  that routes each request to a candidate by size and domain instead of a fixed
+  order, using a System 1 decision model (Laya or Jev).
 - [`features-overview.md`](../features-overview.md) — where aliasing sits in the whole feature map
 - [`../superpowers/specs/2026-08-03-model-alias-groups-design.md`](../superpowers/specs/2026-08-03-model-alias-groups-design.md) — design + rationale
 - [`../superpowers/specs/2026-08-03-model-alias-contract.md`](../superpowers/specs/2026-08-03-model-alias-contract.md) — the frozen module contract, as amended

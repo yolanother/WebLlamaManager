@@ -152,20 +152,36 @@ The SDKs retry 429 and 529 with backoff.
 
 ## How llama-manager uses it today
 
-**llama-manager never calls TypeSafe's hosted Jev.**
+**The Jev pass-through now exists: llama-manager can call TypeSafe's hosted
+Jev, when the operator opts in.**
+
+By default it still doesn't — `config.decision.provider` is `laya` — but
+setting the provider to `jev` or `jev-then-laya` (globally, or per smart alias
+via that alias's `system1` field) makes `callJev` (`api/system1.js`) really
+`POST https://api.typesafe.ai/v1/systemone` with `Authorization: Bearer
+<jevApiKey>`. There are no retries; a 401/429/529 or a missing key throws, and
+`jev-then-laya` then falls through to Laya. See
+[`../../features/smart-aliases.md`](../../features/smart-aliases.md) for the
+provider setting and its privacy note.
+
+Independent of that, the **wire-format pass-through** described below is
+unchanged: it lets an existing TypeSafe client point at llama-manager without
+code changes, and (with `provider: 'laya'`, the default) is answered locally by
+Laya rather than by real Jev.
 
 - **What it uses:** only Jev's wire format. `POST /v1/systemone` and
-  `POST /api/v1/systemone` accept a Jev-shaped body and proxy it to a local
-  laya-server container, so a TypeSafe client needs only its base URL changed.
+  `POST /api/v1/systemone` accept a Jev-shaped body; under the default `laya`
+  provider they proxy it to a local laya-server container, so a TypeSafe
+  client needs only its base URL changed.
 - **Model rewrite:**
   - `isDecisionModel` in `api/decision.js` accepts `jev-*` names
     (`jev-latest`, `jev-1.13.0`, ...), alongside `laya` and `laya-*`.
   - `resolveForwardModel` rewrites them to `laya-<checkpoint>`
     (`laya-typed-decisions` by default).
   - laya-server is also started with `LAYA_SERVER_JEV_ALIAS=1`.
-- **The answer comes from Laya, not Jev.** The response `model` is the Laya
-  checkpoint, not `jev-*`.
-- **Differences from real Jev:**
+- **Under `provider: 'laya'`, the answer comes from Laya, not Jev.** The
+  response `model` is the Laya checkpoint, not `jev-*`.
+- **Differences from real Jev, when answered by Laya:**
   - answers carry an extra `action` field
   - `usage.output_tokens` is 0
   - a `host` field is added
@@ -207,10 +223,13 @@ see [laya.md](laya.md#relevance-to-routing--smart-alias).
 - The jaggedness page says Jev "is not trained to generate text ... there are
   other models for that".
 
-**Practical note:** using hosted Jev for a smart alias would add a paid
-external dependency and network latency (about 250 ms p50, third-party) to
-every request. It would also send prompts off-box. Jev is relevant here as the
-API contract that Laya imitates, not as a component we call.
+**Practical note:** a smart alias, or the global provider setting, CAN now use
+hosted Jev directly (see "How llama-manager uses it today" above) — it is an
+explicit operator opt-in, not the default. Choosing it adds a paid external
+dependency and network latency (about 250 ms p50, third-party) to every
+request, and sends the start of each prompt off-box to TypeSafe; the Dashboard
+surfaces that as a privacy note. `laya` remains the default provider, where
+Jev is relevant only as the API contract Laya imitates.
 
 ## Sources
 
