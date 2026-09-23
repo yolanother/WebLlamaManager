@@ -67,14 +67,18 @@ export function isPinnedImage(image) {
 
 /**
  * Resolve the decision engine config from config.json + environment.
- * DECISION_ENABLED ('true'/'false') and DECISION_PORT override the block.
+ * DECISION_DEFAULT_ENABLED ('true') replaces the shipped `enabled:false` default
+ * when config.json says nothing (set by the llama-manager-laya-rocm drop-in, so
+ * a reimaged appliance serves Laya without a config call). DECISION_ENABLED
+ * ('true'/'false') and DECISION_PORT override the block.
  * @param {object} config Parsed config.json.
  * @param {object} env Environment (e.g. process.env).
  * @returns {object} DECISION_DEFAULTS shape plus `runnable` (safe to start) and
  *   `reason` (why not, or null).
  */
 export function resolveDecisionConfig(config = {}, env = {}) {
-  const d = { ...DECISION_DEFAULTS, ...(config.decision || {}) };
+  const defaults = { ...DECISION_DEFAULTS, enabled: env.DECISION_DEFAULT_ENABLED === 'true' };
+  const d = { ...defaults, ...(config.decision || {}) };
   if (env.DECISION_ENABLED !== undefined) d.enabled = env.DECISION_ENABLED === 'true';
   if (env.DECISION_PORT) d.port = Number(env.DECISION_PORT);
   d.enabled = Boolean(d.enabled);

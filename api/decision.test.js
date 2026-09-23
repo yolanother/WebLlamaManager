@@ -44,6 +44,18 @@ test('resolveDecisionConfig: config block is honoured and env overrides enabled/
   assert.equal(resolveDecisionConfig({ decision: { enabled: true, image: PINNED } }, { DECISION_ENABLED: 'false' }).enabled, false);
 });
 
+// The llama-manager-laya-rocm deb sets DECISION_DEFAULT_ENABLED=true through its
+// service drop-in, so a freshly reimaged appliance serves Laya with no config
+// call; an explicit config.decision.enabled (the operator's switch) still wins.
+test('resolveDecisionConfig: DECISION_DEFAULT_ENABLED enables only when config is silent', () => {
+  const on = { DECISION_DEFAULT_ENABLED: 'true' };
+  assert.equal(resolveDecisionConfig({}, on).enabled, true);
+  assert.equal(resolveDecisionConfig({}, on).runnable, true);
+  assert.equal(resolveDecisionConfig({ decision: { enabled: false } }, on).enabled, false);
+  assert.equal(resolveDecisionConfig({ decision: { enabled: true } }, { DECISION_DEFAULT_ENABLED: 'false' }).enabled, true);
+  assert.equal(resolveDecisionConfig({ decision: { port: 6000 } }, on).enabled, true);
+});
+
 test('resolveDecisionConfig: refuses an image that is not pinned by digest', () => {
   const c = resolveDecisionConfig({ decision: { enabled: true, image: 'ghcr.io/x/laya-server:latest' } }, {});
   assert.equal(c.runnable, false);
