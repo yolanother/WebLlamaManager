@@ -113,25 +113,30 @@ function DecisionGpuControls() {
   const [jevModel, setJevModel] = useState('');
   const [jevApiKey, setJevApiKey] = useState('');
   const [jevApiKeySet, setJevApiKeySet] = useState(false);
+  // The last jevModel value this component knows the server has (loaded or
+  // already submitted), so a blur with no actual edit does not re-POST.
+  const lastJevModelRef = useRef('');
   // Seed from the saved config so a reload never shows (and then re-saves) defaults.
   useEffect(() => {
     fetch(`${API_BASE}/decision/status`).then((r) => r.json()).then((s) => {
       if (s.variant) setVariant(s.variant);
       if (Array.isArray(s.gpus)) setGpus(s.gpus.join(','));
       if (s.provider) setProvider(s.provider);
-      if (s.jevModel) setJevModel(s.jevModel);
+      if (s.jevModel) { setJevModel(s.jevModel); lastJevModelRef.current = s.jevModel; }
       setJevApiKeySet(!!s.jevApiKeySet);
     }).catch(() => {});
   }, []);
+  // Resolves true only on a 2xx response, so a failed POST never claims success.
   const submit = (patch) => fetch(`${API_BASE}/decision/config`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
-  }).catch((err) => console.error('decision config update failed:', err));
+  }).then((r) => r.ok).catch((err) => { console.error('decision config update failed:', err); return false; });
   const submitProvider = (next) => {
     const merged = { provider, jevModel, jevApiKey, ...next };
-    submit(decisionProviderPatch(merged));
-    if (merged.jevApiKey.trim()) setJevApiKeySet(true);
+    const keySubmitted = !!merged.jevApiKey.trim();
+    lastJevModelRef.current = merged.jevModel;
+    submit(decisionProviderPatch(merged)).then((ok) => { if (ok && keySubmitted) setJevApiKeySet(true); });
     setJevApiKey('');
   };
   return (
@@ -172,7 +177,7 @@ function DecisionGpuControls() {
         aria-label="Jev model"
         value={jevModel}
         onChange={(e) => setJevModel(e.target.value)}
-        onBlur={() => submitProvider({ jevModel })}
+        onBlur={() => { if (jevModel !== lastJevModelRef.current) submitProvider({ jevModel }); }}
       />
       <input
         className="glass-input"

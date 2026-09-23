@@ -119,15 +119,23 @@ function groupSignature(group) {
  * reorder and delete one-liners. All are held as strings because they are
  * edited in inputs/selects, and all are `''` when the stored alias has no such
  * field. `domain` and `sizeB` are per-TARGET, so they are read from each target
- * rather than copied from the group.
+ * rather than copied from the group. `inferredSizeB` is likewise per-target and
+ * DISPLAY-ONLY: it is what the server's `GET /api/aliases` computed the target's
+ * size at ignoring any manually authored `sizeB` (parsed from the model name, or
+ * from local file bytes), carried through purely so the editor can show
+ * "≈14B inferred" beside a blank size field. It plays no part in
+ * {@link groupSignature} or {@link rowsToAliases} — editing it is not possible,
+ * and it never reaches a PUT body.
  *
  * @param {Object<string, {targets?: Array<{host?: string, model?: string,
- *   domain?: string, sizeB?: number}>, gpu?: string, gpuPriority?: number,
- *   type?: string, system1?: string}>|null|undefined} aliases
- *   The alias table, as stored in `config.aliases`.
+ *   domain?: string, sizeB?: number, inferredSizeB?: number|null}>, gpu?: string,
+ *   gpuPriority?: number, type?: string, system1?: string}>|null|undefined} aliases
+ *   The alias table, as stored in `config.aliases` (or as `GET /api/aliases` returns it,
+ *   with `inferredSizeB` added).
  * @returns {Array<{rowId: number, aliasName: string, host: string, model: string,
  *   gpu: string, gpuPriority: string, type: string, system1: string, domain: string,
- *   sizeB: string}>} One row per alias target, in authored order.
+ *   sizeB: string, inferredSizeB: (number|null)}>} One row per alias target, in
+ *   authored order.
  */
 export function aliasesToRows(aliases) {
   if (!aliases || typeof aliases !== 'object') return [];
@@ -151,7 +159,8 @@ export function aliasesToRows(aliases) {
         type,
         system1,
         domain: String(target?.domain ?? ''),
-        sizeB: target?.sizeB == null ? '' : String(target.sizeB)
+        sizeB: target?.sizeB == null ? '' : String(target.sizeB),
+        inferredSizeB: Number.isFinite(target?.inferredSizeB) ? target.inferredSizeB : null
       });
     }
   }
@@ -233,7 +242,9 @@ export function aliasGroups(rows) {
  *
  * @param {Array<{aliasName?: string, host?: string, model?: string, gpu?: string,
  *   gpuPriority?: string, type?: string, system1?: string, domain?: string,
- *   sizeB?: string}>|null|undefined} rows The editor rows to fold.
+ *   sizeB?: string, inferredSizeB?: (number|null)}>|null|undefined} rows The editor
+ *   rows to fold. `inferredSizeB` is display-only (see {@link aliasesToRows}) and is
+ *   never read here.
  * @returns {Object<string, {type?: 'smart', targets: Array<{host: string, model: string,
  *   domain?: string, sizeB?: number}>, gpu?: string, gpuPriority?: number,
  *   system1?: string}>} The alias table the API accepts.

@@ -692,3 +692,16 @@ test('validateRows rejects a bad sizeB and an unknown domain on smart rows', () 
   assert.ok(issues.some(i => i.rowId === 1 && i.field === 'sizeB' && i.level === 'error'));
   assert.ok(issues.some(i => i.rowId === 2 && i.field === 'domain' && i.level === 'error'));
 });
+
+test('inferredSizeB survives aliasesToRows for display but is absent from rowsToAliases', () => {
+  const aliases = {
+    smart: { type: 'smart', targets: [{ host: 'local', model: 'a', inferredSizeB: 8 }, { host: 'local', model: 'b' }] },
+  };
+  const rows = aliasesToRows(aliases);
+  assert.equal(rows[0].inferredSizeB, 8);
+  assert.equal(rows[1].inferredSizeB, null);
+
+  const saved = rowsToAliases(rows);
+  assert.deepEqual(Object.keys(saved.smart.targets[0]).sort(), ['host', 'model']);
+  assert.equal(Object.hasOwn(saved.smart.targets[0], 'inferredSizeB'), false);
+});

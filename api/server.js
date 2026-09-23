@@ -58,7 +58,7 @@ import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogE
 import { resolveDecisionConfig, peerOffersDecision, advertisedEngines } from './decision.js';
 import { createDecisionSupervisor } from './decision-supervisor.js';
 import { createDecisionRouter } from './decision-router.js';
-import { routeSmartAlias } from './smart-alias.js';
+import { routeSmartAlias, candidateSize } from './smart-alias.js';
 import { askSystem1 } from './system1.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
@@ -5822,13 +5822,18 @@ refreshGpuPools();
  * @param {{targets: Array<{host: string, model: string}>, gpu?: string, gpuPriority?: number,
  *   type?: string, system1?: string}} group the stored group.
  * @returns {object} the group plus its resolved candidates split into warm and cold, and
- *   `type` ('smart' or 'failover') / `system1` (the alias's provider override, or null).
+ *   `type` ('smart' or 'failover') / `system1` (the alias's provider override, or null). Each
+ *   target also carries `inferredSizeB`: what {@link candidateSize} would size the target at
+ *   ignoring any manually authored `sizeB`, so the UI can show "≈14B inferred" beside a blank
+ *   size field instead of leaving it merely empty.
  */
 function aliasView(name, group) {
   const routing = resolveAliasRouting(name);
   return {
     name,
-    targets: Array.isArray(group?.targets) ? group.targets : [],
+    targets: Array.isArray(group?.targets)
+      ? group.targets.map(t => ({ ...t, inferredSizeB: candidateSize({ host: t?.host, model: t?.model }, {}, localModelBytes()) }))
+      : [],
     gpu: typeof group?.gpu === 'string' ? group.gpu : null,
     gpuPriority: Number.isSafeInteger(group?.gpuPriority) ? group.gpuPriority : null,
     candidates: routing?.candidates ?? [],

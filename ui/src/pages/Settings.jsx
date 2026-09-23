@@ -918,6 +918,21 @@ const LOCAL_HOST = 'local';
 const GROUP_LEVEL_FIELDS = ['aliasName', 'gpu', 'gpuPriority', 'type', 'system1'];
 
 /**
+ * Placeholder text for a smart target's blank Size (B) field: the size the
+ * server inferred for it (from the model name or local file bytes), or an
+ * explicit prompt to set one manually when nothing could be inferred.
+ *
+ * @param {number|null} inferredSizeB The target's `inferredSizeB`, as loaded
+ *   from `GET /api/aliases`.
+ * @returns {string} `"≈<n>B inferred"` (rounded to 1 decimal, dropping a
+ *   trailing `.0`), or `"unknown — set size"` when nothing was inferred.
+ */
+function sizePlaceholder(inferredSizeB) {
+  if (!Number.isFinite(inferredSizeB)) return 'unknown — set size';
+  return `≈${Number(inferredSizeB.toFixed(1))}B inferred`;
+}
+
+/**
  * Normalizes the `GET /api/aliases` body into the keyed alias table the editor
  * works with. Accepts both the keyed-object and array-of-entries shapes and
  * ignores envelope fields such as `success`, so the tab keeps working whichever
@@ -978,7 +993,7 @@ function AliasesSection({ setMessage }) {
   const [localModels, setLocalModels] = React.useState([]); // bare local model ids
   const [presets, setPresets] = React.useState({}); // presetId -> preset
   const [remoteByBackend, setRemoteByBackend] = React.useState({}); // backendId -> string[]
-  const [rows, setRows] = React.useState([]); // { rowId, aliasName, host, model, gpu, gpuPriority, type, system1, domain, sizeB }
+  const [rows, setRows] = React.useState([]); // { rowId, aliasName, host, model, gpu, gpuPriority, type, system1, domain, sizeB, inferredSizeB }
   const [gpuPools, setGpuPools] = React.useState([]); // live pools from GET /api/gpus
   // Null until the pool list has actually loaded. Validation must not accuse an
   // alias of naming an unknown pool merely because the fetch has not landed.
@@ -1096,7 +1111,7 @@ function AliasesSection({ setMessage }) {
   const addAlias = () =>
     setRows(rs => [...rs, {
       rowId: rowIdRef.current++, aliasName: '', host: LOCAL_HOST, model: '',
-      gpu: '', gpuPriority: '', type: '', system1: '', domain: '', sizeB: ''
+      gpu: '', gpuPriority: '', type: '', system1: '', domain: '', sizeB: '', inferredSizeB: null
     }]);
 
   // The GPU pool and priority belong to the ALIAS, so an edit to either writes
@@ -1116,7 +1131,7 @@ function AliasesSection({ setMessage }) {
     next.splice(last < 0 ? next.length : last + 1, 0, {
       rowId: rowIdRef.current++, aliasName: name, host: LOCAL_HOST, model: '',
       gpu: sibling?.gpu ?? '', gpuPriority: sibling?.gpuPriority ?? '',
-      type: sibling?.type ?? '', system1: sibling?.system1 ?? '', domain: '', sizeB: '',
+      type: sibling?.type ?? '', system1: sibling?.system1 ?? '', domain: '', sizeB: '', inferredSizeB: null,
     });
     return next;
   });
@@ -1412,7 +1427,7 @@ function AliasesSection({ setMessage }) {
                                 min="0"
                                 step="0.1"
                                 value={r.sizeB}
-                                placeholder="auto"
+                                placeholder={sizePlaceholder(r.inferredSizeB)}
                                 aria-label="Size (B params)"
                                 onChange={e => updateRow(r.rowId, { sizeB: e.target.value })}
                                 style={{ width: '100%' }}

@@ -460,6 +460,8 @@ test_smart_alias() {
     assert_2xx "PUT creates a smart alias"
     req GET /api/aliases
     assert_has "smart alias persists its type" "$(probe "$RESP" 'JSON.stringify(d.aliases.find(a=>a.name==="smart-x"))')" '"type":"smart"'
+    assert_has "smart alias second target reports its inferred size" \
+        "$(probe "$RESP" 'JSON.stringify(d.aliases.find(a=>a.name==="smart-x").targets[1])')" '"inferredSizeB":8'
 
     req PUT /api/aliases/bad-x '{"targets":[{"host":"local","model":"a","domain":"code"}]}'
     assert_4xx "domain on a failover alias is rejected"
