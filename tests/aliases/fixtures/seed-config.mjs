@@ -113,8 +113,32 @@ export function preAliasConfig() {
           tested: false,
           lastTestTime: 1779731382608,
         },
+        {
+          // Always refuses instantly (nothing listens on loopback port 1), so the
+          // smart-alias fallback test exercises a real remote candidate without
+          // ever waiting on a hung connection.
+          id: 'smart-dead',
+          name: 'smart-dead',
+          url: 'http://127.0.0.1:1',
+          enabled: true,
+          priority: 10,
+          apiKeyEnvVar: '',
+          modelMapping: {},
+          // Includes 'messages' (unlike the other seeded hosts) so the smart-alias test can
+          // exercise remote dispatch on /v1/messages too.
+          supportedEndpoints: ['chat/completions', 'completions', 'embeddings', 'messages'],
+          costs: { inputTokenCostPer1M: 0, outputTokenCostPer1M: 0, currency: 'USD' },
+          sharedResourceWeight: 0,
+          maxConcurrentRequests: 1,
+          timeoutMs: 120000,
+          tested: true,
+          lastTestTime: 1779731382608,
+        },
       ],
     },
+    // Disabled explicitly (rather than relying on the DECISION_DEFAULTS default) so the
+    // smart-alias test's fallback-reason assertion can never flake onto a real Laya answer.
+    decision: { enabled: false },
   };
 }
 

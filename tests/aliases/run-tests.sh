@@ -30,6 +30,7 @@ SRV_PID=""
 BORETHRAX='borethrax-ollama-mnfmirep'
 DAHAKA='dahaka-ollama-mngx88pk'
 EMBER='ember-mpleee8f'
+DEAD='smart-dead'
 BIG_TARGET='Unsloth_gpt-oss-120b-GGUF_Q5_K_M_gpt-oss-120b-Q5_K_M'
 SMALL_TARGET='Qwen_Qwen3-8B-GGUF'
 ACCEPTS_ANY_TARGET='qwen3-8b-jetson:latest'
@@ -144,6 +145,13 @@ req() {
         HTTP_CODE="$(curl -s -m 15 -o "$RESP" -w '%{http_code}' -X "$method" \
             "http://127.0.0.1:$API_PORT$path")"
     fi
+}
+
+# Like req, but also saves response headers to $HDRS. Args: method, path, JSON body.
+req_h() {
+    HDRS="$WORK/headers.txt"
+    HTTP_CODE="$(curl -s -m 20 -D "$HDRS" -o "$RESP" -w '%{http_code}' -X "$1" \
+        -H 'content-type: application/json' -d "$3" "http://127.0.0.1:$API_PORT$2")"
 }
 
 # Evaluate a JS expression (with the document bound to `d`) against a JSON file.
@@ -431,6 +439,49 @@ test_settings_back_compat() {
     stop_server
 }
 
+# Exercise a `type: 'smart'` alias end to end: it persists its type, is listed
+# distinctly on /v1/models, and routes chat/messages requests through the
+# smart-routing headers (System 1 is disabled in the seeded config, so every
+# request falls back to targets[0], the always-refused dead remote). Also
+# asserts embeddings reject smart aliases outright, since they route text
+# generation only.
+test_smart_alias() {
+    printf 'test_smart_alias\n'
+    fresh_server 'smart alias' || return
+
+    # The seeded config leaves remote offloading off (test_boot_migration's restart-idempotency
+    # check needs no background backend probe); flip it on for this session only so the smart
+    # alias's dead-remote candidate is actually dispatched instead of falling back to a local
+    # load of a model name that does not exist.
+    req POST /api/backends/routing '{"enabled":true}'
+    assert_2xx "enable remote routing for this session"
+
+    req PUT /api/aliases/smart-x '{"type":"smart","targets":[{"host":"'"$DEAD"'","model":"remote-9b"},{"host":"local","model":"'"$SMALL_TARGET"'","domain":"code"}]}'
+    assert_2xx "PUT creates a smart alias"
+    req GET /api/aliases
+    assert_has "smart alias persists its type" "$(probe "$RESP" 'JSON.stringify(d.aliases.find(a=>a.name==="smart-x"))')" '"type":"smart"'
+
+    req PUT /api/aliases/bad-x '{"targets":[{"host":"local","model":"a","domain":"code"}]}'
+    assert_4xx "domain on a failover alias is rejected"
+
+    req GET /v1/models
+    assert_has "smart alias listed as smart-alias" "$(probe "$RESP" 'JSON.stringify(d.data.find(m=>m.id==="smart-x"))')" '"owned_by":"smart-alias"'
+
+    # System 1 is disabled in the seeded config, so routing must fall back to targets[0] (the dead remote).
+    req_h POST /v1/chat/completions '{"model":"smart-x","messages":[{"role":"user","content":"hi"}],"stream":false}'
+    assert_has "chat: fallback reason header" "$(cat "$HDRS")" 'x-llama-smart-reason: fallback:'
+    assert_has "chat: smart alias → remote candidate" "$(cat "$HDRS")" "x-llama-smart-choice: $DEAD/remote-9b"
+
+    req_h POST /v1/messages '{"model":"smart-x","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}'
+    assert_has "messages: smart choice header" "$(cat "$HDRS")" "x-llama-smart-choice: $DEAD/remote-9b"
+
+    req POST /v1/embeddings '{"model":"smart-x","input":"hi"}'
+    assert_eq "embeddings reject smart aliases" "400" "$HTTP_CODE"
+    assert_has "embeddings error code" "$(cat "$RESP")" 'smart_alias_not_supported'
+
+    stop_server
+}
+
 # ── run ──────────────────────────────────────────────────────────────────────
 
 # The server's runtime dependencies resolve from api/node_modules. A fresh git
@@ -449,6 +500,7 @@ test_aliases_crud
 test_v1_models_advertises_aliases
 test_model_mapping_back_compat
 test_settings_back_compat
+test_smart_alias
 
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
 FAIL=$(wc -c < "$FAIL_FILE" | tr -d ' ')

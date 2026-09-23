@@ -58,6 +58,8 @@ import { resolveEmbedConfig, embedTargetUrl, estimateEmbedTokens, buildEmbedLogE
 import { resolveDecisionConfig, peerOffersDecision, advertisedEngines } from './decision.js';
 import { createDecisionSupervisor } from './decision-supervisor.js';
 import { createDecisionRouter } from './decision-router.js';
+import { routeSmartAlias } from './smart-alias.js';
+import { askSystem1 } from './system1.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
 import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes } from './resource-guard.js';
@@ -842,8 +844,8 @@ function initBackendQueues() {
 /** TTL for the cached local model-name list used to expand `host:'local'` globs. */
 const LOCAL_MODEL_NAMES_TTL_MS = 30_000;
 
-/** @type {{names: string[], at: number}} last scan of the models directory. */
-let localModelNamesCache = { names: [], at: 0 };
+/** @type {{names: string[], bytes: Object<string, number>, at: number}} last scan of the models directory. */
+let localModelNamesCache = { names: [], bytes: {}, at: 0 };
 
 /**
  * Bare local model names for alias glob expansion, cached for
@@ -858,11 +860,22 @@ function localModelNames(force = false) {
   const now = Date.now();
   if (!force && now - localModelNamesCache.at < LOCAL_MODEL_NAMES_TTL_MS) return localModelNamesCache.names;
   try {
-    localModelNamesCache = { names: scanLocalModels().map(m => m.name).filter(Boolean), at: now };
+    const models = scanLocalModels().filter(m => m?.name);
+    localModelNamesCache = {
+      names: models.map(m => m.name),
+      bytes: Object.fromEntries(models.map(m => [m.name, m.size])),
+      at: now,
+    };
   } catch {
-    localModelNamesCache = { names: localModelNamesCache.names, at: now };
+    localModelNamesCache = { ...localModelNamesCache, at: now };
   }
   return localModelNamesCache.names;
+}
+
+/** Local model name → GGUF bytes, from the same TTL cache as localModelNames(). */
+function localModelBytes() {
+  localModelNames();
+  return localModelNamesCache.bytes || {};
 }
 
 /**
@@ -985,11 +998,13 @@ function resolveAliasRouting(name) {
  * longer identifies the alias.
  *
  * @param {string} rawModel the model name exactly as the client sent it.
+ * @param {AliasRouting|null} [pinned] a smart alias's one-candidate routing that replaces
+ *   the table lookup, e.g. from {@link smartRouting}. Omit for the normal table lookup.
  * @returns {{requestedModel: string, aliasRouting: AliasRouting|null}} the name to serve
  *   locally (unchanged for a non-alias or remote-only alias) and the routing tiers.
  */
-function resolveRequestModel(rawModel) {
-  const aliasRouting = typeof rawModel === 'string' ? resolveAliasRouting(rawModel) : null;
+function resolveRequestModel(rawModel, pinned = null) {
+  const aliasRouting = pinned ?? (typeof rawModel === 'string' ? resolveAliasRouting(rawModel) : null);
   return { requestedModel: aliasRouting?.localTarget ?? rawModel, aliasRouting };
 }
 
@@ -5804,8 +5819,10 @@ refreshGpuPools();
  * alias to a pool at all".
  *
  * @param {string} name the alias name.
- * @param {{targets: Array<{host: string, model: string}>, gpu?: string, gpuPriority?: number}} group the stored group.
- * @returns {object} the group plus its resolved candidates split into warm and cold.
+ * @param {{targets: Array<{host: string, model: string}>, gpu?: string, gpuPriority?: number,
+ *   type?: string, system1?: string}} group the stored group.
+ * @returns {object} the group plus its resolved candidates split into warm and cold, and
+ *   `type` ('smart' or 'failover') / `system1` (the alias's provider override, or null).
  */
 function aliasView(name, group) {
   const routing = resolveAliasRouting(name);
@@ -5819,6 +5836,8 @@ function aliasView(name, group) {
     cold: routing?.cold ?? [],
     resolvable: !!routing,
     localTarget: routing?.localTarget ?? null,
+    type: group?.type === 'smart' ? 'smart' : 'failover',
+    system1: group?.system1 ?? null,
   };
 }
 
@@ -5834,7 +5853,7 @@ app.get('/api/aliases', (req, res) => {
 // Create or replace an alias group. The body carries the full target list; a PUT is a
 // replace, not a merge, so removing a target is expressed by omitting it.
 app.put('/api/aliases/:name', (req, res) => {
-  const result = validateAlias(config, req.params.name, req.body?.targets, localModelNames());
+  const result = validateAlias(config, req.params.name, req.body?.targets, localModelNames(), { type: req.body?.type, system1: req.body?.system1 });
   if (!result.ok) return res.status(400).json({ error: result.error });
 
   const name = req.params.name.trim();
@@ -5862,7 +5881,7 @@ app.put('/api/aliases/:name', (req, res) => {
   // Only when a pool binding is involved: re-resolving reads sysfs, and an ordinary alias
   // edit has nothing to do with the cards.
   if (rebound || binding.gpu) refreshGpuPools();
-  addLog('backends', `${existed ? 'Updated' : 'Created'} alias '${name}' -> ${result.value.targets.map(t => `${t.host}/${t.model}`).join(', ')}`
+  addLog('backends', `${result.value.type === 'smart' ? '(smart) ' : ''}${existed ? 'Updated' : 'Created'} alias '${name}' -> ${result.value.targets.map(t => `${t.host}/${t.model}`).join(', ')}`
     + (binding.gpu ? ` on GPU pool '${binding.gpu}'${binding.gpuPriority === null ? '' : ` at priority ${binding.gpuPriority}`}` : ''));
   for (const warning of result.warnings) addLog('backends', `Alias '${name}': ${warning}`);
 
@@ -8301,7 +8320,7 @@ const decisionSupervisor = createDecisionSupervisor({
   log: (msg) => addLog('decision', msg),
 });
 
-app.use(createDecisionRouter({
+const decisionRouter = createDecisionRouter({
   supervisor: decisionSupervisor,
   getConfig: decisionConfig,
   updateConfig: (patch) => {
@@ -8321,7 +8340,47 @@ app.use(createDecisionRouter({
   fleetPeers: () => lastKnownPeers
     .filter((peer) => peer.address && peerOffersDecision(peer))
     .map((peer) => ({ name: peer.txt?.name || peer.instance, url: `http://${peer.address}:${peer.port}` })),
-}));
+});
+app.use(decisionRouter);
+
+/**
+ * Route a request made to a `type: 'smart'` alias: ask System 1 (per the alias or
+ * global provider) to classify the prompt, pick a candidate, stamp the
+ * x-llama-smart-choice / x-llama-smart-reason headers, and return a
+ * one-candidate AliasRouting for resolveRequestModel/resolveBackend.
+ * @param {import('express').Request} req the request (body.model may be a smart alias)
+ * @param {import('express').Response} res the response, for the headers
+ * @param {'chat'|'completions'|'responses'|'messages'} endpoint body shape
+ * @returns {Promise<AliasRouting|null>} null when body.model is not a routable smart alias
+ */
+async function smartRouting(req, res, endpoint) {
+  const name = req.body?.model;
+  if (typeof name !== 'string' || config.aliases?.[name]?.type !== 'smart') return null;
+  const decision = resolveDecisionConfig(config, process.env);
+  const inventory = buildAliasInventory();
+  const routed = await routeSmartAlias({ name, endpoint, body: req.body }, {
+    config,
+    inventory,
+    localBytes: localModelBytes(),
+    defaultProvider: decision.provider,
+    askSystem1: (questions, state, opts) => askSystem1(questions, state, opts, {
+      fetchImpl: fetch, jevApiKey: decision.jevApiKey, jevModel: decision.jevModel,
+      askLaya: (body, o) => decisionRouter.askLaya(body, o),
+    }),
+    warmSystem1: (provider) => {
+      if (provider === 'jev' || !decision.runnable || memAvailableBytes() < decision.minFreeMemBytes) return;
+      decisionSupervisor.ensureStarted().catch((err) => addLog('decision', `smart-alias warm-up failed: ${err.message}`));
+    },
+  });
+  if (!routed) return null;
+  const { candidate, reason } = routed;
+  res.setHeader('x-llama-smart-choice', `${candidate.host}/${candidate.model}`);
+  res.setHeader('x-llama-smart-reason', reason);
+  addLog('backends', `smart alias '${name}' → ${candidate.host}/${candidate.model} (${reason})`);
+  const one = [candidate];
+  const { warm, cold } = partitionByWarmth(one, inventory);
+  return { name, candidates: one, warm, cold, ranked: one, localTarget: candidate.host === 'local' ? candidate.model : null };
+}
 
 // ── ds4-server supervisor (DeepSeek V4 Flash engine) ─────────────────────────
 // A second supervised process alongside llama-server/embed. ds4-server is a
@@ -13118,7 +13177,8 @@ async function handleChatCompletions(req, res) {
   // must be intercepted before any of the single-model machinery below runs. Resolve
   // through the alias table first: `default-big` points at the chain, and checking the
   // RAW name would let that request fall through and 400 as an unknown model.
-  if (isDuoChainRequest(resolveRequestModel(req.body?.model).requestedModel)) {
+  const smart = await smartRouting(req, res, 'chat');
+  if (isDuoChainRequest(resolveRequestModel(req.body?.model, smart).requestedModel)) {
     return runDuoChain(req, res);
   }
 
@@ -13196,7 +13256,7 @@ async function handleChatCompletions(req, res) {
   // llama.cpp as an unknown model name. rawModel keeps the pre-resolution name so the
   // engine seam can tell an alias request from a direct model request.
   const rawModel = req.body.model || 'default';
-  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel);
+  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel, smart);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   let appendPrepared = null;
@@ -14580,9 +14640,10 @@ async function handleCompletions(req, res) {
   try { requestPolicy = managerRequestPolicy(req.body, req.headers); }
   catch (error) { return res.status(400).json({ error: { message: error.message, code: 'invalid_manager_policy' } }); }
   req.body = stripManagerRequestFields(req.body);
+  const smart = await smartRouting(req, res, 'completions');
   // Resolve default-big/default-small aliases and forward the resolved name downstream.
   const rawModel = req.body.model || 'unknown';
-  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel);
+  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel, smart);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
   const isStreaming = req.body.stream === true;
 
@@ -14856,11 +14917,16 @@ app.post('/v1/completions', handleCompletions);
 // Mounted at the versioned path and an unversioned alias.
 /**
  * Proxy an OpenAI embeddings request to a remote or dedicated local backend.
+ * Rejects a `type: 'smart'` alias outright — smart aliases route text generation
+ * only, so there is no candidate to pick between for an embedding request.
  * @param {import('express').Request} req Express request.
  * @param {import('express').Response} res Express response.
  * @returns {Promise<void>} Resolves after the embedding response is sent.
  */
 async function handleEmbeddings(req, res) {
+  if (config.aliases?.[req.body?.model]?.type === 'smart') {
+    return res.status(400).json({ error: { message: 'smart aliases route text generation only; name a model for embeddings', type: 'invalid_request_error', code: 'smart_alias_not_supported' } });
+  }
   const startedAt = Date.now();
   let requestPolicy;
   try { requestPolicy = managerRequestPolicy(req.body, req.headers); }
@@ -15299,7 +15365,8 @@ async function handleResponses(req, res) {
   // This sits AFTER the background branch on purpose. A background request is queued
   // first and re-posted by the job runner with `background` stripped, so the chain runs on
   // that second pass and background/queued duo requests keep working unchanged.
-  if (isDuoChainRequest(resolveRequestModel(req.body?.model).requestedModel)) {
+  const smart = await smartRouting(req, res, 'responses');
+  if (isDuoChainRequest(resolveRequestModel(req.body?.model, smart).requestedModel)) {
     return runDuoChainResponses(req, res);
   }
   const requestAbort = new AbortController();
@@ -15313,7 +15380,7 @@ async function handleResponses(req, res) {
   try { requestPolicy = managerRequestPolicy(req.body, req.headers); }
   catch (error) { return res.status(400).json({ error: { message: error.message, code: 'invalid_manager_policy' } }); }
   req.body = stripManagerRequestFields(req.body);
-  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel);
+  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel, smart);
   if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
 
   console.log(`[responses] Request for model: ${requestedModel}`);
@@ -15730,7 +15797,9 @@ app.post('/v1/responses/:responseId/cancel', handleCancelBackgroundResponse);
 async function handleMessages(req, res) {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
-  const requestedModel = req.body.model || 'default';
+  const smart = await smartRouting(req, res, 'messages');
+  const requestedModel = smart?.localTarget ?? (req.body.model || 'default');
+  if (smart?.localTarget) req.body.model = smart.localTarget;
   let requestPolicy;
   try { requestPolicy = managerRequestPolicy(req.body, req.headers); }
   catch (error) { return res.status(400).json({ error: { message: error.message, code: 'invalid_manager_policy' } }); }
@@ -15742,7 +15811,7 @@ async function handleMessages(req, res) {
   const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
   // Route to remote backend if applicable
-  const routing = resolveBackend(requestedModel, 'messages', req.body, { localOnly: requestPolicy.localOnly });
+  const routing = resolveBackend(requestedModel, 'messages', req.body, { localOnly: requestPolicy.localOnly, ...(smart ? { aliasRouting: smart } : {}) });
   if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;

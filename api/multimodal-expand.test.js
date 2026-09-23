@@ -500,7 +500,7 @@ test('bare v1 aliases register the same named handlers before the SPA catch-all'
     source.indexOf('async function handleResponses'),
     source.indexOf("app.post('/api/v1/responses'"),
   );
-  assert.match(responsesHandler, /resolveRequestModel\(rawModel\)/);
+  assert.match(responsesHandler, /resolveRequestModel\(rawModel, smart\)/);
   assert.match(responsesHandler, /ensureDs4ForModel\(rawModel, requestedModel,/);
   assert.match(responsesHandler, /readRelayState\(req\.headers\)/);
   assert.match(responsesHandler, /requestPriority: requestPolicy\.priority/);
