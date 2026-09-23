@@ -194,3 +194,43 @@ export async function routeSmartAlias({ name, endpoint, body }, deps) {
     return { candidate: candidates[0], reason: `fallback:${causeOf(err)}` };
   }
 }
+
+/**
+ * Build the one-candidate routing view a smart alias hands to
+ * resolveRequestModel/resolveBackend, from the candidate {@link routeSmartAlias}
+ * picked.
+ *
+ * `localTarget` is the name the LOCAL engine would be asked to serve if the
+ * remote pick is later declined by the routing layer (backends disabled, an
+ * offloadPolicy of 'manual', or no viable remote) — it is NEVER the alias's
+ * own name. When the pick is local, that's just its model. When the pick is
+ * remote, it's the first LOCAL candidate in the alias's full candidate list
+ * (authored order), or null when the alias has no local candidate at all (see
+ * I2: a null-vs-alias-name bug here made a declined remote pick fall back to
+ * loading the alias's own name, which could hang for the full model-load
+ * window).
+ *
+ * `candidates`/`ranked`/`warm` deliberately carry ONLY the one picked
+ * candidate — never the local fallback — so the warm gate keeps offloading to
+ * the remote pick whenever it's viable; `localTarget` only matters once
+ * routing has already decided the remote pick can't be used.
+ *
+ * @param {string} name the smart alias's name.
+ * @param {import('./model-aliases.js').Candidate} candidate the candidate
+ *   {@link routeSmartAlias} picked (real System 1 answer or fallback).
+ * @param {import('./model-aliases.js').Candidate[]} candidates the alias's
+ *   FULL candidate list (from {@link resolveAliasCandidates}), used only to
+ *   find a local fallback when `candidate` is remote.
+ * @param {import('./model-aliases.js').Inventory|null|undefined} inventory
+ *   injected view of local/remote availability, for partitionByWarmth.
+ * @returns {{name:string, candidates:object[], warm:object[], cold:object[],
+ *   ranked:object[], localTarget:(string|null)}} the one-candidate routing view.
+ */
+export function smartAliasRouting(name, candidate, candidates, inventory) {
+  const one = [candidate];
+  const { warm, cold } = partitionByWarmth(one, inventory);
+  const localTarget = candidate.host === 'local'
+    ? candidate.model
+    : candidates.find(c => c.host === 'local')?.model ?? null;
+  return { name, candidates: one, warm, cold, ranked: one, localTarget };
+}

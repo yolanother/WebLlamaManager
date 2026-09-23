@@ -4,12 +4,14 @@
 // Covers the pure smart-alias decision: size inference from sizeB / model name /
 // file bytes, prompt text extraction for the four text endpoints, the
 // difficulty-by-size + domain-tag candidate pick with the resident-candidate
-// rule, and routeSmartAlias's never-block fallback to the first target.
+// rule, routeSmartAlias's never-block fallback to the first target, and
+// smartAliasRouting's localTarget computation (I2: a remote pick must fall
+// back to the alias's own local candidate, never the alias's name).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  parseSizeFromName, candidateSize, extractPromptText, pickSmartCandidate, routeSmartAlias, SMART_QUESTIONS,
+  parseSizeFromName, candidateSize, extractPromptText, pickSmartCandidate, routeSmartAlias, smartAliasRouting, SMART_QUESTIONS,
 } from './smart-alias.js';
 
 const cand = (model, order, host = 'local') => ({ host, model, kind: 'model', backendId: host === 'local' ? null : host, order });
@@ -168,4 +170,36 @@ test('routeSmartAlias returns null for a non-smart or empty alias', async () => 
   assert.equal(await routeSmartAlias({ name: 'nope', endpoint: 'chat', body: chat('hi') }, baseDeps()), null);
   const cfg = { aliases: { f: { targets: [{ host: 'local', model: 's-8b' }] } } };
   assert.equal(await routeSmartAlias({ name: 'f', endpoint: 'chat', body: chat('hi') }, baseDeps({ config: cfg })), null);
+});
+
+// I2: smartAliasRouting's localTarget — a remote pick must fall back to the alias's
+// own local candidate, never to the alias's name (which could hang a request for the
+// full model-load window once the routing layer declines the remote pick).
+test('smartAliasRouting: a LOCAL pick reports itself as localTarget, and only itself in candidates/ranked', () => {
+  const candidate = cand('m-30b', 1);
+  const candidates = [cand('l-120b', 0, 'remote1'), candidate, cand('s-8b', 2)];
+  const r = smartAliasRouting('smart', candidate, candidates, { residentModels: ['m-30b'], backends: [] });
+  assert.equal(r.name, 'smart');
+  assert.deepEqual(r.candidates, [candidate]);
+  assert.deepEqual(r.ranked, [candidate]);
+  assert.deepEqual(r.warm, [candidate]); // resident, per inventory.residentModels
+  assert.deepEqual(r.cold, []);
+  assert.equal(r.localTarget, 'm-30b');
+});
+
+test('smartAliasRouting: a REMOTE pick with a local candidate present falls back to the FIRST local candidate', () => {
+  const candidate = cand('remote-9b', 0, 'remote1');
+  const candidates = [candidate, cand('s-8b', 1), cand('m-30b', 2)];
+  const r = smartAliasRouting('smart', candidate, candidates, { residentModels: [], backends: [] });
+  assert.deepEqual(r.candidates, [candidate]);
+  assert.deepEqual(r.ranked, [candidate]);
+  assert.equal(r.localTarget, 's-8b');
+});
+
+test('smartAliasRouting: a REMOTE-ONLY alias has no local candidate — localTarget is null, not the alias name', () => {
+  const candidate = cand('remote-9b', 0, 'remote1');
+  const candidates = [candidate, cand('other-9b', 1, 'remote2')];
+  const r = smartAliasRouting('smart', candidate, candidates, { residentModels: [], backends: [] });
+  assert.deepEqual(r.candidates, [candidate]);
+  assert.equal(r.localTarget, null);
 });
