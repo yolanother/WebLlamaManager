@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDecisionRouter } from './decision-router.js';
-import { resolveDecisionConfig } from './decision.js';
+import { resolveDecisionConfig, LAYA_HOP_HEADER } from './decision.js';
 import { JEV_API_URL } from './system1.js';
 
 const PINNED = `sha256:${'c'.repeat(64)}`;
@@ -309,6 +309,20 @@ test('provider jev: a jev-1.13.0 request model is forwarded unchanged', async ()
   await invoke(routes, 'POST /v1/systemone', { body: { model: 'jev-1.13.0', state: 'INV-1', questions: Q.questions } });
   const call = state.fetches.find((c) => c.url === JEV_API_URL);
   assert.equal(JSON.parse(call.init.body).model, 'jev-1.13.0');
+});
+
+test('I4: provider jev with the hop header goes straight to laya, never calls Jev', async () => {
+  // A hop-forwarded request already made its own jev-or-not decision on the ORIGINATING
+  // node; a node that only relays for peers (this test's config: provider 'jev' but no
+  // local decision to make) must not spend a second call to TypeSafe for the same request.
+  const { routes, state } = harness({ state: { decision: { enabled: true, image: PINNED, port: 5254, provider: 'jev', jevApiKey: 'k', jevModel: 'jev-latest' } } });
+  const res = await invoke(routes, 'POST /v1/systemone', {
+    body: { model: 'laya', state: 'INV-1', questions: Q.questions },
+    headers: { [LAYA_HOP_HEADER]: 'peer-node' },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.ok(!state.fetches.some((c) => c.url === JEV_API_URL), 'must never call Jev on a hop-forwarded request');
+  assert.equal(state.fetches[0].url, 'http://127.0.0.1:5254/v1/systemone');
 });
 
 test('provider jev-then-laya: jev 529 falls through to local laya (supervisor started)', async () => {

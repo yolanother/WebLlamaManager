@@ -13,7 +13,12 @@
 // When `config.decision.provider` is `jev` or `jev-then-laya`, the request is
 // forwarded to TypeSafe's hosted Jev API first (host `typesafe`); a
 // `jev-then-laya` request that fails there falls through to the local Laya
-// walk. `askLaya` (the peer/local walk) is exported on the router so
+// walk. That Jev step is SKIPPED for a hop-forwarded request (the
+// x-laya-hop header, set by callPeer) even under provider jev(-then-laya):
+// the originating node already made its own jev-or-not call for this
+// request, so a peer relaying it must go straight to its local Laya rather
+// than spending a second TypeSafe call (I4). `askLaya` (the peer/local walk)
+// is exported on the router so
 // api/system1.js's askSystem1 can drive it directly for smart-alias routing.
 // Also serves GET /api/decision/status (config, supervisor state, peer
 // health, provider/jevModel/jevApiKeySet), POST /api/decision/start|stop for
@@ -183,7 +188,11 @@ export function createDecisionRouter({
     res.set(LAYA_HOST_HEADER, host);
     const model = req.body?.model;
     if (!isDecisionModel(model)) return res.status(400).json({ error: 'unsupported_model', model, host });
-    if (cfg.provider !== 'laya') {
+    // A hop-forwarded request (a peer already tried Jev, or has no Jev key of its own,
+    // and is walking straight to Laya) must never be re-routed to Jev here — that would
+    // spend a SECOND jevApiKey call for one logical request, or call Jev on a node that
+    // was never configured to.
+    if (cfg.provider !== 'laya' && !req.headers?.[LAYA_HOP_HEADER]) {
       const j = await viaJev(req, cfg, cfg.provider === 'jev-then-laya');
       if (j) { res.set(LAYA_HOST_HEADER, j.host); return res.status(j.status).json({ ...j.body, host: j.host }); }
     }
