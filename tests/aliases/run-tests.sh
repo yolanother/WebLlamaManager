@@ -81,10 +81,11 @@ seed_config() { node "$FIXTURES/seed-config.mjs" "$CFG"; }
 # Boot api/server.js against the disposable config and wait for it to listen.
 # Every mutable runtime path is redirected into $WORK so the run cannot touch
 # the checkout or the operator's real state. Returns non-zero if it never came up.
-# MODEL_LOAD_WAIT_MS is shrunk from server.js's 180s default: this env has no real
-# GGUF weights or llama-server binary, so a local-model-load wait can never
-# succeed anyway — shrinking it just makes that dead end fail fast instead of
-# eating a test's curl -m budget (see test_smart_alias's I2 fallback-to-local case).
+# DISTROBOX_BIN=/bin/false is extra protection, not the primary guard: no test
+# in this suite should ever route a request to local generation (see
+# test_smart_alias and check_no_host_kill below), but if one ever did, this
+# makes start-llama.sh's distrobox entry fail immediately instead of reaching
+# into the real distrobox/host state (start-llama.sh:77 honors DISTROBOX_BIN).
 start_server() {
     printf '\n===== boot =====\n' >> "$SRV_LOG"
     AUTO_START=false \
@@ -98,7 +99,7 @@ start_server() {
     LLAMA_MANAGER_CONFIG_DIR="$WORK/etc" \
     LLAMA_MANAGER_DATA_DIR="$WORK/data" \
     LLAMA_MANAGER_CACHE_DIR="$WORK/cache" \
-    MODEL_LOAD_WAIT_MS=3000 \
+    DISTROBOX_BIN=/bin/false \
         node "$REPO_ROOT/api/server.js" >> "$SRV_LOG" 2>&1 &
     SRV_PID=$!
     local i
@@ -108,6 +109,28 @@ start_server() {
         sleep 0.5
     done
     return 1
+}
+
+# Tripwire: fail loudly if the test server's log shows it fell through to a
+# HOST-WIDE llama-server kill/restart. server.js's restart/recovery path calls
+# killEnginePidsRobust('llama-server'), which matches by process name across
+# the WHOLE HOST — not scoped to this test's own (nonexistent) child. A smart
+# alias whose fallback reached actual local generation once did exactly this
+# and SIGKILLed a co-resident LIVE dev server's engines five times (2026-09-23
+# incident). No test in this suite should ever reach that code path (see
+# test_smart_alias's remote-only smart-x/smart-y split), but if one regresses
+# and does, this must fail the run instead of silently damaging the host.
+# Called after every stop_server, and once more at the end of the whole suite.
+check_no_host_kill() {
+    [ -f "$SRV_LOG" ] || return 0
+    local hit
+    hit="$(grep -E 'Killing all llama-server processes|\[engine-kill\]|restarting llama server' "$SRV_LOG" 2>/dev/null)"
+    if [ -n "$hit" ]; then
+        printf 'F' >> "$FAIL_FILE"
+        printf '\n  !!!! TRIPWIRE: test server attempted a HOST-WIDE llama-server kill/restart !!!!\n'
+        printf '       This can SIGKILL a co-resident LIVE dev server'"'"'s engines. See: %s\n' "$SRV_LOG"
+        printf '       Matching line(s):\n%s\n' "$hit" | sed 's/^/       /'
+    fi
 }
 
 # Terminate the server under test, escalating to SIGKILL if it ignores SIGTERM.
@@ -122,6 +145,7 @@ stop_server() {
     kill -9 "$SRV_PID" 2>/dev/null
     wait "$SRV_PID" 2>/dev/null
     SRV_PID=""
+    check_no_host_kill
 }
 
 # Reseed the pre-alias config and boot a server on it. Args: test description.
@@ -462,31 +486,48 @@ test_settings_back_compat() {
 # request falls back to targets[0], the always-refused dead remote). Also
 # asserts embeddings reject smart aliases outright, since they route text
 # generation only.
+#
+# IMPORTANT — no request in this test may ever be able to resolve to a LOCAL
+# target: a smart-alias fallback that reached actual local generation once
+# triggered server.js's restart/recovery path, which SIGKILLed a co-resident
+# LIVE dev server's engines (2026-09-23 incident; see check_no_host_kill).
+# `smart-x` is therefore REMOTE-ONLY — no local candidate exists for it to
+# ever fall back to. `smart-y` carries a local candidate (for the
+# inferredSizeB/type assertions below) but is read ONLY via GET /api/aliases
+# and /v1/models — it is NEVER the target of a chat/completions/responses/
+# messages/embeddings request. I2 (a remote pick's fallback when declined)
+# is now covered by the pure smartAliasRouting unit tests in
+# api/smart-alias.test.js instead of by driving it through a real server.
 test_smart_alias() {
     printf 'test_smart_alias\n'
     fresh_server 'smart alias' || return
 
     # The seeded config leaves remote offloading off (test_boot_migration's restart-idempotency
-    # check needs no background backend probe); flip it on for this session only so the smart
-    # alias's dead-remote candidate is actually dispatched instead of falling back to a local
-    # load of a model name that does not exist.
+    # check needs no background backend probe); flip it on for this session only so smart-x's
+    # dead-remote candidate is actually dispatched (and fails fast) rather than declined.
     req POST /api/backends/routing '{"enabled":true}'
     assert_2xx "enable remote routing for this session"
 
-    req PUT /api/aliases/smart-x '{"type":"smart","targets":[{"host":"'"$DEAD"'","model":"remote-9b"},{"host":"local","model":"'"$SMALL_TARGET"'","domain":"code"}]}'
-    assert_2xx "PUT creates a smart alias"
+    req PUT /api/aliases/smart-x '{"type":"smart","targets":[{"host":"'"$DEAD"'","model":"remote-9b"}]}'
+    assert_2xx "PUT creates a remote-only smart alias"
+
+    req PUT /api/aliases/smart-y '{"type":"smart","targets":[{"host":"'"$DEAD"'","model":"remote-9b"},{"host":"local","model":"'"$SMALL_TARGET"'","domain":"code"}]}'
+    assert_2xx "PUT creates a smart alias with a local candidate (read-only in this test)"
+
     req GET /api/aliases
-    assert_has "smart alias persists its type" "$(probe "$RESP" 'JSON.stringify(d.aliases.find(a=>a.name==="smart-x"))')" '"type":"smart"'
-    assert_has "smart alias second target reports its inferred size" \
-        "$(probe "$RESP" 'JSON.stringify(d.aliases.find(a=>a.name==="smart-x").targets[1])')" '"inferredSizeB":8'
+    assert_has "smart-x persists its type" "$(probe "$RESP" 'JSON.stringify(d.aliases.find(a=>a.name==="smart-x"))')" '"type":"smart"'
+    assert_has "smart-y second target reports its inferred size" \
+        "$(probe "$RESP" 'JSON.stringify(d.aliases.find(a=>a.name==="smart-y").targets[1])')" '"inferredSizeB":8'
 
     req PUT /api/aliases/bad-x '{"targets":[{"host":"local","model":"a","domain":"code"}]}'
     assert_4xx "domain on a failover alias is rejected"
 
     req GET /v1/models
-    assert_has "smart alias listed as smart-alias" "$(probe "$RESP" 'JSON.stringify(d.data.find(m=>m.id==="smart-x"))')" '"owned_by":"smart-alias"'
+    assert_has "smart-x listed as smart-alias" "$(probe "$RESP" 'JSON.stringify(d.data.find(m=>m.id==="smart-x"))')" '"owned_by":"smart-alias"'
+    assert_has "smart-y listed as smart-alias" "$(probe "$RESP" 'JSON.stringify(d.data.find(m=>m.id==="smart-y"))')" '"owned_by":"smart-alias"'
 
-    # System 1 is disabled in the seeded config, so routing must fall back to targets[0] (the dead remote).
+    # System 1 is disabled in the seeded config, so routing must fall back to targets[0]
+    # (the dead remote) — smart-x has no other target, so this can never resolve local.
     req_h POST /v1/chat/completions '{"model":"smart-x","messages":[{"role":"user","content":"hi"}],"stream":false}'
     assert_has "chat: fallback reason header" "$(cat "$HDRS")" 'x-llama-smart-reason: fallback:'
     assert_has "chat: smart alias → remote candidate" "$(cat "$HDRS")" "x-llama-smart-choice: $DEAD/remote-9b"
@@ -496,34 +537,10 @@ test_smart_alias() {
     assert_has "messages: smart choice header" "$(cat "$HDRS")" "x-llama-smart-choice: $DEAD/remote-9b"
     assert_not_timeout "messages: dead remote answers with a real HTTP status, not a curl timeout"
 
+    # Rejected before routing even runs, so this can never reach a local target either.
     req POST /v1/embeddings '{"model":"smart-x","input":"hi"}'
     assert_eq "embeddings reject smart aliases" "400" "$HTTP_CODE"
     assert_has "embeddings error code" "$(cat "$RESP")" 'smart_alias_not_supported'
-
-    # I2: with backends routing DISABLED, the dead-remote pick is DECLINED by
-    # resolveBackend (not attempted), so routing must fall back to the alias's
-    # first LOCAL candidate ("$SMALL_TARGET") rather than asking the local engine
-    # to load the alias's own name ("smart-x") — the bug that could hang a request
-    # for the full model-load window. This sandbox has no real llama-server binary
-    # or GGUF weights, so once routing correctly falls to "local", the existing
-    # (pre-existing, out of scope here) local-serve retry/restart cascade genuinely
-    # cannot finish inside any reasonable client timeout — confirmed by letting it
-    # run past a short client-side timeout and inspecting server.log: the request
-    # never got past "Waiting ...s for model ... to finish loading" / a full router
-    # restart. So this checks the ROUTING DECISION itself (server.js logs the
-    # resolved requestedModel, not the raw alias name, at the top of the handler)
-    # rather than the eventual HTTP status, per this ticket's own guidance to report
-    # a local-fallback hang as evidence instead of inflating a timeout to hide it.
-    req POST /api/backends/routing '{"enabled":false}'
-    assert_2xx "disable remote routing for the declined-remote check"
-
-    curl -s -m 5 -o /dev/null -X POST -H 'content-type: application/json' \
-        -d '{"model":"smart-x","messages":[{"role":"user","content":"hi"}],"stream":false}' \
-        "http://127.0.0.1:$API_PORT/v1/chat/completions" >/dev/null 2>&1
-    assert_has "declined remote: falls back to the alias's local candidate, not its own name" \
-        "$(tail -n 20 "$SRV_LOG")" "[chat/completions] Request for model: $SMALL_TARGET"
-    assert_not_has "declined remote: never asks the engine to load the alias's own name" \
-        "$(tail -n 20 "$SRV_LOG")" "[chat/completions] Request for model: smart-x"
 
     stop_server
 }
@@ -547,6 +564,11 @@ test_v1_models_advertises_aliases
 test_model_mapping_back_compat
 test_settings_back_compat
 test_smart_alias
+
+# Belt-and-suspenders: stop_server already runs this after every test, but
+# check once more here against whatever is currently in $SRV_LOG before the
+# suite's pass/fail count is finalized.
+check_no_host_kill
 
 PASS=$(wc -c < "$PASS_FILE" | tr -d ' ')
 FAIL=$(wc -c < "$FAIL_FILE" | tr -d ' ')
