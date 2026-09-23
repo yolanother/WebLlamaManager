@@ -64,13 +64,21 @@ test('isPinnedImage: accepts repo digests and full image ids only', () => {
   assert.equal(isPinnedImage(undefined), false);
 });
 
-test('podmanRunArgs: loopback port map, keep-id cache mount, checkpoint env, gpu args, image last', () => {
+test('podmanRunArgs: host pid/net bound to loopback, keep-id cache mount, checkpoint env, gpu args, image last', () => {
   const cfg = resolveDecisionConfig({ decision: { enabled: true, image: PINNED, device: 'cuda:0',
     podmanArgs: ['--device', '/dev/kfd'] } }, {});
   const args = podmanRunArgs(cfg, { cacheDir: '/var/lib/llama-manager/decision' });
   assert.deepEqual(args.slice(0, 5), ['run', '--rm', '--pull=missing', '--name', DECISION_CONTAINER_NAME]);
   assert.ok(args.includes('--userns=keep-id:uid=1000,gid=1000'));
-  assert.equal(args[args.indexOf('-p') + 1], '127.0.0.1:5254:8765');
+  // The appliance's rootless podman cannot give a container its own proc/net
+  // namespace (crun: "mount proc ... Operation not permitted" and
+  // "ping_group_range: Read-only file system"), the same reason the ROCm
+  // distrobox runs host pid/net. So share them and have laya-server bind loopback.
+  assert.ok(args.includes('--pid=host'));
+  assert.ok(args.includes('--network=host'));
+  assert.ok(!args.includes('-p'), 'host networking cannot publish ports');
+  assert.ok(args.includes('LAYA_SERVER_HOST=127.0.0.1'));
+  assert.ok(args.includes('LAYA_SERVER_PORT=5254'));
   assert.equal(args[args.indexOf('-v') + 1], '/var/lib/llama-manager/decision:/data');
   assert.ok(args.includes('LAYA_SERVER_MODELS=typed-decisions'));
   assert.ok(args.includes('LAYA_SERVER_JEV_ALIAS=1'));

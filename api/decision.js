@@ -99,7 +99,14 @@ export function podmanRunArgs(cfg, { cacheDir }) {
   return [
     'run', '--rm', '--pull=missing', '--name', DECISION_CONTAINER_NAME,
     '--userns=keep-id:uid=1000,gid=1000',
-    '-p', `127.0.0.1:${cfg.port}:${LAYA_CONTAINER_PORT}`,
+    // Host pid + network, like the ROCm engine container: the appliance's
+    // rootless podman cannot create a private proc/net namespace (crun fails on
+    // the proc mount and on the default ping_group_range sysctl). laya-server
+    // therefore binds loopback itself instead of a published port. Operator
+    // approved this posture on 2026-09-22 (unprivileged, loopback-only).
+    '--pid=host', '--network=host',
+    '-e', 'LAYA_SERVER_HOST=127.0.0.1',
+    '-e', `LAYA_SERVER_PORT=${cfg.port}`,
     '-v', `${cacheDir}:/data`,
     '-e', `LAYA_SERVER_MODELS=${cfg.checkpoint}`,
     '-e', 'LAYA_SERVER_JEV_ALIAS=1',
