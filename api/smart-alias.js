@@ -50,7 +50,7 @@ export const SMART_QUESTIONS = Object.freeze({
  */
 export function parseSizeFromName(name) {
   let best = null;
-  for (const m of String(name ?? '').matchAll(/(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z])/g)) {
+  for (const m of String(name ?? '').matchAll(/(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/g)) {
     const n = Number(m[1]);
     if (n > 0 && (best === null || n > best)) best = n;
   }
@@ -132,9 +132,32 @@ function causeOf(err) {
 }
 
 /**
+ * Race `promise` against one timer of `ms`, so a slow/never-resolving promise
+ * can't outlive the caller's budget. The timer is cleared as soon as either
+ * side settles, so no stray timer is left behind once routing has decided.
+ * @param {Promise<any>} promise
+ * @param {number} ms
+ * @returns {Promise<any>} rejects with `{code:'timeout'}` if `ms` elapses first.
+ */
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(Object.assign(new Error('timeout'), { code: 'timeout' })), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+/**
  * Route one request made to a smart alias. Never throws and never waits on a
  * cold System 1: every failure returns the first candidate with a
- * `fallback:<cause>` reason and fires deps.warmSystem1(provider).
+ * `fallback:<cause>` reason and fires deps.warmSystem1(provider). The whole
+ * `deps.askSystem1(...)` call (which may itself walk jev-then-laya, and Laya
+ * peers-then-local, each leg with its own internal timeout) is raced against
+ * ONE `deps.timeoutMs` budget here, so a slow/never-resolving System 1 can't
+ * cost the request more than that single budget (see I3: previously each leg
+ * got the full timeout, so a multi-leg walk could take several times longer).
  * @param {{name:string, endpoint:string, body:object}} request the aliased request
  * @param {{config:object, inventory:object, localBytes:Object<string,number>, defaultProvider:string,
  *   askSystem1:Function, warmSystem1:Function, timeoutMs?:number}} deps injected world
@@ -146,10 +169,14 @@ export async function routeSmartAlias({ name, endpoint, body }, deps) {
   const candidates = resolveAliasCandidates(name, deps.config, deps.inventory);
   if (!candidates.length) return null;
   const provider = group.system1 ?? deps.defaultProvider;
+  const timeoutMs = deps.timeoutMs ?? SMART_TIMEOUT_MS;
   try {
     const text = extractPromptText(endpoint, body);
     if (!text) throw Object.assign(new Error('no_text'), { code: 'no_text' });
-    const r = await deps.askSystem1(SMART_QUESTIONS, text.slice(-SMART_TEXT_MAX), { provider, timeoutMs: deps.timeoutMs ?? SMART_TIMEOUT_MS });
+    const r = await withTimeout(
+      deps.askSystem1(SMART_QUESTIONS, text.slice(-SMART_TEXT_MAX), { provider, timeoutMs }),
+      timeoutMs,
+    );
     const verdict = r?.answers;
     if (!Number.isFinite(Number(verdict?.difficulty?.score))) throw Object.assign(new Error('bad_verdict'), { code: 'bad_verdict' });
     const key = c => `${c.host}\u0000${c.model}`;

@@ -22,6 +22,7 @@ test('parseSizeFromName reads the largest NNb token', () => {
   assert.equal(parseSizeFromName('qwen3:1.5b'), 1.5);
   assert.equal(parseSizeFromName('mystery-model'), null);
   assert.equal(parseSizeFromName('model-bf16'), null);
+  assert.equal(parseSizeFromName('model-a1b2c3'), null); // M1: digit after the b/B must not count as a "b" size token
 });
 
 test('candidateSize: sizeB wins, then name, then local bytes, else null', () => {
@@ -147,6 +148,20 @@ test('routeSmartAlias: no text and missing difficulty both fall back', async () 
 test('routeSmartAlias: fallback cause is sanitized for a header', async () => {
   const r = await routeSmartAlias({ name: 'smart', endpoint: 'chat', body: chat('hi') }, baseDeps({ askSystem1: async () => { throw new Error('boom: bad\nthing'); } }));
   assert.match(r.reason, /^fallback:[\w.-]+$/);
+});
+
+test('routeSmartAlias: I3 — a never-resolving askSystem1 is bounded by ONE timeoutMs budget, not per-leg', async () => {
+  let warmed = null;
+  const start = Date.now();
+  const r = await routeSmartAlias({ name: 'smart', endpoint: 'chat', body: chat('hi') }, baseDeps({
+    timeoutMs: 50,
+    askSystem1: () => new Promise(() => {}), // never resolves — simulates a jev-then-laya walk that outlives its own per-leg timeouts
+    warmSystem1: p => { warmed = p; },
+  }));
+  assert.ok(Date.now() - start < 900, 'must resolve well under the 1s smart budget');
+  assert.equal(r.reason, 'fallback:timeout');
+  assert.equal(r.candidate.model, 'l-120b');
+  assert.equal(warmed, 'laya');
 });
 
 test('routeSmartAlias returns null for a non-smart or empty alias', async () => {
