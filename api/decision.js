@@ -12,6 +12,10 @@
 // engine when the memory guard allows a cold start). Kept out of server.js so
 // it is unit-testable.
 //
+// W6-F1: also resolves the System 1 *provider* (`SYSTEM1_PROVIDERS`: local
+// `laya`, hosted `jev` via TypeSafe, or `jev-then-laya`) and the Jev model/API
+// key, and exposes `publicDecisionConfig` so no route ever returns the raw key.
+//
 // W6-F1: the engine also supports a GPU `variant` — `rocm` (default, today's
 // gfx1151 device passthrough) or `cuda` (nvidia-ctk CDI `--device
 // nvidia.com/gpu=<n>` passthrough, no built-in ROCm/HSA flags) — and an
@@ -64,7 +68,13 @@ export const DECISION_DEFAULTS = Object.freeze({
   peers: [],
   peerHealthTtlMs: 10_000,
   forwardTimeoutMs: 15_000,
+  provider: 'laya', // SYSTEM1_PROVIDERS — who answers System 1 questions
+  jevModel: 'jev-latest', // model sent to TypeSafe for Jev
+  jevApiKey: '', // secret; never returned by any route (see publicDecisionConfig)
 });
+
+/** System 1 providers: local Laya, hosted Jev (TypeSafe), or Jev with Laya fallback. */
+export const SYSTEM1_PROVIDERS = Object.freeze(['laya', 'jev', 'jev-then-laya']);
 
 /**
  * True when an image reference cannot drift: a repo digest (`…@sha256:<64 hex>`)
@@ -101,6 +111,7 @@ export function resolveDecisionConfig(config = {}, env = {}) {
   d.port = Number(d.port);
   d.variant = d.variant === 'cuda' ? 'cuda' : 'rocm';
   d.gpus = Array.isArray(d.gpus) ? d.gpus.map(String) : [];
+  d.provider = SYSTEM1_PROVIDERS.includes(d.provider) ? d.provider : 'laya';
   if (raw.image !== undefined && raw.imageRocm === undefined) d.imageRocm = raw.image;
   // cuda carries no built-in device/HSA flags (those are rocm-only); only an
   // explicit operator override applies unless one was given.
@@ -199,6 +210,17 @@ export function resolveForwardModel(model, cfg) {
  */
 export function pickDecisionPatch(body) {
   return Object.fromEntries(Object.entries(body || {}).filter(([k]) => Object.hasOwn(DECISION_DEFAULTS, k)));
+}
+
+/**
+ * The decision config safe to return over HTTP: the Jev API key is replaced
+ * by a boolean saying whether one is set.
+ * @param {object} cfg resolveDecisionConfig(...) result (or any object with jevApiKey)
+ * @returns {object} cfg without jevApiKey, plus jevApiKeySet
+ */
+export function publicDecisionConfig(cfg) {
+  const { jevApiKey, ...rest } = cfg || {};
+  return { ...rest, jevApiKeySet: Boolean(jevApiKey) };
 }
 
 /**

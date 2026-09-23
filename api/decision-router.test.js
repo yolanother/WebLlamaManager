@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDecisionRouter } from './decision-router.js';
 import { resolveDecisionConfig } from './decision.js';
+import { JEV_API_URL } from './system1.js';
 
 const PINNED = `sha256:${'c'.repeat(64)}`;
 
@@ -46,7 +47,7 @@ function harness(overrides = {}) {
     isLoopback: (req) => req.socket?.remoteAddress === '127.0.0.1',
     fleetPeers: overrides.fleetPeers,
   });
-  return { routes, state };
+  return { routes, state, router };
 }
 
 /** Invoke a recorded handler with a fake req/res; resolves to the res. */
@@ -271,4 +272,72 @@ test('alias: a name-only peer resolves through fleetPeers', async () => {
   });
   const res = await invoke(routes, 'POST /v1/systemone', { body: Q });
   assert.equal(res.headers['x-laya-host'], 'drakemore');
+});
+
+// W6-F1: System 1 providers (laya | jev | jev-then-laya) and Jev key masking.
+test('config: response masks jevApiKey with jevApiKeySet', async () => {
+  const { routes } = harness();
+  const res = await invoke(routes, 'POST /api/decision/config', { body: { jevApiKey: 'sekret' } });
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.decision.jevApiKeySet, true);
+  assert.equal('jevApiKey' in res.body.decision, false);
+  assert.ok(!JSON.stringify(res.body).includes('sekret'));
+});
+
+test('status: reports provider, jevModel, jevApiKeySet and never the key', async () => {
+  const { routes } = harness({ state: { decision: { enabled: true, image: PINNED, port: 5254, jevApiKey: 'sekret2' } } });
+  const res = await invoke(routes, 'GET /api/decision/status');
+  assert.equal(res.body.provider, 'laya');
+  assert.equal(res.body.jevModel, 'jev-latest');
+  assert.equal(res.body.jevApiKeySet, true);
+  assert.ok(!JSON.stringify(res.body).includes('sekret2'));
+});
+
+test("provider jev: forwards to TypeSafe with cfg.jevModel and tags host 'typesafe'", async () => {
+  const { routes, state } = harness({ state: { decision: { enabled: true, image: PINNED, port: 5254, provider: 'jev', jevApiKey: 'k', jevModel: 'jev-latest' } } });
+  const res = await invoke(routes, 'POST /v1/systemone', { body: { model: 'laya', state: 'INV-1', questions: Q.questions } });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers['x-laya-host'], 'typesafe');
+  assert.equal(res.body.host, 'typesafe');
+  const call = state.fetches.find((c) => c.url === JEV_API_URL);
+  assert.ok(call, 'expected a call to JEV_API_URL');
+  assert.equal(JSON.parse(call.init.body).model, 'jev-latest');
+});
+
+test('provider jev: a jev-1.13.0 request model is forwarded unchanged', async () => {
+  const { routes, state } = harness({ state: { decision: { enabled: true, image: PINNED, port: 5254, provider: 'jev', jevApiKey: 'k', jevModel: 'jev-latest' } } });
+  await invoke(routes, 'POST /v1/systemone', { body: { model: 'jev-1.13.0', state: 'INV-1', questions: Q.questions } });
+  const call = state.fetches.find((c) => c.url === JEV_API_URL);
+  assert.equal(JSON.parse(call.init.body).model, 'jev-1.13.0');
+});
+
+test('provider jev-then-laya: jev 529 falls through to local laya (supervisor started)', async () => {
+  const fetchImpl = async (url) => {
+    if (url === JEV_API_URL) return { status: 529, ok: false, json: async () => ({ error: 'overloaded' }) };
+    return new Response(JSON.stringify({ model: 'laya-typed-decisions', answers: {}, usage: { input_tokens: 1, output_tokens: 0 } }), { status: 200 });
+  };
+  const { routes, state } = harness({ state: { decision: { enabled: true, image: PINNED, port: 5254, provider: 'jev-then-laya', jevApiKey: 'k', jevModel: 'jev-latest' } }, fetchImpl });
+  const res = await invoke(routes, 'POST /v1/systemone', { body: { model: 'laya', state: 'INV-1', questions: Q.questions } });
+  assert.equal(res.statusCode, 200);
+  assert.equal(state.starts, 1);
+});
+
+test('askLaya: refresh:false returns without awaiting peer health (within 200ms)', async () => {
+  const fetchImpl = async (url) => {
+    if (url === 'http://d:3001/api/decision/status') return new Promise(() => {}); // never resolves
+    throw new Error(`unexpected ${url}`);
+  };
+  const { router } = harness({ state: WITH_PEER, fetchImpl });
+  const result = await Promise.race([
+    router.askLaya(Q, { refresh: false, allowColdStart: false }),
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 200)),
+  ]);
+  assert.equal(result, null);
+});
+
+test('askLaya: allowColdStart:false with a stopped local engine returns null without starting it', async () => {
+  const { router, state } = harness();
+  const result = await router.askLaya(Q, { allowColdStart: false });
+  assert.equal(result, null);
+  assert.equal(state.starts, 0);
 });

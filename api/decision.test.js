@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   DECISION_DEFAULTS, DECISION_CONTAINER_NAME, resolveDecisionConfig, isPinnedImage,
   podmanRunArgs, isDecisionModel, pickDecisionPatch, resolveForwardModel, resolvePeers, planDecisionRoute, peerOffersDecision, advertisedEngines,
+  publicDecisionConfig,
 } from './decision.js';
 
 const DIGEST = 'a'.repeat(64);
@@ -269,4 +270,27 @@ test('advertisedEngines: appends system_one only when the engine is runnable', (
   assert.deepEqual(advertisedEngines(['llama', 'ds4'], on), ['llama', 'ds4', 'system_one']);
   assert.deepEqual(advertisedEngines(['llama'], resolveDecisionConfig({}, {})), ['llama']);
   assert.deepEqual(advertisedEngines(['llama'], resolveDecisionConfig({ decision: { enabled: true, image: 'x:latest' } }, {})), ['llama']);
+});
+
+// W6-F1 System 1 providers: laya (local), jev (hosted TypeSafe), jev-then-laya.
+test('decision defaults: provider laya, jevModel jev-latest, no key', () => {
+  const cfg = resolveDecisionConfig({}, {});
+  assert.equal(cfg.provider, 'laya');
+  assert.equal(cfg.jevModel, 'jev-latest');
+  assert.equal(cfg.jevApiKey, '');
+});
+
+test('resolveDecisionConfig normalizes an unknown provider to laya', () => {
+  assert.equal(resolveDecisionConfig({ decision: { provider: 'gpt' } }, {}).provider, 'laya');
+  assert.equal(resolveDecisionConfig({ decision: { provider: 'jev-then-laya' } }, {}).provider, 'jev-then-laya');
+});
+
+test('pickDecisionPatch accepts provider, jevModel, jevApiKey', () => {
+  assert.deepEqual(pickDecisionPatch({ provider: 'jev', jevModel: 'jev-1.13.0', jevApiKey: 'k', nope: 1 }),
+    { provider: 'jev', jevModel: 'jev-1.13.0', jevApiKey: 'k' });
+});
+
+test('publicDecisionConfig drops the key and reports whether it is set', () => {
+  assert.deepEqual(publicDecisionConfig({ a: 1, jevApiKey: 'secret' }), { a: 1, jevApiKeySet: true });
+  assert.deepEqual(publicDecisionConfig({ a: 1, jevApiKey: '' }), { a: 1, jevApiKeySet: false });
 });

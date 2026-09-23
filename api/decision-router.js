@@ -10,17 +10,23 @@
 // the first non-5xx answer verbatim with an `x-laya-host` header AND a `host`
 // field in the JSON body (A7: node-proxy drops headers) naming the node that
 // served it; when nothing can serve, 503 {error:"no_decision_host", host}.
+// When `config.decision.provider` is `jev` or `jev-then-laya`, the request is
+// forwarded to TypeSafe's hosted Jev API first (host `typesafe`); a
+// `jev-then-laya` request that fails there falls through to the local Laya
+// walk. `askLaya` (the peer/local walk) is exported on the router so
+// api/system1.js's askSystem1 can drive it directly for smart-alias routing.
 // Also serves GET /api/decision/status (config, supervisor state, peer
-// health), POST /api/decision/start|stop for the dashboard card, and a
-// loopback-only POST /api/decision/config that persists whitelisted
-// `decision` keys (used by the dashboard card's ROCm/CUDA + GPU controls). All
-// collaborators are injected for route tests.
+// health, provider/jevModel/jevApiKeySet), POST /api/decision/start|stop for
+// the dashboard card, and a loopback-only POST /api/decision/config that
+// persists whitelisted `decision` keys and never echoes the raw Jev key back
+// (see publicDecisionConfig). All collaborators are injected for route tests.
 
 import { createRequire } from 'node:module';
 import {
   LAYA_HOST_HEADER, LAYA_HOP_HEADER, isDecisionModel, pickDecisionPatch, resolveForwardModel,
-  resolvePeers, planDecisionRoute,
+  resolvePeers, planDecisionRoute, publicDecisionConfig,
 } from './decision.js';
+import { callJev } from './system1.js';
 
 // Load the server's existing dependency only when a router is actually built,
 // keeping pure-helper tests runnable before npm dependencies are installed
@@ -84,10 +90,10 @@ export function createDecisionRouter({
   }
 
   /** Ordered targets: configured peers (unless forwarded) → local (memory guard) → none. */
-  async function planTargets(req, cfg) {
-    const forwarded = Boolean(req.headers?.[LAYA_HOP_HEADER]);
+  async function planTargets(forwarded, cfg, { refresh = true } = {}) {
     const peers = forwarded ? [] : resolvePeers(cfg.peers, fleetPeers());
-    await Promise.all(peers.map((p) => refreshPeer(p.url, cfg)));
+    const probing = Promise.all(peers.map((p) => refreshPeer(p.url, cfg)));
+    if (refresh) await probing; else probing.catch(() => {});
     const local = supervisor.status();
     return planDecisionRoute({
       peers,
@@ -98,14 +104,14 @@ export function createDecisionRouter({
   }
 
   /** Forward to the local container, starting it lazily. */
-  async function callLocal(body, cfg) {
+  async function callLocal(body, cfg, timeoutMs) {
     await supervisor.ensureStarted();
     try {
       const r = await fetchImpl(`http://127.0.0.1:${cfg.port}/v1/systemone`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(cfg.forwardTimeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       return { status: r.status, body: await readBody(r), host: nodeName() };
     } finally {
@@ -114,22 +120,60 @@ export function createDecisionRouter({
   }
 
   /** Forward to a peer llama-manager's proxy, marking the hop to prevent loops. */
-  async function callPeer(target, body, cfg) {
+  async function callPeer(target, body, cfg, timeoutMs) {
     const r = await fetchImpl(`${target.url}/api/v1/systemone`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', [LAYA_HOP_HEADER]: nodeName() },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(cfg.forwardTimeoutMs),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     return { status: r.status, body: await readBody(r), host: r.headers.get(LAYA_HOST_HEADER) || target.name };
   }
 
   /** Call one planned target. */
-  const callTarget = (target, body, cfg) => (target.kind === 'peer' ? callPeer(target, body, cfg) : callLocal(body, cfg));
+  const callTarget = (target, body, cfg, timeoutMs) => (target.kind === 'peer' ? callPeer(target, body, cfg, timeoutMs) : callLocal(body, cfg, timeoutMs));
 
   /** A failed peer is unavailable until its cache entry ages out. */
   function markDown(target) {
     if (target.kind === 'peer') peerHealth.set(target.url, { available: false, checkedAt: now() });
+  }
+
+  /**
+   * Walk the Laya targets (peers, then local) for one Jev-wire body.
+   * @param {object} body request body (model rewritten to the loaded checkpoint)
+   * @param {{forwarded?:boolean, allowColdStart?:boolean, refresh?:boolean, timeoutMs?:number}} [opts]
+   *   allowColdStart:false skips a local engine that is not already running;
+   *   refresh:false plans on cached peer health and refreshes it in the background.
+   * @returns {Promise<{status:number, body:object, host:string}|null>} first non-5xx answer, or null
+   */
+  async function askLaya(body, { forwarded = false, allowColdStart = true, refresh = true, timeoutMs } = {}) {
+    const cfg = getConfig();
+    const running = supervisor.status().running;
+    const targets = (await planTargets(forwarded, cfg, { refresh }))
+      .filter((t) => allowColdStart || t.kind === 'peer' || running);
+    const forwardBody = { ...body, model: resolveForwardModel(body.model, cfg) };
+    for (const target of targets) {
+      try {
+        const r = await callTarget(target, forwardBody, cfg, timeoutMs ?? cfg.forwardTimeoutMs);
+        if (r.status >= 500) { markDown(target); continue; }
+        return r;
+      } catch {
+        markDown(target);
+      }
+    }
+    return null;
+  }
+
+  /** Answer a proxy request from TypeSafe; null when the caller should fall through to Laya. */
+  async function viaJev(req, cfg, fallThrough) {
+    const model = /^jev-/.test(req.body?.model || '') ? req.body.model : cfg.jevModel;
+    try {
+      const r = await callJev({ ...req.body, model }, { fetchImpl, jevApiKey: cfg.jevApiKey, timeoutMs: cfg.forwardTimeoutMs });
+      if (r.status < 400 || !fallThrough) return { ...r, host: 'typesafe' };
+    } catch (err) {
+      if (!fallThrough) return { status: 502, body: { error: err.code || 'jev_unreachable' }, host: 'typesafe' };
+    }
+    return null;
   }
 
   /** POST /v1/systemone handler. */
@@ -139,18 +183,14 @@ export function createDecisionRouter({
     res.set(LAYA_HOST_HEADER, host);
     const model = req.body?.model;
     if (!isDecisionModel(model)) return res.status(400).json({ error: 'unsupported_model', model, host });
-    const forwardBody = { ...req.body, model: resolveForwardModel(model, cfg) };
-    for (const target of await planTargets(req, cfg)) {
-      try {
-        const r = await callTarget(target, forwardBody, cfg);
-        if (r.status >= 500) { markDown(target); continue; }
-        res.set(LAYA_HOST_HEADER, r.host);
-        return res.status(r.status).json({ ...r.body, host: r.host });
-      } catch {
-        markDown(target);
-      }
+    if (cfg.provider !== 'laya') {
+      const j = await viaJev(req, cfg, cfg.provider === 'jev-then-laya');
+      if (j) { res.set(LAYA_HOST_HEADER, j.host); return res.status(j.status).json({ ...j.body, host: j.host }); }
     }
-    return res.status(503).json({ error: 'no_decision_host', host });
+    const r = await askLaya(req.body, { forwarded: Boolean(req.headers?.[LAYA_HOP_HEADER]) });
+    if (!r) return res.status(503).json({ error: 'no_decision_host', host });
+    res.set(LAYA_HOST_HEADER, r.host);
+    return res.status(r.status).json({ ...r.body, host: r.host });
   }
 
   router.post('/v1/systemone', handleSystemOne);
@@ -172,6 +212,9 @@ export function createDecisionRouter({
       gpus: cfg.gpus,
       port: cfg.port,
       idleTimeoutSec: cfg.idleTimeoutSec,
+      provider: cfg.provider,
+      jevModel: cfg.jevModel,
+      jevApiKeySet: Boolean(cfg.jevApiKey),
       ...supervisor.status(),
       peers: [...peerHealth].map(([url, h]) => ({ url, ...h })),
     });
@@ -194,8 +237,10 @@ export function createDecisionRouter({
   router.post('/api/decision/config', (req, res) => {
     if (!isLoopback(req)) return res.status(403).json({ error: 'decision config may only be changed from this machine', code: 'NOT_LOOPBACK' });
     updateConfig(pickDecisionPatch(req.body));
-    return res.json({ ok: true, decision: getConfig() });
+    return res.json({ ok: true, decision: publicDecisionConfig(getConfig()) });
   });
+
+  router.askLaya = askLaya;
 
   return router;
 }
