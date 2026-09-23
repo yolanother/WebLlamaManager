@@ -19,7 +19,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  RESERVED_ALIAS_NAMES, BIG_ALIAS, SMALL_ALIAS,
+  RESERVED_ALIAS_NAMES, BIG_ALIAS, SMALL_ALIAS, SMART_DOMAINS,
   expandGlob, resolveAliasCandidates, partitionByWarmth, validateAlias, aliasListEntries
 } from './model-aliases.js';
 
@@ -587,4 +587,58 @@ test('aliasListEntries: a null or absent alias table yields no rows', () => {
   assert.deepEqual(aliasListEntries({}, 1000), []);
   assert.deepEqual(aliasListEntries({ presets: PRESETS, aliases: null }, 1000), []);
   assert.deepEqual(aliasListEntries({ presets: PRESETS, aliases: {} }, 1000), []);
+});
+
+test('SMART_DOMAINS is the six laya router domains', () => {
+  assert.deepEqual(SMART_DOMAINS, ['code', 'math_or_logic', 'writing', 'factual_lookup', 'data_analysis', 'chitchat']);
+});
+
+test('validateAlias: smart alias keeps type, system1, domain, sizeB', () => {
+  const r = validateAlias({}, 'smart', [
+    { host: 'local', model: 'a' },
+    { host: 'local', model: 'b', domain: 'code', sizeB: '30' },
+  ], [], { type: 'smart', system1: 'jev' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.value, {
+    type: 'smart', system1: 'jev',
+    targets: [{ host: 'local', model: 'a' }, { host: 'local', model: 'b', domain: 'code', sizeB: 30 }],
+  });
+});
+
+test('validateAlias: failover alias value is unchanged by the new parameter', () => {
+  const r = validateAlias({}, 'x', [{ host: 'local', model: 'a' }]);
+  assert.deepEqual(r.value, { targets: [{ host: 'local', model: 'a' }] });
+});
+
+test('validateAlias rejects smart-only fields on failover aliases and bad values', () => {
+  const bad = (targets, group) => validateAlias({}, 'x', targets, [], group);
+  assert.equal(bad([{ host: 'local', model: 'a', domain: 'code' }], {}).ok, false);
+  assert.equal(bad([{ host: 'local', model: 'a', sizeB: 3 }], {}).ok, false);
+  assert.equal(bad([{ host: 'local', model: 'a' }], { system1: 'jev' }).ok, false);
+  assert.equal(bad([{ host: 'local', model: 'a' }], { type: 'clever' }).ok, false);
+  assert.equal(bad([{ host: 'local', model: 'a', domain: 'poetry' }], { type: 'smart' }).ok, false);
+  assert.equal(bad([{ host: 'local', model: 'a', sizeB: -1 }], { type: 'smart' }).ok, false);
+  assert.equal(bad([{ host: 'local', model: 'a', sizeB: 'x' }], { type: 'smart' }).ok, false);
+  assert.equal(bad([{ host: 'local', model: 'a' }], { type: 'smart', system1: 'gpt' }).ok, false);
+  assert.equal(bad([], { type: 'smart' }).ok, false);
+});
+
+test('validateAlias treats blank domain/sizeB as unset', () => {
+  const r = validateAlias({}, 's', [{ host: 'local', model: 'a', domain: '', sizeB: '' }], [], { type: 'smart' });
+  assert.deepEqual(r.value.targets, [{ host: 'local', model: 'a' }]);
+});
+
+test('validateAlias treats blank system1 as unset', () => {
+  const r = validateAlias({}, 's', [{ host: 'local', model: 'a' }], [], { type: 'smart', system1: '' });
+  assert.equal(r.ok, true);
+  assert.equal(r.value.system1, undefined);
+});
+
+test('aliasListEntries marks smart aliases', () => {
+  const rows = aliasListEntries({ aliases: {
+    s: { type: 'smart', targets: [{ host: 'local', model: 'a', domain: 'code' }] },
+    f: { targets: [{ host: 'local', model: 'b' }] },
+  } }, 1);
+  assert.equal(rows.find(r => r.id === 's').owned_by, 'smart-alias');
+  assert.equal(rows.find(r => r.id === 'f').owned_by, 'llamacpp');
 });

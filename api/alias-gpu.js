@@ -33,7 +33,7 @@
  * less than what was written, with nothing said about it.
  * @type {ReadonlyArray<string>}
  */
-export const ALIAS_GROUP_KEYS = ['targets', 'gpu', 'gpuPriority'];
+export const ALIAS_GROUP_KEYS = ['targets', 'gpu', 'gpuPriority', 'type', 'system1'];
 
 /** Host sentinel meaning "this manager". Mirrors api/model-aliases.js. */
 const LOCAL_HOST = 'local';

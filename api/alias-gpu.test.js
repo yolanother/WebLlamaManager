@@ -131,9 +131,9 @@ test('a priority with no pool is rejected rather than silently ignored', () => {
 test('an unknown key throws rather than being dropped', () => {
   assert.throws(
     () => normalizeAliasGpu('a', { targets: [], gpuPool: 'rtx3090' }, POOL_IDS),
-    /alias "a".*unknown key "gpuPool".*targets, gpu, gpuPriority/s,
+    /alias "a".*unknown key "gpuPool".*targets, gpu, gpuPriority, type, system1/s,
   );
-  assert.deepEqual(ALIAS_GROUP_KEYS, ['targets', 'gpu', 'gpuPriority']);
+  assert.deepEqual(ALIAS_GROUP_KEYS, ['targets', 'gpu', 'gpuPriority', 'type', 'system1']);
 });
 
 test('a non-object alias group throws', () => {
@@ -333,4 +333,9 @@ test('a pin whose pool has left the plan is released, not left holding the card'
   const body = SERVER.slice(start, SERVER.indexOf('\n}\n', start));
   assert.match(body, /gpuPinReservations\)\s*\{[\s\S]*gpuReservations\.release/);
   assert.match(body, /gpuPinReservations\.delete/);
+});
+
+test('ALIAS_GROUP_KEYS admits type and system1', () => {
+  assert.ok(ALIAS_GROUP_KEYS.includes('type'));
+  assert.ok(ALIAS_GROUP_KEYS.includes('system1'));
 });

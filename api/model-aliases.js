@@ -17,6 +17,7 @@
 // classifier. That is what makes routing unit-testable, mirroring `api/resource-guard.js`.
 
 import { isDs4Preset } from './engines.js';
+import { SYSTEM1_PROVIDERS } from './decision.js';
 
 /** Names owned by the chat-router classifier; never valid alias names. */
 export const RESERVED_ALIAS_NAMES = ['auto', 'default-router'];
@@ -26,6 +27,9 @@ export const BIG_ALIAS = 'default-big';
 
 /** Alias resolving to the operator's preferred small model. */
 export const SMALL_ALIAS = 'default-small';
+
+/** Laya router-question domains a smart alias target may be tagged with. */
+export const SMART_DOMAINS = Object.freeze(['code', 'math_or_logic', 'writing', 'factual_lookup', 'data_analysis', 'chitchat']);
 
 /**
  * @typedef {{host: string, model: string}} AliasTarget
@@ -259,6 +263,10 @@ export function partitionByWarmth(candidates, inventory) {
  * alias shadows the real model, since alias resolution runs first), and a target naming a
  * host that is neither 'local' nor a configured backend id.
  *
+ * For smart aliases (group.type === 'smart'), validates `system1` against SYSTEM1_PROVIDERS,
+ * and per-target `domain` and `sizeB` fields against SMART_DOMAINS and positive number constraint.
+ * Blank `domain`, `sizeB`, and `system1` values are treated as unset.
+ *
  * The known-local-model list comes from the `localModels` argument, falling back to
  * `config.localModels`. Callers MUST pass it explicitly (the server's `scanLocalModels()`
  * names): local models are scanned at runtime and are not a field on the persisted config,
@@ -266,12 +274,14 @@ export function partitionByWarmth(candidates, inventory) {
  *
  * @param {{presets?: Object<string, object>, backends?: {directory?: Array<{id?: string}>}, localModels?: Array<string|object>}|null|undefined} config server config
  * @param {*} name the proposed alias name
- * @param {*} targets the proposed target list
+ * @param {*} targets the proposed target list with optional smart-alias fields (domain, sizeB)
  * @param {Array<string|object>} [localModels] known local model names, bare or scanned records
- * @returns {{ok: true, value: AliasGroup, warnings: string[]}|{ok: false, error: string}}
- *   on success `value.targets` are trimmed and normalized to `{host, model}` only.
+ * @param {{type?: string, system1?: string}} [group] alias-level fields: type ('smart') and system1 provider
+ * @returns {{ok: true, value: {targets, type?, system1?}, warnings: string[]}|{ok: false, error: string}}
+ *   on success for failover aliases: `value = {targets: [...]}` with targets normalized to `{host, model}` only.
+ *   on success for smart aliases: `value = {type: 'smart', system1?, targets: [...]}` where targets keep `domain` and `sizeB` fields if present.
  */
-export function validateAlias(config, name, targets, localModels = []) {
+export function validateAlias(config, name, targets, localModels = [], group = {}) {
   if (typeof name !== 'string') return { ok: false, error: 'alias name must be a string' };
   const alias = name.trim();
   if (!alias) return { ok: false, error: 'alias name must not be blank' };
@@ -280,6 +290,15 @@ export function validateAlias(config, name, targets, localModels = []) {
   }
   if (!Array.isArray(targets) || targets.length === 0) {
     return { ok: false, error: `alias '${alias}' must have at least one target` };
+  }
+
+  const type = group?.type ?? null;
+  if (type !== null && type !== 'smart') return { ok: false, error: `unknown alias type '${type}'; the only type is 'smart'` };
+  const smart = type === 'smart';
+  const system1 = group?.system1 == null || group.system1 === '' ? null : group.system1;
+  if (system1 !== null && !smart) return { ok: false, error: 'system1 applies only to smart aliases' };
+  if (system1 !== null && !SYSTEM1_PROVIDERS.includes(system1)) {
+    return { ok: false, error: `system1 must be one of ${SYSTEM1_PROVIDERS.join(', ')}` };
   }
 
   const normalized = [];
@@ -295,7 +314,20 @@ export function validateAlias(config, name, targets, localModels = []) {
     const key = `${host}\u0000${model}`;
     if (seen.has(key)) return { ok: false, error: `duplicate target '${host}' / '${model}'` };
     seen.add(key);
-    normalized.push({ host, model });
+
+    const extra = {};
+    if (target.domain != null && target.domain !== '') {
+      if (!smart) return { ok: false, error: 'domain applies only to smart aliases' };
+      if (!SMART_DOMAINS.includes(target.domain)) return { ok: false, error: `domain must be one of ${SMART_DOMAINS.join(', ')}` };
+      extra.domain = target.domain;
+    }
+    if (target.sizeB != null && target.sizeB !== '') {
+      if (!smart) return { ok: false, error: 'sizeB applies only to smart aliases' };
+      const n = Number(target.sizeB);
+      if (!Number.isFinite(n) || n <= 0) return { ok: false, error: 'sizeB must be a positive number of billions of parameters' };
+      extra.sizeB = n;
+    }
+    normalized.push({ host, model, ...extra });
   }
 
   const warnings = [];
@@ -316,7 +348,10 @@ export function validateAlias(config, name, targets, localModels = []) {
     }
   }
 
-  return { ok: true, value: { targets: normalized }, warnings };
+  const value = smart
+    ? { type: 'smart', ...(system1 ? { system1 } : {}), targets: normalized }
+    : { targets: normalized };
+  return { ok: true, value, warnings };
 }
 
 /**
@@ -381,7 +416,7 @@ export function aliasListEntries(config, nowSeconds, contextByModelId = null) {
       id: name,
       object: 'model',
       created: nowSeconds,
-      owned_by: 'llamacpp',
+      owned_by: aliases[name]?.type === 'smart' ? 'smart-alias' : 'llamacpp',
       meta: null,
       n_ctx: smallestTargetContext(targets, contextByModelId),
       displayName: name,
