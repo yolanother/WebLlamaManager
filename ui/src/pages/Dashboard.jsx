@@ -190,7 +190,7 @@ function DecisionGpuControls() {
         onBlur={() => { if (jevApiKey.trim()) submitProvider({}); }}
       />
       {provider !== 'laya' && (
-        <small>Jev sends the start of each prompt to TypeSafe (api.typesafe.ai).</small>
+        <small>Jev sends your latest message (up to 4,000 characters) to TypeSafe (api.typesafe.ai).</small>
       )}
     </div>
   );

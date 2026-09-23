@@ -227,8 +227,9 @@ see [laya.md](laya.md#relevance-to-routing--smart-alias).
 hosted Jev directly (see "How llama-manager uses it today" above) — it is an
 explicit operator opt-in, not the default. Choosing it adds a paid external
 dependency and network latency (about 250 ms p50, third-party) to every
-request, and sends the start of each prompt off-box to TypeSafe; the Dashboard
-surfaces that as a privacy note. `laya` remains the default provider, where
+request, and sends your latest message (up to 4,000 characters) off-box to
+TypeSafe; the Dashboard surfaces that as a privacy note. `laya` remains the
+default provider, where
 Jev is relevant only as the API contract Laya imitates.
 
 ## Sources

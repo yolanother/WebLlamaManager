@@ -99,9 +99,16 @@ A smart alias never blocks a request on System 1. Every leg — a cold local
 engine, a missing Jev key, a timeout, a non-2xx response, or a bad answer shape —
 is treated the same way: serve **`targets[0]`** (the alias's first/fallback
 candidate) and fire a **background** warm-up of Laya (not awaited, and skipped
-for a Jev-only provider or under low free memory). System 1 gets a **1 second**
-budget per request; `jev-then-laya` gives *each* leg its own full second, so the
-worst case for that provider is 2 seconds before falling back.
+for a Jev-only provider or under low free memory). System 1 gets a single **1
+second budget for the whole request** — including `jev-then-laya`, which walks
+jev then laya (and laya's own peers-then-local walk) inside that one shared
+budget rather than giving each leg its own full second — so no smart-alias
+request waits on System 1 for longer than 1 second before falling back.
+
+If the pick System 1 makes is a REMOTE candidate and the routing layer then
+declines it (backends routing disabled, `offloadPolicy: 'manual'`, or no
+viable remote), the request falls back to the alias's first LOCAL candidate,
+never to loading the alias's own name as if it were a model.
 
 A cold Laya container therefore never delays the answer: the first request or
 two after Laya has been idle falls back while it warms up, and once it is warm
@@ -126,10 +133,12 @@ key is write-only: the field is always blank, shows `key set — type to replace
 once one exists, and is never echoed back by any read. **The key input, and the
 provider controls in general, are loopback-only** — `POST /api/decision/config`
 only accepts changes from a request originating on this machine, so they cannot
-be set from a browser on another host. When the provider is anything but
-`laya`, the UI shows the privacy note:
+be set from a browser on another host. The key is also stripped from
+`GET`/`POST /api/config` and `POST /api/settings` — those return
+`decision.jevApiKeySet` (a boolean) in its place, never the raw key. When the
+provider is anything but `laya`, the UI shows the privacy note:
 
-> Jev sends the start of each prompt to TypeSafe (api.typesafe.ai).
+> Jev sends your latest message (up to 4,000 characters) to TypeSafe (api.typesafe.ai).
 
 ## Headers
 
@@ -182,6 +191,10 @@ to the single candidate System 1 picked, unchanged.
   `8x7B`, where the intended total is 56B, not the 7 the regex would find as
   its largest bare match (`8` has no unit suffix, so `7` wins). Set `sizeB`
   explicitly for any candidate whose name reads wrong.
+- **With `provider: 'jev'`, `/v1/systemone` on this box lets any LAN caller
+  spend the configured TypeSafe key** — the box has no API auth in front of
+  that route, so a request from anywhere on the local network can trigger a
+  paid, off-box call billed to the operator's Jev API key.
 
 ## Links
 
