@@ -160,6 +160,9 @@ test('status: reports config, supervisor state, availability and node', async ()
   assert.equal(res.body.running, false);
   assert.deepEqual(res.body.peers, []);
   assert.equal(res.headers['x-laya-host'], 'frostburn');
+  // The dashboard GPU controls seed themselves from these.
+  assert.equal(res.body.variant, 'rocm');
+  assert.deepEqual(res.body.gpus, []);
 });
 
 test('config: off-box callers get 403; loopback persists only known keys', async () => {

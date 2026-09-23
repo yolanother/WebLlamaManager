@@ -168,6 +168,8 @@ export function createDecisionRouter({
       image: cfg.image,
       checkpoint: cfg.checkpoint,
       gpu: cfg.gpu,
+      variant: cfg.variant,
+      gpus: cfg.gpus,
       port: cfg.port,
       idleTimeoutSec: cfg.idleTimeoutSec,
       ...supervisor.status(),

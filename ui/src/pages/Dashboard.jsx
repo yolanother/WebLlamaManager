@@ -107,6 +107,13 @@ function ModelMetricTooltip({ active, payload, label, dataKey, unit = '', color 
 function DecisionGpuControls() {
   const [variant, setVariant] = useState('rocm');
   const [gpus, setGpus] = useState('');
+  // Seed from the saved config so a reload never shows (and then re-saves) defaults.
+  useEffect(() => {
+    fetch(`${API_BASE}/decision/status`).then((r) => r.json()).then((s) => {
+      if (s.variant) setVariant(s.variant);
+      if (Array.isArray(s.gpus)) setGpus(s.gpus.join(','));
+    }).catch(() => {});
+  }, []);
   const submit = (patch) => fetch(`${API_BASE}/decision/config`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
