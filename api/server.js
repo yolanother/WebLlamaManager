@@ -8353,6 +8353,15 @@ app.use(decisionRouter);
  * global provider) to classify the prompt, pick a candidate, stamp the
  * x-llama-smart-choice / x-llama-smart-reason headers, and return a
  * one-candidate AliasRouting for resolveRequestModel/resolveBackend.
+ *
+ * When the pick is remote, `localTarget` is still set to the alias's first LOCAL
+ * candidate (or null when it has none) — never to the alias NAME itself. Without
+ * this, a remote pick that resolveBackend later declines (backends disabled, an
+ * offloadPolicy of 'manual', or no viable remote) falls back to `resolveRequestModel`'s
+ * `?? rawModel` and asks the local engine to load the alias's own name as if it
+ * were a model, which can hang for the full load-attempt window (I2). `candidates`/
+ * `ranked`/`warm` still carry ONLY the remote pick, so the warm gate keeps offloading
+ * to it whenever it's viable — this only fixes what happens when it isn't.
  * @param {import('express').Request} req the request (body.model may be a smart alias)
  * @param {import('express').Response} res the response, for the headers
  * @param {'chat'|'completions'|'responses'|'messages'} endpoint body shape
@@ -8384,7 +8393,10 @@ async function smartRouting(req, res, endpoint) {
   addLog('backends', `smart alias '${name}' → ${candidate.host}/${candidate.model} (${reason})`);
   const one = [candidate];
   const { warm, cold } = partitionByWarmth(one, inventory);
-  return { name, candidates: one, warm, cold, ranked: one, localTarget: candidate.host === 'local' ? candidate.model : null };
+  const localTarget = candidate.host === 'local'
+    ? candidate.model
+    : resolveAliasCandidates(name, config, inventory).find(c => c.host === 'local')?.model ?? null;
+  return { name, candidates: one, warm, cold, ranked: one, localTarget };
 }
 
 // ── ds4-server supervisor (DeepSeek V4 Flash engine) ─────────────────────────

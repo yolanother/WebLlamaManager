@@ -81,6 +81,10 @@ seed_config() { node "$FIXTURES/seed-config.mjs" "$CFG"; }
 # Boot api/server.js against the disposable config and wait for it to listen.
 # Every mutable runtime path is redirected into $WORK so the run cannot touch
 # the checkout or the operator's real state. Returns non-zero if it never came up.
+# MODEL_LOAD_WAIT_MS is shrunk from server.js's 180s default: this env has no real
+# GGUF weights or llama-server binary, so a local-model-load wait can never
+# succeed anyway — shrinking it just makes that dead end fail fast instead of
+# eating a test's curl -m budget (see test_smart_alias's I2 fallback-to-local case).
 start_server() {
     printf '\n===== boot =====\n' >> "$SRV_LOG"
     AUTO_START=false \
@@ -94,6 +98,7 @@ start_server() {
     LLAMA_MANAGER_CONFIG_DIR="$WORK/etc" \
     LLAMA_MANAGER_DATA_DIR="$WORK/data" \
     LLAMA_MANAGER_CACHE_DIR="$WORK/cache" \
+    MODEL_LOAD_WAIT_MS=3000 \
         node "$REPO_ROOT/api/server.js" >> "$SRV_LOG" 2>&1 &
     SRV_PID=$!
     local i
@@ -235,6 +240,18 @@ assert_4xx() {
         *)  printf 'F' >> "$FAIL_FILE"
             printf '  FAIL %s\n       expected 4xx, got %s: %s\n' "$1" "$HTTP_CODE" "$(head -c 200 "$RESP" 2>/dev/null)" ;;
     esac
+}
+
+# Assert the last request did not curl-timeout. curl reports "000" for HTTP_CODE
+# when it gave up (hit -m) before the server answered at all; any real status —
+# even an error one — means the server itself decided, which is all I2 requires.
+# Args: description.
+assert_not_timeout() {
+    if [ "$HTTP_CODE" = "000" ]; then
+        assert_eq "$1" "not 000" "000"
+    else
+        assert_eq "$1" "not 000" "not 000"
+    fi
 }
 
 # ── tests ────────────────────────────────────────────────────────────────────
@@ -473,13 +490,40 @@ test_smart_alias() {
     req_h POST /v1/chat/completions '{"model":"smart-x","messages":[{"role":"user","content":"hi"}],"stream":false}'
     assert_has "chat: fallback reason header" "$(cat "$HDRS")" 'x-llama-smart-reason: fallback:'
     assert_has "chat: smart alias → remote candidate" "$(cat "$HDRS")" "x-llama-smart-choice: $DEAD/remote-9b"
+    assert_not_timeout "chat: dead remote answers with a real HTTP status, not a curl timeout"
 
     req_h POST /v1/messages '{"model":"smart-x","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}'
     assert_has "messages: smart choice header" "$(cat "$HDRS")" "x-llama-smart-choice: $DEAD/remote-9b"
+    assert_not_timeout "messages: dead remote answers with a real HTTP status, not a curl timeout"
 
     req POST /v1/embeddings '{"model":"smart-x","input":"hi"}'
     assert_eq "embeddings reject smart aliases" "400" "$HTTP_CODE"
     assert_has "embeddings error code" "$(cat "$RESP")" 'smart_alias_not_supported'
+
+    # I2: with backends routing DISABLED, the dead-remote pick is DECLINED by
+    # resolveBackend (not attempted), so routing must fall back to the alias's
+    # first LOCAL candidate ("$SMALL_TARGET") rather than asking the local engine
+    # to load the alias's own name ("smart-x") — the bug that could hang a request
+    # for the full model-load window. This sandbox has no real llama-server binary
+    # or GGUF weights, so once routing correctly falls to "local", the existing
+    # (pre-existing, out of scope here) local-serve retry/restart cascade genuinely
+    # cannot finish inside any reasonable client timeout — confirmed by letting it
+    # run past a short client-side timeout and inspecting server.log: the request
+    # never got past "Waiting ...s for model ... to finish loading" / a full router
+    # restart. So this checks the ROUTING DECISION itself (server.js logs the
+    # resolved requestedModel, not the raw alias name, at the top of the handler)
+    # rather than the eventual HTTP status, per this ticket's own guidance to report
+    # a local-fallback hang as evidence instead of inflating a timeout to hide it.
+    req POST /api/backends/routing '{"enabled":false}'
+    assert_2xx "disable remote routing for the declined-remote check"
+
+    curl -s -m 5 -o /dev/null -X POST -H 'content-type: application/json' \
+        -d '{"model":"smart-x","messages":[{"role":"user","content":"hi"}],"stream":false}' \
+        "http://127.0.0.1:$API_PORT/v1/chat/completions" >/dev/null 2>&1
+    assert_has "declined remote: falls back to the alias's local candidate, not its own name" \
+        "$(tail -n 20 "$SRV_LOG")" "[chat/completions] Request for model: $SMALL_TARGET"
+    assert_not_has "declined remote: never asks the engine to load the alias's own name" \
+        "$(tail -n 20 "$SRV_LOG")" "[chat/completions] Request for model: smart-x"
 
     stop_server
 }
