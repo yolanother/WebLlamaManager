@@ -40,7 +40,7 @@ test('askSystem1 laya passes allowColdStart:false and refresh:false', async () =
   let seen;
   await askSystem1(Q, 's', { provider: 'laya', timeoutMs: 700 }, { askLaya: async (body, o) => { seen = { body, o }; return { status: 200, body: { answers: {} } }; } });
   assert.deepEqual(seen.o, { timeoutMs: 700, allowColdStart: false, refresh: false });
-  assert.deepEqual(seen.body, { questions: Q, state: 's' });
+  assert.deepEqual(seen.body, { questions: Q, state: 's', model: 'laya' });
 });
 
 test('askSystem1 jev: missing key and HTTP errors throw with codes', async () => {

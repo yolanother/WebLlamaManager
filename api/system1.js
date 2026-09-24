@@ -42,11 +42,15 @@ export async function callJev(body, { fetchImpl, jevApiKey, jevModel, timeoutMs 
   return { status: r.status, body: json };
 }
 
-/** One provider leg: resolves with {answers, model} or throws a coded error. */
+/**
+ * One provider leg: resolves with {answers, model} or throws a coded error.
+ * For Laya, the body must include model: 'laya' so laya-server uses the loaded
+ * checkpoint; an omitted model routes to its unloaded English default and 422s.
+ */
 async function askOne(provider, body, timeoutMs, deps) {
   const r = provider === 'jev'
     ? await callJev(body, { ...deps, timeoutMs })
-    : await deps.askLaya(body, { timeoutMs, allowColdStart: false, refresh: false });
+    : await deps.askLaya({ ...body, model: 'laya' }, { timeoutMs, allowColdStart: false, refresh: false });
   if (!r) throw system1Error('no_decision_host');
   if (r.status !== 200) throw system1Error(`${provider}_${r.status}`);
   return { answers: r.body?.answers, model: r.body?.model };
