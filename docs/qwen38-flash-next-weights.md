@@ -33,6 +33,20 @@ selected first shard explicitly, so directory scanning cannot select a different
 quantization for one route. Duo planner availability uses the same selection;
 its Qwen3.6 worker requirements remain unchanged.
 
+In `api/engines.js`, `selectQwen38FlashNextWeights({ modelsDir, fileExists })`
+returns the selected first-shard path or `null`. It checks the presence of all
+three expected filenames through the supplied predicate; it does not inspect
+GGUF contents or verify checksums. The server's `duoWeightPaths()` supplies
+`existsSync` and shares that result between availability and preset generation.
+
+`qwen38FlashNextPresetSection()` and `podcastQwen38PresetSection()` each accept
+the optional `weightsPath` input. A selected path is authoritative; `null` omits
+the section. Omitting the input retains the earlier `weightsExist` gate, canonical
+directory discovery, and podcast IQ3 filename for existing helper callers. The
+manager passes the selector's result to both helpers, so its routes always use
+the shared selection rather than that compatibility behavior. These helpers do
+not access the filesystem themselves.
+
 The weight change preserves `load-mode=mmap`, `lazy-mode=on`, `cpu-moe=1`,
 `fit=off`, `parallel=1`, and thread selection from the physical core count.
 It also preserves GPU reservation priorities. Strix Halo remains the intended
@@ -97,8 +111,11 @@ those layers; it does not purge worker logs, images, containers, or volumes.
 
 ## Remaining verification and deployment
 
-The prepared route change still needs tests, review, and a signed APT deployment
-under the [package upgrade procedure](Utilities/package-installation.md).
+The integrated implementation at `d9b5eff` passed the API suite (1,635 tests),
+the UI suite (28 tests), and the production UI build. Fresh review and a signed
+APT deployment under the [package upgrade procedure](Utilities/package-installation.md)
+remain pending. The native verification commands are `node --test api/*.test.js`
+and, from `ui/`, `npm test` followed by `npm run build`.
 Verify the generated canonical and podcast presets both point to the first IQ4
 shard with their existing context and load settings. Route discovery can be
 checked without loading the 93.7 GB planner alongside active Qwen3.6 or claiming
