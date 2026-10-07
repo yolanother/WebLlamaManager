@@ -12,11 +12,15 @@
 // validate ds4 preset fields, resolve a ds4 GGUF model path under the dedicated
 // ds4 gguf dir, shape the OpenAI `/v1/models` entry/list for an active ds4
 // model, and build pure llama.cpp router preset descriptors for model-specific
-// speculative acceleration. It also decides whether silence is a true
+// speculative acceleration. It selects complete Flash-Next shard sets from a
+// caller-provided file predicate and shares the selected weights across routes.
+// It also decides whether silence is a true
 // generation stall or legitimate DS4 admission wait, and extracts the
 // progress-bearing text (including reasoning/thinking output) from
 // ds4-server's streamed chat and Responses deltas. Kept out of server.js so
 // these policies are unit-testable without booting the server.
+
+import { join } from 'node:path';
 
 /** Canonical engine type identifiers. */
 export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4', DECISION: 'decision' };
@@ -445,6 +449,26 @@ export function museGlimmerDflashPresetSection({ modelsDir, draftExists } = {}) 
 }
 
 /**
+ * Select the first shard of a complete installed Qwen3.8 Flash-Next weight set.
+ * Prefer UD-IQ4_XS, retaining UD-IQ3_XXS as a fallback when the replacement is
+ * absent or incomplete. The caller supplies filesystem checks so selection is
+ * testable without booting the manager or accessing its model directory.
+ * @param {{modelsDir:string, fileExists:function(string):boolean}} params Model
+ *   root and a predicate that confirms each shard is present.
+ * @returns {string|null} Selected first-shard path, or null if neither set is complete.
+ */
+export function selectQwen38FlashNextWeights({ modelsDir, fileExists }) {
+  for (const quantization of ['UD-IQ4_XS', 'UD-IQ3_XXS']) {
+    const shards = ['00001', '00002', '00003'].map((part) => join(
+      modelsDir, 'unsloth_Qwen3.8-Flash-Next-GGUF',
+      `Qwen3.8-Flash-Next-${quantization}-${part}-of-00003.gguf`
+    ));
+    if (shards.every(fileExists)) return shards[0];
+  }
+  return null;
+}
+
+/**
  * Build the models-preset section for the Qwen3.8-Flash-Next planner — the large
  * half of duo mode.
  *
@@ -460,7 +484,8 @@ export function museGlimmerDflashPresetSection({ modelsDir, draftExists } = {}) 
  * mmap, which is why `load-mode mmap` is set alongside it and why any mmap-disabling
  * flag on the router command line silently defeats the whole arrangement (the router
  * merges its own CLI args over every per-model preset). Together these are what make
- * an 82GB file runnable on a box that cannot hold it.
+ * the legacy 82GB UD-IQ3_XXS weights runnable on a box that cannot hold them.
+ * Those legacy observations do not establish the memory fit of UD-IQ4_XS.
  *
  * `cpu-moe` sends the 512-expert MoE weights (10 active per token) to the CPU side,
  * leaving the GPU holding only the tensors that run on every token. `fit off` stops
@@ -471,17 +496,20 @@ export function museGlimmerDflashPresetSection({ modelsDir, draftExists } = {}) 
  *
  * No filesystem access; the caller owns the weights-existence check.
  *
- * @param {{modelsDir:string, weightsExist:boolean, threads:number}} params Model root,
- *   caller-verified weight availability, and the PHYSICAL core count from the hardware
- *   profile (never the logical count — see hardware-profile.js).
+ * @param {{modelsDir:string, weightsExist:boolean, weightsPath?:string|null,
+ *   threads:number, contextSize?:number}} params Model root, caller-verified weight
+ *   availability, optional selected first-shard path (null omits the route), and the
+ *   PHYSICAL core count from the hardware profile (never the logical count — see
+ *   hardware-profile.js). Omitting weightsPath retains legacy caller behavior.
  * @returns {{name:string, options:Object<string,string>}|null} Section descriptor, or
  *   null when the weights are absent so the router serves its other models normally.
  */
-export function qwen38FlashNextPresetSection({ modelsDir, weightsExist, threads, contextSize } = {}) {
-  if (!weightsExist) return null;
+export function qwen38FlashNextPresetSection({ modelsDir, weightsExist, weightsPath, threads, contextSize } = {}) {
+  if (weightsPath === null || (weightsPath === undefined && !weightsExist)) return null;
   return {
     name: 'unsloth_Qwen3.8-Flash-Next-GGUF',
     options: {
+      ...(weightsPath === undefined ? {} : { 'model': weightsPath }),
       'load-mode': 'mmap',
       'lazy-mode': 'on',
       'cpu-moe': '1',
@@ -499,9 +527,11 @@ export function qwen38FlashNextPresetSection({ modelsDir, weightsExist, threads,
  * The context window Qwen3.8 Flash-Next was trained for, from its own GGUF metadata
  * (`qwen4exp.context_length`).
  *
- * Measured on drakemore before adopting it: loading at this size took the box from 25 GB
+ * Measured on drakemore with the legacy UD-IQ3_XXS weights before adopting it:
+ * loading at this size took the box from 25 GB
  * used to 85 GB with 38 GB still free, and the engine's /props reported n_ctx = 262144, so
- * the full window fits alongside the 77 GB of weights with real headroom.
+ * the full window fit alongside those 77 GB of weights with real headroom. This is
+ * legacy-quantization evidence, not a full-window memory measurement for UD-IQ4_XS.
  * @type {number}
  */
 export const QWEN38_FLASH_NEXT_CONTEXT = 262144;
@@ -1306,18 +1336,20 @@ export function globalContextPresetSection({ contextSize } = {}) {
  * make this architecture load at all: mmap plus lazy-mode stream the 51B n-gram
  * table from disk, and cpu-moe puts the experts CPU-side.
  *
- * @param {{modelsDir?: string, weightsExist?: boolean, threads?: number}} [params] Inputs.
+ * @param {{modelsDir?:string, weightsExist?:boolean, weightsPath?:string|null,
+ *   threads?:number}} [params] Inputs; weightsPath is the caller-verified selected
+ *   first shard, null omits the route, and omission retains legacy caller behavior.
  * @returns {{name: string, options: Record<string,string>}|null} Section, or null when
  *   the weights are absent.
  */
-export function podcastQwen38PresetSection({ modelsDir, weightsExist, threads } = {}) {
-  if (!weightsExist) return null;
+export function podcastQwen38PresetSection({ modelsDir, weightsExist, weightsPath, threads } = {}) {
+  if (weightsPath === null || (weightsPath === undefined && !weightsExist)) return null;
   return {
     name: 'podcast-qwen3.8-16k',
     options: {
       // Explicit: this entry does not correspond to a scanned directory, so the
       // router has no auto-detected --model for it.
-      'model': `${modelsDir}/unsloth_Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf`,
+      'model': weightsPath ?? `${modelsDir}/unsloth_Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf`,
       'ctx-size': '16384',
       'load-mode': 'mmap',
       'lazy-mode': 'on',

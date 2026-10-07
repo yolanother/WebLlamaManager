@@ -19,6 +19,8 @@
 // deadlines without re-enqueueing healthy work.
 // The same application is served on API_PORT and, best-effort, on the appliance
 // mirror port ALT_PORT (default 80) when the process is allowed to bind it.
+// Flash-Next availability and both planner routes share a complete installed
+// shard-set selection, preferring IQ4 weights with a legacy IQ3 fallback.
 
 import express from 'express';
 import { reasoningEffortMatchNames } from './reasoning-effort-targets.js';
@@ -185,6 +187,7 @@ import {
   buildLocalServerRegistry, renderModelsPresetIni, gemmaMtpPresetSection,
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection,
+  selectQwen38FlashNextWeights,
   qwen38FlashNextPresetSection,
   qwen36WorkerPresetSection,
   podcastQwen38PresetSection,
@@ -7915,24 +7918,23 @@ async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
  * @returns {string}
  */
 /**
- * Absolute paths to the two duo model files, and whether each is present.
+ * Selected planner first-shard path, worker path, and their availability.
  *
- * Keyed on the FIRST shard of the planner: llama.cpp resolves the remaining shards from
- * it, so that one file existing is the right test for "the planner is downloaded".
+ * The planner requires all three shards of one quantization. Prefer a complete
+ * UD-IQ4_XS set, falling back to a complete legacy UD-IQ3_XXS set; llama.cpp
+ * resolves the remaining shards from the selected first shard.
  * Shared by the models-preset writer and the model list so the two can never disagree
  * about whether duo is available.
  *
- * @returns {{plannerPath:string, workerPath:string, plannerExists:boolean, workerExists:boolean}}
+ * @returns {{plannerPath:string|null, workerPath:string, plannerExists:boolean, workerExists:boolean}}
  */
 function duoWeightPaths() {
-  const plannerPath = join(
-    MODELS_DIR, DUO_PLANNER_ID, 'Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf'
-  );
+  const plannerPath = selectQwen38FlashNextWeights({ modelsDir: MODELS_DIR, fileExists: existsSync });
   const workerPath = join(MODELS_DIR, DUO_WORKER_ID, 'Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf');
   return {
     plannerPath,
     workerPath,
-    plannerExists: existsSync(plannerPath),
+    plannerExists: plannerPath !== null,
     workerExists: existsSync(workerPath),
   };
 }
@@ -8064,9 +8066,9 @@ function writeModelsPresetFile(contextSize = (config.contextSize || 8192), { rpc
     const qwenDir = join(MODELS_DIR, 'unsloth_Qwen3.8-27B-GGUF');
     const qwenDraftPath = join(qwenDir, 'mtp-Qwen3.8-27B-Q4_0.gguf');
     const museDraftPath = join(MODELS_DIR, 'unsloth_Muse-Glimmer-30B-GGUF', 'dflash-kquant.gguf');
-    // Duo mode: the Qwen3.8-Flash-Next planner and its Qwen3.6-35B-A3B worker. Both
-    // are keyed on a shard/file that only exists once the weights are downloaded, so
-    // an absent model simply contributes no section.
+    // Duo mode: the Qwen3.8-Flash-Next planner and its Qwen3.6-35B-A3B worker.
+    // Require a complete planner shard set and the worker's file, so an absent or
+    // incomplete model simply contributes no section.
     const duoWeights = duoWeightPaths();
     const sections = [
       gemmaMtpPresetSection({ modelsDir: MODELS_DIR, draftExists: existsSync(gemmaDraftPath) }),
@@ -8078,6 +8080,7 @@ function writeModelsPresetFile(contextSize = (config.contextSize || 8192), { rpc
       qwen38FlashNextPresetSection({
         modelsDir: MODELS_DIR,
         weightsExist: duoWeights.plannerExists,
+        weightsPath: duoWeights.plannerPath,
         threads: profile.threads,
       }),
       qwen36WorkerPresetSection({
@@ -8092,6 +8095,7 @@ function writeModelsPresetFile(contextSize = (config.contextSize || 8192), { rpc
         ? podcastQwen38PresetSection({
           modelsDir: MODELS_DIR,
           weightsExist: duoWeights.plannerExists,
+          weightsPath: duoWeights.plannerPath,
           threads: profile.threads,
         })
         : null,
