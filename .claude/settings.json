@@ -1,0 +1,76 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] || s=\"$HOME/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] && exec \"$s\" || exit 0"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] || s=\"$HOME/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] && exec \"$s\" || exit 0"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] || s=\"$HOME/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] && exec \"$s\" || exit 0"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] || s=\"$HOME/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] && exec \"$s\" || exit 0"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] || s=\"$HOME/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] && exec \"$s\" || exit 0"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] || s=\"$HOME/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] && exec \"$s\" || exit 0"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] || s=\"$HOME/.orchestrator/scripts/agent-activity.sh\"; [ -x \"$s\" ] && exec \"$s\" || exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
