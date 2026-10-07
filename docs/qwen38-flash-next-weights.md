@@ -47,6 +47,20 @@ manager passes the selector's result to both helpers, so its routes always use
 the shared selection rather than that compatibility behavior. These helpers do
 not access the filesystem themselves.
 
+Serving catalogs apply `qwen38FlashNextCatalogEntryAvailable()` to the canonical,
+podcast, and repository-relative Flash-Next entries. `/v1/models` filters both
+router results and its local-file fallback; `/api/models` filters `serverModels`.
+Those catalogs require a complete selected planner set and omit incomplete
+Flash-Next inventory rows, including an incomplete other quantization when a
+complete set is available. This also removes stale canonical and podcast serving
+rows when neither quantization is complete. Unrelated models retain their existing
+catalog behavior.
+
+The `localModels` field in the `/api/models` response still includes incomplete
+files for storage inspection and cleanup. Seeing a filename there does not mean the model is
+available for inference. The virtual Duo entry still requires its planner and
+worker weights.
+
 The weight change preserves `load-mode=mmap`, `lazy-mode=on`, `cpu-moe=1`,
 `fit=off`, `parallel=1`, and thread selection from the physical core count.
 It also preserves GPU reservation priorities. Strix Halo remains the intended
@@ -111,8 +125,9 @@ those layers; it does not purge worker logs, images, containers, or volumes.
 
 ## Remaining verification and deployment
 
-The integrated implementation at `d9b5eff` passed the API suite (1,635 tests),
-the UI suite (28 tests), and the production UI build. Fresh review and a signed
+The final catalog fix at `71e2012` passed the API suite (1,662 tests). The UI suite
+(28 tests) and production UI build passed during route integration. Fresh review
+and a signed
 APT deployment under the [package upgrade procedure](Utilities/package-installation.md)
 remain pending. The native verification commands are `node --test api/*.test.js`
 and, from `ui/`, `npm test` followed by `npm run build`.
