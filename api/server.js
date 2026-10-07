@@ -20,7 +20,8 @@
 // The same application is served on API_PORT and, best-effort, on the appliance
 // mirror port ALT_PORT (default 80) when the process is allowed to bind it.
 // Flash-Next availability and both planner routes share a complete installed
-// shard-set selection, preferring IQ4 weights with a legacy IQ3 fallback.
+// shard-set selection, preferring IQ4 weights with a legacy IQ3 fallback. Serving
+// catalogs omit incomplete Flash-Next weights while local inventory retains them.
 
 import express from 'express';
 import { reasoningEffortMatchNames } from './reasoning-effort-targets.js';
@@ -188,6 +189,7 @@ import {
   qwen38MtpPresetSection,
   museGlimmerDflashPresetSection,
   selectQwen38FlashNextWeights,
+  qwen38FlashNextCatalogEntryAvailable,
   qwen38FlashNextPresetSection,
   qwen36WorkerPresetSection,
   podcastQwen38PresetSection,
@@ -7019,10 +7021,19 @@ app.get('/api/models', async (req, res) => {
 
     // Get local models from filesystem
     const localModels = scanLocalModels();
+    const duoWeights = duoWeightPaths();
+    serverModels = serverModels.filter((model) => qwen38FlashNextCatalogEntryAvailable({
+      modelId: model.id,
+      incomplete: model.incomplete || localModels.some((local) => local.incomplete && (
+        normalizeModelKey(local.name) === normalizeModelKey(model.id)
+        || normalizeModelKey(local.firstPartName) === normalizeModelKey(model.id)
+      )),
+      plannerExists: duoWeights.plannerExists,
+    }));
 
     // Duo is a workflow across two resident models, not a file, so it is not something
     // scanLocalModels() can find. Offer it only when both halves are downloaded.
-    const duoEntry = duoChainModelEntry(duoWeightPaths());
+    const duoEntry = duoChainModelEntry(duoWeights);
     if (duoEntry) localModels.unshift(duoEntry);
 
     res.json({
@@ -11233,6 +11244,8 @@ async function handleModels(req, res) {
     // which listed the same model twice in the chat picker.
     const norm = normalizeModelKey;
     const seenNorm = new Set();
+    const duoWeights = duoWeightPaths();
+    const localModels = scanLocalModels();
 
     // 1) Models reported by the running router (if it is up).
     try {
@@ -11240,6 +11253,13 @@ async function handleModels(req, res) {
       if (response.ok) {
         const llamaModels = await response.json();
         for (const m of (llamaModels.data || [])) {
+          if (!qwen38FlashNextCatalogEntryAvailable({
+            modelId: m.id,
+            incomplete: m.incomplete || localModels.some((local) => local.incomplete && (
+              norm(local.name) === norm(m.id) || norm(local.firstPartName) === norm(m.id)
+            )),
+            plannerExists: duoWeights.plannerExists,
+          })) continue;
           const args = m.status?.args || [];
           const ctxIndex = args.indexOf('--ctx-size');
           const n_ctx = ctxIndex >= 0 ? parseInt(args[ctxIndex + 1]) : null;
@@ -11266,8 +11286,10 @@ async function handleModels(req, res) {
     }
 
     // 2) Downloaded models on disk that the router did not already report.
-    const localModels = scanLocalModels();
     for (const lm of localModels) {
+      if (!qwen38FlashNextCatalogEntryAvailable({
+        modelId: lm.name, incomplete: lm.incomplete, plannerExists: duoWeights.plannerExists,
+      })) continue;
       if (byId.has(lm.name) || seenNorm.has(norm(lm.name))) continue;
       // A file inside a repo directory the router already serves is the SAME model. The
       // router serves the directory as one id; the disk scan sees the file within it, and
@@ -11332,7 +11354,7 @@ async function handleModels(req, res) {
     // no disk scan can find it — it has to be advertised explicitly. It MUST appear here
     // and not only on /api/models: the chat picker reads /v1/models (ui/src/pages/Chat.jsx),
     // so a duo listed only on the manager's own endpoint is invisible in the UI.
-    const duoEntry = duoChainModelEntry(duoWeightPaths());
+    const duoEntry = duoChainModelEntry(duoWeights);
     if (duoEntry) {
       data.data.push({
         id: duoEntry.name,

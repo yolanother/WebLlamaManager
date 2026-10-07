@@ -13,7 +13,8 @@
 // ds4 gguf dir, shape the OpenAI `/v1/models` entry/list for an active ds4
 // model, and build pure llama.cpp router preset descriptors for model-specific
 // speculative acceleration. It selects complete Flash-Next shard sets from a
-// caller-provided file predicate and shares the selected weights across routes.
+// caller-provided file predicate, shares the selected weights across routes, and
+// gates Flash-Next serving catalog entries on complete installed weights.
 // It also decides whether silence is a true
 // generation stall or legitimate DS4 admission wait, and extracts the
 // progress-bearing text (including reasoning/thinking output) from
@@ -466,6 +467,22 @@ export function selectQwen38FlashNextWeights({ modelsDir, fileExists }) {
     if (shards.every(fileExists)) return shards[0];
   }
   return null;
+}
+
+/**
+ * Decide whether a serving catalog may publish a Flash-Next model entry.
+ * Canonical, podcast, and repo-relative Flash-Next entries require a complete
+ * selected planner set; incomplete inventory rows stay out of serving catalogs.
+ * Unrelated models retain their existing catalog behavior.
+ * @param {{modelId:string, incomplete?:boolean, plannerExists:boolean}} params
+ *   Catalog identifier, inventory completeness marker, and verified planner availability.
+ * @returns {boolean} Whether the entry may be advertised for serving.
+ */
+export function qwen38FlashNextCatalogEntryAvailable({ modelId, incomplete, plannerExists }) {
+  const plannerId = 'unsloth_Qwen3.8-Flash-Next-GGUF';
+  const isFlashNext = modelId === plannerId || modelId === 'podcast-qwen3.8-16k'
+    || modelId?.startsWith(`${plannerId}/`);
+  return !isFlashNext || (Boolean(plannerExists) && !incomplete);
 }
 
 /**
@@ -1325,9 +1342,10 @@ export function globalContextPresetSection({ contextSize } = {}) {
  * author/reviewer calls that are deliberately capped.
  *
  * Those calls need roughly 13k tokens, but the canonical entry is configured at
- * 65536. The oversizing costs real memory — it was ~16 GiB of KV in the admission
- * estimate that refused the model at "needs ~95.3 GiB but only ~94.4 free" — and
- * buys nothing for a bounded workload. A preset section whose name is not a
+ * 262144. Oversizing costs real memory and buys nothing for a bounded workload.
+ * Historically, the legacy IQ3 route at 65536 carried ~16 GiB of KV in the admission
+ * estimate that refused it at "needs ~95.3 GiB but only ~94.4 free"; that estimate
+ * does not establish the memory fit of IQ4 weights. A preset section whose name is not a
  * directory under --models-dir becomes its own model entry, so this is a distinct,
  * separately selectable catalog id over the same weights rather than an alias
  * sharing the canonical model's instance and context.
