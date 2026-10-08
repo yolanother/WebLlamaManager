@@ -5,9 +5,9 @@ GGUF shard set. Unsloth `UD-IQ4_XS` is the preferred replacement for Drakemore's
 legacy `UD-IQ3_XXS` download because the researched Strata version supports IQ4 and
 explicitly rejects that Unsloth IQ3 quantization.
 
-This document records the route contract and verified host preparation on
-2026-10-07. The replacement weights and nightly cache job are installed; the
-manager route update has not yet been deployed. Strata itself has not been
+This document records the route contract, verified host preparation and manager
+deployment through 2026-10-08. The replacement weights, nightly cache job and
+reviewed manager route update are installed. Strata itself has not been
 deployed or benchmarked on Drakemore.
 
 ## Route selection
@@ -123,29 +123,96 @@ flock -n /run/lock/drakemore-build-cache-prune.lock /usr/bin/docker builder prun
 The job overwrites `/var/log/drakemore-build-cache-prune.log` each run and uses a
 nonblocking lock to skip overlapping invocations. File ownership and permissions
 are `root:root` and `0644`. The installed job's command, final newline, active
-`cron.service`, and lock exclusion were verified. Its first scheduled invocation
-is 2026-10-08 at 02:00 UTC. Pruning unused cache means later builds may rebuild
+`cron.service`, and lock exclusion were verified. The first scheduled invocation
+was 2026-10-08 at 02:00 UTC; installation and command validation do not independently
+prove that scheduled invocation ran. Pruning unused cache means later builds may rebuild
 those layers; it does not purge worker logs, images, containers, or volumes.
 
-## Remaining verification and deployment
+## Deployment and qualification — 2026-10-08
 
-The reviewed route changes landed on local and remote main at `707ae50` on
-2026-10-08. The final catalog fix passed the API suite (1,662 tests); the UI suite
-(28 tests) and production UI build passed during route integration. The serving
-context correction requires its own regression checks and review. A signed
-APT deployment under the [package upgrade procedure](Utilities/package-installation.md)
-remains pending. The native verification commands are `node --test api/*.test.js`
+The reviewed route selector landed on local and remote main at `707ae50`;
+the independently reviewed serving-context correction landed at `801d962`.
+The complete API suite passed 1,669 tests, including seven generated-context
+regressions. The unchanged UI previously passed 28 tests and its production
+build. The native verification commands are `node --test api/*.test.js`
 and, from `ui/`, `npm test` followed by `npm run build`.
-Verify the generated canonical and podcast presets both point to the first IQ4
-shard with their existing context and load settings. Route discovery can be
-checked without loading the 93.7 GB planner alongside active Qwen3.6 or claiming
-the RTX 3090 from asset workers.
+Canonical Debian packaging contracts passed. Core package `llama-manager` 1.2.0
+was authenticated against a private signed repository and installed through APT;
+its SHA256 is `50ed4ddc5768d381d0b9e916498b253bd932aca0d9e80ae9ddb94810c85eef2d`.
+Only its declared missing `nvme-cli` dependency was added; engine and driver
+packages were preserved. Existing conffiles were retained. Installed API files
+byte-match the reviewed source, and the manager is active. The exact previous
+core package is retained for rollback.
+
+The host's installed archive key predates the current release key. The current
+public key was delivered over an authenticated SSH loopback channel and checked
+against primary fingerprint `D544964FB38C6CDD680898205B2C748C7B29A1A8`.
+Verification followed signed `InRelease` → package-index SHA256 → core-package
+SHA256 before a guarded local-package APT transaction. APT ignored an attempted
+stdin source; that attempt installed nothing. Persistent archive trust and source
+lists were unchanged; future public-APT trust repair is tracked separately by `T31be340a26806`.
+
+Qualification temporarily used one model slot and disabled the discrete
+accelerator, isolating the Strix Halo. Actual child arguments confirmed IQ4,
+`mmap`, lazy loading, 16 threads, one parallel slot and 65,536 context tokens;
+the podcast route used 16,384. `cpu-moe=1` enables CPU execution for all experts;
+it does not mean one expert layer. No RPC or discrete-device flags were present.
+
+| Measurement | Current default-big, Qwen3.6 | Flash-Next IQ4, CPU experts |
+| --- | ---: | ---: |
+| Six matched novel-text requests, median decode | 52.07 tok/s | 16.15 tok/s |
+| Time to first content, matched requests | 0.17–0.33 s | 1.02–3.68 s |
+| Separate first 16K load, decode / TTFT | — | 12.44 tok/s / 19.16 s |
+
+Matched requests used identical saved prompts, seed 421, temperature 0.2,
+192 output tokens, disabled thinking and local-only routing. Engine decode
+timing is distinct from wall time and first-content latency. All matched prompt
+cache counts were zero. An earlier baseline included one 502 and substantial
+cold delays; the later fully recorded six-request baseline passed.
+
+All twelve canonical requests completed without transport errors, crashes,
+kernel OOMs or new GPU faults. Three arithmetic JSON responses matched exactly.
+Three longer retrieval responses found the correct facts but varied field types
+(zero-padded string IDs and a boolean approval value); their strict schema checks
+failed. These requests reached about 1,355 input tokens; they do not qualify a
+full 64K prompt or the trained 256K maximum.
+
+**The deployed CPU-expert profile fails the user's speed gate.** Default-big,
+default-small and auto routing remain on their original targets. Those two chat
+groups are the custom aliases; auto delegates to them. Vision remains separate.
+An isolated trial with the same engine, `--n-cpu-moe 24`, explicit `ROCm0`,
+64K context and mmap/lazy loading crashed during loading with exit 139. A retry
+with the normal launcher's `GGML_HIP_UMA=1` and ROCm environment also crashed in
+`libamdhip64.so.7.2.70204`. Neither produced a GPU throughput measurement. These
+two observations do not establish that every GPU configuration or Strata fails.
+No OOM or GPU reset accompanied them; minimum available RAM was about 94.53 GB
+and 88.74 GB respectively.
+
+The bounded trial guard stopped manager admission, verified no managed engine
+remained, launched under the service identity in the existing ROCm namespace,
+and terminated only its own process group. Automatic approval review initially
+rejected a guard without automatic manager recovery; the corrected guard added
+recovery and ran. Both trials restored `modelsMax=2`, enabled the discrete
+accelerator setting and started the manager. Default-big responded after each
+recovery, at 51.65 and 48.71 tok/s respectively, including cold model-load latency.
+Aliases and GPU reservation priorities remained unchanged throughout.
+
+Benchmark task `T31bdc3649c80c` remains gated by failed speed and GPU-profile
+stability; alias task `T31bdc3ef6c809` has not been implemented. Runtime follow-up
+`T31be3801bd823` records the reproducible HIP load crash, exact flags and logs.
+A compatible GPU profile or a separately qualified Strata runtime must pass the
+same baseline and repeated-response gate before migration. Strata has not been
+installed or measured, and no temporary Flash process remains running.
 
 Container log reading timed out after the 2026-10-07 cleanup. Docker
 `live-restore` was enabled, but automatic approval review rejected a daemon
 restart; this work did not restart it. On 2026-10-08, reading the current speech
 worker's log succeeds. The previous asset fleet had already stopped before
-today's work. Native Pods log rotation and polling-noise
+today's work. Seventeen oversized stopped-container logs were archived and
+trimmed with stopped-state, inode and writable-descriptor checks, recovering
+about 2.01 TB; root had about 2.04 TB free afterward. The live speech worker's
+identity and start time were preserved. A guarded daemon restart is now approved
+but has not been needed or performed. Native Pods log rotation and polling-noise
 reduction are separately tracked by `T31b6de0bfc85a`; the nightly build-cache job
 does not implement that follow-up.
 
