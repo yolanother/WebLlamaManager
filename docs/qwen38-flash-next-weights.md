@@ -26,8 +26,12 @@ the first shard and resolves the remaining shards from its filename.
 | Incomplete IQ4 set and complete IQ3 set | First legacy IQ3 shard |
 | No complete set | Planner unavailable; no Flash-Next planner or podcast preset published |
 
-The canonical model ID remains `unsloth_Qwen3.8-Flash-Next-GGUF`, with a default
-262,144-token context capped at that model limit. The separate
+The canonical model ID remains `unsloth_Qwen3.8-Flash-Next-GGUF`, with a trained
+maximum of 262,144 tokens. The router passes its configured serving context to
+both the Flash planner and Qwen3.6 worker, aligning allocation with admission
+checks. Drakemore currently configures 65,536 tokens; explicit serving contexts
+are capped at the trained maximum. Standalone helper calls without a context
+retain the full-window default. The separate
 `podcast-qwen3.8-16k` route keeps its 16,384-token context. Both routes use the
 selected first shard explicitly, so directory scanning cannot select a different
 quantization for one route. Duo planner availability uses the same selection;
@@ -125,21 +129,23 @@ those layers; it does not purge worker logs, images, containers, or volumes.
 
 ## Remaining verification and deployment
 
-The final catalog fix at `71e2012` passed the API suite (1,662 tests). The UI suite
-(28 tests) and production UI build passed during route integration. Fresh review
-and a signed
+The reviewed route changes landed on local and remote main at `707ae50` on
+2026-10-08. The final catalog fix passed the API suite (1,662 tests); the UI suite
+(28 tests) and production UI build passed during route integration. The serving
+context correction requires its own regression checks and review. A signed
 APT deployment under the [package upgrade procedure](Utilities/package-installation.md)
-remain pending. The native verification commands are `node --test api/*.test.js`
+remains pending. The native verification commands are `node --test api/*.test.js`
 and, from `ui/`, `npm test` followed by `npm run build`.
 Verify the generated canonical and podcast presets both point to the first IQ4
 shard with their existing context and load settings. Route discovery can be
 checked without loading the 93.7 GB planner alongside active Qwen3.6 or claiming
 the RTX 3090 from asset workers.
 
-Container log reading currently times out following truncation. Docker
-`live-restore` is enabled and verified, but the guarded daemon restart was rejected
-by automatic approval review and remains pending explicit user approval. Logger
-recovery is therefore unresolved. Native Pods log rotation and polling-noise
+Container log reading timed out after the 2026-10-07 cleanup. Docker
+`live-restore` was enabled, but automatic approval review rejected a daemon
+restart; this work did not restart it. On 2026-10-08, reading the current speech
+worker's log succeeds. The previous asset fleet had already stopped before
+today's work. Native Pods log rotation and polling-noise
 reduction are separately tracked by `T31b6de0bfc85a`; the nightly build-cache job
 does not implement that follow-up.
 

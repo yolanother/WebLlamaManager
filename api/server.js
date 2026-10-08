@@ -8093,11 +8093,13 @@ function writeModelsPresetFile(contextSize = (config.contextSize || 8192), { rpc
         weightsExist: duoWeights.plannerExists,
         weightsPath: duoWeights.plannerPath,
         threads: profile.threads,
+        contextSize,
       }),
       qwen36WorkerPresetSection({
         modelsDir: MODELS_DIR,
         weightsExist: duoWeights.workerExists,
         threads: profile.threads,
+        contextSize,
       }),
       // Bounded route for podcast author/reviewer calls: same weights, 16384
       // context. Only meaningful when the default context lives in the preset,

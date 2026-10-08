@@ -517,7 +517,9 @@ export function qwen38FlashNextCatalogEntryAvailable({ modelId, incomplete, plan
  *   threads:number, contextSize?:number}} params Model root, caller-verified weight
  *   availability, optional selected first-shard path (null omits the route), and the
  *   PHYSICAL core count from the hardware profile (never the logical count — see
- *   hardware-profile.js). Omitting weightsPath retains legacy caller behavior.
+ *   hardware-profile.js). Context is the requested serving window, capped at the
+ *   trained maximum; omitting it retains the full-window default.
+ *   Omitting weightsPath retains legacy caller behavior.
  * @returns {{name:string, options:Object<string,string>}|null} Section descriptor, or
  *   null when the weights are absent so the router serves its other models normally.
  */
@@ -579,8 +581,9 @@ export function resolveQwen38Context(contextSize) {
  *
  * No filesystem access; the caller owns the weights-existence check.
  *
- * @param {{modelsDir:string, weightsExist:boolean, threads:number}} params Model root,
- *   caller-verified weight availability, and the physical core count.
+ * @param {{modelsDir:string, weightsExist:boolean, threads:number, contextSize?:number}} params Model root,
+ *   caller-verified weight availability, physical core count, and requested serving
+ *   context capped at the trained maximum (full-window default when omitted).
  * @returns {{name:string, options:Object<string,string>}|null} Section descriptor, or null.
  */
 export function qwen36WorkerPresetSection({ modelsDir, weightsExist, threads, contextSize } = {}) {
