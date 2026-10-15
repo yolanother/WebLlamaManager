@@ -104,7 +104,7 @@ function PresetsPage({ stats }) {
       // backend's validatePresetEngineFields understands; llama presets keep
       // their nested config as before.
       const body = isStrata
-        ? { id: newPreset.id, ...buildStrataPresetBody({ ...newPreset, ...newPreset.strata }) }
+        ? { id: newPreset.id, ...buildStrataPresetBody({ ...newPreset, ...newPreset.strata, argsText: newPreset.strata.args }) }
         : newPreset.engine === 'ds4'
         ? {
             id: newPreset.id,

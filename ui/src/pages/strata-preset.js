@@ -19,7 +19,7 @@ export function parseStrataArgs(text) {
 /**
  * Build the POST /api/presets body for a Strata preset.
  * @param {{name: string, description?: string, context?: number|string,
- *   args: string, tokenizer: string, modelName?: string}} form - Form state.
+ *   argsText: string, tokenizer: string, modelName?: string}} form - Form state.
  * @returns {{name: string, description: string|undefined, engine: 'strata',
  *   context: number, strata: {args: string[], tokenizer: string, modelName: string}}}
  */
@@ -30,7 +30,7 @@ export function buildStrataPresetBody(form) {
     engine: 'strata',
     context: Number(form.context) || 262144,
     strata: {
-      args: parseStrataArgs(form.args),
+      args: parseStrataArgs(form.argsText),
       tokenizer: form.tokenizer,
       modelName: form.modelName,
     },
