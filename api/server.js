@@ -10784,7 +10784,17 @@ async function fetchRepoFilesRecursive(repoId, path = '') {
 
 // Update config
 app.post('/api/config', (req, res) => {
-  const updates = req.body;
+  const updates = req.body || {};
+  // `strata` names executables and env that activation spawns; only this machine may set it
+  // (cors() is open, so a LAN host or any visited web page could otherwise reach this).
+  if ('strata' in updates && !isLoopbackRequest(req)) {
+    return res.status(403).json({ error: 'The strata config may only be changed from this machine.', code: 'NOT_LOOPBACK' });
+  }
+  for (const [presetId, preset] of Object.entries(updates.presets || {})) {
+    if (!preset || (preset.engine || ENGINE_TYPES.LLAMA) === ENGINE_TYPES.LLAMA) continue;
+    const check = validatePresetEngineFields(preset);
+    if (!check.ok) return res.status(400).json({ error: `preset '${presetId}': ${check.error}` });
+  }
   config = { ...config, ...updates };
   saveConfig(config);
   res.json({ success: true, config: redactConfig(config) });

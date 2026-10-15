@@ -94,3 +94,10 @@ test('M5: strataLeaveCuda throws on an unconfirmed stop and the swap path record
   includesAll(fnBody('strataLeaveCuda'), ['ok === false', "'strata stop unconfirmed'"], 'strataLeaveCuda');
   assert.match(fnBody('strataSwapBackend'), /stop-unconfirmed/);
 });
+
+test('M6: POST /api/config refuses strata from off-box callers and validates presets', () => {
+  const body = routeBody("app.post('/api/config'");
+  includesAll(body, ['isLoopbackRequest(req)', "'strata' in", '403', 'validatePresetEngineFields(', '400'], '/api/config');
+  assert.ok(body.indexOf('403') < body.indexOf('saveConfig('), 'refusal precedes the save');
+  assert.ok(body.indexOf('validatePresetEngineFields(') < body.indexOf('saveConfig('), 'validation precedes the save');
+});
