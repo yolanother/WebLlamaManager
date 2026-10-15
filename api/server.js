@@ -539,6 +539,7 @@ const EXCLUSIVE_ENGINES = {
     type: 'ds4',
     label: 'DS4',
     servesMessages: false,
+    servesCompletions: true,
     exactIds: false,
     activePresetId: () => ds4ActivePresetId || currentPreset,
     modelIds: () => ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset),
@@ -568,6 +569,7 @@ const EXCLUSIVE_ENGINES = {
     type: 'strata',
     label: 'Strata',
     servesMessages: true,
+    servesCompletions: false,      // serve/server.py has chat, messages, responses — no /v1/completions
     exactIds: true,
     activePresetId: () => strataState.activePresetId,
     modelIds: () => strataModelIdsForPreset(strataState.activePresetId),
@@ -15577,6 +15579,15 @@ async function handleCompletions(req, res) {
       llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
+      if (!exclusive.servesCompletions) {
+        return res.status(501).json({
+          error: {
+            message: `the legacy completions API is unsupported by ${exclusive.label}; use /v1/chat/completions`,
+            type: 'not_supported_error',
+            code: 'COMPLETIONS_UNSUPPORTED',
+          },
+        });
+      }
       const unavailable = exclusiveUnavailableBody(exclusive);
       if (unavailable) return res.status(503).json(unavailable);
       return serveDs4WithSwapRecovery(req, res, { requestedModel, isStreaming, startTime, engine: exclusive, proxy: proxyCompletionsToDs4 });

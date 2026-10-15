@@ -132,3 +132,21 @@ test('engines.js pure helpers identify Strata presets', () => {
   assert.equal(isStrataPreset({ engine: 'strata' }), true);
   assert.equal(isStrataPreset({ engine: 'llama' }), false);
 });
+
+// Strata's serve/server.py has no /v1/completions (only chat, messages, responses), so the
+// handle advertises it and the completions handler answers a clean 501 instead of proxying a 404.
+test('EXCLUSIVE_ENGINES declares servesCompletions: DS4 true, Strata false', () => {
+  const start = source.indexOf('const EXCLUSIVE_ENGINES = {');
+  const block = source.slice(start, source.indexOf('\n};', start));
+  const ds4 = block.slice(0, block.indexOf('[ENGINE_TYPES.STRATA]:'));
+  const strata = block.slice(block.indexOf('[ENGINE_TYPES.STRATA]:'));
+  assert.match(ds4, /servesCompletions: true/);
+  assert.match(strata, /servesCompletions: false/);
+});
+
+test('handleCompletions returns 501 COMPLETIONS_UNSUPPORTED when the exclusive engine lacks /v1/completions', () => {
+  const body = fnBody('handleCompletions');
+  const i501 = body.indexOf('COMPLETIONS_UNSUPPORTED');
+  assert.ok(body.includes('!exclusive.servesCompletions'), 'gate on the handle flag');
+  assert.ok(i501 > 0 && i501 < body.indexOf('proxy: proxyCompletionsToDs4'), '501 before proxying');
+});
