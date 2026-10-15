@@ -217,6 +217,9 @@ import { createDs4Supervisor, createEngineSupervisor } from './ds4-supervisor.js
 import {
   resolveStrataConfig, strataServerConfig, strataConfigPath, strataLaunchSpec, strataHealthReady,
 } from './strata-engine.js';
+import {
+  STRATA_HOLDER, parseComputeApps, otherComputeVramBytes, blockingClaim, strataBackendDecision, cudaAdmission,
+} from './strata-policy.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
 import { buildRepoRecommendations, computeCapacityBytes } from './repo-recommendations.js';
@@ -5639,6 +5642,11 @@ async function runGpuDrain(reservationId) {
  *   stops being pending (released or preempted while the drain was running).
  */
 async function drainForReservation(reservationId, reservation) {
+  // Strata on this card must leave BEFORE the claim is marked held (R5): the state machine
+  // already preempted its lease, but its engine still has the card until it is stopped.
+  if (strataState.cudaCard && strataState.cudaCard === reservation.card && reservationId !== strataState.cudaLeaseId) {
+    await strataLeaveCuda(`preempted by ${reservation.holder}`);
+  }
   // The accelerator card is NOT the card the engine is bound to — the engine runs on the
   // APU and borrows the NVIDIA card through the rpc-server — so drainPlan below never sees
   // it and would hand the holder a card still owned by our rpc-server. Handled here
@@ -6030,6 +6038,8 @@ setInterval(() => {
     addLog('system', `GPU reservation ${expired.id} on ${expired.gpu} expired (holder ${expired.holder})`);
     endGpuReservation(expired);
   }
+  // Strata's CUDA-vs-HIP policy poll; async and non-reentrant, so it never blocks the sweep.
+  strataBackendTick().catch((err) => addLog('presets', `strata backend tick failed: ${err.message}`));
   // Outside any transaction, so this is where a pin preempted away is re-established.
   syncGpuPinReservations();
   for (const [poolId, id] of gpuPinReservations) {
@@ -6044,6 +6054,8 @@ setInterval(() => {
   // 408. Pins are handled above and are already held by the time we get here.
   for (const id of reservationsNeedingDrain(gpuReservations.list(), gpuDrainsInFlight)) {
     if (gpuPinReservations.get(gpuReservations.get(id)?.gpu) === id) continue;
+    // Strata drives its own lease's drain from startStrataAttempt (R7).
+    if (id === strataState.cudaLeaseId) continue;
     runGpuDrain(id).catch((err) => addLog('system', `GPU drain failed: ${err.message}`));
   }
 }, GPU_SWEEP_INTERVAL_MS).unref?.();
@@ -9287,8 +9299,8 @@ function deactivateDs4Exclusive() { return deactivateExclusive(EXCLUSIVE_ENGINES
 // like DS4: exclusive, verified-reclaim eviction, swap gate, one generation slot.
 // The pure pieces live in strata-engine.js; the supervisor is the generic
 // createEngineSupervisor. Contract: docs/Designs/StrataEngine.md.
-// S3 HOOK: the CUDA attempt (3090 reservation, lease release in stopStrataServer,
-// backend policy tick) is added by the CUDA leaf; only the HIP attempt exists here.
+// CUDA runs on the 3090 through a GPU reservation lease (STRATA_HOLDER); strataBackendTick
+// swaps CUDA <-> HIP with hysteresis (docs/Designs/StrataEngine.md section 8).
 
 let strataSupervisor = null;
 
@@ -9362,11 +9374,51 @@ function getStrataSupervisor() {
 }
 
 /**
- * Stop the Strata engine (verified: SIGTERM, SIGKILL, then comm + port reap).
- * S3 HOOK: also release the CUDA reservation lease here.
+ * Release Strata's CUDA reservation lease, if it holds one, and forget the card. Idempotent.
+ * Never restarts llama: Strata's drain marked no engine to bring back (it restarts lazily).
+ */
+function releaseStrataCudaLease() {
+  const id = strataState.cudaLeaseId;
+  if (!id) return;
+  gpuReservations.release(id);
+  gpuDrainStoppedEngine.delete(id);
+  strataState.cudaLeaseId = null;
+  strataState.cudaCard = null;
+}
+
+/**
+ * Stop the Strata engine (verified: SIGTERM, SIGKILL, then comm + port reap), then release
+ * the CUDA reservation lease: only once the stop is confirmed, since an unconfirmed engine
+ * may still own the card.
  * @returns {Promise<{ok:boolean, remainingPids:number[]}>}
  */
-async function stopStrataServer() { return getStrataSupervisor().stop(); }
+async function stopStrataServer() {
+  const result = await getStrataSupervisor().stop();
+  if (result?.ok !== false) releaseStrataCudaLease();
+  return result;
+}
+
+/**
+ * Sample the foreign compute processes on the NVIDIA card. Deliberately independent of the
+ * `nvidiaSmiUsable` latch (R20): a hiccup here means "blind" (null), never a disabled probe.
+ * @returns {Promise<Array<{pid:number,name:string,usedBytes:number}>|null>} Null when unreadable.
+ */
+function sampleStrataComputeApps() {
+  return new Promise((resolve) => {
+    exec('nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits',
+      { encoding: 'utf-8', timeout: 5000 },
+      (err, stdout) => resolve(err ? null : parseComputeApps(stdout)));
+  });
+}
+
+/**
+ * Whether another pending/held claim on the CUDA pool would not yield to Strata.
+ * @param {object} cfg Resolved Strata config with `cuda` set.
+ * @returns {boolean}
+ */
+function strataCudaBlocked(cfg) {
+  return blockingClaim(gpuReservations.list({ gpu: cfg.cuda.gpuPool }), cfg.cuda.reservationPriority, strataState.cudaLeaseId);
+}
 
 /**
  * Start one Strata backend attempt. Reaps stray `strata` pids (a previous manager
@@ -9390,23 +9442,59 @@ async function startStrataAttempt(preset, { backend }) {
         return { ok: false, abort: true, reason: 'strata-wedged-resident' };
       }
     }
-    if (backend !== 'hip' || !cfg.hip) return { ok: false, abort: false, reason: `backend-unavailable:${backend}` };
-
-    // 3. HIP: unified memory, so llama is always evicted (verified reclaim), like DS4.
-    const headroomBytes = ds4HeadroomBytes();
-    const targetBytes = reclaimTargetBytes({ ds4ModelBytes: cfg.hip.residentBytes, headroomBytes });
-    const keepEmbed = shouldKeepEmbedServer({
-      allowEmbedServer: resolveDs4Config(config, RUNTIME_ENV).allowEmbedServer,
-      ds4ModelBytes: cfg.hip.residentBytes, embedServerBytes: DS4_EMBED_APPROX_BYTES,
-      totalBytes: memTotalBytes(), headroomBytes,
-    });
-    const { resident, residentAfterEvict, reclaimOk } = await evictLlamaForExclusive({ label: 'strata', targetBytes, keepEmbed });
-    const evict = ds4ActivationDecision({ residentAfterEvict, reclaimOk, spawnOk: undefined });
-    if (evict.action === 'abort-stay-exclusive') {
-      addLog('presets', evict.reason === 'llama-wedged-resident'
-        ? `strata activation blocked: llama-server pids [${resident.join(', ')}] would not die after SIGKILL. NOT spawning Strata on top; box stays in exclusive-Strata offload mode.`
-        : `strata activation deferred: memory did not reclaim to ${gibStr(targetBytes)} GiB before spawn; NOT spawning Strata. Box stays in exclusive-Strata offload mode; retry once RAM frees.`);
-      return { ok: false, abort: true, reason: evict.reason };
+    let residentBytes;
+    let evictNeeded = true;
+    if (backend === 'cuda' && cfg.cuda) {
+      // 2. CUDA: take the 3090 through the GPU reservation state machine, drain it, and
+      // evict llama only when host RAM is short (llama may co-reside on the iGPU).
+      const skip = (reason) => {
+        releaseStrataCudaLease();
+        strataState.cudaFailedAt = Date.now();
+        addLog('presets', `strata: cuda attempt skipped (${reason})`);
+        return { ok: false, abort: false, reason };
+      };
+      let lease;
+      try {
+        lease = gpuReservations.reserve({
+          gpu: cfg.cuda.gpuPool, holder: STRATA_HOLDER, priority: cfg.cuda.reservationPriority,
+          ttlMs: null, noWait: true, reason: 'strata cuda',
+        });
+      } catch (err) {
+        return skip(`cuda-reserve-failed:${err.code || err.message}`);
+      }
+      strataState.cudaLeaseId = lease.id;
+      strataState.cudaCard = lease.card;
+      if (!lease.card) return skip('cuda-no-card');
+      await runGpuDrain(lease.id);
+      const waited = await waitForGpuReservation(lease.id, GPU_DRAIN_INFLIGHT_WAIT_MS + 30_000);
+      if (waited.status !== 200) return skip(`cuda-not-held:${waited.status}`);
+      gpuDrainStoppedEngine.delete(lease.id); // Strata restarts llama itself, lazily
+      residentBytes = cfg.cuda.hostResidentBytes;
+      evictNeeded = memAvailableBytes() < residentBytes + ds4HeadroomBytes();
+    } else if (backend === 'hip' && cfg.hip) {
+      // 3. HIP: unified memory, so llama is always evicted (verified reclaim), like DS4.
+      releaseStrataCudaLease();
+      residentBytes = cfg.hip.residentBytes;
+    } else {
+      return { ok: false, abort: false, reason: `backend-unavailable:${backend}` };
+    }
+    if (evictNeeded) {
+      const headroomBytes = ds4HeadroomBytes();
+      const targetBytes = reclaimTargetBytes({ ds4ModelBytes: residentBytes, headroomBytes });
+      const keepEmbed = shouldKeepEmbedServer({
+        allowEmbedServer: resolveDs4Config(config, RUNTIME_ENV).allowEmbedServer,
+        ds4ModelBytes: residentBytes, embedServerBytes: DS4_EMBED_APPROX_BYTES,
+        totalBytes: memTotalBytes(), headroomBytes,
+      });
+      const { resident, residentAfterEvict, reclaimOk } = await evictLlamaForExclusive({ label: 'strata', targetBytes, keepEmbed });
+      const evict = ds4ActivationDecision({ residentAfterEvict, reclaimOk, spawnOk: undefined });
+      if (evict.action === 'abort-stay-exclusive') {
+        addLog('presets', evict.reason === 'llama-wedged-resident'
+          ? `strata activation blocked: llama-server pids [${resident.join(', ')}] would not die after SIGKILL. NOT spawning Strata on top; box stays in exclusive-Strata offload mode.`
+          : `strata activation deferred: memory did not reclaim to ${gibStr(targetBytes)} GiB before spawn; NOT spawning Strata. Box stays in exclusive-Strata offload mode; retry once RAM frees.`);
+        releaseStrataCudaLease();
+        return { ok: false, abort: true, reason: evict.reason };
+      }
     }
 
     // 4. Spawn on the chosen backend; the override makes a post-settle auto-restart reuse it.
@@ -9416,6 +9504,183 @@ async function startStrataAttempt(preset, { backend }) {
   } catch (err) {
     addLog('presets', `strata: ${backend} attempt could not start: ${err.message}`);
     return { ok: false, abort: true, reason: `start-error:${err.message}` };
+  }
+}
+
+let strataPriorityWarned = false;
+/** Log once when the configured CUDA lease priority sits outside the intended band (pin < ours < Pods 80). */
+function warnStrataCudaPriority(cfg) {
+  if (strataPriorityWarned || !cfg.cuda) return;
+  const pin = gpuPinPlan.find((p) => p.id === cfg.cuda.gpuPool)?.priority;
+  const prio = cfg.cuda.reservationPriority;
+  if ((pin != null && prio <= pin) || prio >= 80) {
+    strataPriorityWarned = true;
+    addLog('presets', `strata: cuda.reservationPriority ${prio} should be above the ${cfg.cuda.gpuPool} pin priority${pin != null ? ` (${pin})` : ''} and below 80 (Pods)`);
+  }
+}
+
+/**
+ * Take Strata off the CUDA card: drain in-flight requests (bounded), abort what remains,
+ * then a verified stop that releases the lease. Returns once Strata no longer holds the card.
+ *
+ * Called from a swap (pass its `swapGate`) or, without one, from a preemption: it then arms
+ * the swap gate itself (waiting out any swap or load in flight) and, once the card is free,
+ * starts the HIP load in the background under that same gate.
+ *
+ * @param {string} reason Why Strata is leaving.
+ * @param {{swapGate?: ?function}} [opts] The caller's settle function when it already holds the gate.
+ * @returns {Promise<void>}
+ */
+async function strataLeaveCuda(reason, { swapGate = null } = {}) {
+  const eng = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA];
+  let settle = swapGate;
+  if (!settle) {
+    while (!(settle = eng.armSwapGate())) await strataState.swapPromise;
+    if (!strataState.cudaLeaseId) { settle(); return; } // already off the card
+    strataState.swapGeneration += 1;
+    if (strataState.runtime) strataState.runtime.status = 'swapping';
+  }
+  try {
+    addLog('presets', `strata: leaving cuda (${reason})`);
+    await drainExclusiveRequests(eng, strataConfig().policy.drainMaxWaitMs);
+    for (const entry of activeRequests.values()) {
+      if (entry.backend === 'strata') entry.abortController?.abort();
+    }
+    await stopStrataServer();
+  } catch (err) {
+    if (!swapGate) settle();
+    throw err;
+  }
+  if (!swapGate) runStrataLoadPhase('hip', reason, settle);
+}
+
+/**
+ * Background load phase of a swap, run with the swap gate held and settled at the end.
+ * @param {'cuda'|'hip'} target Preferred backend; a failed CUDA return falls back to HIP.
+ * @param {string} reason Why the swap happened.
+ * @param {function} settle The gate's settle function.
+ */
+function runStrataLoadPhase(target, reason, settle) {
+  const cfg = strataConfig();
+  const runtime = strataState.runtime;
+  const preset = config.presets?.[strataState.activePresetId];
+  const attempts = (target === 'hip' ? [cfg.hip && { backend: 'hip' }] : [cfg.cuda && { backend: 'cuda' }, cfg.hip && { backend: 'hip' }]).filter(Boolean);
+  (async () => {
+    try {
+      if (!preset || !runtime || attempts.length === 0) {
+        if (runtime) Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: 'swap-no-backend' });
+        return;
+      }
+      addLog('presets', `strata: swapping to ${target} (${reason})`);
+      const sup = getStrataSupervisor();
+      const eng = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA];
+      const result = await runDs4AdaptivePlan({
+        attempts,
+        startAttempt: async (attempt) => {
+          addLog('presets', `strata: trying ${attempt.backend}`);
+          const started = await startStrataAttempt(preset, attempt);
+          if (started.ok === false) runtime.attempts.push({ backend: attempt.backend, outcome: started.reason });
+          return started;
+        },
+        waitForOutcome: async (attempt) => {
+          const outcome = await waitEngineAttemptOutcome(eng);
+          runtime.attempts.push({ backend: attempt.backend, outcome });
+          return outcome;
+        },
+        stopAttempt: async () => {
+          if (strataState.cudaLeaseId) strataState.cudaFailedAt = Date.now(); // next attempt is HIP
+          try { return await stopStrataServer(); } catch { return { ok: true, remainingPids: [] }; }
+        },
+        onAttempt: (attempt, i) => {
+          if (i > 0) addLog('presets', `strata: previous attempt failed to load; stepping to attempt ${i + 1}/${attempts.length}`);
+        },
+      });
+      if (result.ok) {
+        sup.endPlan({ settled: result.settled });
+        Object.assign(runtime, { status: 'ready', backend: result.settled.backend, settledAt: Date.now() });
+        addLog('presets', `strata: SETTLED — serving on ${result.settled.backend} after attempt ${result.attemptsMade}/${attempts.length}`);
+      } else {
+        sup.endPlan({ settled: null });
+        try { await stopStrataServer(); } catch { /* already gone */ }
+        Object.assign(runtime, {
+          status: result.reason === 'stop-unconfirmed' ? 'stop-unconfirmed' : 'exhausted',
+          backend: null, settledAt: Date.now(), reason: result.reason,
+        });
+        addLog('presets', `strata activation did not serve (${result.reason}). Box stays in exclusive-Strata offload mode; local strata requests get a clean 503. Re-activate the preset to retry.`);
+      }
+    } catch (err) {
+      getStrataSupervisor().endPlan({ settled: null });
+      Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: err.message });
+      addLog('presets', `strata swap errored: ${err.message}; staying exclusive`);
+    } finally {
+      settle();
+    }
+  })();
+}
+
+/**
+ * Swap Strata between CUDA and HIP, one swap at a time (the swap gate is the lock). The
+ * leave phase is awaited; the load phase continues in the background with the gate held, so
+ * requests arriving mid-swap queue behind it.
+ *
+ * @param {'cuda'|'hip'} target Backend to move to.
+ * @param {string} reason Why.
+ * @returns {Promise<void>} Resolves when the leave phase is done; returns at once if a swap is in flight.
+ */
+async function strataSwapBackend(target, reason) {
+  const settle = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();
+  if (!settle) return;
+  const runtime = strataState.runtime;
+  strataState.swapGeneration += 1;
+  if (runtime) runtime.status = 'swapping';
+  try {
+    await strataLeaveCuda(reason, { swapGate: settle }); // drain + abort + verified stop; also serves HIP -> CUDA
+  } catch (err) {
+    addLog('presets', `strata: leave phase failed (${err.message})`);
+    if (runtime) Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: err.message });
+    settle();
+    return;
+  }
+  runStrataLoadPhase(target, reason, settle);
+}
+
+let strataTickRunning = false;
+/**
+ * Periodic CUDA/HIP policy poll, called from the GPU sweep timer. Samples foreign compute
+ * VRAM, asks {@link strataBackendDecision}, records `runtime.cuda`, and swaps when told to.
+ * Non-reentrant; a no-op unless Strata is ready, CUDA is configured and no swap is in flight.
+ * @returns {Promise<void>}
+ */
+async function strataBackendTick() {
+  const cfg = strataConfig();
+  const runtime = strataState.runtime;
+  if (strataTickRunning || currentEngine !== ENGINE_TYPES.STRATA || runtime?.status !== 'ready'
+    || !cfg.cuda || strataState.swapPromise) return;
+  strataTickRunning = true;
+  try {
+    const otherVramBytes = otherComputeVramBytes(await sampleStrataComputeApps());
+    if (currentEngine !== ENGINE_TYPES.STRATA || strataState.runtime !== runtime
+      || runtime.status !== 'ready' || strataState.swapPromise) return; // changed while sampling
+    const now = Date.now();
+    const lease = strataState.cudaLeaseId ? gpuReservations.get(strataState.cudaLeaseId) : null;
+    const decision = strataBackendDecision({
+      backend: runtime.backend, cudaConfigured: true, leaseState: lease?.state ?? null,
+      blocking: strataCudaBlocked(cfg), otherVramBytes,
+      baselineBytes: cfg.policy.idleBaselineBytes, growthBytes: cfg.policy.yieldGrowthBytes,
+      idleSinceMs: strataState.idleSinceMs, cudaFailedAt: strataState.cudaFailedAt,
+      busy: [...activeRequests.values()].some((r) => r.backend === 'strata'),
+      now, returnAfterMs: cfg.policy.returnToCudaAfterMs,
+    });
+    strataState.idleSinceMs = decision.idleSinceMs;
+    runtime.cuda = {
+      leaseId: strataState.cudaLeaseId, leaseState: lease?.state ?? null, otherVramBytes,
+      idleSinceMs: decision.idleSinceMs, cudaFailedAt: strataState.cudaFailedAt,
+      lastDecision: { action: decision.action, reason: decision.reason, at: now },
+    };
+    if (decision.action === 'yield-to-hip') await strataSwapBackend('hip', decision.reason);
+    else if (decision.action === 'return-to-cuda') await strataSwapBackend('cuda', decision.reason);
+  } finally {
+    strataTickRunning = false;
   }
 }
 
@@ -9432,10 +9697,23 @@ async function startStrataAttempt(preset, { backend }) {
  */
 async function activateStrataExclusive(presetId, preset) {
   const cfg = strataConfig();
-  const attempts = [cfg.hip && { backend: 'hip' }].filter(Boolean); // S3 HOOK: CUDA attempt goes first
-  if (!cfg.enabled || attempts.length === 0) {
-    return { ok: false, status: 503, error: `Strata is not configured: ${cfg.reason || 'no usable backend for this build (hip required)'}` };
+  if (!cfg.enabled || !(cfg.cuda || cfg.hip)) {
+    return { ok: false, status: 503, error: `Strata is not configured: ${cfg.reason || 'no usable backend (cuda or hip) for this build'}` };
   }
+  const now = Date.now();
+  const admission = cudaAdmission({
+    cudaConfigured: !!cfg.cuda,
+    blocking: cfg.cuda ? strataCudaBlocked(cfg) : false,
+    otherVramBytes: cfg.cuda ? otherComputeVramBytes(await sampleStrataComputeApps()) : null,
+    baselineBytes: cfg.policy.idleBaselineBytes, growthBytes: cfg.policy.yieldGrowthBytes,
+    cudaFailedAt: strataState.cudaFailedAt, now, returnAfterMs: cfg.policy.returnToCudaAfterMs,
+  });
+  const attempts = [admission.admit && { backend: 'cuda' }, cfg.hip && { backend: 'hip' }].filter(Boolean);
+  if (cfg.cuda) addLog('presets', `strata: cuda ${admission.admit ? 'admitted' : 'not admitted'} (${admission.reason})`);
+  if (attempts.length === 0) {
+    return { ok: false, status: 503, error: `Strata is not configured: cuda unavailable (${admission.reason}) and hip is not configured` };
+  }
+  warnStrataCudaPriority(cfg);
   const eng = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA];
   if (currentEngine === ENGINE_TYPES.DS4) await deactivateDs4Exclusive();
 
@@ -9468,6 +9746,7 @@ async function activateStrataExclusive(presetId, preset) {
           return outcome;
         },
         stopAttempt: async () => {
+          if (strataState.cudaLeaseId) strataState.cudaFailedAt = Date.now(); // next attempt is HIP
           try { return await stopStrataServer(); } catch { return { ok: true, remainingPids: [] }; }
         },
         onAttempt: (attempt, i) => {
