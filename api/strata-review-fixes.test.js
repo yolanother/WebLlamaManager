@@ -65,3 +65,12 @@ test('M1: handleMessages answers 501 for a DS4 target before ensureDs4ForModel',
   assert.ok(at501 !== -1 && at501 < ensure, 'DS4 check must precede ensureDs4ForModel');
   assert.match(body.slice(at501, ensure), /MESSAGES_UNSUPPORTED/);
 });
+
+test('M2: Strata activation is single-flight for every caller', () => {
+  const wrapper = fnBody('activateStrataSingleFlight');
+  includesAll(wrapper, ['strataActivating', 'activateStrataExclusive('], 'activateStrataSingleFlight');
+  assert.match(wrapper, /\.finally\(/, 'the guard must clear when the flip settles');
+  assert.ok(source.includes('activate: (presetId, preset) => activateStrataSingleFlight(presetId, preset)'), 'EXCLUSIVE_ENGINES.strata.activate');
+  assert.ok(source.includes('await activateStrataSingleFlight(presetId, preset)'), 'preset activate route');
+  assert.ok(!/await activateStrataExclusive\(/.test(source), 'no caller bypasses the guard');
+});

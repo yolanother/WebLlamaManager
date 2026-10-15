@@ -589,7 +589,7 @@ const EXCLUSIVE_ENGINES = {
     health: () => getStrataSupervisor().health(),
     runtime: () => strataState.runtime,
     refForModel: (model) => strataPresetForModel(config, model),
-    activate: (presetId, preset) => activateStrataExclusive(presetId, preset),
+    activate: (presetId, preset) => activateStrataSingleFlight(presetId, preset),
     stop: () => stopStrataServer(),
     clear: () => { strataState.runtime = null; strataState.activePresetId = null; strataState.swapGeneration += 1; },
     admitsLlamaBeside: () => true,
@@ -9686,6 +9686,29 @@ async function strataBackendTick() {
   }
 }
 
+/** In-flight Strata activation ({presetId, promise}), so concurrent callers share one flip. */
+let strataActivating = null;
+
+/**
+ * Single-flight front for activateStrataExclusive: activateStrataExclusive awaits (nvidia-smi
+ * sampling, DS4 deactivation) before it flips currentEngine and arms the swap gate, so two
+ * concurrent callers would otherwise run two ladders and stomp each other's gate and CUDA lease.
+ * A concurrent call for the same preset joins the in-flight one; a different preset is refused.
+ *
+ * @param {string} presetId preset to activate.
+ * @param {object} preset the preset body.
+ * @returns {Promise<{ok: boolean, status?: number, error?: string}>} the activation result.
+ */
+function activateStrataSingleFlight(presetId, preset) {
+  if (strataActivating) {
+    if (strataActivating.presetId === presetId) return strataActivating.promise;
+    return Promise.resolve({ ok: false, status: 409, error: `Strata activation of '${strataActivating.presetId}' is already in progress` });
+  }
+  const promise = activateStrataExclusive(presetId, preset).finally(() => { strataActivating = null; });
+  strataActivating = { presetId, promise };
+  return promise;
+}
+
 /**
  * Activate a Strata preset in exclusive mode. Mirrors activateDs4Exclusive: flip the
  * engine and arm the swap gate immediately (so a request flood offloads instead of
@@ -9894,7 +9917,7 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
   // background while mid-swap traffic is held on the Strata gate.
   if (isStrataPreset(preset)) {
     console.log(`[presets] Activating strata preset (exclusive): ${presetId}`);
-    const result = await activateStrataExclusive(presetId, preset);
+    const result = await activateStrataSingleFlight(presetId, preset);
     if (result.ok) {
       return res.json({
         success: true,
