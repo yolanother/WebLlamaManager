@@ -74,3 +74,11 @@ test('M2: Strata activation is single-flight for every caller', () => {
   assert.ok(source.includes('await activateStrataSingleFlight(presetId, preset)'), 'preset activate route');
   assert.ok(!/await activateStrataExclusive\(/.test(source), 'no caller bypasses the guard');
 });
+
+test('M3: llama is not admitted beside an exclusive engine that is loading or not ready', () => {
+  const body = fnBody('ensureDs4ForModel');
+  const branch = body.indexOf('exclusive.admitsLlamaBeside(rawModel)');
+  const fit = body.indexOf('largestContextBesideDs4(', branch);
+  const guard = body.slice(branch, fit);
+  includesAll(guard, ['exclusive.swapPromise()', "!== 'ready'", 'return null'], 'co-residence guard before the fit check');
+});

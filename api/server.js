@@ -7991,6 +7991,11 @@ async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'i
   const exclusive = activeExclusive();
   const isAliasRequest = rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS;
   if (exclusive && exclusive.admitsLlamaBeside(rawModel)) {
+    // Free memory is only meaningful once the engine has taken its share: while it is loading
+    // (swap gate held) or settled non-ready, admitting llama would overcommit and get one OOM-killed.
+    // Return null → the caller's offload / 503 path, never block the handler on the gate here.
+    const exclusiveRuntime = exclusive.runtime();
+    if (exclusive.swapPromise() || (exclusiveRuntime && exclusiveRuntime.status !== 'ready')) return null;
     // Evict DS4 only if the llama target genuinely cannot run beside it. On a
     // host dedicated to llama-manager, DS4 resident still leaves room for a
     // small model, and tearing down an ~80GB engine to serve default-small
