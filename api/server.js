@@ -3,7 +3,9 @@
 // LICENSE file in the repository root.
 //
 // This process serves the dashboard and OpenAI-compatible API, supervises the
-// llama.cpp and DS4 inference engines, manages models and configuration, and
+// llama.cpp, DS4 and Strata inference engines (DS4 and Strata are exclusive
+// engines behind one EXCLUSIVE_ENGINES handle; Strata runs on the HIP backend
+// here), manages models and configuration, and
 // persists operational analytics, including distinct per-request decode,
 // prefill, first-token, cache, workload, and speculative-decoding evidence.
 // Mutable resources are resolved through the
@@ -179,7 +181,7 @@ import {
   validateResponsesPayload,
 } from './responses-output-guard.js';
 import {
-  ENGINE_TYPES, presetEngine, isDs4Preset, resolveDs4Config,
+  ENGINE_TYPES, presetEngine, isDs4Preset, isStrataPreset, isExclusiveEngine, strataCatalogEntries, resolveDs4Config,
   validatePresetEngineFields, ds4ModelsList, ds4TargetUrl,
   isEngineProcessComm, engineSupportsSlots,
   listDs4GgufFiles, ds4ModelRef, llamaFitsBesideDs4, validateDs4DownloadRequest, isDs4RepoAllowed,
@@ -211,7 +213,10 @@ import {
 } from './duo-chain.js';
 import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 import { loopingTextReason } from './degenerate-output.js';
-import { createDs4Supervisor } from './ds4-supervisor.js';
+import { createDs4Supervisor, createEngineSupervisor } from './ds4-supervisor.js';
+import {
+  resolveStrataConfig, strataServerConfig, strataConfigPath, strataLaunchSpec, strataHealthReady,
+} from './strata-engine.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
 import { buildRepoRecommendations, computeCapacityBytes } from './repo-recommendations.js';
@@ -500,6 +505,19 @@ let ds4SwapPromise = null;
 let ds4SettledRuntime = null;
 
 /**
+ * Strata's routing and runtime state (the DS4 equivalents are the loose `ds4*`
+ * variables above, whose names are pinned by tests). `runtime` is
+ * `{status:'loading'|'ready'|'swapping'|'exhausted'|'stop-unconfirmed', presetId,
+ * backend:'cuda'|'hip'|null, attempts:[{backend,outcome}], settledAt, cuda:null}`.
+ * The cuda* fields are reserved for the CUDA backend leaf (S3); nothing here sets them yet.
+ */
+const strataState = {
+  activePresetId: null, swapPromise: null, swapGeneration: 0, lastServedAt: 0,
+  runtime: null,
+  cudaLeaseId: null, cudaCard: null, idleSinceMs: null, cudaFailedAt: null,
+};
+
+/**
  * One handle per exclusive engine (an engine that owns the box while active:
  * llama-server is stopped, one generation slot, other models offload or 503).
  * Only one is active at a time (`currentEngine`). DS4's entry reads the DS4
@@ -543,7 +561,35 @@ const EXCLUSIVE_ENGINES = {
     admitsLlamaBeside: (rawModel) => rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS,
     deactivate: () => deactivateExclusive(EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4]),
   },
-  // S2 adds the Strata entry here.
+  [ENGINE_TYPES.STRATA]: {
+    type: 'strata',
+    label: 'Strata',
+    servesMessages: true,
+    exactIds: true,
+    activePresetId: () => strataState.activePresetId,
+    modelIds: () => strataModelIdsForPreset(strataState.activePresetId),
+    displayName: () => config.presets?.[strataState.activePresetId]?.name || strataState.activePresetId || 'strata',
+    port: () => strataConfig().port,
+    swapPromise: () => strataState.swapPromise,
+    swapGeneration: () => strataState.swapGeneration,
+    armSwapGate: ({ force = false } = {}) => {
+      if (strataState.swapPromise && !force) return null;
+      let releaseGate;
+      strataState.swapPromise = new Promise((resolve) => { releaseGate = resolve; });
+      return () => { releaseGate(); strataState.swapPromise = null; };
+    },
+    markServed: () => { strataState.lastServedAt = Date.now(); },
+    lastServedAt: () => strataState.lastServedAt,
+    supervisor: () => getStrataSupervisor(),
+    health: () => getStrataSupervisor().health(),
+    runtime: () => strataState.runtime,
+    refForModel: (model) => strataPresetForModel(config, model),
+    activate: (presetId, preset) => activateStrataExclusive(presetId, preset),
+    stop: () => stopStrataServer(),
+    clear: () => { strataState.runtime = null; strataState.activePresetId = null; strataState.swapGeneration += 1; },
+    admitsLlamaBeside: () => true,
+    deactivate: () => deactivateExclusive(EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA]),
+  },
 };
 
 /** @returns {object|null} the handle of the exclusive engine currently owning the box, else null. */
@@ -1144,6 +1190,33 @@ function ds4PresetForModel(cfg, modelName) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Classify a resolved local model name as a Strata preset: Strata model ids are the
+ * preset ids (exact match, no GGUF directory fallback like DS4).
+ *
+ * @param {{presets?: Object<string, object>}|null|undefined} cfg server config.
+ * @param {string} modelName the already alias-resolved local model or preset name.
+ * @returns {{presetId: string, preset: object, engine: string}|null} the activation ref, or null.
+ */
+function strataPresetForModel(cfg, modelName) {
+  if (!cfg || typeof modelName !== 'string') return null;
+  const preset = cfg.presets?.[modelName];
+  if (preset && isStrataPreset(preset)) return { presetId: modelName, preset, engine: ENGINE_TYPES.STRATA };
+  return null;
+}
+
+/** Model names (exact-matched, normalized) that route to the active Strata preset. */
+function strataModelIdsForPreset(presetId) {
+  const preset = config.presets?.[presetId];
+  if (!preset) return presetId ? [presetId] : [];
+  return [presetId, preset.name].filter(Boolean);
+}
+
+/** Resolved `config.strata` block (see strata-engine.js); `enabled` is false when unusable. */
+function strataConfig() {
+  return resolveStrataConfig(config, { dataDirDefault: join(RUNTIME_PATHS.dataDir, 'strata') });
 }
 
 /**
@@ -4058,6 +4131,16 @@ async function getSystemStats() {
     try { ds4Stats = await getDs4Health(); } catch { /* ds4 down */ }
   }
 
+  // Strata is probed only while it is the active engine (its /health is cheap but
+  // there is nothing to report while stopped). `backend` comes from the runtime.
+  let strataStats = null;
+  if (currentEngine === ENGINE_TYPES.STRATA) {
+    try {
+      const h = await getStrataSupervisor().health();
+      strataStats = { ...h, backend: strataState.runtime?.backend ?? null };
+    } catch { /* strata down */ }
+  }
+
   // Uniform per-local-server view: the llama.cpp router (hosts general GGUF
   // models AND gemma-4 via --mmproj+MTP), the embeddings server, and ds4 — all
   // in one shape, differing only by their models and state. Remote backends are
@@ -4095,6 +4178,14 @@ async function getSystemStats() {
       const dc = decisionConfig();
       return { ...decisionSupervisor.status(), runnable: dc.runnable, reason: dc.reason, port: dc.port, models: [`laya-${dc.checkpoint}`] };
     })(),
+    // Present only once Strata is configured, so a box without it has no 'strata' entry.
+    strata: strataConfig().enabled ? {
+      running: currentEngine === ENGINE_TYPES.STRATA && !!strataStats && strataStats.status !== 'stopped',
+      healthy: strataStats?.status === 'ok',
+      port: strataConfig().port,
+      models: strataState.activePresetId ? [strataState.activePresetId] : [],
+      mode: strataState.runtime?.backend ?? null,
+    } : null,
   });
 
   return {
@@ -4130,6 +4221,8 @@ async function getSystemStats() {
     embed: embedStats,
     ds4: ds4Stats,
     ds4Runtime: ds4SettledRuntime,
+    strata: strataStats,
+    strataRuntime: strataState.runtime,
     engine: currentEngine,
     guard: guardLast,
     memoryGuard: guardMemLast,
@@ -6876,7 +6969,7 @@ app.get('/api/queue', (req, res) => {
   });
   // Annotate pendingFromActive with their queue position (1-based for display).
   for (const p of pendingFromActive) {
-    const inDs4Lane = p.backend === 'ds4';
+    const inDs4Lane = isExclusiveEngine(p.backend); // ds4 and strata share the one exclusive lane
     const idx = (inDs4Lane ? ds4PositionByActiveReqId : positionByActiveReqId).get(p.activeRequestId);
     if (idx != null) p.queuePosition = idx + 1;
     p.queueLength = (inDs4Lane ? ds4Queue.queue : llamaQueue.queue).length;
@@ -7403,6 +7496,35 @@ app.get('/api/presets', (req, res) => {
 app.post('/api/presets', (req, res) => {
   const { id, name, description, modelPath, hfRepo, context, config: presetConfig } = req.body;
 
+  // ── strata engine preset ───────────────────────────────────────────────────
+  // Handled BEFORE the required-field check below: a strata preset carries a
+  // tokenizer + argv instead of modelPath/hfRepo, so that check would reject it.
+  if (String(req.body.engine || '').toLowerCase() === ENGINE_TYPES.STRATA) {
+    if (!id || !name) return res.status(400).json({ error: 'Missing required fields: id and name' });
+    if (config.presets && config.presets[id]) {
+      return res.status(409).json({ error: `Preset with ID '${id}' already exists. Use PUT to update or choose a different ID.` });
+    }
+    const strataCheck = validatePresetEngineFields(req.body);
+    if (!strataCheck.ok) return res.status(400).json({ error: strataCheck.error });
+    if (!existsSync(strataCheck.strata.tokenizer)) {
+      return res.status(404).json({ error: `strata tokenizer not found: ${strataCheck.strata.tokenizer}` });
+    }
+    const preset = {
+      id,
+      name,
+      engine: ENGINE_TYPES.STRATA,
+      description: description || `Preset for ${name}`,
+      context: strataCheck.context,
+      strata: strataCheck.strata,
+    };
+    if (!config.presets) config.presets = {};
+    config.presets[id] = preset;
+    saveConfig(config);
+    console.log(`[presets] Created strata preset: ${id}`);
+    addLog('presets', `Created strata preset: ${name}`);
+    return res.json({ success: true, preset });
+  }
+
   // Either modelPath or hfRepo must be provided
   if (!id || !name || (!modelPath && !hfRepo)) {
     return res.status(400).json({ error: 'Missing required fields: id, name, and either modelPath or hfRepo' });
@@ -7516,7 +7638,7 @@ app.put('/api/presets/:presetId', (req, res) => {
   // If the engine field is being set/changed, validate it (+ ds4 fields). Merge
   // the effective body so a ds4-field-only update still validates against the
   // stored engine.
-  if ('engine' in updates || presetEngine(config.presets[presetId]) === ENGINE_TYPES.DS4) {
+  if ('engine' in updates || presetEngine(config.presets[presetId]) !== ENGINE_TYPES.LLAMA) {
     const merged = { ...config.presets[presetId], ...updates };
     const engineCheck = validatePresetEngineFields(merged);
     if (!engineCheck.ok) {
@@ -7803,20 +7925,27 @@ let modeSwitchPromise = null;
  *   activation result when a ds4 activation was attempted, else null.
  */
 async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'interactive', relay = null } = {}) {
-  const ref = ds4PresetForModel(config, resolvedModel);
+  const ds4Ref = ds4PresetForModel(config, resolvedModel);
+  const ref = ds4Ref
+    ? { ...ds4Ref, engine: ds4Ref.engine || ENGINE_TYPES.DS4 }
+    : strataPresetForModel(config, resolvedModel);
   if (ref) {
+    const target = EXCLUSIVE_ENGINES[ref.engine];
     const desiredModels = desiredResidentModels();
     if (desiredModels.length > 0 && !desiredModels.includes(resolvedModel)) {
       return {
         ok: false,
         status: 409,
-        error: `DS4 activation blocked to preserve desired resident model '${desiredModels[0]}'`,
+        error: `${target.label} activation blocked to preserve desired resident model '${desiredModels[0]}'`,
       };
     }
-    if (currentEngine === ENGINE_TYPES.DS4) return null; // ds4 already active → served downstream
-    console.log(`[ds4] default-model request for ds4 preset '${ref.presetId}' — activating exclusive ds4 mode`);
-    addLog('presets', `Request for ds4 preset '${ref.presetId}' (via default-model alias or name) — activating exclusive ds4 mode`);
-    return activateDs4Exclusive(ref.presetId, ref.preset);
+    if (currentEngine === ref.engine) return null; // the target engine is already active → served downstream
+    // A different exclusive engine owns the box: reverse it (verified reclaim) first.
+    const active = activeExclusive();
+    if (active) await active.deactivate();
+    console.log(`[${target.type}] default-model request for ${target.type} preset '${ref.presetId}' — activating exclusive ${target.type} mode`);
+    addLog('presets', `Request for ${target.type} preset '${ref.presetId}' (via default-model alias or name) — activating exclusive ${target.type} mode`);
+    return target.activate(ref.presetId, ref.preset);
   }
   // ds4PresetForModel() found no ref for resolvedModel. That does NOT prove the
   // alias/model has moved to llama: for a ds4 model with no hand-built preset
@@ -7835,10 +7964,19 @@ async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'i
     && ds4ModelMatches(resolvedModel, ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset))) {
     return null; // still the ds4 model; nothing to reverse
   }
-  // Resolved target is a llama model. Reverse exclusive ds4 ONLY for an alias request
+  if (currentEngine === ENGINE_TYPES.STRATA
+    && ds4ModelMatches(resolvedModel, strataModelIdsForPreset(strataState.activePresetId), { exact: true })) {
+    return null; // still the strata model; nothing to reverse
+  }
+  // Resolved target is a llama model. An exclusive engine may admit it beside itself:
+  // DS4 only for the default alias requests (rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS),
+  // Strata for any llama model. Reverse the exclusive engine ONLY for an alias request
   // whose target has been re-pointed at llama — the alias follows the operator's
-  // preferred-big choice. Arbitrary non-alias models keep offloading (task-3).
-  if (currentEngine === ENGINE_TYPES.DS4 && (rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS)) {
+  // preferred-big choice. Arbitrary non-alias models keep offloading (task-3) and a
+  // Strata non-alias miss that does not fit never evicts Strata.
+  const exclusive = activeExclusive();
+  const isAliasRequest = rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS;
+  if (exclusive && exclusive.admitsLlamaBeside(rawModel)) {
     // Evict DS4 only if the llama target genuinely cannot run beside it. On a
     // host dedicated to llama-manager, DS4 resident still leaves room for a
     // small model, and tearing down an ~80GB engine to serve default-small
@@ -7860,15 +7998,15 @@ async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'i
       minContext: DS4_CORESIDENT_MIN_CONTEXT,
     });
     if (fit.fits) {
-      console.log(`[ds4] keeping DS4 resident for '${rawModel}' -> '${resolvedModel}': ${fit.reason}`);
-      addLog('presets', `Serving '${resolvedModel}' beside DS4 rather than evicting it. ${fit.reason}`);
+      console.log(`[${exclusive.type}] keeping ${exclusive.label} resident for '${rawModel}' -> '${resolvedModel}': ${fit.reason}`);
+      addLog('presets', `Serving '${resolvedModel}' beside ${exclusive.label} rather than evicting it. ${fit.reason}`);
       // Keeping DS4 is only half the job: DS4's own activation evicted llama, so
       // without starting it back up the request would be offloaded to a remote
       // backend or rejected — worse than the eviction this avoids. Bring llama
       // up beside DS4 now that the memory budget has admitted it.
       if (!llamaProcess) {
-        console.log(`[ds4] starting llama beside DS4 to serve '${resolvedModel}' at context ${fit.context}`);
-        await restartLlamaServer({ governed: false, contextOverride: fit.context });
+        console.log(`[${exclusive.type}] starting llama beside ${exclusive.label} to serve '${resolvedModel}' at context ${fit.context}`);
+        await restartLlamaServer({ governed: false, contextOverride: fit.context, besideExclusive: true });
       }
     } else {
       // The model does not fit beside DS4 — but eviction is the most expensive
@@ -7880,7 +8018,7 @@ async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'i
         // aliasRouting is a local of the chat handler and is NOT in scope here;
         // findFastestAvailableBackend resolves it itself when omitted.
         hasViableRemote: !!findFastestAvailableBackend(resolvedModel, 'chat/completions'),
-        ds4IdleMs: ds4LastServedAt ? Date.now() - ds4LastServedAt : Number.MAX_SAFE_INTEGER,
+        ds4IdleMs: exclusive.lastServedAt() ? Date.now() - exclusive.lastServedAt() : Number.MAX_SAFE_INTEGER,
         idleEvictAfterMs: DS4_IDLE_EVICT_AFTER_MS,
         requestPriority,
         // A request another manager already offloaded to us must not cost an
@@ -7888,17 +8026,17 @@ async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'i
         // relayed work around the fleet is how a loop starts.
         relayed: !!relay?.relayed,
       });
-      if (plan.action !== 'evict') {
+      if (plan.action !== 'evict' || !isAliasRequest) {
         // Leave DS4 exactly as it is. ds4RequestTarget then routes this request
         // to a remote backend (or refuses it cleanly), which is what the
         // exclusive-mode path already does for any non-alias model.
-        console.log(`[ds4] keeping DS4 for '${rawModel}' -> '${resolvedModel}': ${plan.reason} (${fit.reason})`);
-        addLog('presets', `Kept DS4 rather than evicting it for '${resolvedModel}': ${plan.reason}`);
+        console.log(`[${exclusive.type}] keeping ${exclusive.label} for '${rawModel}' -> '${resolvedModel}': ${plan.reason} (${fit.reason})`);
+        addLog('presets', `Kept ${exclusive.label} rather than evicting it for '${resolvedModel}': ${plan.reason}`);
         return null;
       }
-      console.log(`[ds4] default-model alias '${rawModel}' now points at llama target '${resolvedModel}' — deactivating exclusive ds4 mode (${plan.reason}; ${fit.reason})`);
-      addLog('presets', `default-model alias '${rawModel}' re-pointed at llama target '${resolvedModel}' — reversing exclusive ds4 mode. ${plan.reason} ${fit.reason}`);
-      await deactivateDs4Exclusive();
+      console.log(`[${exclusive.type}] default-model alias '${rawModel}' now points at llama target '${resolvedModel}' — deactivating exclusive ${exclusive.type} mode (${plan.reason}; ${fit.reason})`);
+      addLog('presets', `default-model alias '${rawModel}' re-pointed at llama target '${resolvedModel}' — reversing exclusive ${exclusive.type} mode. ${plan.reason} ${fit.reason}`);
+      await exclusive.deactivate();
       // Symmetric to the fit branch above, and for the same reason. Evicting
       // DS4 frees the box but leaves NO local engine running, so the request
       // then waits out the whole load timeout against a server that never
@@ -7910,7 +8048,7 @@ async function ensureDs4ForModel(rawModel, resolvedModel, { requestPriority = 'i
       // already co-resident the alias switch appeared to work, because the
       // router it needed happened to be up already.
       if (!llamaProcess) {
-        console.log(`[ds4] starting llama to serve '${resolvedModel}' after evicting DS4`);
+        console.log(`[${exclusive.type}] starting llama to serve '${resolvedModel}' after evicting ${exclusive.label}`);
         await restartLlamaServer({ governed: false });
       }
     }
@@ -8216,7 +8354,17 @@ function writeModelsPresetFile(contextSize = (config.contextSize || 8192), { rpc
   }
 }
 
-async function restartLlamaServer({ governed = true, contextOverride = 0 } = {}) {
+/**
+ * (Re)start the local llama server for the current mode, or hand a ds4 restart to
+ * its supervisor. While Strata owns the box and llama is not running, a restart
+ * is refused unless `besideExclusive` is set: only the fit-admission paths (which
+ * measured that a llama model fits beside Strata) may start llama next to it;
+ * crash, watchdog and idle-wake restarts must not.
+ *
+ * @param {{governed?:boolean, contextOverride?:number, besideExclusive?:boolean}} [opts]
+ * @returns {Promise<void>}
+ */
+async function restartLlamaServer({ governed = true, contextOverride = 0, besideExclusive = false } = {}) {
   // When the active engine is ds4, "restart the local server" means restart the
   // ds4 supervisor's process, NOT llama-server (which is stopped). The ds4
   // supervisor runs its own governor, so we bypass the llama governor here.
@@ -8226,6 +8374,11 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
       await restartDs4Server(preset);
       return;
     }
+  }
+
+  if (currentEngine === ENGINE_TYPES.STRATA && !llamaProcess && !besideExclusive) {
+    console.log('[restart] Strata owns the box; not starting llama-server beside it without a fit admission');
+    return;
   }
 
   if (restartInProgress) {
@@ -8783,20 +8936,24 @@ function ds4HeadroomBytes() {
  * ceiling). The adaptive controller advances on anything but 'ready'. Reuses the
  * supervisor's sawReady/exit signal — health() flips sawReady on a 200; isRunning()
  * goes false once the child exits.
+ * @param {object} engine An EXCLUSIVE_ENGINES handle (its health() and supervisor() are polled).
  * @returns {Promise<'ready'|'load-failure'|'timeout'>}
  */
-async function waitDs4AttemptOutcome() {
+async function waitEngineAttemptOutcome(engine) {
   const start = Date.now();
-  const sup = getDs4Supervisor();
+  const sup = engine.supervisor();
   while (Date.now() - start < DS4_READY_TIMEOUT_MS) {
     let h;
-    try { h = await getDs4Health(); } catch { /* not up yet */ }
+    try { h = await engine.health(); } catch { /* not up yet */ }
     if (h?.status === 'ok') return 'ready';
     if (!sup.isRunning()) return 'load-failure'; // exited before serving = load failure
     await new Promise((r) => setTimeout(r, DS4_READY_INTERVAL_MS));
   }
   return 'timeout';
 }
+
+/** DS4 wrapper kept by name: waitEngineAttemptOutcome over the DS4 handle. */
+async function waitDs4AttemptOutcome() { return waitEngineAttemptOutcome(EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4]); }
 
 /**
  * Resolve the effective adaptive-activation settings for a ds4 preset: per-preset
@@ -8816,6 +8973,51 @@ function ds4AdaptiveSettings(preset, ds4cfg) {
     ssdStreamingCacheExperts: pick('ssdStreamingCacheExperts') ?? ds4cfg.ssdStreamingCacheExperts,
     adaptiveContext: pick('adaptiveContext') ?? ds4cfg.adaptiveContext,
   };
+}
+
+/**
+ * Evict every local llama model (and, unless `keepEmbed`, the embed server) for an
+ * exclusive engine: robust host-PID kill, one bounded retry for a survivor, then
+ * wait for MemAvailable to reclaim to `targetBytes`. Never rolls back to llama;
+ * the caller decides what a failed eviction means (see ds4ActivationDecision).
+ * Shared by activateDs4Exclusive and the Strata HIP attempt.
+ *
+ * @param {{label:string, targetBytes:number, keepEmbed?:boolean}} opts `label` prefixes the log lines ('ds4'|'strata').
+ * @returns {Promise<{resident:number[], residentAfterEvict:boolean, reclaimOk:boolean}>}
+ *   `resident` lists llama-server pids that survived; `reclaimOk` is only measured when none did.
+ */
+async function evictLlamaForExclusive({ label, targetBytes, keepEmbed = false }) {
+  await stopLlamaServer();
+  if (!keepEmbed) {
+    addLog('presets', `${label}: stopping embed server — does not fit the exclusive-${label.toUpperCase()} memory budget`);
+    await stopEmbedServer();
+  } else {
+    addLog('presets', `${label}: keeping embed server resident (fits the memory budget)`);
+  }
+
+  let resident = residentEnginePids('llama-server');
+  if (resident.length) {
+    addLog('presets', `${label}: llama-server pids [${resident.join(', ')}] still resident after eviction — retrying robust host kill (staying exclusive, not resuming llama)`);
+    await killEnginePidsRobust('llama-server');
+    resident = residentEnginePids('llama-server');
+  }
+  const residentAfterEvict = resident.length > 0;
+
+  // Only measure reclaim once the model process is actually gone.
+  let reclaimOk = false;
+  if (!residentAfterEvict) {
+    addLog('presets', `${label}: waiting for memory reclaim — need MemAvailable ≥ ${gibStr(targetBytes)} GiB before spawn`);
+    const poll = await pollForReclaim({
+      readMemAvailable: memAvailableBytes,
+      targetBytes,
+      timeoutMs: DS4_RECLAIM_TIMEOUT_MS,
+      intervalMs: DS4_RECLAIM_INTERVAL_MS,
+    });
+    reclaimOk = poll.ok;
+    if (reclaimOk) addLog('presets', `${label}: reclaim verified (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB ≥ ${gibStr(targetBytes)} GiB); spawning ${label === 'ds4' ? 'ds4-server' : label}`);
+    else addLog('presets', `${label}: reclaim short (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB < ${gibStr(targetBytes)} GiB after ${Math.round(poll.waitedMs / 1000)}s)`);
+  }
+  return { resident, residentAfterEvict, reclaimOk };
 }
 
 /**
@@ -8872,37 +9074,8 @@ async function activateDs4Exclusive(presetId, preset) {
   // ── Eviction phase ──────────────────────────────────────────────────────────
   // Robust host-PID kill of llama-server (waits until gone), then a bounded retry
   // if a model survives the first SIGKILL window. A hiccup here NEVER rolls back.
-  await stopLlamaServer();
-  if (!keepEmbed) {
-    addLog('presets', 'ds4: stopping embed server — does not fit the exclusive-DS4 memory budget');
-    await stopEmbedServer();
-  } else {
-    addLog('presets', 'ds4: keeping embed server resident (fits the memory budget)');
-  }
-
-  let resident = residentEnginePids('llama-server');
-  if (resident.length) {
-    addLog('presets', `ds4: llama-server pids [${resident.join(', ')}] still resident after eviction — retrying robust host kill (staying exclusive, not resuming llama)`);
-    await killEnginePidsRobust('llama-server');
-    resident = residentEnginePids('llama-server');
-  }
-  const residentAfterEvict = resident.length > 0;
-
-  // Only measure reclaim once the model process is actually gone.
   const targetBytes = reclaimTargetBytes({ ds4ModelBytes, headroomBytes });
-  let reclaimOk = false;
-  if (!residentAfterEvict) {
-    addLog('presets', `ds4: waiting for memory reclaim — need MemAvailable ≥ ${gibStr(targetBytes)} GiB before spawn`);
-    const poll = await pollForReclaim({
-      readMemAvailable: memAvailableBytes,
-      targetBytes,
-      timeoutMs: DS4_RECLAIM_TIMEOUT_MS,
-      intervalMs: DS4_RECLAIM_INTERVAL_MS,
-    });
-    reclaimOk = poll.ok;
-    if (reclaimOk) addLog('presets', `ds4: reclaim verified (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB ≥ ${gibStr(targetBytes)} GiB); spawning ds4-server`);
-    else addLog('presets', `ds4: reclaim short (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB < ${gibStr(targetBytes)} GiB after ${Math.round(poll.waitedMs / 1000)}s)`);
-  }
+  const { resident, residentAfterEvict, reclaimOk } = await evictLlamaForExclusive({ label: 'ds4', targetBytes, keepEmbed });
 
   // ── Decide whether eviction cleared the way to spawn ──────────────────────────
   const evict = ds4ActivationDecision({ residentAfterEvict, reclaimOk, spawnOk: undefined });
@@ -9109,13 +9282,231 @@ async function deactivateExclusive(engine) {
 /** Deactivate exclusive DS4 mode. Name kept for callers/tests; see deactivateExclusive. */
 function deactivateDs4Exclusive() { return deactivateExclusive(EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4]); }
 
+// ── Strata engine (exclusive; HIP backend) ────────────────────────────────────
+// Qwen3.8 Flash Next served by Strata's python front (serve/server.py), managed
+// like DS4: exclusive, verified-reclaim eviction, swap gate, one generation slot.
+// The pure pieces live in strata-engine.js; the supervisor is the generic
+// createEngineSupervisor. Contract: docs/Designs/StrataEngine.md.
+// S3 HOOK: the CUDA attempt (3090 reservation, lease release in stopStrataServer,
+// backend policy tick) is added by the CUDA leaf; only the HIP attempt exists here.
+
+let strataSupervisor = null;
+
+/**
+ * Host-side reap of every `strata` process plus the Strata port. Matches the
+ * exact comm 'strata', never 'llama-server'.
+ * @returns {Promise<{ok:boolean, remainingPids:number[]}>} Confirmation the engine is gone.
+ */
+async function strataRunKill() {
+  const cfg = strataConfig();
+  const kill = await killEnginePidsRobust('strata');
+  await runKillCommand({ label: 'strata host fuser', command: `fuser -k ${cfg.port}/tcp 2>/dev/null || true`, useContainer: false });
+  return { ok: kill.ok, remainingPids: residentEnginePids('strata') };
+}
+
+/**
+ * Lazily construct the singleton Strata supervisor. It spawns server.py directly
+ * (argv, no shell) with a per-backend generated config JSON, and treats /health
+ * as ready only once the model has loaded (strataHealthReady).
+ * @returns {ReturnType<typeof createEngineSupervisor>}
+ */
+function getStrataSupervisor() {
+  if (!strataSupervisor) {
+    strataSupervisor = createEngineSupervisor({
+      label: 'strata',
+      processName: 'strata',
+      launch: (preset, override) => {
+        const cfg = strataConfig();
+        const backend = override?.backend || 'hip';
+        const path = strataConfigPath(cfg, backend);
+        mkdirSync(cfg.dataDir, { recursive: true });
+        writeFileSync(path, JSON.stringify(strataServerConfig({ cfg, preset, backend }), null, 2));
+        const spec = strataLaunchSpec({ cfg, configPath: path });
+        return { cmd: spec.cmd, args: spec.args, opts: { cwd: spec.cwd, env: { ...RUNTIME_ENV } } };
+      },
+      probe: async ({ fetchFn, port }) => {
+        const r = await fetchFn(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(3000) });
+        if (!r.ok) return { status: 'error' };
+        const body = await r.json().catch(() => null);
+        return {
+          status: strataHealthReady(body) ? 'ok' : 'loading',
+          detail: { loaded: body?.loaded === true, maxContext: Number(body?.max_context) || 0 },
+        };
+      },
+      port: () => strataConfig().port,
+      maxLoadFailures: () => config.guard?.strataMaxLoadFailures ?? 2,
+      spawn,
+      fetchFn: fetch,
+      getConfig: () => config,
+      restartDecision,
+      restartDefaults: RESTART_DEFAULTS,
+      log: (m) => console.log(m),
+      addLog,
+      runKill: strataRunKill,
+      getWedged: () => containerExecWedged >= CONTAINER_EXEC_WEDGED_LIMIT
+        || consecutiveFailedRestarts >= FAILED_RESTART_LIMIT,
+      now: () => Date.now(),
+      // A crash-driven auto-restart never went through activateStrataExclusive; arm the
+      // same gate so requests queue behind the reload instead of hitting a loading engine.
+      onRestartBegin: () => {
+        const settle = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();
+        if (!settle) return;
+        (async () => {
+          try { await waitEngineAttemptOutcome(EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA]); }
+          finally { settle(); }
+        })();
+      },
+    });
+  }
+  return strataSupervisor;
+}
+
+/**
+ * Stop the Strata engine (verified: SIGTERM, SIGKILL, then comm + port reap).
+ * S3 HOOK: also release the CUDA reservation lease here.
+ * @returns {Promise<{ok:boolean, remainingPids:number[]}>}
+ */
+async function stopStrataServer() { return getStrataSupervisor().stop(); }
+
+/**
+ * Start one Strata backend attempt. Reaps stray `strata` pids (a previous manager
+ * instance's orphans, since KillMode=process), then for HIP always evicts llama with
+ * verified reclaim, then spawns. Never throws.
+ *
+ * @param {object} preset The strata preset.
+ * @param {{backend:'hip'|'cuda'}} attempt The backend to try.
+ * @returns {Promise<{ok:true}|{ok:false, abort:boolean, reason:string}>} `abort` ends the whole ladder.
+ */
+async function startStrataAttempt(preset, { backend }) {
+  const cfg = strataConfig();
+  try {
+    // 1. Reap strays; a survivor means a wedged resident engine: do not spawn on top of it.
+    if (residentEnginePids('strata').length) {
+      addLog('presets', `strata: stray strata pids [${residentEnginePids('strata').join(', ')}] resident before spawn — reaping`);
+      await killEnginePidsRobust('strata');
+      await runKillCommand({ label: 'strata host fuser', command: `fuser -k ${cfg.port}/tcp 2>/dev/null || true`, useContainer: false });
+      if (residentEnginePids('strata').length) {
+        addLog('presets', 'strata activation blocked: a stray strata process would not die after SIGKILL (possible D-state / wedged GPU). Box stays in exclusive-Strata mode; manual recovery may be needed.');
+        return { ok: false, abort: true, reason: 'strata-wedged-resident' };
+      }
+    }
+    if (backend !== 'hip' || !cfg.hip) return { ok: false, abort: false, reason: `backend-unavailable:${backend}` };
+
+    // 3. HIP: unified memory, so llama is always evicted (verified reclaim), like DS4.
+    const headroomBytes = ds4HeadroomBytes();
+    const targetBytes = reclaimTargetBytes({ ds4ModelBytes: cfg.hip.residentBytes, headroomBytes });
+    const keepEmbed = shouldKeepEmbedServer({
+      allowEmbedServer: resolveDs4Config(config, RUNTIME_ENV).allowEmbedServer,
+      ds4ModelBytes: cfg.hip.residentBytes, embedServerBytes: DS4_EMBED_APPROX_BYTES,
+      totalBytes: memTotalBytes(), headroomBytes,
+    });
+    const { resident, residentAfterEvict, reclaimOk } = await evictLlamaForExclusive({ label: 'strata', targetBytes, keepEmbed });
+    const evict = ds4ActivationDecision({ residentAfterEvict, reclaimOk, spawnOk: undefined });
+    if (evict.action === 'abort-stay-exclusive') {
+      addLog('presets', evict.reason === 'llama-wedged-resident'
+        ? `strata activation blocked: llama-server pids [${resident.join(', ')}] would not die after SIGKILL. NOT spawning Strata on top; box stays in exclusive-Strata offload mode.`
+        : `strata activation deferred: memory did not reclaim to ${gibStr(targetBytes)} GiB before spawn; NOT spawning Strata. Box stays in exclusive-Strata offload mode; retry once RAM frees.`);
+      return { ok: false, abort: true, reason: evict.reason };
+    }
+
+    // 4. Spawn on the chosen backend; the override makes a post-settle auto-restart reuse it.
+    if (strataState.runtime) strataState.runtime.backend = backend;
+    getStrataSupervisor().start(preset, { planMode: true, override: { backend } });
+    return { ok: true };
+  } catch (err) {
+    addLog('presets', `strata: ${backend} attempt could not start: ${err.message}`);
+    return { ok: false, abort: true, reason: `start-error:${err.message}` };
+  }
+}
+
+/**
+ * Activate a Strata preset in exclusive mode. Mirrors activateDs4Exclusive: flip the
+ * engine and arm the swap gate immediately (so a request flood offloads instead of
+ * racing a llama load), then run the attempt ladder in the background and settle the
+ * gate. Failure stays exclusive (status 'exhausted'/'stop-unconfirmed', local Strata
+ * requests get a 503); it never rolls back to a competing llama load.
+ *
+ * @param {string} presetId The strata preset id.
+ * @param {object} preset The strata preset.
+ * @returns {Promise<{ok:true}|{ok:false,status:number,error:string}>}
+ */
+async function activateStrataExclusive(presetId, preset) {
+  const cfg = strataConfig();
+  const attempts = [cfg.hip && { backend: 'hip' }].filter(Boolean); // S3 HOOK: CUDA attempt goes first
+  if (!cfg.enabled || attempts.length === 0) {
+    return { ok: false, status: 503, error: `Strata is not configured: ${cfg.reason || 'no usable backend for this build (hip required)'}` };
+  }
+  const eng = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA];
+  if (currentEngine === ENGINE_TYPES.DS4) await deactivateDs4Exclusive();
+
+  currentMode = 'single';
+  currentPreset = presetId;
+  strataState.activePresetId = presetId;
+  strataState.swapGeneration += 1;
+  currentEngine = ENGINE_TYPES.STRATA;
+  const settleGate = eng.armSwapGate({ force: true });
+  const runtime = { status: 'loading', presetId, backend: null, attempts: [], settledAt: null, cuda: null };
+  strataState.runtime = runtime;
+  addLog('presets', `Activating Strata EXCLUSIVE mode: ${preset.name} (evicting local models by host PID, verifying reclaim before spawn)`);
+
+  (async () => {
+    const sup = getStrataSupervisor();
+    try {
+      // Re-activation of a running engine is a restart: the spawn path reaps strays.
+      if (sup.isRunning()) { try { await stopStrataServer(); } catch { /* already gone */ } }
+      const result = await runDs4AdaptivePlan({
+        attempts,
+        startAttempt: async (attempt) => {
+          addLog('presets', `strata: trying ${attempt.backend}`);
+          const started = await startStrataAttempt(preset, attempt);
+          if (started.ok === false) runtime.attempts.push({ backend: attempt.backend, outcome: started.reason });
+          return started;
+        },
+        waitForOutcome: async (attempt) => {
+          const outcome = await waitEngineAttemptOutcome(eng);
+          runtime.attempts.push({ backend: attempt.backend, outcome });
+          return outcome;
+        },
+        stopAttempt: async () => {
+          try { return await stopStrataServer(); } catch { return { ok: true, remainingPids: [] }; }
+        },
+        onAttempt: (attempt, i) => {
+          if (i > 0) addLog('presets', `strata: previous attempt failed to load; stepping to attempt ${i + 1}/${attempts.length}`);
+        },
+      });
+      if (result.ok) {
+        sup.endPlan({ settled: result.settled });
+        Object.assign(runtime, { status: 'ready', backend: result.settled.backend, settledAt: Date.now() });
+        addLog('presets', `strata: SETTLED — serving on ${result.settled.backend} after attempt ${result.attemptsMade}/${attempts.length}`);
+      } else {
+        sup.endPlan({ settled: null });
+        try { await stopStrataServer(); } catch { /* already gone */ }
+        Object.assign(runtime, {
+          status: result.reason === 'stop-unconfirmed' ? 'stop-unconfirmed' : 'exhausted',
+          backend: null, settledAt: Date.now(), reason: result.reason,
+        });
+        addLog('presets', `strata activation did not serve (${result.reason}). Box stays in exclusive-Strata offload mode; local strata requests get a clean 503. Re-activate the preset to retry.`);
+      }
+    } catch (err) {
+      sup.endPlan({ settled: null });
+      Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: err.message });
+      addLog('presets', `strata activation errored: ${err.message}; staying exclusive`);
+    } finally {
+      settleGate();
+    }
+  })();
+
+  return { ok: true };
+}
+
 // Start llama server in router mode (multi-model)
 app.post('/api/server/start', async (req, res) => {
   idleShutdown = false;
-  // Switching to router while ds4 owns the box reverses exclusive mode first
-  // (stop ds4, verify its 81GB reclaimed) so llama and ds4 never over-commit RAM.
-  if (currentEngine === ENGINE_TYPES.DS4) {
-    await deactivateDs4Exclusive();
+  // Switching to router while an exclusive engine (ds4/strata) owns the box reverses
+  // exclusive mode first (stop it, verify its memory reclaimed) so llama and the
+  // engine never over-commit RAM.
+  if (activeExclusive()) {
+    await activeExclusive().deactivate();
   }
   await stopLlamaServer();
 
@@ -9202,6 +9593,8 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
   // on ds4SwapPromise until ds4 is ready. See activateDs4Exclusive().
   if (isDs4Preset(preset)) {
     console.log(`[presets] Activating ds4 preset (exclusive): ${presetId} with model ${preset.modelPath}`);
+    // The two exclusive engines never co-reside: reverse Strata first.
+    if (currentEngine === ENGINE_TYPES.STRATA) await activeExclusive().deactivate();
     const result = await activateDs4Exclusive(presetId, preset);
     if (result.ok) {
       return res.json({
@@ -9215,12 +9608,31 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
     return res.status(result.status || 500).json({ error: result.error });
   }
 
+  // ── strata engine preset ───────────────────────────────────────────────────
+  // Exclusive like ds4: evict llama with verified reclaim, then load Strata in the
+  // background while mid-swap traffic is held on the Strata gate.
+  if (isStrataPreset(preset)) {
+    console.log(`[presets] Activating strata preset (exclusive): ${presetId}`);
+    const result = await activateStrataExclusive(presetId, preset);
+    if (result.ok) {
+      return res.json({
+        success: true,
+        mode: 'single',
+        engine: ENGINE_TYPES.STRATA,
+        preset,
+        pid: getStrataSupervisor().getPid()
+      });
+    }
+    return res.status(result.status || 500).json({ error: result.error });
+  }
+
   // ── llama engine preset ────────────────────────────────────────────────────
-  // If we were serving ds4, reverse exclusive mode with the same verified-reclaim
-  // discipline (stop ds4, free port, confirm ds4's 81GB is released) before we
-  // start a llama model, so the two engines never co-reside / over-commit RAM.
-  if (currentEngine === ENGINE_TYPES.DS4) {
-    await deactivateDs4Exclusive();
+  // If we were serving an exclusive engine, reverse exclusive mode with the same
+  // verified-reclaim discipline (stop it, free its port, confirm its memory is
+  // released) before we start a llama model, so the engines never co-reside /
+  // over-commit RAM.
+  if (activeExclusive()) {
+    await activeExclusive().deactivate();
   }
 
   await stopLlamaServer();
@@ -9229,6 +9641,7 @@ app.post('/api/presets/:presetId/activate', async (req, res) => {
     currentMode = 'single';
     currentPreset = presetId;
     ds4ActivePresetId = null;  // a llama preset now owns the box
+    strataState.activePresetId = null;
     currentEngine = ENGINE_TYPES.LLAMA;
 
     // All presets use the same script with environment variables
@@ -10286,8 +10699,9 @@ function installedEngines() {
  * @returns {{engine: string, model: string|null}} Engine state and loaded model.
  */
 function describeEngineForFleet() {
-  const running = currentEngine === ENGINE_TYPES.DS4
-    ? !!getDs4Supervisor()?.isRunning()
+  const exclusive = activeExclusive();
+  const running = exclusive
+    ? !!exclusive.supervisor()?.isRunning()
     : llamaProcess !== null && !llamaProcess.killed;
   return { engine: running ? 'running' : 'idle', model: activeLocalModel || null };
 }
@@ -11301,8 +11715,12 @@ async function handleModels(req, res) {
     // skip the llama /models + disk-scan shape entirely.
     const ds4List = ds4ModelsList(config, { currentEngine, currentPreset, created: Math.floor(Date.now() / 1000) });
     if (ds4List) {
-      const ds4Capabilities = contextCapabilities('ds4');
+      const ds4Capabilities = contextCapabilities(currentEngine);
       const out = { object: 'list', data: ds4List.map(entry => ({ ...entry, context_management: ds4Capabilities })) };
+      // The other Strata presets stay listed (unloaded) beside the active exclusive model.
+      for (const entry of strataCatalogEntries(config, { currentEngine, currentPreset, created: Math.floor(Date.now() / 1000) })) {
+        if (!out.data.some((m) => m.id === entry.id)) out.data.push({ ...entry, context_management: ds4Capabilities });
+      }
       // An alias can only advertise a window it can prove, so it is resolved from the
       // windows this response already reports for the real models behind it.
       const ds4Contexts = Object.fromEntries(
@@ -11435,6 +11853,13 @@ async function handleModels(req, res) {
         seenNorm.add(norm(f.name));
       }
     } catch { /* ds4 not configured on this host — leave the list as-is */ }
+
+    // 4) Strata presets: every configured one is listed, active or not (activating one
+    // is what requesting it does, exactly like DS4).
+    for (const entry of strataCatalogEntries(config, { currentEngine, currentPreset, created: Math.floor(Date.now() / 1000) })) {
+      if (byId.has(entry.id)) continue;
+      byId.set(entry.id, { ...entry, alias: aliases[entry.id] || null, context_management: contextCapabilities(ENGINE_TYPES.STRATA, { slotCacheEnabled: slotCacheCfg().enabled, slotOperationsSupported: false }) });
+    }
 
     const data = { object: 'list', data: [...byId.values()] };
 
@@ -16985,7 +17410,7 @@ setInterval(async () => {
       // Observability only, no behavior change: make the watchdog's own
       // reasoning about a ds4 entry answerable from logs instead of live
       // polling a box that has already moved on. See shouldLogDs4Verdict.
-      if (entry.backend === 'ds4' && shouldLogDs4Verdict(verdict, entry._lastLoggedVerdict, entry._verdictLogAt, now)) {
+      if (isExclusiveEngine(entry.backend) && shouldLogDs4Verdict(verdict, entry._lastLoggedVerdict, entry._verdictLogAt, now)) {
         entry._lastLoggedVerdict = { action: verdict.action, reason: verdict.reason };
         entry._verdictLogAt = now;
         const verdictMsg = `Stall watchdog verdict for ds4 request ${id}: action=${verdict.action} idleMs=${verdict.idleMs} limitMs=${verdict.limitMs} reason="${verdict.reason}"`;
@@ -17057,6 +17482,18 @@ setInterval(() => {
   // unmonitored — branch on the active engine instead.
   const ds4Active = currentEngine === ENGINE_TYPES.DS4;
   let engineLabel;
+  if (currentEngine === ENGINE_TYPES.STRATA) {
+    // Strata never auto-restarts: a restart reloads the same weights, and HIP
+    // allocations may not show in RSS (unified memory), so a threshold breach alone
+    // proves nothing. Log (throttled) and HOLD; the operator decides.
+    if (Date.now() - _memWatchdogLastDeferLogAt > 60_000) {
+      _memWatchdogLastDeferLogAt = Date.now();
+      const msg = `Memory watchdog (${ENGINE_TYPES.STRATA}): ${memPercent.toFixed(1)}% ≥ ${cfg.memThresholdPct}% — holding, never auto-restarting Strata (a restart would reload the same weights)`;
+      console.warn(`[mem-watchdog] ${msg}`);
+      addLog('system', msg);
+    }
+    return;
+  }
   if (ds4Active) {
     // ds4's 81GB baseline means a threshold breach alone is NOT a leak: restarting
     // reloads the same weights and reclaims nothing. Only restart when ds4's RSS
@@ -17390,6 +17827,7 @@ function shutdownWithTimeout(signal) {
     stopEmbedServer(),
     decisionSupervisor.stop(),
     stopDs4Server(),
+    stopStrataServer(),
   // Last, and only after the engine is down: the rpc-server outlives an abrupt manager
   // exit otherwise, holding VRAM on a card whose owner is gone.
   ]).then(() => stopRpcServer('llama-manager is shutting down')).finally(() => process.exit(0));
