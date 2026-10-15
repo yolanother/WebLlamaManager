@@ -210,6 +210,14 @@ export function createEngineSupervisor({
     };
     child.stdout?.on('data', (d) => { addLog(label, d); captureOutput(d); });
     child.stderr?.on('data', (d) => { addLog(label, d); captureOutput(d); });
+    // A failed spawn (ENOENT, EACCES) emits 'error' and may never emit 'exit': clear the
+    // process so isRunning() goes false and the attempt records a load failure promptly.
+    child.on('error', (err) => {
+      if (proc !== child) return;
+      log(`[${label}] ${processName} failed to spawn: ${err.message}`);
+      addLog('system', `${processName} failed to spawn: ${err.message}`);
+      proc = null;
+    });
     child.on('exit', (code) => {
       if (proc !== child) return; // superseded; ignore late exit
       const tail = recentLines.length

@@ -101,3 +101,27 @@ test('M6: POST /api/config refuses strata from off-box callers and validates pre
   assert.ok(body.indexOf('403') < body.indexOf('saveConfig('), 'refusal precedes the save');
   assert.ok(body.indexOf('validatePresetEngineFields(') < body.indexOf('saveConfig('), 'validation precedes the save');
 });
+
+test('m1: a spawn error event clears the process so isRunning() goes false', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { createDs4Supervisor } = await import('./ds4-supervisor.js');
+  const child = Object.assign(new EventEmitter(), { pid: 1, killed: false, kill() { return true; }, stdout: new EventEmitter(), stderr: new EventEmitter() });
+  const logs = [];
+  const sup = createDs4Supervisor({
+    spawn: () => child, fetchFn: async () => ({ ok: true }), getConfig: () => ({ ds4: {} }), env: {}, projectRoot: '/proj',
+    restartDecision: (a) => ({ allow: true, reason: 'ok', history: [], retryAfterMs: 0 }), restartDefaults: {},
+    log: (m) => logs.push(m), addLog: () => {}, runKill: async () => {}, now: () => 1000, sleep: async () => {},
+    setTimeoutFn: () => 0,
+  });
+  sup.start({ id: 'p', name: 'p', engine: 'ds4', modelPath: 'm.gguf' });
+  assert.equal(sup.isRunning(), true);
+  child.emit('error', new Error('spawn ENOENT'));
+  assert.equal(sup.isRunning(), false);
+  assert.ok(logs.some((l) => /ENOENT/.test(l)), 'error is logged');
+});
+
+test('m1: startStrataAttempt reports python-missing instead of spawning', () => {
+  const body = fnBody('startStrataAttempt');
+  assert.match(body, /existsSync\(cfg\.pythonPath\)/);
+  assert.match(body, /python-missing/);
+});

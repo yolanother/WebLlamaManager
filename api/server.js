@@ -9449,6 +9449,12 @@ function strataCudaBlocked(cfg) {
 async function startStrataAttempt(preset, { backend }) {
   const cfg = strataConfig();
   try {
+    // 0. A missing interpreter fails every backend the same way: abort the ladder before
+    // evicting llama or taking a CUDA lease for a spawn that cannot succeed.
+    if (!existsSync(cfg.pythonPath)) {
+      addLog('presets', `strata: pythonPath ${cfg.pythonPath} does not exist; aborting activation`);
+      return { ok: false, abort: true, reason: 'python-missing' };
+    }
     // 1. Reap strays; a survivor means a wedged resident engine: do not spawn on top of it.
     if (residentEnginePids('strata').length) {
       addLog('presets', `strata: stray strata pids [${residentEnginePids('strata').join(', ')}] resident before spawn — reaping`);
