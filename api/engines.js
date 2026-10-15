@@ -1,9 +1,10 @@
-// Llama Manager — engine abstraction helpers (llama.cpp + ds4-server).
+// Llama Manager — engine abstraction helpers (llama.cpp, ds4-server, strata).
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 //
 // Pure, side-effect-free helpers that describe the inference engines this
 // manager can supervise — the default llama.cpp router/preset engine, the
-// ds4-server (DeepSeek V4 Flash) engine, and the laya decision sidecar's
+// ds4-server (DeepSeek V4 Flash) engine, the strata exclusive engine (preset
+// validation, catalog entries, stall policy), and the laya decision sidecar's
 // registry entry — behind one seam so the rest of the server can branch on an
 // engine descriptor instead of scattering `if (ds4)` checks. Responsibilities:
 // normalize a preset's declared engine, resolve the top-level `config.ds4`
@@ -24,7 +25,17 @@
 import { join } from 'node:path';
 
 /** Canonical engine type identifiers. */
-export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4', DECISION: 'decision' };
+export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4', STRATA: 'strata', DECISION: 'decision' };
+
+/**
+ * True for engine types that own the whole box while active (ds4, strata): one at a
+ * time, no llama co-residence by default, one generation lane.
+ * @param {string} type Engine type id.
+ * @returns {boolean}
+ */
+export function isExclusiveEngine(type) {
+  return type === ENGINE_TYPES.DS4 || type === ENGINE_TYPES.STRATA;
+}
 
 /**
  * `comm` values (as reported by /proc/<pid>/comm) of the local inference-engine
@@ -33,7 +44,7 @@ export const ENGINE_TYPES = { LLAMA: 'llama', DS4: 'ds4', DECISION: 'decision' }
  * guards to attribute memory + heat to "the llama stack" regardless of which
  * engine is active, so an 81GB ds4-server is not mistaken for external load.
  */
-export const ENGINE_PROCESS_COMMS = ['llama-server', 'ds4-server'];
+export const ENGINE_PROCESS_COMMS = ['llama-server', 'ds4-server', 'strata'];
 
 /**
  * True when a /proc comm belongs to a supervised inference-engine process
@@ -47,7 +58,7 @@ export function isEngineProcessComm(comm) {
 
 /**
  * True when the given engine type exposes llama.cpp-style per-slot `/slots`
- * (llama does; ds4-server does not). The slot-cache / slot-reaper / per-slot
+ * (llama does; ds4-server and strata do not). The slot-cache / slot-reaper / per-slot
  * proof-of-life machinery is llama-only and must no-op cleanly under ds4.
  * Unknown/empty engine defaults to slot-capable (the llama default) so a missing
  * engine flag never silently disables the llama slot guards.
@@ -55,7 +66,7 @@ export function isEngineProcessComm(comm) {
  * @returns {boolean}
  */
 export function engineSupportsSlots(engineType) {
-  return String(engineType || '').toLowerCase() !== ENGINE_TYPES.DS4;
+  return !isExclusiveEngine(String(engineType || '').toLowerCase());
 }
 
 /** Default ds4 configuration when neither config.ds4 nor DS4_* env is present. */
@@ -125,11 +136,18 @@ function resolveAllowedRepos(envVal, cfgVal, dflt) {
  * (typo, unsupported engine) also degrades to 'llama' so a bad preset can never
  * silently route to a non-existent supervisor.
  * @param {object|null} preset
- * @returns {'llama'|'ds4'}
+ * @returns {'llama'|'ds4'|'strata'}
  */
 export function presetEngine(preset) {
   const e = String(preset?.engine || '').toLowerCase();
-  return e === ENGINE_TYPES.DS4 ? ENGINE_TYPES.DS4 : ENGINE_TYPES.LLAMA;
+  if (e === ENGINE_TYPES.DS4) return ENGINE_TYPES.DS4;
+  if (e === ENGINE_TYPES.STRATA) return ENGINE_TYPES.STRATA;
+  return ENGINE_TYPES.LLAMA;
+}
+
+/** True when the preset declares the strata engine. */
+export function isStrataPreset(preset) {
+  return presetEngine(preset) === ENGINE_TYPES.STRATA;
 }
 
 /** True when the preset declares the ds4 engine. */
@@ -285,11 +303,13 @@ export function ds4EnableGate({ freeMemBytes = 0, ds4Config, weightsPresent = tr
  * enable), 'insufficient-memory' (ds4 off and cannot fit), 'down'.
  *
  * @param {{llama:object, embed:object, ds4:object, decision:(object|null)}} params
+ * @param {object} [params.strata] Optional: `{running, healthy, port, models, mode, queue, tps, requests}`
+ *   for the strata engine; omitted ⇒ no entry.
  * @param {object} [params.decision] Optional: `{running, healthy, runnable, reason, port,
  *   models}` from the decision supervisor; omitted ⇒ no entry.
  * @returns {Array<object>} uniform server descriptors, id-sorted
  */
-export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {}, decision = null } = {}) {
+export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {}, decision = null, strata = null } = {}) {
   /** Shape a plain (llama-family) local server entry into the uniform record. */
   const entry = (id, type, displayName, role, src, supports) => {
     const running = !!src.running;
@@ -345,6 +365,11 @@ export function buildLocalServerRegistry({ llama = {}, embed = {}, ds4 = {}, dec
   }
 
   const entries = [llamaEntry, embedEntry, ds4Entry];
+  if (strata) {
+    entries.push(entry('strata', ENGINE_TYPES.STRATA, 'Strata (Qwen3.8 Flash Next)', 'single',
+      { ...strata, idleReady: false },
+      { router: false, slots: false, vision: false, speculative: true }));
+  }
   if (decision) {
     const decisionEntry = entry('decision', ENGINE_TYPES.DECISION, 'Decision (Laya)', 'decision',
       { ...decision, idleReady: !!decision.runnable },
@@ -627,23 +652,68 @@ export function resolveQwen36Context(contextSize) {
   return Math.min(contextSize, QWEN36_WORKER_CONTEXT);
 }
 
+/** Flags the manager owns for strata; a preset may not set them. */
+const STRATA_RESERVED_FLAGS = ['--expert-cache', '--max-context', '--port'];
+
+/** Upper bound for a strata preset's context window. */
+const STRATA_MAX_CONTEXT = 1048576;
+
+/**
+ * Validate the strata branch of a preset request body (see StrataEngine.md §5.2).
+ * @param {object} body Request body with a `strata` block and optional `context`.
+ * @returns {{ok:true, engine:'strata', strata:object, context:number}|{ok:false, error:string}}
+ */
+function validateStrataPresetFields(body) {
+  const st = body.strata;
+  if (!st || typeof st !== 'object' || Array.isArray(st)) {
+    return { ok: false, error: 'strata presets require a strata object ({ args, tokenizer }).' };
+  }
+  const { args, tokenizer, modelName } = st;
+  if (!Array.isArray(args) || args.length < 1 || args.length > 200
+      || args.some((a) => typeof a !== 'string' || a === '')) {
+    return { ok: false, error: 'strata.args must be an array of 1-200 non-empty strings.' };
+  }
+  const reserved = args.find((a) => STRATA_RESERVED_FLAGS.some((f) => a === f || a.startsWith(`${f}=`)));
+  if (reserved) {
+    return { ok: false, error: `strata.args must not contain ${reserved.split('=')[0]} (managed by the manager).` };
+  }
+  if (typeof tokenizer !== 'string' || !tokenizer.startsWith('/')) {
+    return { ok: false, error: 'strata.tokenizer must be a non-empty absolute path.' };
+  }
+  if (modelName !== undefined && modelName !== null && typeof modelName !== 'string') {
+    return { ok: false, error: 'strata.modelName must be a string.' };
+  }
+  let context = QWEN38_FLASH_NEXT_CONTEXT;
+  if (body.context !== undefined && body.context !== null && body.context !== '') {
+    const c = Number(body.context);
+    if (!Number.isInteger(c) || c <= 0 || c > STRATA_MAX_CONTEXT) {
+      return { ok: false, error: `strata context must be a positive integer <= ${STRATA_MAX_CONTEXT}.` };
+    }
+    context = c;
+  }
+  return { ok: true, engine: ENGINE_TYPES.STRATA, strata: { args: [...args], tokenizer, modelName }, context };
+}
+
 /**
  * Validate the engine-related fields of a preset create/update request body.
  * Returns the normalized engine and (for ds4) a validated ds4 field block, or a
  * human-readable error. Does NOT touch the filesystem — existence checks stay in
  * the server handler so this remains pure/testable.
  * @param {object} body Request body ({ engine, modelPath, context, power, ... }).
- * @returns {{ok:true, engine:'llama'}|{ok:true, engine:'ds4', ds4:object}|{ok:false, error:string}}
+ * @returns {{ok:true, engine:'llama'}|{ok:true, engine:'ds4', ds4:object}|
+ *   {ok:true, engine:'strata', strata:{args:string[],tokenizer:string,modelName:(string|undefined)}, context:number}|
+ *   {ok:false, error:string}}
  */
 export function validatePresetEngineFields(body = {}) {
   const engineRaw = body.engine === undefined || body.engine === null || body.engine === ''
     ? ENGINE_TYPES.LLAMA
     : String(body.engine).toLowerCase();
 
-  if (engineRaw !== ENGINE_TYPES.LLAMA && engineRaw !== ENGINE_TYPES.DS4) {
-    return { ok: false, error: `Unsupported engine '${body.engine}'. Must be 'llama' or 'ds4'.` };
+  if (engineRaw !== ENGINE_TYPES.LLAMA && engineRaw !== ENGINE_TYPES.DS4 && engineRaw !== ENGINE_TYPES.STRATA) {
+    return { ok: false, error: `Unsupported engine '${body.engine}'. Must be 'llama', 'ds4' or 'strata'.` };
   }
   if (engineRaw === ENGINE_TYPES.LLAMA) return { ok: true, engine: ENGINE_TYPES.LLAMA };
+  if (engineRaw === ENGINE_TYPES.STRATA) return validateStrataPresetFields(body);
 
   // ds4 validation.
   if (!body.modelPath || typeof body.modelPath !== 'string') {
@@ -734,8 +804,9 @@ export function resolveDs4ModelPath(modelPath, ggufDir) {
 }
 
 /**
- * Build the OpenAI `/v1/models` entry for a ds4 preset's model.
- * @param {object} preset The active ds4 preset.
+ * Build the OpenAI `/v1/models` entry for a ds4 or strata preset's model (a preset
+ * without `engine` stays ds4).
+ * @param {object} preset The active ds4/strata preset.
  * @param {{created?:number}} [opts]
  * @returns {object}
  */
@@ -744,13 +815,13 @@ export function ds4ModelEntry(preset, { created } = {}) {
     id: preset.id,
     object: 'model',
     created: created ?? Math.floor(Date.now() / 1000),
-    owned_by: 'ds4',
+    owned_by: preset.engine === ENGINE_TYPES.STRATA ? ENGINE_TYPES.STRATA : ENGINE_TYPES.DS4,
     meta: null,
     n_ctx: preset.context || null,
     displayName: preset.name || preset.id,
     status: 'loaded',
     alias: null,
-    engine: 'ds4',
+    engine: preset.engine === ENGINE_TYPES.STRATA ? ENGINE_TYPES.STRATA : ENGINE_TYPES.DS4,
   };
 }
 
@@ -763,10 +834,29 @@ export function ds4ModelEntry(preset, { created } = {}) {
  * @returns {object[]|null}
  */
 export function ds4ModelsList(config, { currentEngine, currentPreset, created } = {}) {
-  if (currentEngine !== ENGINE_TYPES.DS4) return null;
+  if (currentEngine !== ENGINE_TYPES.DS4 && currentEngine !== ENGINE_TYPES.STRATA) return null;
   const preset = config?.presets?.[currentPreset];
   if (!preset) return null;
   return [ds4ModelEntry(preset, { created })];
+}
+
+/**
+ * Serving catalog for the strata engine: one entry per strata preset in config
+ * (same entry shape as ds4ModelsList), so every strata model is listed whether or
+ * not it is the active one. Returns [] when no strata presets exist.
+ * @param {object} config Parsed config.json.
+ * @param {{currentEngine?:string, currentPreset?:(string|null), created?:number}} [state]
+ *   `currentEngine`/`currentPreset` mark the active model's `status` ('loaded' vs 'unloaded').
+ * @returns {object[]}
+ */
+export function strataCatalogEntries(config, { currentEngine, currentPreset, created } = {}) {
+  return Object.values(config?.presets || {})
+    .filter((p) => p && isStrataPreset(p))
+    .map((p) => {
+      const e = ds4ModelEntry(p, { created });
+      if (!(currentEngine === ENGINE_TYPES.STRATA && currentPreset === p.id)) e.status = 'unloaded';
+      return e;
+    });
 }
 
 /**
@@ -1087,6 +1177,9 @@ export function remoteStallMs({ contextTokens = 0, floorMs = 120000, safetyFacto
  */
 export const DS4_ZERO_TOKEN_STALL_MS = 480_000;
 
+/** Zero-token idle ceiling for strata-backed requests (long prefill on a 262k window). */
+export const STRATA_ZERO_TOKEN_STALL_MS = 900_000;
+
 /**
  * Idle ceiling for a remote-backed request that has produced NOTHING yet.
  *
@@ -1128,6 +1221,7 @@ export const REMOTE_ZERO_TOKEN_STALL_MS = 900_000;
  */
 export function remoteStallCeilingMs(entry, genericRemoteStallMs) {
   if (entry?.backend === 'ds4') return DS4_ZERO_TOKEN_STALL_MS;
+  if (entry?.backend === 'strata') return STRATA_ZERO_TOKEN_STALL_MS;
   if (!entry?.tokens) return Math.max(genericRemoteStallMs, REMOTE_ZERO_TOKEN_STALL_MS);
   return genericRemoteStallMs;
 }
@@ -1206,7 +1300,7 @@ export function ds4ResponsesEventText(event) {
  */
 export function remoteStallVerdict({ entry, holdsDs4Slot = false, queuedForDs4Slot = false, now, genericRemoteStallMs }) {
   const limitMs = remoteStallCeilingMs(entry, genericRemoteStallMs);
-  const isDs4 = entry?.backend === 'ds4';
+  const isDs4 = entry?.backend === 'ds4' || entry?.backend === 'strata';
   if (isDs4 && !holdsDs4Slot && queuedForDs4Slot) {
     return {
       action: 'skip',

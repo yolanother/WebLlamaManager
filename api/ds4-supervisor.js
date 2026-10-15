@@ -1,7 +1,10 @@
-// Llama Manager — ds4-server process supervisor (DeepSeek V4 Flash engine).
+// Llama Manager — exclusive-engine process supervisor (ds4-server, strata).
 // Copyright (c) Llama Manager project. See the LICENSE file in the repo root.
 //
-// A dependency-injected supervisor for the ds4-server process, modeled on the
+// A dependency-injected, engine-agnostic supervisor (createEngineSupervisor) plus the
+// thin DS4 wrapper (createDs4Supervisor). The state machine is shared by every exclusive
+// engine; each engine supplies its own launch spec and readiness probe. For DS4: a
+// dependency-injected supervisor for the ds4-server process, modeled on the
 // existing embed-server supervisor in server.js but extracted into its own module
 // so its start/stop/restart/exit→restart state machine is unit-testable without
 // booting the HTTP server. Owns a single ds4-server child process: spawns it via
@@ -26,9 +29,22 @@ import { resolveDs4Config, resolveDs4ModelPath } from './engines.js';
 const RECENT_OUTPUT_LINES = 20;
 
 /**
- * Create a ds4-server supervisor.
+ * Create a generic exclusive-engine supervisor. Same state machine for every engine:
+ * governed auto-restart, load-failure circuit breaker, adaptive planMode with a
+ * per-attempt override and endPlan({settled}), verified stop, and a trailing-output
+ * exit log. Engine specifics are injected via launch/probe/port/maxLoadFailures.
  *
  * @param {object} deps
+ * @param {string} deps.label Log prefix and addLog channel ('ds4' | 'strata').
+ * @param {string} deps.processName Name used in start/exit log lines ('ds4-server' | 'strata').
+ * @param {(preset:object, override:(object|null))=>{cmd:string,args:string[],opts?:object}} deps.launch
+ *   Build the spawn spec for an attempt (may write files). `opts` (cwd, env, ...) is merged over the
+ *   supervisor's `stdio`/`detached` defaults.
+ * @param {(a:{fetchFn:Function, port:number})=>Promise<{status:('ok'|'loading'|'error'), detail?:object}>} deps.probe
+ *   Readiness probe; a throw is reported as status 'unavailable'. `sawReady` flips only on 'ok'.
+ * @param {()=>number} deps.port Engine port.
+ * @param {()=>number} deps.maxLoadFailures Consecutive load failures before auto-restart stops.
+ * @param {(settled:object)=>object} [deps.settledOverride] Maps a settled attempt to the stored override (default: identity).
  * @param {Function} deps.spawn Node child_process spawn (or a fake). Signature (cmd, args, opts) → ChildProcess.
  * @param {Function} [deps.fetchFn] fetch implementation for the health probe.
  * @param {Function} deps.getConfig () => parsed config.json (read fresh each call).
@@ -57,12 +73,17 @@ const RECENT_OUTPUT_LINES = 20;
  *   isRunning:Function, getPid:Function, getActivePreset:Function,
  *   getActiveOverride:Function, endPlan:Function}}
  */
-export function createDs4Supervisor({
+export function createEngineSupervisor({
+  label,
+  processName,
+  launch,
+  probe,
+  port,
+  maxLoadFailures,
+  settledOverride = (settled) => settled,
   spawn,
   fetchFn = fetch,
   getConfig,
-  env = {},
-  projectRoot,
   restartDecision,
   restartDefaults = {},
   log = () => {},
@@ -117,48 +138,6 @@ export function createDs4Supervisor({
     return activeOverride;
   }
 
-  /**
-   * Build the launch environment for start-ds4.sh from the resolved ds4 config
-   * and the preset's model/context and ds4 launch knobs (under preset.config).
-   * When an adaptive override is active it wins for context and drives the SSD
-   * expert-streaming flags (DS4_SSD_STREAMING 0/1 + cache-experts size).
-   */
-  function buildEnv(preset) {
-    const ds4 = resolveDs4Config(getConfig() || {}, env);
-    const modelAbs = resolveDs4ModelPath(preset.modelPath || '', ds4.ggufDir);
-    const pc = preset.config || {};
-    const e = {
-      ...env,
-      DS4_SERVER_BIN: ds4.binPath,
-      DS4_PORT: String(ds4.port),
-      DS4_GGUF_DIR: ds4.ggufDir,
-      DS4_CONTAINER: ds4.container,
-      DS4_IN_DISTROBOX: ds4.runInDistrobox ? '1' : '0',
-      DS4_MODEL: modelAbs,
-      DS4_CTX: String(preset.context || 0),
-    };
-    // Adaptive override: the controller sets the per-attempt context + streaming.
-    if (activeOverride) {
-      if (activeOverride.context !== undefined && activeOverride.context !== null) {
-        e.DS4_CTX = String(activeOverride.context);
-      }
-      if (activeOverride.ssdStreaming) {
-        e.DS4_SSD_STREAMING = '1';
-        const ce = activeOverride.cacheExperts || ds4.ssdStreamingCacheExperts;
-        if (ce) e.DS4_SSD_STREAMING_CACHE_EXPERTS = String(ce);
-      } else {
-        e.DS4_SSD_STREAMING = '0';
-      }
-    }
-    if (pc.power !== undefined && pc.power !== null && pc.power !== '') e.DS4_POWER = String(pc.power);
-    if (pc.kvDiskDir) e.DS4_KV_DISK_DIR = String(pc.kvDiskDir);
-    if (pc.kvDiskSpaceMb !== undefined && pc.kvDiskSpaceMb !== null && pc.kvDiskSpaceMb !== '') {
-      e.DS4_KV_DISK_SPACE_MB = String(pc.kvDiskSpaceMb);
-    }
-    if (pc.extraSwitches) e.DS4_EXTRA_SWITCHES = String(pc.extraSwitches);
-    return e;
-  }
-
   /** Schedule a governed auto-restart after an unexpected exit. */
   function scheduleAutoRestart() {
     const knobs = { ...restartDefaults, ...(getConfig()?.guard?.restart || {}) };
@@ -167,8 +146,8 @@ export function createDs4Supervisor({
     // onto the locked GPU every cooldown — the same protection llama-server gets.
     const decision = restartDecision({ history: restartHistory, now: now(), wedged: !!getWedged(), ...knobs });
     if (!decision.allow) {
-      log(`[ds4] auto-restart suppressed by governor (${decision.reason})`);
-      addLog('system', `ds4-server restart suppressed (${decision.reason}); backing off`);
+      log(`[${label}] auto-restart suppressed by governor (${decision.reason})`);
+      addLog('system', `${processName} restart suppressed (${decision.reason}); backing off`);
       return;
     }
     restartHistory = decision.history;
@@ -194,7 +173,7 @@ export function createDs4Supervisor({
    */
   function start(preset = activePreset, { isAutoRestart = false, planMode = false, override = undefined } = {}) {
     if (!preset) {
-      log('[ds4] start called with no preset; ignoring');
+      log(`[${label}] start called with no preset; ignoring`);
       return;
     }
     activePreset = preset;
@@ -207,18 +186,16 @@ export function createDs4Supervisor({
     if (!isAutoRestart) consecutiveLoadFailures = 0;
     sawReady = false;
 
-    const startScript = `${projectRoot}/start-ds4.sh`;
-    const child = spawn('bash', [startScript], {
-      cwd: projectRoot,
+    const spec = launch(preset, activeOverride);
+    const child = spawn(spec.cmd, spec.args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: buildEnv(preset),
       detached: false,
+      ...(spec.opts || {}),
     });
     proc = child;
     ownsEngine = true;
-    const ds4 = resolveDs4Config(getConfig() || {}, env);
-    log(`[ds4] Starting ds4-server on :${ds4.port} (preset: ${preset.id})`);
-    addLog('system', `Starting ds4-server on :${ds4.port} (preset: ${preset.id})`);
+    log(`[${label}] Starting ${processName} on :${port()} (preset: ${preset.id})`);
+    addLog('system', `Starting ${processName} on :${port()} (preset: ${preset.id})`);
     // Bounded trailing-line buffer for THIS attempt, so a crash's own stderr
     // (e.g. ds4-server's CLI arg-parser naming the bad flag) can be attached to
     // the exit log line below instead of vanishing once the process is gone.
@@ -231,15 +208,15 @@ export function createDs4Supervisor({
         if (recentLines.length > RECENT_OUTPUT_LINES) recentLines.shift();
       }
     };
-    child.stdout?.on('data', (d) => { addLog('ds4', d); captureOutput(d); });
-    child.stderr?.on('data', (d) => { addLog('ds4', d); captureOutput(d); });
+    child.stdout?.on('data', (d) => { addLog(label, d); captureOutput(d); });
+    child.stderr?.on('data', (d) => { addLog(label, d); captureOutput(d); });
     child.on('exit', (code) => {
       if (proc !== child) return; // superseded; ignore late exit
       const tail = recentLines.length
         ? ` — last output:\n${recentLines.join('\n')}`
         : ' — no stdout/stderr captured before exit';
-      log(`[ds4] ds4-server exited (code ${code})${tail}`);
-      addLog('system', `ds4-server exited (code ${code})${tail}`);
+      log(`[${label}] ${processName} exited (code ${code})${tail}`);
+      addLog('system', `${processName} exited (code ${code})${tail}`);
       const wasIntentional = intentionalStop;
       proc = null;
       if (wasIntentional) return;
@@ -248,7 +225,7 @@ export function createDs4Supervisor({
       // controller advances to the next attempt itself. The breaker is the BACKSTOP
       // only after the plan settles (planInProgress cleared by endPlan()).
       if (planInProgress) {
-        log('[ds4] ds4-server exited during adaptive plan; controller drives the next attempt');
+        log(`[${label}] ${processName} exited during adaptive plan; controller drives the next attempt`);
         return;
       }
       // Load-failure circuit breaker: exited non-zero before ever serving = an OOM/
@@ -256,10 +233,10 @@ export function createDs4Supervisor({
       // after ds4MaxLoadFailures consecutive load failures and surface the cause.
       if (!sawReady && code !== 0) {
         consecutiveLoadFailures++;
-        const max = getConfig()?.guard?.ds4MaxLoadFailures ?? 2;
+        const max = maxLoadFailures();
         if (consecutiveLoadFailures >= max) {
-          log(`[ds4] ds4-server failed to load ${consecutiveLoadFailures}x without serving (exit ${code}, likely OOM at the weight-load tail); NOT auto-restarting. Lower ds4 context, free RAM, or drop the embed server, then re-activate.`);
-          addLog('system', `ds4-server failed to load ${consecutiveLoadFailures}x (likely OOM before ready); auto-restart stopped. Lower ctx / free memory and re-activate.`);
+          log(`[${label}] ${processName} failed to load ${consecutiveLoadFailures}x without serving (exit ${code}, likely OOM at the weight-load tail); NOT auto-restarting. Lower ${label} context, free RAM, or drop the embed server, then re-activate.`);
+          addLog('system', `${processName} failed to load ${consecutiveLoadFailures}x (likely OOM before ready); auto-restart stopped. Lower ctx / free memory and re-activate.`);
           return;
         }
       }
@@ -323,27 +300,99 @@ export function createDs4Supervisor({
    */
   function endPlan({ settled = null } = {}) {
     planInProgress = false;
-    activeOverride = settled
-      ? { context: settled.context, ssdStreaming: !!settled.ssdStreaming, cacheExperts: settled.cacheExperts }
-      : null;
+    activeOverride = settled ? settledOverride(settled) : null;
   }
 
   /**
-   * Probe ds4 health via GET /v1/models (ds4 has no /health).
-   * @returns {Promise<{status:string, port:number, model:(string|null)}>}
+   * Probe engine health through the injected probe.
+   * @returns {Promise<{status:string, port:number, model:(string|null), [detail:string]:any}>}
    */
   async function health() {
-    const ds4 = resolveDs4Config(getConfig() || {}, env);
+    const p = port();
     const model = activePreset?.id || null;
-    if (!isRunning()) return { status: 'stopped', port: ds4.port, model };
+    if (!isRunning()) return { status: 'stopped', port: p, model };
     try {
-      const r = await fetchFn(`http://127.0.0.1:${ds4.port}/v1/models`, { signal: AbortSignal.timeout(3000) });
-      if (r.ok) { sawReady = true; consecutiveLoadFailures = 0; }
-      return { status: r.ok ? 'ok' : 'error', port: ds4.port, model };
+      const r = await probe({ fetchFn, port: p });
+      if (r.status === 'ok') { sawReady = true; consecutiveLoadFailures = 0; }
+      return { ...(r.detail || {}), status: r.status, port: p, model };
     } catch {
-      return { status: 'unavailable', port: ds4.port, model };
+      return { status: 'unavailable', port: p, model };
     }
   }
 
   return { start, stop, restart, health, isRunning, getPid, getActivePreset, getActiveOverride, endPlan };
+}
+
+/**
+ * Create the DS4 (ds4-server) supervisor: createEngineSupervisor wired to start-ds4.sh,
+ * a GET /v1/models readiness probe (ds4 has NO /health), the ds4 port from config and
+ * `guard.ds4MaxLoadFailures` (default 2). Behaviour is identical to the pre-generic version.
+ *
+ * @param {object} deps Same deps as createEngineSupervisor plus the DS4-specific ones:
+ * @param {object} [deps.env] Environment merged into the child's env.
+ * @param {string} deps.projectRoot Absolute repo root (holds start-ds4.sh).
+ * @returns {ReturnType<typeof createEngineSupervisor>}
+ */
+export function createDs4Supervisor({ env = {}, projectRoot, ...deps }) {
+  const { getConfig } = deps;
+
+  /**
+   * Build the launch environment for start-ds4.sh from the resolved ds4 config
+   * and the preset's model/context and ds4 launch knobs (under preset.config).
+   * When an adaptive override is active it wins for context and drives the SSD
+   * expert-streaming flags (DS4_SSD_STREAMING 0/1 + cache-experts size).
+   */
+  function buildEnv(preset, activeOverride) {
+    const ds4 = resolveDs4Config(getConfig() || {}, env);
+    const modelAbs = resolveDs4ModelPath(preset.modelPath || '', ds4.ggufDir);
+    const pc = preset.config || {};
+    const e = {
+      ...env,
+      DS4_SERVER_BIN: ds4.binPath,
+      DS4_PORT: String(ds4.port),
+      DS4_GGUF_DIR: ds4.ggufDir,
+      DS4_CONTAINER: ds4.container,
+      DS4_IN_DISTROBOX: ds4.runInDistrobox ? '1' : '0',
+      DS4_MODEL: modelAbs,
+      DS4_CTX: String(preset.context || 0),
+    };
+    // Adaptive override: the controller sets the per-attempt context + streaming.
+    if (activeOverride) {
+      if (activeOverride.context !== undefined && activeOverride.context !== null) {
+        e.DS4_CTX = String(activeOverride.context);
+      }
+      if (activeOverride.ssdStreaming) {
+        e.DS4_SSD_STREAMING = '1';
+        const ce = activeOverride.cacheExperts || ds4.ssdStreamingCacheExperts;
+        if (ce) e.DS4_SSD_STREAMING_CACHE_EXPERTS = String(ce);
+      } else {
+        e.DS4_SSD_STREAMING = '0';
+      }
+    }
+    if (pc.power !== undefined && pc.power !== null && pc.power !== '') e.DS4_POWER = String(pc.power);
+    if (pc.kvDiskDir) e.DS4_KV_DISK_DIR = String(pc.kvDiskDir);
+    if (pc.kvDiskSpaceMb !== undefined && pc.kvDiskSpaceMb !== null && pc.kvDiskSpaceMb !== '') {
+      e.DS4_KV_DISK_SPACE_MB = String(pc.kvDiskSpaceMb);
+    }
+    if (pc.extraSwitches) e.DS4_EXTRA_SWITCHES = String(pc.extraSwitches);
+    return e;
+  }
+
+  return createEngineSupervisor({
+    ...deps,
+    label: 'ds4',
+    processName: 'ds4-server',
+    launch: (preset, override) => ({
+      cmd: 'bash',
+      args: [`${projectRoot}/start-ds4.sh`],
+      opts: { cwd: projectRoot, env: buildEnv(preset, override) },
+    }),
+    probe: async ({ fetchFn, port }) => {
+      const r = await fetchFn(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(3000) });
+      return { status: r.ok ? 'ok' : 'error' };
+    },
+    port: () => resolveDs4Config(getConfig() || {}, env).port,
+    maxLoadFailures: () => getConfig()?.guard?.ds4MaxLoadFailures ?? 2,
+    settledOverride: (settled) => ({ context: settled.context, ssdStreaming: !!settled.ssdStreaming, cacheExperts: settled.cacheExperts }),
+  });
 }

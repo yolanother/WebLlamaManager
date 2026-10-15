@@ -57,7 +57,7 @@ export function findLeakedSlots({ items, liveReqIds, now, graceMs, hardCapMs }) 
  *
  * A remote backend (another box) has no local admission gate to reflect, so
  * every offloaded request to one is legitimately "active" the moment it's
- * sent. The local ds4-server engine is different: it runs ON this box and
+ * sent. The local exclusive engines (ds4-server, strata) are different: it runs ON this box and
  * serializes to one concurrent generation via ds4Queue, so a request queued
  * behind another one is NOT active yet — treating it as active (as plain
  * "isOffloaded" did) misreports queued ds4 work as simultaneously running,
@@ -71,7 +71,7 @@ export function findLeakedSlots({ items, liveReqIds, now, graceMs, hardCapMs }) 
  */
 export function activeRequestHoldsSlot(activeRequest, activeRequestId, localSlotHolders, ds4SlotHolders) {
   const backendId = activeRequest?.backend || 'local';
-  if (backendId === 'ds4') return (ds4SlotHolders || new Set()).has(activeRequestId);
+  if (backendId === 'ds4' || backendId === 'strata') return (ds4SlotHolders || new Set()).has(activeRequestId);
   if (backendId === 'local') return (localSlotHolders || new Set()).has(activeRequestId);
   return true; // other remote backends: no local admission gate to reflect
 }

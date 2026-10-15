@@ -180,10 +180,12 @@ export function planDs4Attempts({
  *
  * @param {object} params
  * @param {Array<{context:number, ssdStreaming:boolean, cacheExperts:string}>} params.attempts Ordered plan.
- * @param {(attempt:object)=>void} params.startAttempt Spawn ds4 for the attempt (ctx + streaming env).
+ * @param {(attempt:object)=>(void|{ok:boolean,abort?:boolean,reason?:string}|Promise<void|{ok:boolean,abort?:boolean,reason?:string}>)} params.startAttempt
+ *   Spawn the engine for the attempt (awaited). Returning `{ok:false, abort:true, reason}` aborts the plan
+ *   with that reason; `{ok:false}` skips to the next attempt without stopAttempt; anything else proceeds.
  * @param {(attempt:object)=>Promise<('ready'|'load-failure'|'timeout')>} params.waitForOutcome
  *   Resolve once ds4 is serving (`ready`) or the process exited/timed out before ever serving.
- * @param {()=>Promise<({ok:boolean}|void)>} [params.stopAttempt] Stop the current (failed) ds4
+ * @param {(attempt:object)=>Promise<({ok:boolean}|void)>} [params.stopAttempt] Stop the current (failed) ds4
  *   before the next attempt. An explicit `{ok:false}` (kill could not confirm the old
  *   process/port is gone) aborts the ladder rather than risking a second engine spawned
  *   on top of the first; any other return (including none) advances normally.
@@ -203,7 +205,13 @@ export async function runDs4AdaptivePlan({
   for (let i = 0; i < attempts.length; i++) {
     const attempt = attempts[i];
     onAttempt(attempt, i);
-    startAttempt(attempt);
+    const started = await startAttempt(attempt);
+    if (started?.ok === false) {
+      // The attempt never launched. abort -> end the plan; otherwise skip to the next
+      // attempt without stopAttempt (nothing was started, so there is nothing to stop).
+      if (started.abort) return { ok: false, settled: null, attemptsMade: i + 1, reason: started.reason || 'start-aborted' };
+      continue;
+    }
     const outcome = await waitForOutcome(attempt);
     if (outcome === 'ready') {
       return { ok: true, settled: attempt, attemptsMade: i + 1, reason: 'ready' };
@@ -214,7 +222,7 @@ export async function runDs4AdaptivePlan({
     // wedged/D-state kill), do NOT spawn the next attempt on top of it: that is how a
     // second ds4-server ends up fighting the first for the same port and GPU. Abort the
     // ladder instead, same as exhausting every attempt.
-    const stopped = await stopAttempt();
+    const stopped = await stopAttempt(attempt);
     if (stopped?.ok === false) {
       return { ok: false, settled: null, attemptsMade: i + 1, reason: 'stop-unconfirmed' };
     }

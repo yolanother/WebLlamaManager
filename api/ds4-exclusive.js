@@ -34,14 +34,16 @@ function norm(s) {
  * a preset id, its display name, or the GGUF basename all match the same ds4 engine.
  * @param {string} requestedModel The resolved model name from the request.
  * @param {string[]} ds4ModelIds  Names that map to the local ds4 engine (preset id, basename, …).
+ * @param {{exact?:boolean}} [opts] `exact` requires normalized equality (no substring tolerance), for
+ *   engines whose model ids are short/overlapping (strata).
  * @returns {boolean}
  */
-export function ds4ModelMatches(requestedModel, ds4ModelIds = []) {
+export function ds4ModelMatches(requestedModel, ds4ModelIds = [], { exact = false } = {}) {
   const t = norm(requestedModel);
   if (!t) return false;
   return ds4ModelIds.some((id) => {
     const n = norm(id);
-    return !!n && (n === t || n.includes(t) || t.includes(n));
+    return !!n && (n === t || (!exact && (n.includes(t) || t.includes(n))));
   });
 }
 
@@ -54,12 +56,17 @@ export function ds4ModelMatches(requestedModel, ds4ModelIds = []) {
  * @param {string} params.requestedModel        Resolved model name from the request.
  * @param {string[]} [params.ds4ModelIds=[]]     Names that map to the local ds4 engine.
  * @param {boolean} [params.hasViableRemote=false] Whether some remote backend can serve requestedModel.
+ * @param {string[]|null} [params.exactIds=null] When an array, the local match is EXACT against these ids
+ *   (replacing the tolerant ds4ModelIds match). Target names are unchanged: 'local-ds4' means "the local exclusive engine".
  * @returns {{target:'local-ds4'|'remote'|'reject', reason:string}}
  */
 export function ds4RequestTarget({
-  requestedModel, ds4ModelIds = [], hasViableRemote = false, llamaRunning = false,
+  requestedModel, ds4ModelIds = [], hasViableRemote = false, llamaRunning = false, exactIds = null,
 } = {}) {
-  if (ds4ModelMatches(requestedModel, ds4ModelIds)) return { target: 'local-ds4', reason: 'ds4-model' };
+  const local = Array.isArray(exactIds)
+    ? ds4ModelMatches(requestedModel, exactIds, { exact: true })
+    : ds4ModelMatches(requestedModel, ds4ModelIds);
+  if (local) return { target: 'local-ds4', reason: 'ds4-model' };
   // DS4 is exclusive by DEFAULT, not by necessity. When a llama model was
   // admitted beside it (see llamaFitsBesideDs4 — measured free memory, not an
   // assumption about the host), that model is running locally and should serve
@@ -193,16 +200,37 @@ export function ds4ActivationDecision({ residentAfterEvict, reclaimOk, spawnOk }
  * and no offload backend can serve the requested model. Returned with HTTP 503.
  * @param {string} requestedModel The model the client asked for.
  * @param {string} [ds4ModelName] The ds4 model currently served (for the message).
+ * @param {string} [engineLabel='DS4'] Engine name for the message; type/code stay `exclusive_ds4_mode` (peers match on it).
  * @returns {{error:{message:string,type:string,code:string,param:string}}}
  */
-export function ds4Exclusive503Body(requestedModel, ds4ModelName) {
+export function ds4Exclusive503Body(requestedModel, ds4ModelName, engineLabel = 'DS4') {
   return {
     error: {
       message:
-        `This host is in exclusive DS4 mode (serving '${ds4ModelName || 'ds4'}'). ` +
+        `This host is in exclusive ${engineLabel} mode (serving '${ds4ModelName || String(engineLabel).toLowerCase()}'). ` +
         `The requested model '${requestedModel}' is not served locally and no remote ` +
         `offload backend can serve it. Configure a remote backend (config.backends) that ` +
-        `maps '${requestedModel}', or switch the host off DS4 mode.`,
+        `maps '${requestedModel}', or switch the host off ${engineLabel} mode.`,
+      type: DS4_EXCLUSIVE_ERROR,
+      code: DS4_EXCLUSIVE_ERROR,
+      param: 'model',
+    },
+  };
+}
+
+/**
+ * OpenAI-style 503 body for a request to an exclusive engine that failed to load
+ * (status `exhausted`/`failed`), as opposed to one that is merely busy or not selected.
+ * @param {string} engineLabel Engine name for the message (e.g. 'Strata').
+ * @param {string} modelName The model the client asked for.
+ * @param {string} [status] Engine status (e.g. 'exhausted').
+ * @returns {{error:{message:string,type:string,code:string,param:string}}}
+ */
+export function exclusiveUnavailable503Body(engineLabel, modelName, status) {
+  return {
+    error: {
+      message: `${engineLabel} could not load '${modelName}'${status ? ` (status: ${status})` : ''}. ` +
+        `The host is held in exclusive ${engineLabel} mode; check the ${engineLabel} engine logs or switch presets.`,
       type: DS4_EXCLUSIVE_ERROR,
       code: DS4_EXCLUSIVE_ERROR,
       param: 'model',
@@ -220,11 +248,12 @@ export function ds4Exclusive503Body(requestedModel, ds4ModelName) {
  * looks like a backend fault rather than a scheduling decision.
  *
  * @param {Iterable<{backend?:string}>} requests Active request records.
- * @returns {number} How many are being served by ds4.
+ * @param {string} [backend='ds4'] Backend id to count ('ds4' or 'strata').
+ * @returns {number} How many are being served by that engine.
  */
-export function ds4InFlightCount(requests = []) {
+export function ds4InFlightCount(requests = [], backend = 'ds4') {
   let n = 0;
-  for (const r of requests) if (r && r.backend === 'ds4') n += 1;
+  for (const r of requests) if (r && r.backend === backend) n += 1;
   return n;
 }
 
@@ -236,20 +265,20 @@ export function ds4InFlightCount(requests = []) {
  * in-flight request is lost — the previous behaviour, but only as a last resort
  * rather than immediately.
  *
- * @param {{inFlight:number, waitedMs:number, maxWaitMs:number}} p
+ * @param {{inFlight:number, waitedMs:number, maxWaitMs:number, label?:string}} p `label` names the engine in messages (default 'ds4').
  * @returns {{evict:boolean, reason:string}}
  */
-export function ds4EvictionReadiness({ inFlight = 0, waitedMs = 0, maxWaitMs = 0 } = {}) {
-  if (inFlight <= 0) return { evict: true, reason: 'no ds4 requests in flight' };
+export function ds4EvictionReadiness({ inFlight = 0, waitedMs = 0, maxWaitMs = 0, label = 'ds4' } = {}) {
+  if (inFlight <= 0) return { evict: true, reason: `no ${label} requests in flight` };
   if (waitedMs >= maxWaitMs) {
     return {
       evict: true,
-      reason: `${inFlight} ds4 request(s) still in flight after ${Math.round(waitedMs / 1000)}s — evicting anyway so the box is not pinned`,
+      reason: `${inFlight} ${label} request(s) still in flight after ${Math.round(waitedMs / 1000)}s — evicting anyway so the box is not pinned`,
     };
   }
   return {
     evict: false,
-    reason: `waiting for ${inFlight} in-flight ds4 request(s) to finish before evicting`,
+    reason: `waiting for ${inFlight} in-flight ${label} request(s) to finish before evicting`,
   };
 }
 

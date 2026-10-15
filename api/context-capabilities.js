@@ -8,7 +8,7 @@
 
 /**
  * Build context-management capabilities for a serving engine.
- * @param {'llama'|'ds4'|'remote'|'embedding'} engine Engine type.
+ * @param {'llama'|'ds4'|'strata'|'remote'|'embedding'} engine Engine type.
  * @param {{slotCacheEnabled?:boolean,slotOperationsSupported?:boolean}} options Runtime feature settings.
  * @returns {Record<string, unknown>} Versioned public capability metadata.
  */
@@ -39,7 +39,7 @@ export function contextCapabilities(engine, {
       cooperative_preemption: llama,
     },
     routing: {
-      local_only: engine === 'llama' || engine === 'ds4',
+      local_only: engine === 'llama' || engine === 'ds4' || engine === 'strata',
     },
     limits: llama ? {
       conversation_key_characters: 200,
