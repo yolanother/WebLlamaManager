@@ -45,7 +45,7 @@ test('exclusive-engine registry and helpers exist', () => {
 test('proxyMessagesToExclusive sits directly before handleMessages', () => {
   assert.match(
     source,
-    /async function proxyMessagesToExclusive\([\s\S]*?\n}\n\s*(?:\/\*\*[\s\S]*?\*\/\s*)?async function handleMessages\(/,
+    /async function proxyMessagesToExclusive\([\s\S]*?\n}\n\s*(?:(?:\/\/[^\n]*\n|\/\*\*[\s\S]*?\*\/)\s*)*async function handleMessages\(/,
   );
   const body = fnBody('proxyMessagesToExclusive');
   assert.ok(!body.includes('async function handleMessages('), 'no other function may sit between them');
