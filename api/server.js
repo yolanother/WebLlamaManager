@@ -217,7 +217,7 @@ import { resolveDs4ModelPath } from './engines.js';
 import { buildRepoRecommendations, computeCapacityBytes } from './repo-recommendations.js';
 import {
   ds4ModelMatches, ds4RequestTarget, reclaimTargetBytes, pollForReclaim,
-  shouldKeepEmbedServer, ds4Exclusive503Body, ds4ActivationDecision,
+  shouldKeepEmbedServer, ds4Exclusive503Body, exclusiveUnavailable503Body, ds4ActivationDecision,
   ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan, ds4SwapRetryDecision,
   readRelayState, relayHeadersFor, DS4_EXCLUSIVE_ERROR
 } from './ds4-exclusive.js';
@@ -498,6 +498,81 @@ let ds4SwapPromise = null;
 // the ladder actually landed on and is serving), plus a status the UI surfaces
 // ('loading' | 'ready' | 'exhausted'). See ds4-adaptive.js.
 let ds4SettledRuntime = null;
+
+/**
+ * One handle per exclusive engine (an engine that owns the box while active:
+ * llama-server is stopped, one generation slot, other models offload or 503).
+ * Only one is active at a time (`currentEngine`). DS4's entry reads the DS4
+ * state above through accessors so its names and behaviour stay as they were;
+ * request routing, the swap gate, drain and deactivation go through this handle
+ * so a second exclusive engine can be added as one more entry (see
+ * docs/Designs/StrataEngine.md §2.2).
+ *
+ * `armSwapGate({force})` arms the traffic gate and returns its settle function,
+ * or null when a swap is already in flight and `force` is not set.
+ * `admitsLlamaBeside(rawModel)` says whether a request for a llama model may be
+ * served by a co-resident llama beside this engine.
+ */
+const EXCLUSIVE_ENGINES = {
+  [ENGINE_TYPES.DS4]: {
+    type: 'ds4',
+    label: 'DS4',
+    servesMessages: false,
+    exactIds: false,
+    activePresetId: () => ds4ActivePresetId || currentPreset,
+    modelIds: () => ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset),
+    displayName: () => config.presets?.[currentPreset]?.name || currentPreset || 'ds4',
+    port: () => resolveDs4Config(config, RUNTIME_ENV).port,
+    swapPromise: () => ds4SwapPromise,
+    swapGeneration: () => ds4SwapGeneration,
+    armSwapGate: ({ force = false } = {}) => {
+      if (ds4SwapPromise && !force) return null;
+      let releaseGate;
+      ds4SwapPromise = new Promise((resolve) => { releaseGate = resolve; });
+      return () => { releaseGate(); ds4SwapPromise = null; };
+    },
+    markServed: () => { ds4LastServedAt = Date.now(); },
+    lastServedAt: () => ds4LastServedAt,
+    supervisor: () => getDs4Supervisor(),
+    health: () => getDs4Health(),
+    runtime: () => ds4SettledRuntime,
+    refForModel: (model) => ds4PresetForModel(config, model),
+    activate: (presetId, preset) => activateDs4Exclusive(presetId, preset),
+    stop: () => stopDs4Server(),
+    clear: () => { ds4SettledRuntime = null; ds4ActivePresetId = null; ds4SwapGeneration += 1; },
+    admitsLlamaBeside: (rawModel) => rawModel === BIG_ALIAS || rawModel === SMALL_ALIAS,
+    deactivate: () => deactivateExclusive(EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4]),
+  },
+  // S2 adds the Strata entry here.
+};
+
+/** @returns {object|null} the handle of the exclusive engine currently owning the box, else null. */
+function activeExclusive() { return EXCLUSIVE_ENGINES[currentEngine] || null; }
+
+/**
+ * 503 body when an exclusive engine failed to load (runtime exhausted or its
+ * stop was not confirmed), else null. Local requests get this instead of a
+ * doomed proxy attempt that would surface as a 502.
+ * @param {object} engine An EXCLUSIVE_ENGINES handle.
+ * @returns {object|null} Error body for a 503, or null when the engine is usable.
+ */
+function exclusiveUnavailableBody(engine) {
+  const status = engine.runtime()?.status;
+  if (status !== 'exhausted' && status !== 'stop-unconfirmed') return null;
+  return exclusiveUnavailable503Body(engine.label, engine.displayName(), status);
+}
+
+/**
+ * Wait for any in-flight exclusive-engine swap (activation or deactivation) to
+ * settle, so mid-swap requests are held rather than 404'd or mis-routed.
+ * @returns {Promise<void>}
+ */
+async function exclusiveSwapsSettled() {
+  for (const e of Object.values(EXCLUSIVE_ENGINES)) {
+    const p = e.swapPromise();
+    if (p) { try { await p; } catch { /* settle */ } }
+  }
+}
 let lastUsedModel = null;   // most recently used model name
 let lastUsedModelTime = 0;  // timestamp of last use
 // When the router process last started. Idle time is measured from the LATER of
@@ -948,7 +1023,8 @@ function buildAliasInventory() {
   return {
     localModels: localModelNames(),
     presets: config.presets || {},
-    residentModels: loadedModelsSnapshot.map(m => m.id),
+    // The active exclusive engine's preset is resident too: without it a warm remote could beat the local engine that is serving.
+    residentModels: [...loadedModelsSnapshot.map(m => m.id), ...[activeExclusive()?.activePresetId()].filter(Boolean)],
     backends: (config.backends?.directory || []).map(b => ({
       id: b.id,
       enabled: !!b.enabled,
@@ -7855,7 +7931,7 @@ async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
   // measured free memory) is allowed through the normal path — that is the whole
   // point of not evicting DS4 for a model that fits. Everything else still
   // early-returns below.
-  if (currentEngine === ENGINE_TYPES.DS4 && llamaProcess) {
+  if (activeExclusive() && llamaProcess) {
     return;
   }
   // While the ds4 engine owns the box, do NOT run any llama mode-switch/restart:
@@ -7863,7 +7939,7 @@ async function ensureModelServed(modelName, { requireKnownSize = false } = {}) {
   // model can't coexist in 124GB RAM). ds4 chat requests are served upstream in
   // the chat handler; other llama-only endpoints simply don't serve while ds4 is
   // active (full offload routing for non-ds4 requests lands in a later task).
-  if (currentEngine === ENGINE_TYPES.DS4) return;
+  if (activeExclusive()) return;
 
   // Pre-flight memory guard with graceful recovery: if the model doesn't fit the
   // current free RAM but the shortfall is reclaimable, free memory (unload other
@@ -8199,7 +8275,9 @@ async function restartLlamaServer({ governed = true, contextOverride = 0 } = {})
 
     await stopLlamaServer();
 
-    if (currentMode === 'single' && currentPreset && config.presets?.[currentPreset]) {
+    // Only llama presets launch via start-preset.sh; a stored ds4/exclusive preset falls through to router mode.
+    if (currentMode === 'single' && currentPreset && config.presets?.[currentPreset]
+      && presetEngine(config.presets[currentPreset]) === ENGINE_TYPES.LLAMA) {
       const preset = config.presets[currentPreset];
       const startScript = join(PROJECT_ROOT, 'start-preset.sh');
       const env = {
@@ -8971,42 +9049,48 @@ const DS4_DRAIN_MAX_WAIT_MS = 300000;
  *
  * @returns {Promise<void>} Resolves once ds4 is idle or the deadline passes.
  */
-async function drainDs4RequestsBeforeEviction() {
+async function drainExclusiveRequests(engine, maxWaitMs = DS4_DRAIN_MAX_WAIT_MS) {
   const startedAt = Date.now();
   let announced = false;
   for (;;) {
-    const inFlight = ds4InFlightCount(activeRequests.values());
+    const inFlight = ds4InFlightCount(activeRequests.values(), engine.type);
     const readiness = ds4EvictionReadiness({
       inFlight,
       waitedMs: Date.now() - startedAt,
-      maxWaitMs: DS4_DRAIN_MAX_WAIT_MS,
+      maxWaitMs,
+      label: engine.type,
     });
     if (readiness.evict) {
       if (announced) {
-        console.log(`[ds4] ${readiness.reason}`);
-        addLog('presets', `ds4: ${readiness.reason}`);
+        console.log(`[${engine.type}] ${readiness.reason}`);
+        addLog('presets', `${engine.type}: ${readiness.reason}`);
       }
       return;
     }
     if (!announced) {
       announced = true;
-      console.log(`[ds4] ${readiness.reason}`);
-      addLog('presets', `ds4: ${readiness.reason}`);
+      console.log(`[${engine.type}] ${readiness.reason}`);
+      addLog('presets', `${engine.type}: ${readiness.reason}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 }
 
-async function deactivateDs4Exclusive() {
-  let releaseGate;
-  ds4SwapPromise = new Promise((resolve) => { releaseGate = resolve; });
+/**
+ * Deactivate an exclusive engine: drain its in-flight requests, stop it
+ * (verified), clear its routing state, flip the engine back to llama and wait
+ * for its memory to reclaim. Mid-swap requests are held on the engine's gate.
+ *
+ * @param {object} engine An EXCLUSIVE_ENGINES handle.
+ * @returns {Promise<void>}
+ */
+async function deactivateExclusive(engine) {
+  const settleGate = engine.armSwapGate({ force: true });
   try {
-    addLog('presets', 'ds4: deactivating exclusive mode — stopping ds4-server and verifying reclaim');
-    await drainDs4RequestsBeforeEviction();
-    await stopDs4Server();
-    ds4SettledRuntime = null; // no longer serving ds4 — clear the settled runtime state
-    ds4ActivePresetId = null;  // ds4 is gone; stop claiming its model routes locally
-    ds4SwapGeneration += 1;
+    addLog('presets', `${engine.type}: deactivating exclusive mode — stopping ${engine.type === 'ds4' ? 'ds4-server' : engine.type} and verifying reclaim`);
+    await drainExclusiveRequests(engine);
+    await engine.stop();
+    engine.clear(); // no longer serving: drop runtime state, stop claiming its model routes locally
     currentEngine = ENGINE_TYPES.LLAMA;
     const targetBytes = ds4HeadroomBytes();
     const poll = await pollForReclaim({
@@ -9015,13 +9099,15 @@ async function deactivateDs4Exclusive() {
       timeoutMs: DS4_RECLAIM_TIMEOUT_MS,
       intervalMs: DS4_RECLAIM_INTERVAL_MS,
     });
-    if (poll.ok) addLog('presets', `ds4: reclaim after deactivation verified (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB)`);
-    else addLog('presets', `ds4: reclaim after deactivation still short (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB); llama preflight guard will gate the next load`);
+    if (poll.ok) addLog('presets', `${engine.type}: reclaim after deactivation verified (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB)`);
+    else addLog('presets', `${engine.type}: reclaim after deactivation still short (MemAvailable ${gibStr(poll.memAvailableBytes)} GiB); llama preflight guard will gate the next load`);
   } finally {
-    if (releaseGate) releaseGate();
-    ds4SwapPromise = null;
+    settleGate();
   }
 }
+
+/** Deactivate exclusive DS4 mode. Name kept for callers/tests; see deactivateExclusive. */
+function deactivateDs4Exclusive() { return deactivateExclusive(EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4]); }
 
 // Start llama server in router mode (multi-model)
 app.post('/api/server/start', async (req, res) => {
@@ -11450,7 +11536,7 @@ async function handleExactInputTokenRequest(kind, req, res) {
   if (currentEngine !== ENGINE_TYPES.LLAMA || ds4PresetForModel(config, resolvedModel)) {
     res.status(501).json({
       error: {
-        message: `exact ${kind} input counting is unsupported for the active DS4 engine`,
+        message: `exact ${kind} input counting is unsupported for the active ${activeExclusive()?.label || 'DS4'} engine`,
         type: 'unsupported_feature',
         code: 'exact_input_tokens_unsupported',
       },
@@ -12571,33 +12657,34 @@ function writeGuardedCompletionFragments(res, fragments) {
  * @returns {Promise<void>}
  */
 async function serveDs4WithSwapRecovery(req, res, opts) {
+  const engine = opts.engine || EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4];
   for (let attempt = 0; ; attempt++) {
-    const genBefore = ds4SwapGeneration;
+    const genBefore = engine.swapGeneration();
     try {
       const proxy = opts.proxy || proxyChatToDs4;
       return await proxy(req, res, opts);
     } catch (err) {
       const decision = ds4SwapRetryDecision({
-        swapOccurred: ds4SwapGeneration !== genBefore || !!ds4SwapPromise,
+        swapOccurred: engine.swapGeneration() !== genBefore || !!engine.swapPromise(),
         attempt,
         maxRetries: DS4_SWAP_MAX_RETRIES,
         bodyCommitted: res.headersSent || res.writableEnded,
       });
       if (!decision.retry) {
-        console.warn(`[ds4] not re-serving '${opts.requestedModel}': ${decision.reason} (${err.message})`);
+        console.warn(`[${engine.type}] not re-serving '${opts.requestedModel}': ${decision.reason} (${err.message})`);
         if (!res.headersSent) {
           return res.status(502).json({
-            error: { message: `ds4-server request failed: ${err.message}`, type: 'ds4_backend_error' },
+            error: { message: `${engine.type}-server request failed: ${err.message}`, type: `${engine.type}_backend_error` },
           });
         }
         try { res.end(); } catch { /* ignore */ }
         return;
       }
-      console.log(`[ds4] ${decision.reason} — '${opts.requestedModel}' (${err.message})`);
-      addLog('presets', `ds4 request re-served after an engine swap: ${decision.reason}`);
+      console.log(`[${engine.type}] ${decision.reason} — '${opts.requestedModel}' (${err.message})`);
+      addLog('presets', `${engine.type} request re-served after an engine swap: ${decision.reason}`);
       // Let the swap finish before trying again, then make sure ds4 is the
       // engine for this model once more; the alias may since have moved.
-      if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
+      { const pending = engine.swapPromise(); if (pending) { try { await pending; } catch { /* settle */ } } }
       await ensureDs4ForModel(opts.rawModel || opts.requestedModel, opts.requestedModel, {
         requestPriority: opts.priority,
         relay: opts.relay,
@@ -12606,11 +12693,10 @@ async function serveDs4WithSwapRecovery(req, res, opts) {
   }
 }
 
-async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime, mediaMetadata }) {
-  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
-  const url = ds4TargetUrl(ds4.port, '/v1/chat/completions');
+async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime, mediaMetadata, engine = EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4] }) {
+  const url = ds4TargetUrl(engine.port(), '/v1/chat/completions');
   console.log(`[chat/completions] ds4 engine active — forwarding to ${url}`);
-  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: 'ds4', relayRequestId: readRelayRequestId(req.headers) });
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'chat/completions', messages: req.body.messages, backend: engine.type, relayRequestId: readRelayRequestId(req.headers) });
   // Reuse the controller stored on activeRequests. The stall watchdog aborts
   // that exact controller; a separate local controller would leave the DS4
   // fetch and its single generation slot alive after the watchdog killed it.
@@ -12649,7 +12735,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
 
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');
-      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: errText, backend: 'ds4', requestBody: req.body });
+      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: errText, backend: engine.type, requestBody: req.body });
       endActiveRequest(activeReqId, { status: 'error' });
       if (!res.headersSent) return res.status(upstream.status).send(errText);
       try { res.end(); } catch { /* ignore */ }
@@ -12693,12 +12779,12 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
       try { res.end(); } catch { /* ignore */ }
       const dur = Date.now() - startTime;
       if (outputCorrupted) {
-        addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: outputError.status, duration: dur, promptTokens, completionTokens, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: outputError.body.error.message, backend: 'ds4', requestBody: req.body });
+        addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: outputError.status, duration: dur, promptTokens, completionTokens, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: outputError.body.error.message, backend: engine.type, requestBody: req.body });
         endActiveRequest(activeReqId, { status: 'error' });
         return;
       }
-      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: 200, duration: dur, promptTokens, completionTokens, tokensPerSecond: completionTokens / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
-      ds4LastServedAt = Date.now();
+      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: true, status: 200, duration: dur, promptTokens, completionTokens, tokensPerSecond: completionTokens / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: responseText, error: null, backend: engine.type, requestBody: req.body });
+      engine.markServed();
     endActiveRequest(activeReqId, { status: 'complete' });
       return;
     }
@@ -12708,7 +12794,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
     const outputError = validateChatCompletionPayload(data);
         if (outputError) {
       const dur = Date.now() - startTime;
-      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: outputError.status, duration: dur, promptTokens: data.usage?.prompt_tokens || 0, completionTokens: data.usage?.completion_tokens || 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: outputError.body.error.message, backend: 'ds4', requestBody: req.body });
+      addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: outputError.status, duration: dur, promptTokens: data.usage?.prompt_tokens || 0, completionTokens: data.usage?.completion_tokens || 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: outputError.body.error.message, backend: engine.type, requestBody: req.body });
       endActiveRequest(activeReqId, { status: 'error' });
       sendQuestionMarkOnlyOutputError(res, outputError);
       return;
@@ -12718,13 +12804,13 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
     }
     const dur = Date.now() - startTime;
     const usage = data.usage || {};
-    addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: 200, duration: dur, promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0, tokensPerSecond: (usage.completion_tokens || 0) / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: data.choices?.[0]?.message?.content || null, error: null, backend: 'ds4', requestBody: req.body });
-    ds4LastServedAt = Date.now();
+    addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: false, status: 200, duration: dur, promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0, tokensPerSecond: (usage.completion_tokens || 0) / ((dur / 1000) || 1), messages: req.body.messages || null, prompt: null, response: data.choices?.[0]?.message?.content || null, error: null, backend: engine.type, requestBody: req.body });
+    engine.markServed();
     endActiveRequest(activeReqId, { status: 'complete' });
     return res.json(data);
   } catch (err) {
     endActiveRequest(activeReqId, { status: 'error' });
-    addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: err.message, backend: 'ds4', requestBody: req.body });
+    addLlmLog({ endpoint: 'chat/completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: err.message, backend: engine.type, requestBody: req.body });
     // Rethrow rather than answering here. serveDs4WithSwapRecovery decides
     // whether this was our own hot-swap killing the request (retry internally,
     // invisible to the caller) or a real backend fault (answer 502). Sending
@@ -12744,10 +12830,9 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
  * @param {import('express').Response} res
  * @param {{requestedModel:string, isStreaming:boolean, startTime:number}} ctx
  */
-async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, startTime }) {
-  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
-  const url = ds4TargetUrl(ds4.port, '/v1/completions');
-  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'completions', messages: null, backend: 'ds4', relayRequestId: readRelayRequestId(req.headers) });
+async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, startTime, engine = EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4] }) {
+  const url = ds4TargetUrl(engine.port(), '/v1/completions');
+  const activeReqId = startActiveRequest({ model: requestedModel, endpoint: 'completions', messages: null, backend: engine.type, relayRequestId: readRelayRequestId(req.headers) });
   // Share the tracked controller for the same watchdog-to-fetch lifecycle used
   // by chat/completions and responses.
   const controller = activeRequests.get(activeReqId)?.abortController;
@@ -12772,7 +12857,7 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
     });
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');
-      addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error: errText, backend: 'ds4', requestBody: req.body });
+      addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error: errText, backend: engine.type, requestBody: req.body });
       endActiveRequest(activeReqId, { status: 'error' });
       if (!res.headersSent) return res.status(upstream.status).send(errText);
       try { res.end(); } catch { /* ignore */ }
@@ -12798,19 +12883,22 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
         res.write(chunk);
       }
       try { res.end(); } catch { /* ignore */ }
-      addLlmLog({ endpoint: 'completions', model: requestedModel, stream: true, status: 200, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
+      addLlmLog({ endpoint: 'completions', model: requestedModel, stream: true, status: 200, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: responseText, error: null, backend: engine.type, requestBody: req.body });
+      engine.markServed();
       endActiveRequest(activeReqId, { status: 'complete' });
       return;
     }
     const data = await upstream.json();
     if (data.model) data.model = requestedModel;
-    addLlmLog({ endpoint: 'completions', model: requestedModel, stream: false, status: 200, duration: Date.now() - startTime, promptTokens: data.usage?.prompt_tokens || 0, completionTokens: data.usage?.completion_tokens || 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: data.choices?.[0]?.text || null, error: null, backend: 'ds4', requestBody: req.body });
+    addLlmLog({ endpoint: 'completions', model: requestedModel, stream: false, status: 200, duration: Date.now() - startTime, promptTokens: data.usage?.prompt_tokens || 0, completionTokens: data.usage?.completion_tokens || 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: data.choices?.[0]?.text || null, error: null, backend: engine.type, requestBody: req.body });
     endActiveRequest(activeReqId, { status: 'complete' });
     return res.json(data);
   } catch (err) {
     endActiveRequest(activeReqId, { status: 'error' });
-    addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error: err.message, backend: 'ds4', requestBody: req.body });
-    if (!res.headersSent) return res.status(502).json({ error: { message: `ds4-server request failed: ${err.message}`, type: 'ds4_backend_error' } });
+    addLlmLog({ endpoint: 'completions', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: null, prompt: req.body.prompt || null, response: null, error: err.message, backend: engine.type, requestBody: req.body });
+    // Rethrow like proxyChatToDs4 so serveDs4WithSwapRecovery can tell our own
+    // hot-swap from a real backend fault.
+    if (!res.headersSent) throw err;
     try { res.end(); } catch { /* ignore */ }
   } finally {
     ds4Slot.release();
@@ -13428,7 +13516,7 @@ async function handleChatCompletions(req, res) {
   // If a ds4 engine swap (activation/deactivation) is in flight, await it so this
   // request is served after readiness rather than 404'd or routed to a half-up
   // engine. The promise resolves (never rejects) for awaiters.
-  if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
+  await exclusiveSwapsSettled();
 
   const mediaExpansion = await expandMessages(req.body.messages, {
     model: req.body.model || 'default',
@@ -13457,16 +13545,20 @@ async function handleChatCompletions(req, res) {
   // for ANY other model is OFFLOADED to a configured remote backend (never loaded
   // locally beside ds4's 81GB); if no backend can serve it, 503 (never queue forever).
   let routing;
-  if (currentEngine === ENGINE_TYPES.DS4) {
+  const exclusive = activeExclusive();
+  if (exclusive) {
     const decision = ds4RequestTarget({
       requestedModel,
-      ds4ModelIds: ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset),
+      ds4ModelIds: exclusive.modelIds(),
+      exactIds: exclusive.exactIds,
       hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'chat/completions', aliasRouting),
       // A llama server admitted beside DS4 serves its own models locally rather
       // than being offloaded or refused.
       llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
+      const unavailable = exclusiveUnavailableBody(exclusive);
+      if (unavailable) return res.status(503).json(unavailable);
       if (req.body?.prepared_context_id && (req.body?.context_cache_strict === true || appendPreparedContext)) {
         return res.status(501).json({
           error: {
@@ -13477,7 +13569,7 @@ async function handleChatCompletions(req, res) {
         });
       }
       req.body = proxyBody;
-      return serveDs4WithSwapRecovery(req, res, { requestedModel, isStreaming, startTime, mediaMetadata });
+      return serveDs4WithSwapRecovery(req, res, { requestedModel, isStreaming, startTime, mediaMetadata, engine: exclusive });
     }
     // A llama server was admitted beside DS4, so this model is served LOCALLY by
     // it. Skip the whole exclusive-mode offload block below: that path assumes
@@ -13497,16 +13589,15 @@ async function handleChatCompletions(req, res) {
       addLog('backends', `offload-suppressed(local_only): ds4 exclusive cannot locally serve '${requestedModel}'`);
       return res.status(503).json({
         error: {
-          message: `Local-only request cannot be served while DS4 exclusively owns the local engine`,
+          message: `Local-only request cannot be served while ${exclusive.label} exclusively owns the local engine`,
           type: 'local_backend_unavailable',
           code: 'LOCAL_ONLY_UNAVAILABLE',
         },
         _llama_manager: { routing: 'local_only', routing_outcome: 'rejected', offload_suppressed: true },
       });
     } else if (decision.target === 'reject') {
-      const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
-      addLog('backends', `ds4 exclusive: no offload backend for '${requestedModel}' — returning 503`);
-      return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
+      addLog('backends', `${exclusive.type} exclusive: no offload backend for '${requestedModel}' — returning 503`);
+      return res.status(503).json(ds4Exclusive503Body(requestedModel, exclusive.displayName(), exclusive.label));
     } else {
       // Force remote (never local): build routing from the fastest viable backend.
       const backend = findFastestAvailableBackend(requestedModel, 'chat/completions', aliasRouting);
@@ -14765,33 +14856,40 @@ async function handleCompletions(req, res) {
   }
 
   // Hold mid-swap traffic until any ds4 engine swap settles (see chat/completions).
-  if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
+  await exclusiveSwapsSettled();
 
   // ── ds4 engine active (EXCLUSIVE mode) ───────────────────────────────────────
   // ds4 model → local ds4-server; other model → remote offload (never local beside
   // ds4's 81GB); no viable backend → clean 503. Never fall through to a stopped llama.
   let routing;
-  if (currentEngine === ENGINE_TYPES.DS4) {
+  const exclusive = activeExclusive();
+  if (exclusive) {
     const decision = ds4RequestTarget({
       requestedModel,
-      ds4ModelIds: ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset),
+      ds4ModelIds: exclusive.modelIds(),
+      exactIds: exclusive.exactIds,
       hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'completions', aliasRouting),
+      // A llama server admitted beside the exclusive engine serves its own models locally.
+      llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
-      return proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, startTime });
+      const unavailable = exclusiveUnavailableBody(exclusive);
+      if (unavailable) return res.status(503).json(unavailable);
+      return serveDs4WithSwapRecovery(req, res, { requestedModel, isStreaming, startTime, engine: exclusive, proxy: proxyCompletionsToDs4 });
     }
-    if (requestPolicy.localOnly) {
+    if (decision.target === 'local-llama') {
+      routing = resolveBackend(requestedModel, 'completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
+    } else if (requestPolicy.localOnly) {
       contextRoutingStats.offloadSuppressedLocalOnly++;
       contextRoutingStats.localOnlyRejected++;
-      return res.status(503).json({ error: { message: 'local_only request is unavailable while DS4 owns a different local model', code: 'LOCAL_ONLY_UNAVAILABLE' } });
+      return res.status(503).json({ error: { message: `local_only request is unavailable while ${exclusive.label} owns a different local model`, code: 'LOCAL_ONLY_UNAVAILABLE' } });
+    } else if (decision.target === 'reject') {
+      return res.status(503).json(ds4Exclusive503Body(requestedModel, exclusive.displayName(), exclusive.label));
+    } else {
+      const backend = findFastestAvailableBackend(requestedModel, 'completions', aliasRouting);
+      routing = buildRemoteRouting(backend, remoteTargetModel(backend, aliasRouting), 'completions');
+      console.log(`[completions] ${exclusive.type} exclusive: offloading non-${exclusive.type} model '${requestedModel}' to ${backend.name}`);
     }
-    if (decision.target === 'reject') {
-      const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
-      return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
-    }
-    const backend = findFastestAvailableBackend(requestedModel, 'completions', aliasRouting);
-    routing = buildRemoteRouting(backend, remoteTargetModel(backend, aliasRouting), 'completions');
-    console.log(`[completions] ds4 exclusive: offloading non-ds4 model '${requestedModel}' to ${backend.name}`);
   } else {
     // Route to remote backend if applicable
     routing = resolveBackend(requestedModel, 'completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
@@ -15311,9 +15409,9 @@ async function proxyResponsesToDs4(req, res, {
   startTime,
   priority = 'interactive',
   routing = 'auto',
+  engine = EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4],
 }) {
-  const ds4 = resolveDs4Config(config, RUNTIME_ENV);
-  const url = ds4TargetUrl(ds4.port, '/v1/responses');
+  const url = ds4TargetUrl(engine.port(), '/v1/responses');
   const messages = req.body.input
     ? (Array.isArray(req.body.input) ? req.body.input : [{ role: 'user', content: req.body.input }])
     : null;
@@ -15321,7 +15419,7 @@ async function proxyResponsesToDs4(req, res, {
     model: requestedModel,
     endpoint: 'responses',
     messages,
-    backend: 'ds4',
+    backend: engine.type,
     priority,
     routing,
     relayRequestId: readRelayRequestId(req.headers),
@@ -15349,7 +15447,7 @@ async function proxyResponsesToDs4(req, res, {
     });
     if (!upstream.ok) {
       const error = await upstream.text().catch(() => '');
-      addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages, prompt: null, response: null, error, backend: 'ds4', requestBody: req.body });
+      addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: upstream.status, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages, prompt: null, response: null, error, backend: engine.type, requestBody: req.body });
       endActiveRequest(activeReqId, { status: 'error' });
       return res.status(upstream.status).send(error);
     }
@@ -15393,9 +15491,9 @@ async function proxyResponsesToDs4(req, res, {
       res.end();
       const duration = Date.now() - startTime;
       const tokensPerSecond = duration > 0 ? completionTokens / (duration / 1000) : 0;
-      recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: 'ds4' });
-      addLlmLog({ endpoint: 'responses', model: requestedModel, stream: true, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
-      ds4LastServedAt = Date.now();
+      recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: engine.type });
+      addLlmLog({ endpoint: 'responses', model: requestedModel, stream: true, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages, prompt: null, response: responseText, error: null, backend: engine.type, requestBody: req.body });
+      engine.markServed();
       endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
       return;
     }
@@ -15413,18 +15511,18 @@ async function proxyResponsesToDs4(req, res, {
         break;
       }
     }
-    recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || requestedModel, duration, backend: 'ds4' });
-    addLlmLog({ endpoint: 'responses', model: data.model || requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages, prompt: null, response: responseText, error: null, backend: 'ds4', requestBody: req.body });
+    recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || requestedModel, duration, backend: engine.type });
+    addLlmLog({ endpoint: 'responses', model: data.model || requestedModel, stream: false, status: 200, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, messages, prompt: null, response: responseText, error: null, backend: engine.type, requestBody: req.body });
     data._llama_manager = enrichLlamaManagerMeta(
-      { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: 'ds4' },
+      { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: engine.type },
       { completionTokens },
     );
-    ds4LastServedAt = Date.now();
+    engine.markServed();
     endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
     res.json(data);
   } catch (error) {
     endActiveRequest(activeReqId, { status: 'error' });
-    addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages, prompt: null, response: null, error: error.message, backend: 'ds4', requestBody: req.body });
+    addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages, prompt: null, response: null, error: error.message, backend: engine.type, requestBody: req.body });
     if (!res.headersSent) throw error;
     if (!res.writableEnded) res.end();
   } finally {
@@ -15499,7 +15597,7 @@ async function handleResponses(req, res) {
   if (ds4Activation && !ds4Activation.ok) {
     return res.status(ds4Activation.status || 503).json({ error: { message: ds4Activation.error, type: 'server_error' } });
   }
-  if (ds4SwapPromise) { try { await ds4SwapPromise; } catch { /* settle */ } }
+  await exclusiveSwapsSettled();
 
   // Inject reasoning_effort if configured
   const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
@@ -15507,16 +15605,21 @@ async function handleResponses(req, res) {
   // Match Chat Completions alias and exclusive-engine routing semantics while
   // preserving the Responses wire format on the selected backend.
   let routing;
-  if (currentEngine === ENGINE_TYPES.DS4) {
+  const exclusive = activeExclusive();
+  if (exclusive) {
     const decision = ds4RequestTarget({
       requestedModel,
-      ds4ModelIds: ds4ModelIdsForPreset(ds4ActivePresetId || currentPreset),
+      ds4ModelIds: exclusive.modelIds(),
+      exactIds: exclusive.exactIds,
       hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'responses', aliasRouting),
       llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
+      const unavailable = exclusiveUnavailableBody(exclusive);
+      if (unavailable) return res.status(503).json(unavailable);
       req.body = proxyBody;
       return serveDs4WithSwapRecovery(req, res, {
+        engine: exclusive,
         proxy: proxyResponsesToDs4,
         rawModel,
         requestedModel,
@@ -15537,15 +15640,14 @@ async function handleResponses(req, res) {
       contextRoutingStats.localOnlyRejected++;
       return res.status(503).json({
         error: {
-          message: 'Local-only request cannot be served while DS4 exclusively owns the local engine',
+          message: `Local-only request cannot be served while ${exclusive.label} exclusively owns the local engine`,
           type: 'local_backend_unavailable',
           code: 'LOCAL_ONLY_UNAVAILABLE',
         },
         _llama_manager: { routing: 'local_only', routing_outcome: 'rejected', offload_suppressed: true },
       });
     } else if (decision.target === 'reject') {
-      const ds4Name = config.presets?.[currentPreset]?.name || currentPreset || 'ds4';
-      return res.status(503).json(ds4Exclusive503Body(requestedModel, ds4Name));
+      return res.status(503).json(ds4Exclusive503Body(requestedModel, exclusive.displayName(), exclusive.label));
     } else {
       const backend = findFastestAvailableBackend(requestedModel, 'responses', aliasRouting);
       const remoteModel = remoteTargetModel(backend, aliasRouting);
@@ -15893,6 +15995,136 @@ app.get('/v1/responses/:responseId', handleGetBackgroundResponse);
 app.post('/api/v1/responses/:responseId/cancel', handleCancelBackgroundResponse);
 app.post('/v1/responses/:responseId/cancel', handleCancelBackgroundResponse);
 
+/**
+ * Forward an Anthropic Messages request to the active exclusive engine, bypassing
+ * the llama.cpp machinery (slots, retry, ensureModelServed). Streaming responses
+ * are relayed as raw SSE; non-streaming as JSON. Shares the exclusive generation
+ * lane (acquireDs4Slot) and rethrows uncommitted transport errors so
+ * `serveDs4WithSwapRecovery` can re-serve work killed by an engine swap.
+ *
+ * @param {import('express').Request} req Express request carrying the stripped upstream body.
+ * @param {import('express').Response} res Express response.
+ * @param {{requestedModel:string,isStreaming:boolean,startTime:number,priority?:string,routing?:string,engine:object}} ctx Routing context; `engine` is an EXCLUSIVE_ENGINES handle.
+ * @returns {Promise<void>} Resolves after the complete JSON or SSE response is delivered.
+ */
+async function proxyMessagesToExclusive(req, res, {
+  requestedModel,
+  isStreaming,
+  startTime,
+  priority = 'interactive',
+  routing = 'auto',
+  engine,
+}) {
+  const url = ds4TargetUrl(engine.port(), '/v1/messages');
+  const activeReqId = startActiveRequest({
+    model: requestedModel,
+    endpoint: 'messages',
+    messages: req.body.messages || null,
+    backend: engine.type,
+    priority,
+    routing,
+    relayRequestId: readRelayRequestId(req.headers),
+  });
+  const controller = activeRequests.get(activeReqId)?.abortController;
+  const abort = () => { try { controller?.abort('client_disconnect'); } catch { /* best effort */ } };
+  res.once('close', abort);
+
+  let slot;
+  try {
+    slot = await acquireDs4Slot(res, { model: requestedModel, endpoint: 'messages', activeReqId, priority, signal: controller?.signal });
+  } catch (err) {
+    endActiveRequest(activeReqId, { status: 'error' });
+    res.off('close', abort);
+    throw err;
+  }
+
+  const log = (fields) => addLlmLog({ endpoint: 'messages', model: requestedModel, stream: isStreaming, status: 200, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages: req.body.messages || null, prompt: null, response: null, error: null, backend: engine.type, requestBody: req.body, ...fields });
+  try {
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+      dispatcher: llamaDispatcher,
+      signal: controller?.signal,
+    });
+    if (!upstream.ok) {
+      const error = await upstream.text().catch(() => '');
+      log({ status: upstream.status, error });
+      endActiveRequest(activeReqId, { status: 'error' });
+      if (!res.headersSent) return res.status(upstream.status).send(error);
+      try { res.end(); } catch { /* ignore */ }
+      return;
+    }
+
+    if (isStreaming) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      let completionTokens = 0;
+      let promptTokens = 0;
+      let responseText = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        res.write(chunk);
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            const text = event.type === 'content_block_delta' ? (event.delta?.text || event.delta?.thinking || '') : '';
+            if (text) { completionTokens++; responseText += text; updateActiveRequest(activeReqId, text); }
+            const usage = event.usage || event.message?.usage;
+            if (usage) {
+              promptTokens = usage.input_tokens || promptTokens;
+              completionTokens = usage.output_tokens || completionTokens;
+            }
+          } catch { /* non-JSON keepalive */ }
+        }
+      }
+      const tail = decoder.decode();
+      if (tail) res.write(tail);
+      res.end();
+      const duration = Date.now() - startTime;
+      const tokensPerSecond = duration > 0 ? completionTokens / (duration / 1000) : 0;
+      recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: requestedModel, duration, backend: engine.type });
+      log({ stream: true, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, response: responseText });
+      engine.markServed();
+      endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
+      return;
+    }
+
+    const data = await upstream.json();
+    const duration = Date.now() - startTime;
+    const usage = data.usage || {};
+    const promptTokens = usage.input_tokens || 0;
+    const completionTokens = usage.output_tokens || 0;
+    const tokensPerSecond = duration > 0 ? completionTokens / (duration / 1000) : 0;
+    const responseText = Array.isArray(data.content) ? data.content.map(c => c.text || '').join('') : '';
+    recordTokenStats({ promptTokens, completionTokens, tokensPerSecond, model: data.model || requestedModel, duration, backend: engine.type });
+    log({ model: data.model || requestedModel, duration, promptTokens, completionTokens, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, response: responseText });
+    data._llama_manager = enrichLlamaManagerMeta(
+      { duration, tokensPerSecond: Math.round(tokensPerSecond * 10) / 10, backend: engine.type },
+      { completionTokens },
+    );
+    engine.markServed();
+    endActiveRequest(activeReqId, { status: 'complete', tokens: completionTokens, responseText });
+    res.json(data);
+  } catch (error) {
+    endActiveRequest(activeReqId, { status: 'error' });
+    log({ status: 502, duration: Date.now() - startTime, error: error.message });
+    // Rethrow so serveDs4WithSwapRecovery can tell our own hot-swap from a real fault.
+    if (!res.headersSent) throw error;
+    if (!res.writableEnded) res.end();
+  } finally {
+    res.off('close', abort);
+    slot.release();
+  }
+}
+
 // Anthropic Messages API compatibility (proxied to llama.cpp)
 /**
  * Proxy an Anthropic-compatible Messages request to the selected backend.
@@ -15904,8 +16136,9 @@ async function handleMessages(req, res) {
   const startTime = Date.now();
   const isStreaming = req.body.stream === true;
   const smart = await smartRouting(req, res, 'messages');
-  const requestedModel = smart?.localTarget ?? (req.body.model || 'default');
-  if (smart?.localTarget) req.body.model = smart.localTarget;
+  const rawModel = req.body.model || 'default';
+  const { requestedModel, aliasRouting } = resolveRequestModel(rawModel, smart);
+  if (req.body.model && req.body.model !== requestedModel) req.body.model = requestedModel;
   let requestPolicy;
   try { requestPolicy = managerRequestPolicy(req.body, req.headers); }
   catch (error) { return res.status(400).json({ error: { message: error.message, code: 'invalid_manager_policy' } }); }
@@ -15916,8 +16149,68 @@ async function handleMessages(req, res) {
   // Inject reasoning_effort if configured
   const proxyBody = injectModelSamplingDefaults(injectReasoningEffort(req.body));
 
+  // Follow the alias to its engine (same order as chat/completions): activate the
+  // exclusive engine this model names, hold mid-swap traffic, then route.
+  const inboundRelay = readRelayState(req.headers);
+  const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel, {
+    requestPriority: requestPolicy.priority,
+    relay: inboundRelay,
+  });
+  if (ds4Activation && !ds4Activation.ok) {
+    return res.status(ds4Activation.status || 503).json({ error: { message: ds4Activation.error, type: 'server_error' } });
+  }
+  await exclusiveSwapsSettled();
+
   // Route to remote backend if applicable
-  const routing = resolveBackend(requestedModel, 'messages', req.body, { localOnly: requestPolicy.localOnly, ...(smart ? { aliasRouting: smart } : {}) });
+  let routing;
+  const exclusive = activeExclusive();
+  if (exclusive) {
+    const decision = ds4RequestTarget({
+      requestedModel,
+      ds4ModelIds: exclusive.modelIds(),
+      exactIds: exclusive.exactIds,
+      hasViableRemote: !!findFastestAvailableBackend(requestedModel, 'messages', aliasRouting),
+      llamaRunning: !!llamaProcess,
+    });
+    if (decision.target === 'local-ds4') {
+      if (!exclusive.servesMessages) {
+        return res.status(501).json({
+          error: {
+            message: `the Anthropic Messages API is unsupported by ${exclusive.label}; use /v1/chat/completions`,
+            type: 'not_supported_error',
+            code: 'MESSAGES_UNSUPPORTED',
+          },
+        });
+      }
+      const unavailable = exclusiveUnavailableBody(exclusive);
+      if (unavailable) return res.status(503).json(unavailable);
+      req.body = proxyBody;
+      return serveDs4WithSwapRecovery(req, res, {
+        engine: exclusive,
+        proxy: proxyMessagesToExclusive,
+        rawModel,
+        requestedModel,
+        isStreaming,
+        startTime,
+        priority: requestPolicy.priority,
+        routing: requestPolicy.routing,
+        relay: inboundRelay,
+      });
+    } else if (decision.target === 'local-llama') {
+      routing = resolveBackend(requestedModel, 'messages', req.body, { localOnly: requestPolicy.localOnly, aliasRouting });
+    } else if (requestPolicy.localOnly) {
+      contextRoutingStats.offloadSuppressedLocalOnly++;
+      contextRoutingStats.localOnlyRejected++;
+      return res.status(503).json({ error: { message: `local_only request is unavailable while ${exclusive.label} owns a different local model`, code: 'LOCAL_ONLY_UNAVAILABLE' } });
+    } else if (decision.target === 'reject') {
+      return res.status(503).json(ds4Exclusive503Body(requestedModel, exclusive.displayName(), exclusive.label));
+    } else {
+      const backend = findFastestAvailableBackend(requestedModel, 'messages', aliasRouting);
+      routing = buildRemoteRouting(backend, remoteTargetModel(backend, aliasRouting), 'messages', inboundRelay);
+    }
+  } else {
+    routing = resolveBackend(requestedModel, 'messages', req.body, { localOnly: requestPolicy.localOnly, ...(aliasRouting ? { aliasRouting } : {}) });
+  }
   if (routing.blocked) return sendBlockedResidency(res, routing);
   if (routing.suppressionReason === 'explicit_remote_backend') {
     contextRoutingStats.localOnlyRejected++;
