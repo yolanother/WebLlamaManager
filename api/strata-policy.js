@@ -114,3 +114,21 @@ export function strataBackendDecision(input) {
   if (busy) return { action: 'stay', idleSinceMs: idleSince, reason: 'engine-busy' };
   return { action: 'return-to-cuda', idleSinceMs: idleSince, reason: 'cuda-idle' };
 }
+
+/**
+ * Wait until Strata's CUDA lease is released. If a swap is already in flight the lease is
+ * released by that swap's verified stop, so only poll; otherwise call `leave` once.
+ * @param {{isHeld: function(): boolean, swapInFlight: function(): boolean, leave: function(): Promise<void>,
+ *   sleep: function(number): Promise<void>, now: function(): number, timeoutMs: number, pollMs?: number}} opts
+ *   Injected probes (no I/O here); `isHeld` is true while the lease is still held on the card.
+ * @returns {Promise<void>} Resolves once the lease is gone.
+ * @throws {Error} 'strata cuda lease release timed out' when still held after `timeoutMs`.
+ */
+export async function waitForCudaLeaseRelease({ isHeld, swapInFlight, leave, sleep, now, timeoutMs, pollMs = 500 }) {
+  const deadline = now() + timeoutMs;
+  while (isHeld()) {
+    if (!swapInFlight()) { await leave(); return; }
+    if (now() >= deadline) throw new Error('strata cuda lease release timed out');
+    await sleep(pollMs);
+  }
+}

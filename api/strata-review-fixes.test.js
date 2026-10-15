@@ -82,3 +82,15 @@ test('M3: llama is not admitted beside an exclusive engine that is loading or no
   const guard = body.slice(branch, fit);
   includesAll(guard, ['exclusive.swapPromise()', "!== 'ready'", 'return null'], 'co-residence guard before the fit check');
 });
+
+test('M4: the Pods drain hook waits for the CUDA lease, not the swap gate', () => {
+  const body = fnBody('drainForReservation');
+  const hook = body.slice(0, body.indexOf('rpcServer'));
+  includesAll(hook, ['waitForCudaLeaseRelease(', 'strataLeaveCuda(', 'drainMaxWaitMs'], 'drain hook');
+  assert.ok(!/await strataLeaveCuda\(/.test(hook), 'hook must not call strataLeaveCuda directly (blocks on the gate)');
+});
+
+test('M5: strataLeaveCuda throws on an unconfirmed stop and the swap path records stop-unconfirmed', () => {
+  includesAll(fnBody('strataLeaveCuda'), ['ok === false', "'strata stop unconfirmed'"], 'strataLeaveCuda');
+  assert.match(fnBody('strataSwapBackend'), /stop-unconfirmed/);
+});

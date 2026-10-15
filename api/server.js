@@ -219,6 +219,7 @@ import {
 } from './strata-engine.js';
 import {
   STRATA_HOLDER, parseComputeApps, otherComputeVramBytes, blockingClaim, strataBackendDecision, cudaAdmission,
+  waitForCudaLeaseRelease,
 } from './strata-policy.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
@@ -5647,7 +5648,16 @@ async function drainForReservation(reservationId, reservation) {
   // Strata on this card must leave BEFORE the claim is marked held (R5): the state machine
   // already preempted its lease, but its engine still has the card until it is stopped.
   if (strataState.cudaCard && strataState.cudaCard === reservation.card && reservationId !== strataState.cudaLeaseId) {
-    await strataLeaveCuda(`preempted by ${reservation.holder}`);
+    // Wait for the lease (released by the verified stop), not the swap gate: a swap in flight
+    // holds the gate through the whole HIP load, long after Strata left the card.
+    await waitForCudaLeaseRelease({
+      isHeld: () => strataState.cudaCard === reservation.card && !!strataState.cudaLeaseId,
+      swapInFlight: () => !!strataState.swapPromise,
+      leave: () => strataLeaveCuda(`preempted by ${reservation.holder}`),
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      now: Date.now,
+      timeoutMs: strataConfig().policy.drainMaxWaitMs + 60000,
+    });
   }
   // The accelerator card is NOT the card the engine is bound to — the engine runs on the
   // APU and borrows the NVIDIA card through the rpc-server — so drainPlan below never sees
@@ -9553,7 +9563,10 @@ async function strataLeaveCuda(reason, { swapGate = null } = {}) {
     for (const entry of activeRequests.values()) {
       if (entry.backend === 'strata') entry.abortController?.abort();
     }
-    await stopStrataServer();
+    const stopped = await stopStrataServer();
+    if (stopped?.ok === false) {
+      throw Object.assign(new Error('strata stop unconfirmed'), { stopUnconfirmed: true });
+    }
   } catch (err) {
     if (!swapGate) settle();
     throw err;
@@ -9644,7 +9657,7 @@ async function strataSwapBackend(target, reason) {
     await strataLeaveCuda(reason, { swapGate: settle }); // drain + abort + verified stop; also serves HIP -> CUDA
   } catch (err) {
     addLog('presets', `strata: leave phase failed (${err.message})`);
-    if (runtime) Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: err.message });
+    if (runtime) Object.assign(runtime, { status: err.stopUnconfirmed ? 'stop-unconfirmed' : 'exhausted', backend: null, settledAt: Date.now(), reason: err.message });
     settle();
     return;
   }

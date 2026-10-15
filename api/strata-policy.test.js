@@ -245,3 +245,30 @@ test('cudaAdmission rule 5: a recent CUDA failure refuses, an old one admits', (
   expectAdmission(cudaAdmission({ ...admitBase(), cudaFailedAt: NOW - RETURN_AFTER + 1 }), false);
   expectAdmission(cudaAdmission({ ...admitBase(), cudaFailedAt: NOW - RETURN_AFTER }), true);
 });
+
+test('waitForCudaLeaseRelease: returns once the lease clears, leaving itself only when no swap is in flight', async () => {
+  const { waitForCudaLeaseRelease } = await import('./strata-policy.js');
+  // swap in flight: polls, never calls leave, resolves when the lease is released
+  let held = true; let polls = 0; let left = 0;
+  await waitForCudaLeaseRelease({
+    isHeld: () => held, swapInFlight: () => true, leave: async () => { left += 1; },
+    sleep: async () => { if (++polls === 3) held = false; }, now: () => 0, timeoutMs: 10_000,
+  });
+  assert.equal(polls, 3); assert.equal(left, 0);
+  // no swap: leave once and stop
+  held = true; left = 0;
+  await waitForCudaLeaseRelease({
+    isHeld: () => held, swapInFlight: () => false, leave: async () => { left += 1; held = false; },
+    sleep: async () => {}, now: () => 0, timeoutMs: 10_000,
+  });
+  assert.equal(left, 1);
+});
+
+test('waitForCudaLeaseRelease: throws when the lease is still held at the timeout', async () => {
+  const { waitForCudaLeaseRelease } = await import('./strata-policy.js');
+  let t = 0;
+  await assert.rejects(waitForCudaLeaseRelease({
+    isHeld: () => true, swapInFlight: () => true, leave: async () => {},
+    sleep: async () => { t += 500; }, now: () => t, timeoutMs: 2000,
+  }), /timed out/);
+});
