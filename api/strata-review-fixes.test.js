@@ -125,3 +125,29 @@ test('m1: startStrataAttempt reports python-missing instead of spawning', () => 
   assert.match(body, /existsSync\(cfg\.pythonPath\)/);
   assert.match(body, /python-missing/);
 });
+
+test('m2: strataBackendTick excludes Strata\'s own executables from foreign VRAM', () => {
+  const body = fnBody('strataBackendTick');
+  includesAll(body, ['otherComputeVramBytes(', 'basename(cfg.cuda.exe)', 'basename(cfg.pythonPath)'], 'strataBackendTick');
+});
+
+test('m3: runStrataLoadPhase does its setup inside the try so a throw settles the gate', () => {
+  const body = fnBody('runStrataLoadPhase');
+  const tryAt = body.indexOf('try {');
+  assert.ok(tryAt !== -1 && body.indexOf('strataConfig()') > tryAt, 'strataConfig() must run inside try');
+  assert.ok(body.indexOf("config.presets?.[") > tryAt, 'preset lookup must run inside try');
+  assert.ok(body.includes('finally {') && body.includes('settle();'));
+});
+
+test('m5: strataBackendTick marks a dead ready engine exhausted and releases the CUDA lease', () => {
+  const body = fnBody('strataBackendTick');
+  includesAll(body, ['isRunning()', "'engine-stopped'", 'releaseStrataCudaLease()'], 'strataBackendTick');
+  assert.ok(body.indexOf("'engine-stopped'") < body.indexOf('!cfg.cuda'), 'dead-engine check must not depend on CUDA being configured');
+});
+
+test('m6: handleModels advertises strata entries with Strata context capabilities under DS4', () => {
+  const body = fnBody('handleModels');
+  const at = body.indexOf('strataCatalogEntries(config');
+  const stop = body.indexOf('}', at);
+  assert.match(body.slice(at, stop + 200), /contextCapabilities\(ENGINE_TYPES\.STRATA/);
+});

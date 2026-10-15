@@ -516,7 +516,7 @@ let ds4SettledRuntime = null;
  * The cuda* fields are reserved for the CUDA backend leaf (S3); nothing here sets them yet.
  */
 const strataState = {
-  activePresetId: null, swapPromise: null, swapGeneration: 0, lastServedAt: 0,
+  activePresetId: null, swapPromise: null, swapGeneration: 0, lastServedAt: 0, deadSinceMs: 0,
   runtime: null,
   cudaLeaseId: null, cudaCard: null, idleSinceMs: null, cudaFailedAt: null,
 };
@@ -9587,12 +9587,13 @@ async function strataLeaveCuda(reason, { swapGate = null } = {}) {
  * @param {function} settle The gate's settle function.
  */
 function runStrataLoadPhase(target, reason, settle) {
-  const cfg = strataConfig();
   const runtime = strataState.runtime;
-  const preset = config.presets?.[strataState.activePresetId];
-  const attempts = (target === 'hip' ? [cfg.hip && { backend: 'hip' }] : [cfg.cuda && { backend: 'cuda' }, cfg.hip && { backend: 'hip' }]).filter(Boolean);
   (async () => {
     try {
+      // Setup lives inside the try: a throw here must still settle the gate.
+      const cfg = strataConfig();
+      const preset = config.presets?.[strataState.activePresetId];
+      const attempts = (target === 'hip' ? [cfg.hip && { backend: 'hip' }] : [cfg.cuda && { backend: 'cuda' }, cfg.hip && { backend: 'hip' }]).filter(Boolean);
       if (!preset || !runtime || attempts.length === 0) {
         if (runtime) Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: 'swap-no-backend' });
         return;
@@ -9680,11 +9681,26 @@ let strataTickRunning = false;
 async function strataBackendTick() {
   const cfg = strataConfig();
   const runtime = strataState.runtime;
+  if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready' && !strataState.swapPromise) {
+    // The supervisor gave up (load-failure breaker / governor): a ready runtime over a dead
+    // engine would hold the CUDA lease forever. Debounced past the 3 s auto-restart delay.
+    if (getStrataSupervisor().isRunning()) strataState.deadSinceMs = 0;
+    else if (!strataState.deadSinceMs) strataState.deadSinceMs = Date.now();
+    else if (Date.now() - strataState.deadSinceMs > 30000) {
+      strataState.deadSinceMs = 0;
+      Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: 'engine-stopped' });
+      releaseStrataCudaLease();
+      addLog('presets', 'strata: engine is no longer running and is not restarting; marked exhausted and released the CUDA lease. Re-activate the preset to retry.');
+      return;
+    }
+  }
   if (strataTickRunning || currentEngine !== ENGINE_TYPES.STRATA || runtime?.status !== 'ready'
     || !cfg.cuda || strataState.swapPromise) return;
   strataTickRunning = true;
   try {
-    const otherVramBytes = otherComputeVramBytes(await sampleStrataComputeApps());
+    const otherVramBytes = otherComputeVramBytes(await sampleStrataComputeApps(), [
+      'strata', 'ggml-rpc-server', 'rpc-server', basename(cfg.cuda.exe), basename(cfg.pythonPath),
+    ]);
     if (currentEngine !== ENGINE_TYPES.STRATA || strataState.runtime !== runtime
       || runtime.status !== 'ready' || strataState.swapPromise) return; // changed while sampling
     const now = Date.now();
@@ -12057,7 +12073,7 @@ async function handleModels(req, res) {
       const out = { object: 'list', data: ds4List.map(entry => ({ ...entry, context_management: ds4Capabilities })) };
       // The other Strata presets stay listed (unloaded) beside the active exclusive model.
       for (const entry of strataCatalogEntries(config, { currentEngine, currentPreset, created: Math.floor(Date.now() / 1000) })) {
-        if (!out.data.some((m) => m.id === entry.id)) out.data.push({ ...entry, context_management: ds4Capabilities });
+        if (!out.data.some((m) => m.id === entry.id)) out.data.push({ ...entry, context_management: contextCapabilities(ENGINE_TYPES.STRATA, { slotCacheEnabled: slotCacheCfg().enabled, slotOperationsSupported: false }) });
       }
       // An alias can only advertise a window it can prove, so it is resolved from the
       // windows this response already reports for the real models behind it.
