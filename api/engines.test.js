@@ -1547,7 +1547,7 @@ test('strata: validatePresetEngineFields rejects bad args arrays', () => {
     assert.equal(validatePresetEngineFields(b).ok, false, JSON.stringify(args)?.slice(0, 40));
   }
   const b = STRATA_BODY();
-  b.strata.args = new Array(200).fill('--x');
+  b.strata.args = new Array(200).fill('--mmap-experts'); // an allowlisted flag (see the allowlist tests)
   assert.equal(validatePresetEngineFields(b).ok, true);
 });
 
@@ -1664,4 +1664,22 @@ test('strata: buildLocalServerRegistry adds a strata entry only when passed', ()
   assert.ok(entry);
   assert.equal(entry.running, true);
   assert.equal(entry.port, 18090);
+});
+
+// ── strata args flag allowlist (security: presets are LAN-writable) ──────────
+test('validatePresetEngineFields(strata): rejects flags outside the allowlist (no file-writing engine flags)', () => {
+  const base = { engine: 'strata', strata: { tokenizer: '/m/tok', args: ['--pack', '/m/p'] } };
+  for (const bad of ['--expert-profile-save', '--log', '--api-key', '--expert-profile-save=/etc/x', '--mcp']) {
+    const r = validatePresetEngineFields({ ...base, strata: { ...base.strata, args: ['--pack', '/m/p', bad, '/tmp/x'] } });
+    assert.equal(r.ok, false, `${bad} must be rejected`);
+    assert.match(r.error, /not allowed/);
+  }
+});
+
+test('validatePresetEngineFields(strata): accepts the deployed Flash-Next tuning flags', () => {
+  const args = ['--pack', '/p', '--native', '/g1', '--ple-gguf', '/g2', '--expert-profile', '/f', '--prefill', '16384',
+    '--spec', '5', '--spec-min-p', '0.5', '--mtp', '/m', '--kv', 'int8', '--kv-resident', '32768',
+    '--mtp-window', '8192', '--lookup-chain', '3', '--mtp-q4', 'all', '--resident-budget-gib', '55'];
+  const r = validatePresetEngineFields({ engine: 'strata', strata: { tokenizer: '/m/tok', args } });
+  assert.equal(r.ok, true, r.error);
 });

@@ -654,6 +654,18 @@ export function resolveQwen36Context(contextSize) {
 
 /** Flags the manager owns for strata; a preset may not set them. */
 const STRATA_RESERVED_FLAGS = ['--expert-cache', '--max-context', '--port'];
+/**
+ * Engine flags a Strata preset may carry. POST/PUT /api/presets are reachable from the LAN, so
+ * the args are an allowlist, not a denylist: Strata has flags that write files or open sockets
+ * (e.g. --expert-profile-save), and the args are passed to the engine as argv. Model and tuning
+ * flags only; executables, env and lib dirs come from config.strata.
+ */
+const STRATA_ALLOWED_FLAGS = new Set([
+  '--pack', '--native', '--native-dense-gguf', '--ple-gguf', '--embd-gguf', '--expert-profile',
+  '--prefill', '--spec', '--spec-min-p', '--mtp', '--kv', '--kv-resident', '--mtp-window',
+  '--lookup-chain', '--mtp-q4', '--resident-budget-gib', '--rope-scaling', '--rope-scale',
+  '--mmap-experts', '--resident-experts', '--kv-streaming', '--draft-vocab',
+]);
 
 /** Upper bound for a strata preset's context window. */
 const STRATA_MAX_CONTEXT = 1048576;
@@ -676,6 +688,10 @@ function validateStrataPresetFields(body) {
   const reserved = args.find((a) => STRATA_RESERVED_FLAGS.some((f) => a === f || a.startsWith(`${f}=`)));
   if (reserved) {
     return { ok: false, error: `strata.args must not contain ${reserved.split('=')[0]} (managed by the manager).` };
+  }
+  const unknown = args.find((a) => a.startsWith('-') && !/^-\d/.test(a) && !STRATA_ALLOWED_FLAGS.has(a.split('=')[0]));
+  if (unknown) {
+    return { ok: false, error: `strata.args flag ${unknown.split('=')[0]} is not allowed (model/tuning flags only).` };
   }
   if (typeof tokenizer !== 'string' || !tokenizer.startsWith('/')) {
     return { ok: false, error: 'strata.tokenizer must be a non-empty absolute path.' };
