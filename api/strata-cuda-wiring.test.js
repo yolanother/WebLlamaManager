@@ -83,5 +83,8 @@ test('activateStrataExclusive gates the CUDA attempt on cudaAdmission', () => {
 });
 
 test('stopStrataServer releases the CUDA lease', () => {
-  assert.ok(fnBody('stopStrataServer').includes('cudaLeaseId'), 'stopStrataServer must release strataState.cudaLeaseId');
+  const body = fnBody('stopStrataServer');
+  assert.ok(body.includes('cudaLeaseId') || body.includes('releaseStrataCudaLease('),
+    'stopStrataServer must release strataState.cudaLeaseId');
+  assert.ok(fnBody('releaseStrataCudaLease').includes('cudaLeaseId'), 'releaseStrataCudaLease must clear the lease id');
 });
