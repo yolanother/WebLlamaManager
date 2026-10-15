@@ -56,16 +56,14 @@ export function ds4ModelMatches(requestedModel, ds4ModelIds = [], { exact = fals
  * @param {string} params.requestedModel        Resolved model name from the request.
  * @param {string[]} [params.ds4ModelIds=[]]     Names that map to the local ds4 engine.
  * @param {boolean} [params.hasViableRemote=false] Whether some remote backend can serve requestedModel.
- * @param {string[]|null} [params.exactIds=null] When an array, the local match is EXACT against these ids
- *   (replacing the tolerant ds4ModelIds match). Target names are unchanged: 'local-ds4' means "the local exclusive engine".
+ * @param {boolean} [params.exactIds=false] When true, ds4ModelIds must match EXACTLY (normalized case/punctuation)
+ *   instead of DS4's tolerant substring match (Strata uses this). Target names are unchanged: 'local-ds4' means "the local exclusive engine".
  * @returns {{target:'local-ds4'|'remote'|'reject', reason:string}}
  */
 export function ds4RequestTarget({
-  requestedModel, ds4ModelIds = [], hasViableRemote = false, llamaRunning = false, exactIds = null,
+  requestedModel, ds4ModelIds = [], hasViableRemote = false, llamaRunning = false, exactIds = false,
 } = {}) {
-  const local = Array.isArray(exactIds)
-    ? ds4ModelMatches(requestedModel, exactIds, { exact: true })
-    : ds4ModelMatches(requestedModel, ds4ModelIds);
+  const local = ds4ModelMatches(requestedModel, ds4ModelIds, { exact: !!exactIds });
   if (local) return { target: 'local-ds4', reason: 'ds4-model' };
   // DS4 is exclusive by DEFAULT, not by necessity. When a llama model was
   // admitted beside it (see llamaFitsBesideDs4 — measured free memory, not an
