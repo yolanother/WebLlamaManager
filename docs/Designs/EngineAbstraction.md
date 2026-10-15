@@ -358,12 +358,26 @@ ever active**, so a single "local engine" governor/watchdog is correct.
   ds4 deactivation and the mem-watchdog restart explicitly claim supervision
   and reap ds4 via the supervisor.
 
+## Generalized exclusive engines (Strata)
+
+DS4 is no longer the only exclusive engine. `api/server.js` now carries an
+`EXCLUSIVE_ENGINES` table (keyed by `ENGINE_TYPES.DS4` / `ENGINE_TYPES.STRATA`) that
+gives every caller one engine-neutral handle: `activePresetId()`, `swapPromise()`,
+`swapGeneration()`, `port()`, `markServed()`, `deactivate()`, `servesMessages`,
+`exactIds`, `admitsLlamaBeside(model)`, and so on. `activeExclusive()` returns the
+handle for `currentEngine`, and `exclusiveSwapsSettled()` awaits every engine's swap.
+The DS4-named top-level variables and functions keep their names (source-text tests pin
+them); the DS4 handle simply reads them. *(implementation in progress)*
+
+See [`StrataEngine.md`](StrataEngine.md) for the full design and
+[`../strata-engine.md`](../strata-engine.md) for the operator guide.
+
 ## State variables (`api/server.js`)
 
 ```javascript
 let currentMode = 'router';   // 'router' | 'single'
 let currentPreset = null;
-let currentEngine = 'llama';  // 'llama' | 'ds4'
+let currentEngine = 'llama';  // 'llama' | 'ds4' | 'strata'
 ```
 
 ## Live verification (pending)

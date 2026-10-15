@@ -412,6 +412,27 @@ module 610.43.02 and `nvidia_uvm` live.
 
 ---
 
+---
+
+## Strata as a reservation holder
+
+The Strata engine (see [`StrataEngine.md`](StrataEngine.md)) reserves the `rtx3090`
+pool as holder `llama-manager/strata` at **priority 50** with no TTL. Why 50:
+
+- **Above the model pin (25).** The card has capacity 1 and Strata CUDA needs all of
+  it, so Strata displaces the pinned Qwen3-8B. The pin waits as pending, and while
+  Strata holds the card the accelerator plan sees a claim above 0 and starts no
+  rpc-server.
+- **Below Pods (80).** A Pods lock preempts Strata. `onPreempt` only clears
+  `gpuDrainedModels` for the Strata lease; the real work is a new first step in
+  `drainForReservation`: if Strata is on the reservation's card, `await
+  strataLeaveCuda(reason)` (drain, cancel, verified stop, release lease) before Pods is
+  marked held. Without it Pods would be marked held while Strata still occupies the
+  card.
+
+The Strata lease is internal, like the pin: not offered over HTTP with a null TTL, and
+skipped by the sweep's external-claim drain loop. *(implementation in progress)*
+
 ## Related
 
 - [`../features/gpu-reservations.md`](../features/gpu-reservations.md) — what it does and how to use it

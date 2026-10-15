@@ -164,6 +164,16 @@ $ curl -s -X POST http://127.0.0.1:5250/api/gpus/apu/reserve \
 {"error":"GPU \"apu\" is fully reserved at or above priority -10","code":"GPU_BUSY"}
 ```
 
+### Strata's own claim (priority 50)
+
+When the Strata engine is enabled it holds the `rtx3090` pool as
+`llama-manager/strata` at priority **50**, between the model pin (25) and pods (80).
+So it displaces the pinned model, and a pods lock at 80 preempts it: the drain path
+(`drainForReservation`) first calls the `strataLeaveCuda` hook, which drains and stops
+Strata, and only then reports the pods lock as held. Strata falls back to the iGPU
+(HIP) and returns to the card after it has been idle for `returnToCudaAfterMin`. See
+[`../strata-engine.md`](../strata-engine.md). *(implementation in progress)*
+
 ### Worked example
 
 The `apu` pool has capacity 1 and llama-manager's own model pin on it at priority
