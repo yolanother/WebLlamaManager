@@ -16866,6 +16866,17 @@ async function handleMessages(req, res) {
 
   // Follow the alias to its engine (same order as chat/completions): activate the
   // exclusive engine this model names, hold mid-swap traffic, then route.
+  // A DS4 target can never serve /v1/messages: answer 501 BEFORE ensureDs4ForModel so a
+  // probe does not cost a full engine swap.
+  if (ds4PresetForModel(config, requestedModel)) {
+    return res.status(501).json({
+      error: {
+        message: `the Anthropic Messages API is unsupported by ${EXCLUSIVE_ENGINES[ENGINE_TYPES.DS4].label}; use /v1/chat/completions`,
+        type: 'not_supported_error',
+        code: 'MESSAGES_UNSUPPORTED',
+      },
+    });
+  }
   const inboundRelay = readRelayState(req.headers);
   const ds4Activation = await ensureDs4ForModel(rawModel, requestedModel, {
     requestPriority: requestPolicy.priority,
