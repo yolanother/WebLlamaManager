@@ -214,7 +214,7 @@ lock at Pods' priority (80 > 50):
 ```console
 $ curl -s -X POST http://127.0.0.1:5250/api/gpus/rtx3090/lock \
     -H 'Content-Type: application/json' \
-    -d '{"holder":"swap-test","priority":80,"ttlSec":600}'
+    -d '{"holder":"swap-test","priority":80,"ttlSeconds":600}'
 ```
 
 Expected, while Strata is running on CUDA:
@@ -222,7 +222,7 @@ Expected, while Strata is running on CUDA:
 1. Strata's lease is preempted; the drain hook (`drainForReservation` calls
    `strataLeaveCuda` first) stops Strata *before* the lock is reported held.
 2. Strata reloads on HIP (`strataRuntime.backend` becomes `hip`; ~27-40 s).
-3. Release the lock (`POST /api/gpus/rtx3090/release` with the returned id). After
+3. Release the lock (`DELETE /api/gpus/reservations/<id>` with the returned id; loopback only). After
    `returnToCudaAfterMin` of idle card and no in-flight request, the manager swaps back
    to CUDA. Lower `returnToCudaAfterMin` for the test.
 
