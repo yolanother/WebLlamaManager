@@ -137,7 +137,7 @@ function ModelsPage({ stats }) {
   // Healthy when EITHER the llama server is up OR the ds4 engine is active and
   // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
   // is the real signal — otherwise the chat/status would show "not running").
-  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
+  const isHealthy = engineHealthy(stats);
   const isSingleMode = stats?.mode === 'single';
 
   if (isSingleMode) {

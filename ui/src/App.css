@@ -6463,6 +6463,14 @@ input::placeholder {
   color: var(--text-primary);
   background: linear-gradient(135deg, var(--series-2-alt2) 0%, var(--series-4) 100%);
 }
+.engine-badge.strata {
+  color: var(--text-primary);
+  background: linear-gradient(135deg, var(--series-3) 0%, var(--series-1) 100%);
+}
+.preset-card.active-strata {
+  border-style: solid;
+  border-color: var(--series-3);
+}
 .sidebar-engine {
   margin-top: 8px;
 }

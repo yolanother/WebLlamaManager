@@ -7,6 +7,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { API_BASE, formatBytes, formatModelName } from '../api.js';
+import { buildStrataPresetBody } from './strata-preset.js';
 import { SearchableSelect } from '../components/SearchableSelect.jsx';
 import '../styles/pages.css';
 
@@ -28,6 +29,8 @@ const EMPTY_PRESET = {
     chatTemplateKwargs: '',
     extraSwitches: '--jinja'
   },
+  // strata-only fields (args is a whitespace-separated textarea).
+  strata: { args: '', tokenizer: '', modelName: '' },
   // ds4-only launch knobs (flat body fields consumed by validatePresetEngineFields).
   ds4: {
     power: 100,
@@ -90,8 +93,9 @@ function PresetsPage({ stats }) {
   }, [fetchPresets, fetchModels, fetchDs4Models]);
 
   const createPreset = async () => {
-    if (!newPreset.id || !newPreset.name || !newPreset.modelPath) {
-      alert('Please fill in ID, Name, and select a model');
+    const isStrata = newPreset.engine === 'strata';
+    if (!newPreset.id || !newPreset.name || (isStrata ? !newPreset.strata.tokenizer || !newPreset.strata.args.trim() : !newPreset.modelPath)) {
+      alert(isStrata ? 'Please fill in ID, Name, Args and Tokenizer' : 'Please fill in ID, Name, and select a model');
       return;
     }
     setLoading(l => ({ ...l, create: true }));
@@ -99,7 +103,9 @@ function PresetsPage({ stats }) {
       // ds4 presets POST a FLAT body (engine + ds4 launch knobs) that the
       // backend's validatePresetEngineFields understands; llama presets keep
       // their nested config as before.
-      const body = newPreset.engine === 'ds4'
+      const body = isStrata
+        ? { id: newPreset.id, ...buildStrataPresetBody({ ...newPreset, ...newPreset.strata }) }
+        : newPreset.engine === 'ds4'
         ? {
             id: newPreset.id,
             name: newPreset.name,
@@ -112,7 +118,7 @@ function PresetsPage({ stats }) {
             kvDiskSpaceMb: newPreset.ds4.kvDiskSpaceMb,
             extraSwitches: newPreset.ds4.extraSwitches
           }
-        : { ...newPreset, engine: 'llama', ds4: undefined };
+        : { ...newPreset, engine: 'llama', ds4: undefined, strata: undefined };
       const res = await fetch(`${API_BASE}/presets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -201,10 +207,11 @@ function PresetsPage({ stats }) {
                 id="preset-engine"
                 className="glass-input"
                 value={newPreset.engine}
-                onChange={(e) => setNewPreset(p => ({ ...p, engine: e.target.value, modelPath: '' }))}
+                onChange={(e) => setNewPreset(p => ({ ...p, engine: e.target.value, modelPath: '', context: e.target.value === 'strata' ? 262144 : 0 }))}
               >
                 <option value="llama">llama.cpp (router / presets)</option>
                 <option value="ds4">DS4 · DeepSeek V4 (exclusive)</option>
+                <option value="strata">Strata (exclusive)</option>
               </select>
               {newPreset.engine === 'ds4' && (
                 <span className="hint">
@@ -213,6 +220,40 @@ function PresetsPage({ stats }) {
                 </span>
               )}
             </div>
+            {newPreset.engine === 'strata' ? (
+              <>
+                <div className="form-group full-width">
+                  <label htmlFor="preset-strata-args">Args (whitespace-separated; the manager owns --expert-cache, --max-context and --port)</label>
+                  <textarea
+                    id="preset-strata-args"
+                    className="glass-input"
+                    rows={4}
+                    value={newPreset.strata.args}
+                    onChange={(e) => setNewPreset(p => ({ ...p, strata: { ...p.strata, args: e.target.value } }))}
+                  />
+                </div>
+                <div className="form-group full-width">
+                  <label htmlFor="preset-strata-tokenizer">Tokenizer (absolute path)</label>
+                  <input
+                    id="preset-strata-tokenizer"
+                    type="text"
+                    className="glass-input"
+                    value={newPreset.strata.tokenizer}
+                    onChange={(e) => setNewPreset(p => ({ ...p, strata: { ...p.strata, tokenizer: e.target.value } }))}
+                  />
+                </div>
+                <div className="form-group full-width">
+                  <label htmlFor="preset-strata-model-name">Model Name</label>
+                  <input
+                    id="preset-strata-model-name"
+                    type="text"
+                    className="glass-input"
+                    value={newPreset.strata.modelName}
+                    onChange={(e) => setNewPreset(p => ({ ...p, strata: { ...p.strata, modelName: e.target.value } }))}
+                  />
+                </div>
+              </>
+            ) : (
             <div className="form-group full-width">
               <span className="form-label">Model</span>
               {newPreset.engine === 'ds4' ? (
@@ -235,6 +276,7 @@ function PresetsPage({ stats }) {
                 />
               )}
             </div>
+            )}
             <div className="form-group">
               <label htmlFor="preset-context">{newPreset.engine === 'ds4' ? 'Context (--ctx, 0 = default)' : 'Context Size (0 = default)'}</label>
               <input
@@ -378,9 +420,11 @@ function PresetsPage({ stats }) {
               'Unknown';
             const isDs4 = preset.engine === 'ds4';
             const isActiveDs4 = isDs4 && activeEngine === 'ds4' && activePresetId === preset.id;
+            const isStrata = preset.engine === 'strata';
+            const isActiveStrata = isStrata && activeEngine === 'strata' && activePresetId === preset.id;
 
             return (
-              <div key={preset.id} className={`preset-card${isActiveDs4 ? ' active-ds4' : ''}`}>
+              <div key={preset.id} className={`preset-card${isActiveDs4 ? ' active-ds4' : ''}${isActiveStrata ? ' active-strata' : ''}`}>
                 <div className="preset-header">
                   <h3>{preset.name}</h3>
                   {isDs4 && (
@@ -388,6 +432,11 @@ function PresetsPage({ stats }) {
                       {isActiveDs4 ? 'DS4 · exclusive' : 'DS4'}
                     </span>
                   )}
+                {isStrata && (
+                  <span className="engine-badge strata" title="Strata engine — runs in exclusive mode">
+                    {isActiveStrata ? 'Strata · exclusive' : 'Strata'}
+                  </span>
+                )}
                 </div>
 
                 {isActiveDs4 && (

@@ -6,6 +6,7 @@
 // site-theme logo.
 
 import React from 'react';
+import { engineHealthy } from './engineHealth.js';
 import { NavLink } from 'react-router-dom';
 import { useSiteThemeLogo } from '../theme/siteTheme.js';
 import {
@@ -30,7 +31,7 @@ function Sidebar({ stats }) {
   // Healthy when EITHER the llama server is up OR the ds4 engine is active and
   // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
   // is the real signal — otherwise the chat/status would show "not running").
-  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
+  const isHealthy = engineHealthy(stats);
   const logoSrc = useSiteThemeLogo('/favicon/favicon-32x32.png');
 
   return (
@@ -44,6 +45,11 @@ function Sidebar({ stats }) {
           <span className="status-dot" />
           <span>{isHealthy ? 'Running' : stats?.mode ? 'Starting' : 'Stopped'}</span>
         </div>
+        {stats?.engine === 'strata' && (
+          <div className="engine-badge strata sidebar-engine" title="Strata engine active — llama models offloaded to backends">
+            {stats?.strataRuntime?.backend ? `Strata \u00B7 ${stats.strataRuntime.backend.toUpperCase()}` : 'Strata'}
+          </div>
+        )}
         {stats?.engine === 'ds4' && (
           <div className="engine-badge ds4 sidebar-engine" title="DeepSeek V4 active — llama models offloaded to backends">
             DS4 · exclusive

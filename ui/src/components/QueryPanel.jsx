@@ -9,6 +9,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useLocation } from 'react-router-dom';
 import { API_BASE, copyTextToClipboard, formatModelName } from '../api.js';
 import { useLayout } from '../theme/uiPrefs.js';
+import { engineHealthy } from './engineHealth.js';
 import { parseMessageWithCodeBlocks } from './CodeBlock.jsx';
 import { SearchableSelect } from './SearchableSelect.jsx';
 
@@ -296,7 +297,7 @@ function QueryPanel({ stats }) {
   // Healthy when EITHER the llama server is up OR the ds4 engine is active and
   // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
   // is the real signal — otherwise the chat/status would show "not running").
-  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
+  const isHealthy = engineHealthy(stats);
 
   return (
     <div className={`query-panel ${isOpen ? 'open' : ''}`}>

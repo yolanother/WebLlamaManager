@@ -16,6 +16,7 @@ import { API_BASE, formatBytes, formatUptime, formatModelName } from '../api.js'
 import { isLocalKioskHost, requestSystemLogin } from '../kiosk-control.js';
 import { resolveGpuPanel } from '../gpu-panel.js';
 import { resolveDrivePanel, resolveDriveAlerts, resolveLastCrash } from '../drive-panel.js';
+import { engineHealthy } from '../components/engineHealth.js';
 import { decisionCardAction, decisionConfigPatch, decisionProviderPatch } from './decision-card.js';
 import { useVisiblePolling } from '../hooks/useVisiblePolling.js';
 import {
@@ -483,7 +484,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
   // Healthy when EITHER the llama server is up OR the ds4 engine is active and
   // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
   // is the real signal — otherwise the chat/status would show "not running").
-  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
+  const isHealthy = engineHealthy(stats);
   const isSingleMode = stats?.mode === 'single';
   const llamaPort = stats?.llamaPort || 5251;
   const llamaUiUrl = stats?.llamaUiUrl || `http://${window.location.hostname}:${llamaPort}`;
@@ -1290,7 +1291,7 @@ function Dashboard({ stats, activeRequest, kiosk = false }) {
                 const status = srv.state === 'running' ? 'success'
                   : (srv.state === 'down' || srv.state === 'degraded' || srv.state === 'insufficient-memory') ? 'error'
                   : 'warning';
-                const icon = srv.type === 'ds4' ? '\u{1F9EC}' : srv.role === 'embeddings' ? '\u{1F9EE}' : srv.id === 'decision' ? '\u{2696}\u{FE0F}' : '\u{1F680}';
+                const icon = srv.type === 'ds4' ? '\u{1F9EC}' : srv.type === 'strata' ? '\u{1F9E9}' : srv.role === 'embeddings' ? '\u{1F9EE}' : srv.id === 'decision' ? '\u{2696}\u{FE0F}' : '\u{1F680}';
                 const models = Array.isArray(srv.models) ? srv.models : [];
                 const modelSummary = models.length
                   ? `${models.slice(0, 3).map((m) => formatModelName({ id: m })).join(', ')}${models.length > 3 ? ` +${models.length - 3}` : ''}`

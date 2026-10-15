@@ -6,6 +6,7 @@
 // active/recent download indicators.
 
 import React, { useState, useEffect, useRef } from 'react';
+import { engineHealthy } from './engineHealth.js';
 import { copyTextToClipboard } from '../api.js';
 import { resolveGpuRings, resolveGpuTempRows } from '../gpu-panel.js';
 import { ProgressRing, ConcentricRings, guardSeverity, sensorSeverity, severityColor } from './util.jsx';
@@ -19,7 +20,7 @@ function StatsHeader({ stats }) {
   // Healthy when EITHER the llama server is up OR the ds4 engine is active and
   // serving (in ds4-exclusive mode llama is intentionally stopped, so ds4 health
   // is the real signal — otherwise the chat/status would show "not running").
-  const isHealthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
+  const isHealthy = engineHealthy(stats);
 
   // Get downloads from stats
   const downloads = stats?.downloads ? Object.entries(stats.downloads).map(([id, info]) => ({ id, ...info })) : [];

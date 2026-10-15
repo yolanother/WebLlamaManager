@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { API_BASE } from '../api.js';
+import { engineHealthy } from '../components/engineHealth.js';
 import { ArtifactWorkbench } from '../components/chat/ArtifactWorkbench.jsx';
 import { Composer } from '../components/chat/Composer.jsx';
 import { ConversationSidebar } from '../components/chat/ConversationSidebar.jsx';
@@ -119,8 +120,7 @@ function ChatPage({ stats, embedded = false }) {
     [activeArtifactId, activeConversation],
   );
   const healthy = !stats
-    || stats.llama?.status === 'ok'
-    || stats.ds4?.status === 'ok';
+    || engineHealthy(stats);
 
   useEffect(() => subscribeErrors(setPageError), []);
 

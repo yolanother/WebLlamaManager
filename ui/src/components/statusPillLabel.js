@@ -8,6 +8,7 @@
 // `node --test` without mounting React.
 
 import { formatModelName } from '../api.js';
+import { engineHealthy } from './engineHealth.js';
 
 /**
  * Health/state/model label shown by the chat-first shell's top-bar pill.
@@ -26,7 +27,7 @@ import { formatModelName } from '../api.js';
  * @returns {StatusPillLabel}
  */
 export function statusPillLabel(stats) {
-  const healthy = stats?.llama?.status === 'ok' || stats?.ds4?.status === 'ok';
+  const healthy = engineHealthy(stats);
   const state = healthy ? 'Running' : (stats?.mode ? 'Starting' : 'Stopped');
   const isSingleMode = stats?.mode === 'single';
   const modelLabel = (isSingleMode && stats?.activeModel)
