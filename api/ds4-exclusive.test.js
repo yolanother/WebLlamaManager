@@ -27,6 +27,7 @@ import {
   ds4Exclusive503Body,
   ds4ActivationDecision,
 } from './ds4-exclusive.js';
+import * as excNs from './ds4-exclusive.js';
 
 const GB = 1024 * 1024 * 1024;
 
@@ -407,4 +408,44 @@ test('mayRelayOnward stops a request looping between nodes', () => {
   assert.equal(mayRelayOnward({ hops: 0 }, 2).allowed, true);
   assert.equal(mayRelayOnward({ hops: 2 }, 2).allowed, false);
   assert.match(mayRelayOnward({ hops: 2 }, 2).reason, /loop/);
+});
+
+// ── Strata generalization ────────────────────────────────────────────────────
+test('ds4ModelMatches: default stays substring-tolerant, exact:true is exact-only (normalized)', () => {
+  assert.equal(ds4ModelMatches('deepseek', ['deepseek-v4-flash']), true);
+  assert.equal(ds4ModelMatches('deepseek', ['deepseek-v4-flash'], { exact: true }), false);
+  assert.equal(ds4ModelMatches('Qwen3.8-Flash', ['qwen38flash'], { exact: true }), true);
+  assert.equal(ds4ModelMatches('qwen38', ['qwen38flash'], { exact: true }), false);
+  assert.equal(ds4ModelMatches('', ['x'], { exact: true }), false);
+});
+
+test('ds4RequestTarget: exactIds passes through to matching', () => {
+  const base = { requestedModel: 'qwen', ds4ModelIds: ['qwen38flash'], hasViableRemote: true };
+  assert.equal(ds4RequestTarget(base).target, 'local-ds4');
+  assert.equal(ds4RequestTarget({ ...base, exactIds: true }).target, 'remote');
+  assert.equal(ds4RequestTarget({ ...base, requestedModel: 'Qwen3.8-Flash', exactIds: true }).target, 'local-ds4');
+});
+
+test('ds4InFlightCount: backend argument selects which engine is counted', () => {
+  const reqs = [{ backend: 'ds4' }, { backend: 'strata' }, { backend: 'strata' }, { backend: 'local' }, null];
+  assert.equal(ds4InFlightCount(reqs), 1);
+  assert.equal(ds4InFlightCount(reqs, 'strata'), 2);
+  assert.equal(ds4InFlightCount(reqs, 'ds4'), 1);
+});
+
+test('ds4Exclusive503Body: engine label appears in the message, type/code stay exclusive_ds4_mode', () => {
+  const b = ds4Exclusive503Body('gpt-x', 'qwen38', 'Strata');
+  assert.match(b.error.message, /Strata/);
+  assert.equal(b.error.type, 'exclusive_ds4_mode');
+  assert.equal(b.error.code, 'exclusive_ds4_mode');
+  assert.match(ds4Exclusive503Body('gpt-x', 'deepseek').error.message, /DS4/);
+});
+
+test('exclusiveUnavailable503Body: OpenAI-style 503 body naming the engine and model', () => {
+  const b = excNs.exclusiveUnavailable503Body('Strata', 'qwen38', 'exhausted');
+  assert.equal(typeof b.error.message, 'string');
+  assert.match(b.error.message, /Strata/);
+  assert.match(b.error.message, /qwen38/);
+  assert.equal(typeof b.error.type, 'string');
+  assert.equal(typeof b.error.code, 'string');
 });

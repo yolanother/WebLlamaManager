@@ -87,3 +87,9 @@ test('activeRequestHoldsSlot: missing backend defaults to local semantics', () =
   assert.equal(activeRequestHoldsSlot({}, 1, new Set([1]), new Set()), true);
   assert.equal(activeRequestHoldsSlot({}, 1, new Set(), new Set()), false);
 });
+
+test('activeRequestHoldsSlot: strata uses the exclusive (ds4) lane like ds4', () => {
+  assert.equal(activeRequestHoldsSlot({ backend: 'strata' }, 7, new Set([7]), new Set()), false);
+  assert.equal(activeRequestHoldsSlot({ backend: 'strata' }, 7, new Set(), new Set([7])), true);
+  assert.equal(activeRequestHoldsSlot({ backend: 'strata' }, 7, new Set(), new Set()), false);
+});

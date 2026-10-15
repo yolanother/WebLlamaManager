@@ -302,3 +302,61 @@ test('runDs4AdaptivePlan: onAttempt is invoked for each attempt made', async () 
   await runDs4AdaptivePlan({ attempts, ...h, onAttempt: (a, i) => seen.push([i, a.context]) });
   assert.deepEqual(seen, [[0, 32768], [1, 16384]]);
 });
+
+// ── runDs4AdaptivePlan: generic-engine contract (async start, abort, attempt) ─
+test('runDs4AdaptivePlan: async startAttempt is awaited before waitForOutcome', async () => {
+  const order = [];
+  const r = await runDs4AdaptivePlan({
+    attempts: [{ backend: 'cuda' }],
+    startAttempt: async () => {
+      await new Promise((res) => setTimeout(res, 10));
+      order.push('start-done');
+      return { ok: true };
+    },
+    waitForOutcome: async () => { order.push('wait'); return 'ready'; },
+  });
+  assert.equal(r.ok, true);
+  assert.deepEqual(order, ['start-done', 'wait']);
+});
+
+test('runDs4AdaptivePlan: startAttempt {ok:false,abort:true,reason} aborts with that reason', async () => {
+  let waited = 0;
+  const r = await runDs4AdaptivePlan({
+    attempts: [{ backend: 'cuda' }, { backend: 'hip' }],
+    startAttempt: async () => ({ ok: false, abort: true, reason: 'strata-wedged-resident' }),
+    waitForOutcome: async () => { waited += 1; return 'ready'; },
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.settled, null);
+  assert.equal(r.reason, 'strata-wedged-resident');
+  assert.equal(waited, 0);
+});
+
+test('runDs4AdaptivePlan: startAttempt {ok:false} skips to the next attempt without stopAttempt', async () => {
+  const started = [];
+  let stops = 0;
+  const r = await runDs4AdaptivePlan({
+    attempts: [{ backend: 'cuda' }, { backend: 'hip' }],
+    startAttempt: async (a) => { started.push(a.backend); return a.backend === 'cuda' ? { ok: false } : { ok: true }; },
+    waitForOutcome: async (a) => (a.backend === 'hip' ? 'ready' : 'load-failure'),
+    stopAttempt: async () => { stops += 1; },
+  });
+  assert.deepEqual(started, ['cuda', 'hip']);
+  assert.equal(stops, 0);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.settled, { backend: 'hip' });
+});
+
+test('runDs4AdaptivePlan: stopAttempt receives the failed attempt object', async () => {
+  const seen = [];
+  const attempts = [{ backend: 'cuda' }, { backend: 'hip' }];
+  const r = await runDs4AdaptivePlan({
+    attempts,
+    startAttempt: async () => ({ ok: true }),
+    waitForOutcome: async (a) => (a.backend === 'hip' ? 'ready' : 'load-failure'),
+    stopAttempt: async (a) => { seen.push(a); },
+  });
+  assert.equal(r.ok, true);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], attempts[0]);
+});

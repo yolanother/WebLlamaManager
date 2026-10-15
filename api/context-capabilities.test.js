@@ -52,3 +52,7 @@ test('modelSupportsSlotOperations rejects concrete multimodal and mmproj childre
   assert.equal(modelSupportsSlotOperations({ status: { args: ['llama-server', '--mmproj', '/models/mmproj.gguf'] } }), false);
   assert.equal(modelSupportsSlotOperations(null), false);
 });
+
+test('strata is a local-only engine', () => {
+  assert.equal(contextCapabilities('strata').routing.local_only, true);
+});

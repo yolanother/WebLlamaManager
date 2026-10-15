@@ -9,6 +9,7 @@ import { existsSync, readdirSync, statSync, mkdtempSync, writeFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as enginesNs from './engines.js';
 import {
   ENGINE_TYPES,
   presetEngine,
@@ -67,8 +68,8 @@ test('isEngineProcessComm: rejects unrelated processes and junk', () => {
   assert.equal(isEngineProcessComm(null), false);
   assert.equal(isEngineProcessComm(undefined), false);
 });
-test('ENGINE_PROCESS_COMMS lists exactly the two engine binaries', () => {
-  assert.deepEqual([...ENGINE_PROCESS_COMMS].sort(), ['ds4-server', 'llama-server']);
+test('ENGINE_PROCESS_COMMS lists exactly the three engine binaries', () => {
+  assert.deepEqual([...ENGINE_PROCESS_COMMS].sort(), ['ds4-server', 'llama-server', 'strata']);
 });
 
 // ── engineSupportsSlots (slot machinery no-op gate) ──────────────────────────
@@ -1478,4 +1479,189 @@ test('buildLocalServerRegistry: decision entry only when passed, same uniform sh
   const up = buildLocalServerRegistry({ ...base, decision: { running: true, healthy: true, runnable: true, port: 5254 } })
     .find((s) => s.id === 'decision');
   assert.equal(up.state, 'running');
+});
+
+// ── Strata (generalized exclusive engine) ────────────────────────────────────
+// The namespace import keeps these red-but-loadable until the code leaf lands.
+const STRATA_BODY = () => ({
+  engine: 'strata',
+  strata: { args: ['--pack', '/p', '--kv', 'int8'], tokenizer: '/abs/tok', modelName: 'Qwen3.8-Flash-Next' },
+});
+
+test('strata: ENGINE_TYPES.STRATA is "strata"', () => {
+  assert.equal(enginesNs.ENGINE_TYPES.STRATA, 'strata');
+});
+
+test('strata: ENGINE_PROCESS_COMMS attributes the strata engine process', () => {
+  assert.equal(isEngineProcessComm('strata\n'), true);
+});
+
+test('strata: presetEngine and isStrataPreset recognize engine strata', () => {
+  assert.equal(presetEngine({ engine: 'strata' }), 'strata');
+  assert.equal(presetEngine({ engine: 'STRATA' }), 'strata');
+  assert.equal(enginesNs.isStrataPreset({ engine: 'strata' }), true);
+  assert.equal(enginesNs.isStrataPreset({ engine: 'ds4' }), false);
+  assert.equal(enginesNs.isStrataPreset({}), false);
+  assert.equal(enginesNs.isStrataPreset(null), false);
+});
+
+test('strata: isExclusiveEngine is true for ds4 and strata only', () => {
+  assert.equal(enginesNs.isExclusiveEngine('ds4'), true);
+  assert.equal(enginesNs.isExclusiveEngine('strata'), true);
+  assert.equal(enginesNs.isExclusiveEngine('llama'), false);
+});
+
+test('strata: engineSupportsSlots is false for strata', () => {
+  assert.equal(engineSupportsSlots('strata'), false);
+});
+
+test('strata: validatePresetEngineFields ok shape with default context', () => {
+  const r = validatePresetEngineFields(STRATA_BODY());
+  assert.deepEqual(r, {
+    ok: true,
+    engine: 'strata',
+    strata: { args: ['--pack', '/p', '--kv', 'int8'], tokenizer: '/abs/tok', modelName: 'Qwen3.8-Flash-Next' },
+    context: 262144,
+  });
+});
+
+test('strata: validatePresetEngineFields honours an explicit context', () => {
+  const r = validatePresetEngineFields({ ...STRATA_BODY(), context: 65536 });
+  assert.equal(r.ok, true);
+  assert.equal(r.context, 65536);
+});
+
+test('strata: validatePresetEngineFields rejects a missing or non-object strata block', () => {
+  for (const strata of [undefined, null, 'x', 5, ['a']]) {
+    const r = validatePresetEngineFields({ engine: 'strata', strata });
+    assert.equal(r.ok, false, JSON.stringify(strata));
+    assert.equal(typeof r.error, 'string');
+  }
+});
+
+test('strata: validatePresetEngineFields rejects bad args arrays', () => {
+  const bad = [undefined, 'a b', {}, [], new Array(201).fill('--x'), [5], [''], ['--ok', ''], ['--ok', null]];
+  for (const args of bad) {
+    const b = STRATA_BODY();
+    b.strata.args = args;
+    assert.equal(validatePresetEngineFields(b).ok, false, JSON.stringify(args)?.slice(0, 40));
+  }
+  const b = STRATA_BODY();
+  b.strata.args = new Array(200).fill('--x');
+  assert.equal(validatePresetEngineFields(b).ok, true);
+});
+
+test('strata: validatePresetEngineFields rejects manager-owned flags in args', () => {
+  for (const flag of ['--expert-cache', '--max-context', '--port']) {
+    const b = STRATA_BODY();
+    b.strata.args = ['--pack', '/p', flag, '1'];
+    const r = validatePresetEngineFields(b);
+    assert.equal(r.ok, false, flag);
+    assert.ok(r.error.includes(flag), r.error);
+  }
+});
+
+test('strata: validatePresetEngineFields requires an absolute tokenizer path', () => {
+  for (const tokenizer of [undefined, '', 'tok', './tok', 5]) {
+    const b = STRATA_BODY();
+    b.strata.tokenizer = tokenizer;
+    assert.equal(validatePresetEngineFields(b).ok, false, String(tokenizer));
+  }
+});
+
+test('strata: validatePresetEngineFields rejects invalid context', () => {
+  for (const context of [0, -1, 1.5, 'abc', 1048577]) {
+    const r = validatePresetEngineFields({ ...STRATA_BODY(), context });
+    assert.equal(r.ok, false, String(context));
+  }
+  assert.equal(validatePresetEngineFields({ ...STRATA_BODY(), context: 1048576 }).ok, true);
+});
+
+test('strata: unsupported-engine error now names strata', () => {
+  const r = validatePresetEngineFields({ engine: 'vllm' });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /strata/);
+});
+
+test('strata: ds4ModelEntry/ds4ModelsList label a strata preset strata', () => {
+  const preset = { id: 'strata-q', name: 'Q', engine: 'strata', context: 262144 };
+  const e = ds4ModelEntry(preset, { created: 1 });
+  assert.equal(e.owned_by, 'strata');
+  assert.equal(e.engine, 'strata');
+  const config = { presets: { 'strata-q': preset } };
+  const list = ds4ModelsList(config, { currentEngine: 'strata', currentPreset: 'strata-q', created: 1 });
+  assert.equal(list.length, 1);
+  assert.equal(list[0].engine, 'strata');
+});
+
+test('strata: a preset without engine stays ds4 in ds4ModelEntry', () => {
+  const e = ds4ModelEntry({ id: 'x', name: 'X' }, { created: 1 });
+  assert.equal(e.owned_by, 'ds4');
+  assert.equal(e.engine, 'ds4');
+});
+
+test('strata: strataCatalogEntries lists strata presets with engine strata', () => {
+  const config = {
+    presets: {
+      'strata-a': { id: 'strata-a', name: 'A', engine: 'strata', context: 262144 },
+      'llama-b': { id: 'llama-b', name: 'B' },
+      'ds4-c': { id: 'ds4-c', name: 'C', engine: 'ds4' },
+    },
+  };
+  const entries = enginesNs.strataCatalogEntries(config, { currentEngine: 'llama', currentPreset: null, created: 1 });
+  assert.ok(Array.isArray(entries));
+  const ids = entries.map((e) => e.id);
+  assert.ok(ids.includes('strata-a'));
+  assert.ok(!ids.includes('llama-b'));
+  assert.ok(!ids.includes('ds4-c'));
+  assert.ok(entries.every((e) => e.engine === 'strata'));
+});
+
+test('strata: STRATA_ZERO_TOKEN_STALL_MS is 15 minutes', () => {
+  assert.equal(enginesNs.STRATA_ZERO_TOKEN_STALL_MS, 900_000);
+});
+
+test('strata: remoteStallCeilingMs treats strata like ds4 (fixed ceiling, even with tokens)', () => {
+  assert.equal(remoteStallCeilingMs({ backend: 'strata', tokens: 10 }, 100_000), 900_000);
+  assert.equal(remoteStallCeilingMs({ backend: 'strata' }, 100_000), 900_000);
+  assert.equal(remoteStallCeilingMs({ backend: 'ds4', tokens: 10 }, 100_000), DS4_ZERO_TOKEN_STALL_MS);
+});
+
+test('strata: remoteStallVerdict skips a strata entry queued for the exclusive slot', () => {
+  const v = remoteStallVerdict({
+    entry: { backend: 'strata', startTime: 0, lastActivityAt: 0 },
+    holdsDs4Slot: false,
+    queuedForDs4Slot: true,
+    now: 5_000_000,
+    genericRemoteStallMs: 100_000,
+  });
+  assert.equal(v.action, 'skip');
+  assert.equal(v.limitMs, 900_000);
+});
+
+test('strata: remoteStallVerdict anchors a slot-holding strata entry on slotAcquiredAt', () => {
+  const v = remoteStallVerdict({
+    entry: { backend: 'strata', tokens: 1, startTime: 0, lastActivityAt: 0, slotAcquiredAt: 4_900_000 },
+    holdsDs4Slot: true,
+    now: 5_000_000,
+    genericRemoteStallMs: 100_000,
+  });
+  assert.equal(v.action, 'skip');
+  const stalled = remoteStallVerdict({
+    entry: { backend: 'strata', tokens: 1, startTime: 0, lastActivityAt: 0, slotAcquiredAt: 1_000_000 },
+    holdsDs4Slot: true,
+    now: 5_000_000,
+    genericRemoteStallMs: 100_000,
+  });
+  assert.equal(stalled.action, 'stalled');
+});
+
+test('strata: buildLocalServerRegistry adds a strata entry only when passed', () => {
+  const without = buildLocalServerRegistry({});
+  assert.equal(without.some((e) => e.id === 'strata'), false);
+  const withS = buildLocalServerRegistry({ strata: { running: true, healthy: true, port: 18090, models: ['strata-a'] } });
+  const entry = withS.find((e) => e.id === 'strata');
+  assert.ok(entry);
+  assert.equal(entry.running, true);
+  assert.equal(entry.port, 18090);
 });
