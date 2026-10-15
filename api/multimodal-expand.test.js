@@ -511,8 +511,8 @@ test('bare v1 aliases register the same named handlers before the SPA catch-all'
     source.indexOf('async function proxyResponsesToDs4'),
     source.indexOf('async function handleResponses'),
   );
-  assert.match(responsesDs4Proxy, /ds4TargetUrl\(ds4\.port, '\/v1\/responses'\)/);
-  assert.match(responsesDs4Proxy, /startActiveRequest\([^)]*endpoint: 'responses'[^)]*backend: 'ds4'/s);
+  assert.match(responsesDs4Proxy, /ds4TargetUrl\(engine\.port\(\), '\/v1\/responses'\)/);
+  assert.match(responsesDs4Proxy, /startActiveRequest\([^)]*endpoint: 'responses'[^)]*backend: engine\.type/s);
   assert.match(responsesDs4Proxy, /endActiveRequest\(activeReqId/);
 });
 
