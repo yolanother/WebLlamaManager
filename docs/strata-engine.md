@@ -241,6 +241,30 @@ Held requests during step 2 should complete after the reload, not fail.
   prompt processing 1,757 tok/s.
 - `STRATA_PREFILL_CPU_SHARE=auto` with `STRATA_PREFILL_CPU_SHARE_MAX=3072` cut TTFT for
   1-2K-token prompts from ~6.3 s to 2.6-3.5 s on OCuLink x4.
+- The rows above are the raw engine with `--expert-cache auto` (the whole 3090). The deployed
+  config uses an explicit `cuda.expertCache` of **2400 slots** (~1.94 MiB each), which leaves
+  ~7.5 GB of the 3090 free so a Pods job can start allocating and be seen by the yield
+  heuristic: 4000 slots measured 81.0 tok/s, 2400 slots 73.7 tok/s.
+
+### Live qualification through llama-manager (deployed `main` 362b328)
+
+The Oct-8 canonical 12-request gate (3 novel prompts x2, 3 exact-JSON arithmetic, 3 long-record
+JSON; seed 421, temp 0.2, thinking off, streamed) sent to the **`default-big` alias** on
+drakemore while Strata ran on CUDA with `expertCache` 2400:
+
+| Metric | Result |
+|---|---|
+| Median decode | **75.6 tok/s** (min 61.0, max 92.3; every request > 60). An earlier run on the integration branch gave 69.5 |
+| Previous `default-big` (llama.cpp Qwen3.6-35B-A3B) | 52.07 tok/s median on the same fixtures |
+| Structured JSON | 3/3 strict exact |
+| Long-record JSON | 3/3 facts correct (field types such as `"046"` / `true` vary, as on Oct 8) |
+| TTFT | 0.32-0.50 s short prompts, ~3.3-3.5 s for ~1.35K-token prompts (higher when other clients are queued: Strata serves one sequence at a time) |
+| Cold activation from a request | 28-52 s |
+| Pods-priority (80) lock while serving | in-flight request drained, then the lock was held once Strata left the card (4.3 s idle; 40.9 s with a live request draining); HIP ready ~39-66 s, HIP decode 45-57 tok/s |
+| Return to CUDA after release | ~15 min (`returnToCudaAfterMin` 15), ready ~20 s later |
+
+Since 2026-10-15 both `default-big` and `default-small` on drakemore target the
+`strata-qwen38-flash-iq3s` preset; Frostburn's `default-big` and `default-small` forward to them.
 
 ## Troubleshooting
 
