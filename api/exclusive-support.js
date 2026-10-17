@@ -14,11 +14,11 @@ import { ENGINE_TYPES, presetEngine } from './engines.js';
 /**
  * Decide which exclusive preset (if any) to re-activate at manager boot.
  * @param {object} config Manager config: `lastExclusivePreset`, `presets`, and
- *   `settings.exclusiveBootReactivate` (default on; only an explicit false disables).
+ *   `config.exclusiveBootReactivate`, a top-level setting like the others (default on; only an explicit false disables).
  * @returns {{engine:string, presetId:string}|null} The strata/ds4 preset to bring up, else null.
  */
 export function selectBootExclusive(config) {
-  if (config?.settings?.exclusiveBootReactivate === false) return null;
+  if (config?.exclusiveBootReactivate === false) return null;
   const presetId = config?.lastExclusivePreset;
   const engine = presetId ? presetEngine(config.presets?.[presetId]) : ENGINE_TYPES.LLAMA;
   return engine === ENGINE_TYPES.LLAMA ? null : { engine, presetId };

@@ -77,7 +77,7 @@ test('selectBootExclusive returns null when unset, gone, llama, or disabled', ()
   assert.equal(selectBootExclusive({ lastExclusivePreset: 'p1', presets: {} }), null);
   assert.equal(selectBootExclusive({ lastExclusivePreset: 'p1', presets: { p1: { id: 'p1' } } }), null);
   assert.equal(selectBootExclusive({
-    lastExclusivePreset: 'p1', settings: { exclusiveBootReactivate: false },
+    lastExclusivePreset: 'p1', exclusiveBootReactivate: false,
     presets: { p1: { engine: 'strata' } },
   }), null);
 });
