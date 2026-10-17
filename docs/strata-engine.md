@@ -137,9 +137,11 @@ has a missing or `auto` `expertCache` it is disabled with a warning. There are n
 `--expert-cache N` is a count of expert slots (~1.94 MiB each).
 
 - **CUDA `auto`** takes ~6594 slots (~12.5 GiB) and leaves only **~0.3 GB** of the
-  3090 free. That is a risk to any Pods job that expects VRAM on the same card. Until
-  Pods takes GPU reservations (T31e32fa602834), consider an explicit slot count that
-  leaves at least 8 GB free.
+  3090 free. Pods now takes a priority-80 reservation before each asset job (local-runpod
+  node agent, 2026-10-17), which drains Strata first, but a worker container still takes
+  ~352 MiB of CUDA context when it *starts*, with no reservation. drakemore therefore runs
+  **`cuda.expertCache` 4000**: ~2.5 GiB free with 13 idle workers, 81 tok/s raw, **84.5 tok/s
+  median through `default-big`** (12-request gate, 2026-10-17; 75.6 at 2400).
 - **HIP `auto`** is greedy: it leaves just 12.9 GB free on the unified-memory iGPU, so
   HIP requires an explicit slot count.
 - HIP allocations do not show in `VmRSS` (12.9 GB RES vs 168 GB VIRT). Look at
@@ -258,9 +260,13 @@ Held requests during step 2 should complete after the reload, not fail.
 - `STRATA_PREFILL_CPU_SHARE=auto` with `STRATA_PREFILL_CPU_SHARE_MAX=3072` cut TTFT for
   1-2K-token prompts from ~6.3 s to 2.6-3.5 s on OCuLink x4.
 - The rows above are the raw engine with `--expert-cache auto` (the whole 3090). The deployed
-  config uses an explicit `cuda.expertCache` of **2400 slots** (~1.94 MiB each), which leaves
-  ~7.5 GB of the 3090 free so a Pods job can start allocating and be seen by the yield
-  heuristic: 4000 slots measured 81.0 tok/s, 2400 slots 73.7 tok/s.
+  config uses an explicit `cuda.expertCache`: 2400 slots (~7.5 GB free) until 2026-10-17, now
+  **4000 slots** (~2.5 GB free) since Pods takes reservations. Raw engine: 4000 slots 81.0 tok/s,
+  2400 slots 73.7 tok/s.
+
+A re-run of the same gate on 2026-10-17 (main c555716, `expertCache` 4000, Pods reserving):
+**median 84.5 tok/s** (min 74.6, max 112.4, n 12), structured JSON 3/3 strict, long-record facts
+3/3, TTFT 0.27-0.48 s short / 3.1-3.4 s at ~1.35K tokens.
 
 ### Live qualification through llama-manager (deployed `main` 362b328)
 
@@ -312,8 +318,9 @@ Since 2026-10-15 both `default-big` and `default-small` on drakemore target the
 | Status `exhausted` / 503 on local requests | Both backends failed. Read `<dataDir>/engine-<backend>.log`; re-activate via the activate route. If the engine was brought back some other way, the next local request probes its health (at most every 5 s) and clears the status itself. |
 | Status `stop-unconfirmed` | A `strata` process survived the stop. Kill it (`pkill -x strata` as the service user's root) and re-activate. |
 | Engine logs mlock / pinned allocation failure | Add a `LimitMEMLOCK=infinity` drop-in to the unit. |
-| **Pods busy-poll CPU contention** | Pods busy-polls and competes with Strata for CPU, hurting decode and prefill (the CPU-share prefill assist especially). Cap Pods' CPU use, or accept lower numbers while it runs. |
-| **Pods ignores reservations** | Pods does not take GPU reservations yet (T31e32fa602834), so the manager only sees it through the VRAM heuristic (other VRAM over baseline+growth). Until then, CUDA `auto` can starve Pods of VRAM: use an explicit `cuda.expertCache`. |
+| **Pods busy-poll CPU contention** | Fixed in the node agent (2026-10-17): idle job-take long-polls for 25 s, so idle workers use ~0.5% CPU instead of ~1-2 cores, and RunPod SDK logging is INFO. Workers created before that still poll until redeployed. |
+| **Asset job preempts Strata** | Expected. The Pods node agent locks `rtx3090` at priority 80 before handing a job to an NVIDIA worker (renewed every 30 s, released at job-done, worker exit or a 2 h cap); Strata leaves CUDA in ~2 s, reloads on HIP, and returns to CUDA after 15 idle minutes. Lock state: `GET /api/gpus`; agent side: `journalctl -u doubtech-pods-node \| grep GpuReservation`. |
+| **Always on HIP although the 3090 is idle** | Idle Pods workers hold ~352 MiB of CUDA context each; if their total exceeds `policy.idleBaselineMb`, Strata treats the card as busy. drakemore uses 6144 (13 workers = ~4.6 GB). |
 | Over-long prompt gets 400 | Strata rejects, never truncates; keep prompts under the preset `context`. |
 | Mem-watchdog logs but does not restart Strata | By design: a restart reloads the same weights, and HIP memory does not show in RSS. |
 
