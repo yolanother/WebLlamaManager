@@ -230,6 +230,7 @@ import {
   ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan, ds4SwapRetryDecision,
   readRelayState, relayHeadersFor, DS4_EXCLUSIVE_ERROR
 } from './ds4-exclusive.js';
+import { createSseLineSplitter, pushCapped, createThrottledProbe } from './exclusive-support.js';
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
 import { shouldRunGlobalEngineCleanup } from './engine-cleanup-policy.js';
@@ -598,6 +599,9 @@ const EXCLUSIVE_ENGINES = {
   },
 };
 
+/** Per-engine throttled recovery probes for exclusiveUnavailableBody, keyed by engine type. */
+const exclusiveRecoveryProbes = new Map();
+
 /** @returns {object|null} the handle of the exclusive engine currently owning the box, else null. */
 function activeExclusive() { return EXCLUSIVE_ENGINES[currentEngine] || null; }
 
@@ -605,12 +609,28 @@ function activeExclusive() { return EXCLUSIVE_ENGINES[currentEngine] || null; }
  * 503 body when an exclusive engine failed to load (runtime exhausted or its
  * stop was not confirmed), else null. Local requests get this instead of a
  * doomed proxy attempt that would surface as a 502.
+ * 'exhausted' is sticky, so if the engine has since come up outside the ladder
+ * (operator start, updater restart, supervisor) a throttled health probe (at most
+ * once per 5 s per engine) flips the runtime back to 'ready'.
  * @param {object} engine An EXCLUSIVE_ENGINES handle.
- * @returns {object|null} Error body for a 503, or null when the engine is usable.
+ * @returns {Promise<object|null>} Error body for a 503, or null when the engine is usable.
  */
-function exclusiveUnavailableBody(engine) {
+async function exclusiveUnavailableBody(engine) {
   const status = engine.runtime()?.status;
   if (status !== 'exhausted' && status !== 'stop-unconfirmed') return null;
+  let probe = exclusiveRecoveryProbes.get(engine.type);
+  if (!probe) {
+    probe = createThrottledProbe(async () => (await engine.health())?.status === 'ok', 5000);
+    exclusiveRecoveryProbes.set(engine.type, probe);
+  }
+  if (await probe()) {
+    const rt = engine.runtime();
+    if (rt && (rt.status === 'exhausted' || rt.status === 'stop-unconfirmed')) {
+      rt.status = 'ready';
+      console.log(`[${engine.type}] engine healthy again; clearing sticky ${status} status`);
+    }
+    return null;
+  }
   return exclusiveUnavailable503Body(engine.label, engine.displayName(), status);
 }
 
@@ -7530,9 +7550,6 @@ app.post('/api/presets', (req, res) => {
     }
     const strataCheck = validatePresetEngineFields(req.body);
     if (!strataCheck.ok) return res.status(400).json({ error: strataCheck.error });
-    if (!existsSync(strataCheck.strata.tokenizer)) {
-      return res.status(404).json({ error: `strata tokenizer not found: ${strataCheck.strata.tokenizer}` });
-    }
     const preset = {
       id,
       name,
@@ -9606,12 +9623,12 @@ function runStrataLoadPhase(target, reason, settle) {
         startAttempt: async (attempt) => {
           addLog('presets', `strata: trying ${attempt.backend}`);
           const started = await startStrataAttempt(preset, attempt);
-          if (started.ok === false) runtime.attempts.push({ backend: attempt.backend, outcome: started.reason });
+          if (started.ok === false) pushCapped(runtime.attempts, { backend: attempt.backend, outcome: started.reason });
           return started;
         },
         waitForOutcome: async (attempt) => {
           const outcome = await waitEngineAttemptOutcome(eng);
-          runtime.attempts.push({ backend: attempt.backend, outcome });
+          pushCapped(runtime.attempts, { backend: attempt.backend, outcome });
           return outcome;
         },
         stopAttempt: async () => {
@@ -9802,12 +9819,12 @@ async function activateStrataExclusive(presetId, preset) {
         startAttempt: async (attempt) => {
           addLog('presets', `strata: trying ${attempt.backend}`);
           const started = await startStrataAttempt(preset, attempt);
-          if (started.ok === false) runtime.attempts.push({ backend: attempt.backend, outcome: started.reason });
+          if (started.ok === false) pushCapped(runtime.attempts, { backend: attempt.backend, outcome: started.reason });
           return started;
         },
         waitForOutcome: async (attempt) => {
           const outcome = await waitEngineAttemptOutcome(eng);
-          runtime.attempts.push({ backend: attempt.backend, outcome });
+          pushCapped(runtime.attempts, { backend: attempt.backend, outcome });
           return outcome;
         },
         stopAttempt: async () => {
@@ -13526,7 +13543,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders();
-      const reader = upstream.body.getReader();
+      const reader = upstream.body.getReader(); const sse = createSseLineSplitter();
       const decoder = new TextDecoder();
       const outputGuard = createChatCompletionStreamGuard();
       let responseText = '';
@@ -13536,7 +13553,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
-        for (const line of chunk.split('\n')) {
+        for (const line of sse.push(chunk)) {
           if (line.startsWith('data: ') && line !== 'data: [DONE]') {
             try {
               const d = JSON.parse(line.slice(6));
@@ -13647,14 +13664,14 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders();
-      const reader = upstream.body.getReader();
+      const reader = upstream.body.getReader(); const sse = createSseLineSplitter();
       const decoder = new TextDecoder();
       let responseText = '';
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = decoder.decode(value);
-        for (const line of chunk.split('\n')) {
+        for (const line of sse.push(chunk)) {
           if (line.startsWith('data: ') && line !== 'data: [DONE]') {
             try { const d = JSON.parse(line.slice(6)); const t = d.choices?.[0]?.text || ''; if (t) { responseText += t; updateActiveRequest(activeReqId, t); } } catch { /* keepalive */ }
           }
@@ -14336,7 +14353,7 @@ async function handleChatCompletions(req, res) {
       llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
-      const unavailable = exclusiveUnavailableBody(exclusive);
+      const unavailable = await exclusiveUnavailableBody(exclusive);
       if (unavailable) return res.status(503).json(unavailable);
       if (req.body?.prepared_context_id && (req.body?.context_cache_strict === true || appendPreparedContext)) {
         return res.status(501).json({
@@ -15661,7 +15678,7 @@ async function handleCompletions(req, res) {
           },
         });
       }
-      const unavailable = exclusiveUnavailableBody(exclusive);
+      const unavailable = await exclusiveUnavailableBody(exclusive);
       if (unavailable) return res.status(503).json(unavailable);
       return serveDs4WithSwapRecovery(req, res, { requestedModel, isStreaming, startTime, engine: exclusive, proxy: proxyCompletionsToDs4 });
     }
@@ -16244,7 +16261,7 @@ async function proxyResponsesToDs4(req, res, {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      const reader = upstream.body.getReader();
+      const reader = upstream.body.getReader(); const sse = createSseLineSplitter();
       const decoder = new TextDecoder();
       let completionTokens = 0;
       let promptTokens = 0;
@@ -16254,7 +16271,7 @@ async function proxyResponsesToDs4(req, res, {
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
         res.write(chunk);
-        for (const line of chunk.split('\n')) {
+        for (const line of sse.push(chunk)) {
           if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
           try {
             const event = JSON.parse(line.slice(6));
@@ -16403,7 +16420,7 @@ async function handleResponses(req, res) {
       llamaRunning: !!llamaProcess,
     });
     if (decision.target === 'local-ds4') {
-      const unavailable = exclusiveUnavailableBody(exclusive);
+      const unavailable = await exclusiveUnavailableBody(exclusive);
       if (unavailable) return res.status(503).json(unavailable);
       req.body = proxyBody;
       return serveDs4WithSwapRecovery(req, res, {
@@ -16849,7 +16866,7 @@ async function proxyMessagesToExclusive(req, res, {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders();
-      const reader = upstream.body.getReader();
+      const reader = upstream.body.getReader(); const sse = createSseLineSplitter();
       const decoder = new TextDecoder();
       let completionTokens = 0;
       let promptTokens = 0;
@@ -16859,7 +16876,7 @@ async function proxyMessagesToExclusive(req, res, {
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
         res.write(chunk);
-        for (const line of chunk.split('\n')) {
+        for (const line of sse.push(chunk)) {
           if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
           try {
             const event = JSON.parse(line.slice(6));
@@ -16981,7 +16998,7 @@ async function handleMessages(req, res) {
           },
         });
       }
-      const unavailable = exclusiveUnavailableBody(exclusive);
+      const unavailable = await exclusiveUnavailableBody(exclusive);
       if (unavailable) return res.status(503).json(unavailable);
       req.body = proxyBody;
       return serveDs4WithSwapRecovery(req, res, {
