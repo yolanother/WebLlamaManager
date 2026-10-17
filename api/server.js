@@ -215,7 +215,7 @@ import { DUO_PLANNER_ID, DUO_WORKER_ID } from './duo-exclusive.js';
 import { loopingTextReason } from './degenerate-output.js';
 import { createDs4Supervisor, createEngineSupervisor } from './ds4-supervisor.js';
 import {
-  resolveStrataConfig, strataServerConfig, strataConfigPath, strataLaunchSpec, strataHealthReady,
+  resolveStrataConfig, strataServerConfig, strataConfigPath, strataLaunchSpec, strataHealthReady, effectiveStrataBlock,
 } from './strata-engine.js';
 import {
   STRATA_HOLDER, parseComputeApps, otherComputeVramBytes, blockingClaim, strataBackendDecision, cudaAdmission,
@@ -1251,9 +1251,24 @@ function strataModelIdsForPreset(presetId) {
   return [presetId, preset.name].filter(Boolean);
 }
 
+let strataDefaultsText;
+/**
+ * Read the packaged Strata defaults file once per process.
+ * @param {string} p Defaults file path.
+ * @returns {string|null} File text, or null when absent/unreadable.
+ */
+function readStrataDefaultsOnce(p) {
+  if (strataDefaultsText === undefined) {
+    try { strataDefaultsText = readFileSync(p, 'utf-8'); } catch { strataDefaultsText = null; }
+  }
+  return strataDefaultsText;
+}
+
 /** Resolved `config.strata` block (see strata-engine.js); `enabled` is false when unusable. */
 function strataConfig() {
-  return resolveStrataConfig(config, { dataDirDefault: join(RUNTIME_PATHS.dataDir, 'strata') });
+  // An empty/absent config.strata falls back to the packaged defaults file (read once, never persisted).
+  const strata = effectiveStrataBlock(config.strata, { env: process.env, readText: readStrataDefaultsOnce });
+  return resolveStrataConfig(strata === config.strata ? config : { ...config, strata }, { dataDirDefault: join(RUNTIME_PATHS.dataDir, 'strata') });
 }
 
 /**

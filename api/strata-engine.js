@@ -39,6 +39,25 @@ function baseBackend(raw) {
 }
 
 /**
+ * Pick the `strata` block to use: the operator's own when it has any keys (never
+ * merged), else the packaged defaults file (path overridable with
+ * LLAMA_MANAGER_STRATA_DEFAULTS), else the block unchanged. Never persisted.
+ * @param {object|undefined} block - `config.strata` as stored.
+ * @param {{env?: object, readText: (p:string)=>(string|null)}} deps - env and a file reader
+ *   returning null when the file is missing (injected to keep this module I/O-free).
+ * @returns {object|undefined} the operator block, the parsed defaults, or `block`.
+ */
+export function effectiveStrataBlock(block, { env = {}, readText }) {
+  if (block && typeof block === 'object' && Object.keys(block).length > 0) return block;
+  const text = readText(env.LLAMA_MANAGER_STRATA_DEFAULTS || '/usr/share/llama-manager/strata/defaults.json');
+  if (!text) return block;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : block;
+  } catch { return block; }
+}
+
+/**
  * Resolve `config.strata` into the normalized runtime shape.
  * @param {object} config - the full manager config (reads `config.strata`).
  * @param {{dataDirDefault: string}} opts - default data dir when `strata.dataDir` is unset.

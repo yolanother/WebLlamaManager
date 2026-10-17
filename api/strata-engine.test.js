@@ -17,6 +17,7 @@ import {
   strataConfigPath,
   strataLaunchSpec,
   strataHealthReady,
+  effectiveStrataBlock,
 } from './strata-engine.js';
 
 const GB = 1024 * 1024 * 1024;
@@ -220,4 +221,31 @@ test('strataHealthReady: truth table', () => {
   assert.equal(strataHealthReady({ status: 'loading', loaded: true, max_context: 262144 }), false);
   assert.equal(strataHealthReady(null), false);
   assert.equal(strataHealthReady(undefined), false);
+});
+
+// ── effectiveStrataBlock: packaged defaults fallback (A4) ───────────────────
+
+test('effectiveStrataBlock: operator block always wins, no merge, no file read', () => {
+  const operator = { root: '/op' };
+  const read = () => { throw new Error('must not read'); };
+  assert.equal(effectiveStrataBlock(operator, { readText: read }), operator);
+});
+
+test('effectiveStrataBlock: absent or empty block loads the defaults file', () => {
+  const readText = (p) => (p === '/d.json' ? '{"root":"/pkg","port":1}' : null);
+  const env = { LLAMA_MANAGER_STRATA_DEFAULTS: '/d.json' };
+  assert.deepEqual(effectiveStrataBlock(undefined, { env, readText }), { root: '/pkg', port: 1 });
+  assert.deepEqual(effectiveStrataBlock({}, { env, readText }), { root: '/pkg', port: 1 });
+});
+
+test('effectiveStrataBlock: missing or malformed file leaves the block untouched', () => {
+  assert.equal(effectiveStrataBlock(undefined, { env: {}, readText: () => null }), undefined);
+  assert.equal(effectiveStrataBlock(undefined, { env: {}, readText: () => '{nope' }), undefined);
+  assert.equal(effectiveStrataBlock(undefined, { env: {}, readText: () => '[1]' }), undefined);
+});
+
+test('effectiveStrataBlock: default path is the packaged location', () => {
+  let seen = null;
+  effectiveStrataBlock(undefined, { env: {}, readText: (p) => { seen = p; return null; } });
+  assert.equal(seen, '/usr/share/llama-manager/strata/defaults.json');
 });
