@@ -6,7 +6,23 @@
 // network chunks so `data:` lines split mid-way are not dropped, (2) an in-place
 // cap for the per-activation `attempts` history exposed in /api/stats, and (3) a
 // throttled, single-flight boolean probe used to clear a sticky 'exhausted'
-// status once the engine has recovered outside the activation ladder.
+// status once the engine has recovered outside the activation ladder, and (4) the
+// pure selector that picks which persisted exclusive preset to re-activate at boot.
+
+import { ENGINE_TYPES, presetEngine } from './engines.js';
+
+/**
+ * Decide which exclusive preset (if any) to re-activate at manager boot.
+ * @param {object} config Manager config: `lastExclusivePreset`, `presets`, and
+ *   `settings.exclusiveBootReactivate` (default on; only an explicit false disables).
+ * @returns {{engine:string, presetId:string}|null} The strata/ds4 preset to bring up, else null.
+ */
+export function selectBootExclusive(config) {
+  if (config?.settings?.exclusiveBootReactivate === false) return null;
+  const presetId = config?.lastExclusivePreset;
+  const engine = presetId ? presetEngine(config.presets?.[presetId]) : ENGINE_TYPES.LLAMA;
+  return engine === ENGINE_TYPES.LLAMA ? null : { engine, presetId };
+}
 
 /**
  * Create a stateful splitter that turns arbitrary text chunks into whole lines.

@@ -230,7 +230,7 @@ import {
   ds4InFlightCount, ds4EvictionReadiness, ds4EvictionPlan, ds4SwapRetryDecision,
   readRelayState, relayHeadersFor, DS4_EXCLUSIVE_ERROR
 } from './ds4-exclusive.js';
-import { createSseLineSplitter, pushCapped, createThrottledProbe } from './exclusive-support.js';
+import { createSseLineSplitter, pushCapped, createThrottledProbe, selectBootExclusive } from './exclusive-support.js';
 import { planDs4Attempts, runDs4AdaptivePlan } from './ds4-adaptive.js';
 import { killEngineByComm, enginePids } from './engine-kill.js';
 import { shouldRunGlobalEngineCleanup } from './engine-cleanup-policy.js';
@@ -601,6 +601,17 @@ const EXCLUSIVE_ENGINES = {
 
 /** Per-engine throttled recovery probes for exclusiveUnavailableBody, keyed by engine type. */
 const exclusiveRecoveryProbes = new Map();
+
+/**
+ * Persist the exclusive preset that just settled 'ready' so the next manager boot
+ * can re-activate it (see selectBootExclusive). Cleared by deactivateExclusive.
+ * @param {string} presetId Preset id that is now serving.
+ */
+function rememberExclusivePreset(presetId) {
+  if (!presetId || config.lastExclusivePreset === presetId) return;
+  config.lastExclusivePreset = presetId;
+  try { saveConfig(config); } catch (err) { console.warn(`[exclusive] could not persist last preset: ${err.message}`); }
+}
 
 /** @returns {object|null} the handle of the exclusive engine currently owning the box, else null. */
 function activeExclusive() { return EXCLUSIVE_ENGINES[currentEngine] || null; }
@@ -9206,6 +9217,7 @@ async function activateDs4Exclusive(presetId, preset) {
           effective: { context: result.settled.context, ssdStreaming: result.settled.ssdStreaming, cacheExperts: result.settled.cacheExperts },
           status: 'ready', plannedAttempts: plan.length, attemptsMade: result.attemptsMade, settledAt: Date.now(),
         };
+        rememberExclusivePreset(presetId);
         addLog('presets', `ds4: SETTLED — serving at ctx=${result.settled.context}${result.settled.ssdStreaming ? ` with SSD streaming (cache ${result.settled.cacheExperts})` : ' (no streaming)'} after attempt ${result.attemptsMade}/${plan.length}`);
       } else {
         // Aborted without serving — either every attempt was tried (exhausted) or a
@@ -9310,6 +9322,7 @@ async function deactivateExclusive(engine) {
     await drainExclusiveRequests(engine);
     await engine.stop();
     engine.clear(); // no longer serving: drop runtime state, stop claiming its model routes locally
+    if (config.lastExclusivePreset) { delete config.lastExclusivePreset; saveConfig(config); } // deliberate: do not re-activate at boot
     currentEngine = ENGINE_TYPES.LLAMA;
     const targetBytes = ds4HeadroomBytes();
     const poll = await pollForReclaim({
@@ -9642,6 +9655,7 @@ function runStrataLoadPhase(target, reason, settle) {
       if (result.ok) {
         sup.endPlan({ settled: result.settled });
         Object.assign(runtime, { status: 'ready', backend: result.settled.backend, settledAt: Date.now() });
+        rememberExclusivePreset(runtime.presetId);
         addLog('presets', `strata: SETTLED — serving on ${result.settled.backend} after attempt ${result.attemptsMade}/${attempts.length}`);
       } else {
         sup.endPlan({ settled: null });
@@ -9838,6 +9852,7 @@ async function activateStrataExclusive(presetId, preset) {
       if (result.ok) {
         sup.endPlan({ settled: result.settled });
         Object.assign(runtime, { status: 'ready', backend: result.settled.backend, settledAt: Date.now() });
+        rememberExclusivePreset(runtime.presetId);
         addLog('presets', `strata: SETTLED — serving on ${result.settled.backend} after attempt ${result.attemptsMade}/${attempts.length}`);
       } else {
         sup.endPlan({ settled: null });
@@ -17414,6 +17429,20 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   // Always auto-start the dedicated embedding server (independent of the chat
   // router) when one is configured. No user command required.
   setTimeout(() => { startEmbedServer(); }, 1500);
+
+  // Bring the last exclusive engine (Strata/DS4) back without waiting for the first
+  // request to pay the cold load. Background, never blocks startup; the normal
+  // activation path applies its own memory/thermal guards and may refuse.
+  const boot = selectBootExclusive(config);
+  if (boot) {
+    const preset = config.presets[boot.presetId];
+    console.log(`boot: re-activating ${boot.engine} preset ${boot.presetId}`);
+    addLog('presets', `boot: re-activating ${boot.engine} preset ${boot.presetId}`);
+    Promise.resolve()
+      .then(() => EXCLUSIVE_ENGINES[boot.engine].activate(boot.presetId, preset))
+      .then((r) => { if (r && r.ok === false) console.warn(`[${boot.engine}] boot re-activation refused: ${r.error}`); })
+      .catch((err) => console.warn(`[${boot.engine}] boot re-activation failed: ${err.message}`));
+  }
 });
 
 // Appliance installs also answer on port 80 so a plain http://localhost lands on

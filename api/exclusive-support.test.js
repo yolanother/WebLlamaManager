@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'fs/promises';
-import { createSseLineSplitter, pushCapped, createThrottledProbe } from './exclusive-support.js';
+import { createSseLineSplitter, pushCapped, createThrottledProbe, selectBootExclusive } from './exclusive-support.js';
 
 const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
 
@@ -61,4 +61,30 @@ test('server wiring: preset POST/PUT no longer probe the tokenizer path (m7)', (
 test('server wiring: exclusive proxies use the SSE splitter, attempts are capped (m8)', () => {
   assert.ok((source.match(/createSseLineSplitter\(\)/g) || []).length >= 4);
   assert.equal((source.match(/pushCapped\(runtime\.attempts,/g) || []).length, 4);
+});
+
+// ── A2: boot re-activation of the last exclusive preset ─────────────────────
+
+test('selectBootExclusive picks the persisted strata/ds4 preset', () => {
+  const config = { lastExclusivePreset: 'p1', presets: { p1: { id: 'p1', engine: 'strata' } } };
+  assert.deepEqual(selectBootExclusive(config), { engine: 'strata', presetId: 'p1' });
+  config.presets.p1.engine = 'ds4';
+  assert.deepEqual(selectBootExclusive(config), { engine: 'ds4', presetId: 'p1' });
+});
+
+test('selectBootExclusive returns null when unset, gone, llama, or disabled', () => {
+  assert.equal(selectBootExclusive({ presets: {} }), null);
+  assert.equal(selectBootExclusive({ lastExclusivePreset: 'p1', presets: {} }), null);
+  assert.equal(selectBootExclusive({ lastExclusivePreset: 'p1', presets: { p1: { id: 'p1' } } }), null);
+  assert.equal(selectBootExclusive({
+    lastExclusivePreset: 'p1', settings: { exclusiveBootReactivate: false },
+    presets: { p1: { engine: 'strata' } },
+  }), null);
+});
+
+test('server wiring: persist on ready, clear on deactivate, kick off at listen (A2)', () => {
+  assert.ok((source.match(/rememberExclusivePreset\(/g) || []).length >= 4); // def + ds4 + 2 strata
+  assert.match(source, /delete config\.lastExclusivePreset/);
+  assert.match(source, /selectBootExclusive\(config\)/);
+  assert.match(source, /boot: re-activating \$\{/);
 });
