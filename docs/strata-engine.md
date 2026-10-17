@@ -184,7 +184,20 @@ Or send a request naming the preset id: the manager activates it on demand and h
 the request during the swap. Activation tries CUDA first (if configured, admitted and
 the 3090 is free), then HIP. Load takes 27-40 s; there is no request needed to trigger
 the load. Status is visible at `GET /api/stats` under `strata` and `strataRuntime`
-(backend, attempts, lease state, last policy decision).
+(backend, the last 20 attempts, lease state, last policy decision).
+
+**Boot re-activation.** When a Strata (or DS4) preset settles `ready`, the manager
+records it as `config.lastExclusivePreset`. After a restart it re-activates that preset
+in the background as soon as the server is listening (log line
+`boot: re-activating strata preset <id>`), so the first request no longer pays the
+28-52 s cold load. Deactivating the engine deliberately (or switching to a llama preset)
+clears it. Set `"exclusiveBootReactivate": false` at the top level of the config to turn
+it off.
+
+**Packaged defaults.** When `config.strata` is absent or empty, the manager uses
+`/usr/share/llama-manager/strata/defaults.json` (installed by the `llama-manager-strata`
+package; override the path with `LLAMA_MANAGER_STRATA_DEFAULTS`). The file is read once
+and never written into `config.json`; any operator `config.strata` block wins outright.
 
 ## CUDA and HIP swap, with hysteresis
 
@@ -263,6 +276,26 @@ drakemore while Strata ran on CUDA with `expertCache` 2400:
 | Pods-priority (80) lock while serving | in-flight request drained, then the lock was held once Strata left the card (4.3 s idle; 40.9 s with a live request draining); HIP ready ~39-66 s, HIP decode 45-57 tok/s |
 | Return to CUDA after release | ~15 min (`returnToCudaAfterMin` 15), ready ~20 s later |
 
+### Parallel slots (`--batch N`), measured 2026-10-17
+
+Strata can decode several conversations at once (`--batch N`, docs/BATCHING.md upstream).
+On the 3090 with IQ3_S at 262144 context and `cuda.expertCache` 2400 it costs too much
+single-stream speed, so the preset stays at one sequence at a time. Bench: manager
+stopped, 256-token greedy-ish completions, `/opt/strata/bench/par_bench.py`, results in
+`/opt/strata/bench/par.jsonl`.
+
+| Config | Solo median tok/s | 2 clients: aggregate tok/s, per stream, 2nd TTFT | 3 clients: aggregate tok/s, per stream |
+|---|---|---|---|
+| 1 slot (current) | **65.9** | 48-54, 42-72, 4.5-6.0 s | 58-68, 55-77 (3rd TTFT 9.6 s) |
+| `--batch 2` | 45.0 | 41-49, 22-26, 0.5-1.5 s | 45-47 |
+| `--batch 2 --batch-mtp` | 43.5 | 46-53, 26-29, 0.7-0.9 s | 47-48 |
+| `--batch 3` | 48.1 | 45-51, 24-27, 0.5-1.4 s | 51, 17-19 each |
+
+Slots cut queueing latency (the second client starts within ~1 s instead of 4.5-6 s) but
+every slotted stream drops to 17-29 tok/s and a lone request falls below the 60 tok/s
+target, matching upstream's note that IQ3_S needs 32 GB for slots to pay. Revisit with a
+larger card or once `expertCache` can return to `auto`.
+
 Since 2026-10-15 both `default-big` and `default-small` on drakemore target the
 `strata-qwen38-flash-iq3s` preset; Frostburn's `default-big` and `default-small` forward to them.
 
@@ -273,7 +306,7 @@ Since 2026-10-15 both `default-big` and `default-small` on drakemore target the
 | Activation 503 `Strata is not configured: <reason>` | `config.strata` missing `root`/`pythonPath`, non-absolute paths, or neither backend usable. |
 | Always lands on HIP | CUDA not configured, lease not grantable (another claim at >= 50), other VRAM busy on the card, or a recent CUDA failure inside the hysteresis window. Check `strataRuntime.cuda.lastDecision`. |
 | HIP backend disabled with warning | `hip.expertCache` missing or `auto`; set an explicit slot count. |
-| Status `exhausted` / 503 on local requests | Both backends failed. Read `<dataDir>/engine-<backend>.log`; re-activate via the activate route. |
+| Status `exhausted` / 503 on local requests | Both backends failed. Read `<dataDir>/engine-<backend>.log`; re-activate via the activate route. If the engine was brought back some other way, the next local request probes its health (at most every 5 s) and clears the status itself. |
 | Status `stop-unconfirmed` | A `strata` process survived the stop. Kill it (`pkill -x strata` as the service user's root) and re-activate. |
 | Engine logs mlock / pinned allocation failure | Add a `LimitMEMLOCK=infinity` drop-in to the unit. |
 | **Pods busy-poll CPU contention** | Pods busy-polls and competes with Strata for CPU, hurting decode and prefill (the CPU-share prefill assist especially). Cap Pods' CPU use, or accept lower numbers while it runs. |
