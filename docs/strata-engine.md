@@ -191,8 +191,11 @@ records it as `config.lastExclusivePreset`. After a restart it re-activates that
 in the background as soon as the server is listening (log line
 `boot: re-activating strata preset <id>`), so the first request no longer pays the
 28-52 s cold load. Deactivating the engine deliberately (or switching to a llama preset)
-clears it. Set `"exclusiveBootReactivate": false` at the top level of the config to turn
-it off.
+clears it. A planned boot re-activation replaces the llama `autoStart` (which would
+otherwise deactivate the exclusive engine a second after boot), and an activation that is
+superseded mid-load stops its CUDA/HIP ladder instead of starting an orphan engine. Set
+`"exclusiveBootReactivate": false` at the top level of the config to turn it off. Measured on
+drakemore: CUDA ready 27 s after a restart with no request sent.
 
 **Packaged defaults.** When `config.strata` is absent or empty, the manager uses
 `/usr/share/llama-manager/strata/defaults.json` (installed by the `llama-manager-strata`
