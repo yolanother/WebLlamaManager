@@ -9836,6 +9836,9 @@ async function activateStrataExclusive(presetId, preset) {
   const settleGate = eng.armSwapGate({ force: true });
   const runtime = { status: 'loading', presetId, backend: null, attempts: [], settledAt: null, cuda: null };
   strataState.runtime = runtime;
+  // Deactivation (engine.clear()) or a newer activation replaces strataState.runtime;
+  // this ladder must then neither start its next backend nor touch the engine.
+  const superseded = () => strataState.runtime !== runtime || currentEngine !== ENGINE_TYPES.STRATA;
   addLog('presets', `Activating Strata EXCLUSIVE mode: ${preset.name} (evicting local models by host PID, verifying reclaim before spawn)`);
 
   (async () => {
@@ -9846,6 +9849,7 @@ async function activateStrataExclusive(presetId, preset) {
       const result = await runDs4AdaptivePlan({
         attempts,
         startAttempt: async (attempt) => {
+          if (superseded()) return { ok: false, reason: 'superseded' };
           addLog('presets', `strata: trying ${attempt.backend}`);
           const started = await startStrataAttempt(preset, attempt);
           if (started.ok === false) pushCapped(runtime.attempts, { backend: attempt.backend, outcome: started.reason });
@@ -9857,6 +9861,7 @@ async function activateStrataExclusive(presetId, preset) {
           return outcome;
         },
         stopAttempt: async () => {
+          if (superseded()) return { ok: true, remainingPids: [] }; // not a CUDA failure; the engine is not ours
           if (strataState.cudaLeaseId) strataState.cudaFailedAt = Date.now(); // next attempt is HIP
           try { return await stopStrataServer(); } catch { return { ok: true, remainingPids: [] }; }
         },
@@ -9864,6 +9869,11 @@ async function activateStrataExclusive(presetId, preset) {
           if (i > 0) addLog('presets', `strata: previous attempt failed to load; stepping to attempt ${i + 1}/${attempts.length}`);
         },
       });
+      if (superseded()) {
+        if (!strataState.runtime) sup.endPlan({ settled: null });
+        addLog('presets', 'strata: activation superseded mid-load (deactivated or replaced); leaving the engine to its new owner');
+        return;
+      }
       if (result.ok) {
         sup.endPlan({ settled: result.settled });
         Object.assign(runtime, { status: 'ready', backend: result.settled.backend, settledAt: Date.now() });
@@ -17427,8 +17437,11 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
     console.warn(`[aliases] could not seed default-small: ${error.message}`);
   }
 
+  // Chosen before auto-start: POST /api/server/start deactivates any exclusive engine,
+  // so a planned boot re-activation replaces the llama auto-start instead of racing it.
+  const boot = selectBootExclusive(config);
   const autoStartScheduled = scheduleAutoStart({
-    autoStart: config.autoStart,
+    autoStart: boot ? false : config.autoStart,
     schedule: setTimeout,
     start: () => {
       fetch(`http://localhost:${API_PORT}/api/server/start`, {
@@ -17448,7 +17461,6 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   // Bring the last exclusive engine (Strata/DS4) back without waiting for the first
   // request to pay the cold load. Background, never blocks startup; the normal
   // activation path applies its own memory/thermal guards and may refuse.
-  const boot = selectBootExclusive(config);
   if (boot) {
     const preset = config.presets[boot.presetId];
     console.log(`boot: re-activating ${boot.engine} preset ${boot.presetId}`);
