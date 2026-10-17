@@ -21,6 +21,16 @@ assert_contains() {
   fi
 }
 
+assert_eq() {
+  local description="$1" expected="$2" actual="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    printf '  ok   %s\n' "$description"
+  else
+    printf '  FAIL %s (expected %q, got %q)\n' "$description" "$expected" "$actual"
+    failures=$((failures + 1))
+  fi
+}
+
 test_packaged_install_helper_is_sourceable() {
   printf 'test_packaged_install_helper_is_sourceable\n'
   local result
@@ -323,7 +333,13 @@ test_llama_launcher_maps_package_scripts_into_distrobox() {
   assert_contains "packaged llama uses fixed ROCm container" "$output" "container=llama-rocm-7.2.4"
   assert_contains "packaged llama maps container launcher through host root" "$output" \
     "launcher=/run/host/usr/lib/llama-manager/container-start.sh"
-  assert_contains "packaged llama selects container-owned server" "$output" \
+  # 1db4d94: packaged mode HONOURS a configured LLAMA_SERVER_BIN (so an appliance can run a
+  # llama.cpp newer than its image) and only defaults to the container-owned server.
+  assert_contains "packaged llama honours a configured server" "$output" \
+    "llama_server=/tmp/operator-llama"
+  output="$(env -u LLAMA_SERVER_BIN LLAMA_MANAGER_PACKAGED=1 DISTROBOX_CONTAINER=operator-container \
+    MODELS_DIR="$sandbox/models" bash "$REPO_ROOT/start-llama.sh" --print-cmd 2>&1)"
+  assert_contains "packaged llama defaults to the container-owned server" "$output" \
     "llama_server=/usr/local/bin/llama-server"
 
   source_output="$(DISTROBOX_CONTAINER=source-container LLAMA_SERVER_BIN=/source/llama-server \
@@ -558,7 +574,8 @@ EOF
   assert_contains "invalid llama port falls back safely" "$output" "LLAMA_PORT=8080"
   assert_contains "invalid embedding port falls back safely" "$output" "EMBED_PORT=5252"
   assert_contains "invalid model limit falls back safely" "$output" "MODELS_MAX=2"
-  assert_contains "invalid context falls back safely" "$output" "CONTEXT_SIZE=8192"
+  # f092f74 raised the packaged default context to 65536 (DS4 honours the system size).
+  assert_contains "invalid context falls back safely" "$output" "CONTEXT_SIZE=65536"
   assert_contains "invalid autostart falls back safely" "$output" "AUTO_START=true"
   assert_contains "invalid stats interval falls back safely" "$output" "STATS_INTERVAL=1000"
   rm -rf "$sandbox"
