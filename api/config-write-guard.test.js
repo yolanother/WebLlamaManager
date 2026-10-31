@@ -35,3 +35,36 @@ test('a DNS-rebinding host name is refused even with a matching Origin', () => {
   assert.match(r.reason, /Host/);
   assert.equal(configWriteTrusted({ host: undefined, localNames }).ok, false, 'no Host header');
 });
+
+// ── configUpdateRefusal: what POST /api/config enforces (review LOW: test the refusal, not names) ──
+import { configUpdateRefusal } from './config-write-guard.js';
+
+const req = (over = {}) => ({ loopback: true, host: '127.0.0.1:3001', origin: undefined, localNames, ...over });
+
+test('configUpdateRefusal: podsRelease from off-box is 403 NOT_LOOPBACK', () => {
+  const r = configUpdateRefusal({ updates: { podsRelease: { enabled: true } }, ...req({ loopback: false }) });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.code, 'NOT_LOOPBACK');
+});
+
+test('configUpdateRefusal: strata or podsRelease from a foreign Origin or a rebinding Host is 403 UNTRUSTED_ORIGIN', () => {
+  for (const updates of [{ podsRelease: { enabled: true } }, { strata: {} }]) {
+    assert.equal(configUpdateRefusal({ updates, ...req({ origin: 'https://evil.example' }) }).body.code, 'UNTRUSTED_ORIGIN');
+    assert.equal(configUpdateRefusal({ updates, ...req({ host: 'rebind.evil.example:3001' }) }).body.code, 'UNTRUSTED_ORIGIN');
+  }
+});
+
+test('configUpdateRefusal: podsRelease may not carry coordinatorUrl, nodeId or anything but enabled/minIdleSec', () => {
+  for (const pr of [{ coordinatorUrl: 'https://attacker.example' }, { enabled: true, nodeId: 'x' }, 'on', null]) {
+    const r = configUpdateRefusal({ updates: { podsRelease: pr }, ...req() });
+    assert.equal(r.status, 400, JSON.stringify(pr));
+    assert.equal(r.body.code, 'PODS_RELEASE_FIELD');
+  }
+});
+
+test('configUpdateRefusal: allowed writes pass (negative control)', () => {
+  assert.equal(configUpdateRefusal({ updates: { podsRelease: { enabled: true, minIdleSec: 900 } }, ...req() }), null);
+  assert.equal(configUpdateRefusal({ updates: { strata: {} }, ...req({ origin: 'http://127.0.0.1:3001' }) }), null);
+  assert.equal(configUpdateRefusal({ updates: { contextSize: 8192 }, ...req({ loopback: false, origin: 'https://ui.example', host: 'ui.example' }) }), null,
+    'other settings are untouched by this guard');
+});

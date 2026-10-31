@@ -137,29 +137,43 @@ export async function waitForCudaLeaseRelease({ isHeld, swapInFlight, leave, sle
 
 /**
  * Prefill-hang watchdog step. Strata's GET /metrics reports `live.state` ('reading' while it
- * reads a prompt) and `live.prompt_read` (advanced once per prefill chunk). A prompt whose read
- * position has not moved for `stallMs` is cancelled; if the engine is still reading with no
- * progress `wedgeGraceMs` after that cancel, it is wedged and must be restarted. drakemore
- * 2026-10-31: 540 s reading a 1282-token prompt at 0 tok/s, which only the 900 s zero-token
- * ceiling would have ended. Unreadable metrics fail open.
- * @param {{live: ?{state?:string, prompt_read?:?number, prompt_total?:?number}, prev: ?{read:number,
- *   since:number, cancelledAt:?number}, now:number, stallMs:number, wedgeGraceMs?:number}} p the
- *   `live` block (null when unreadable), the previous step's state, the clock and the limits.
- * @returns {{action:'ok'|'cancel'|'restart', state: ?{read:number, since:number, cancelledAt:?number}, reason:string}}
- *   what to do and the state to pass to the next step.
+ * reads a prompt), `live.prompt_read` (advanced once per prefill chunk) and `live.prompt_total`.
+ * The clock belongs to one prompt: a different request id (the exclusive-slot holder) or a
+ * different prompt_total starts a fresh one, so a request never inherits another's stall time.
+ * A prompt whose read position has not moved for `stallMs` is cancelled. After the cancel the
+ * caller holds the exclusive lane; if the engine is still reading with no progress (or its
+ * metrics stop answering) `wedgeGraceMs` later it is wedged and must be restarted, while any
+ * progress or leaving the reading state clears the cancel so the caller releases the lane.
+ * drakemore 2026-10-31: 540 s reading a 1282-token prompt at 0 tok/s. Unreadable metrics with
+ * no cancel pending fail open.
+ * @param {{live: ?{state?:string, prompt_read?:?number, prompt_total?:?number}, prev: ?{reqId:*,
+ *   read:number, total:?number, since:number, cancelledAt:?number}, reqId?: *, now:number,
+ *   stallMs:number, wedgeGraceMs?:number}} p the `live` block (null when unreadable), the
+ *   previous step's state, the slot holder's request id, the clock and the limits.
+ * @returns {{action:'ok'|'cancel'|'restart', state: ?{reqId:*, read:number, total:?number, since:number,
+ *   cancelledAt:?number}, reason:string}} what to do and the state to pass to the next step;
+ *   `state.cancelledAt` non-null means the caller must keep holding the lane.
  */
-export function strataPrefillVerdict({ live, prev, now, stallMs, wedgeGraceMs = 30_000 }) {
-  if (!live) return { action: 'ok', state: prev, reason: 'metrics unreadable' };
+export function strataPrefillVerdict({ live, prev, reqId = null, now, stallMs, wedgeGraceMs = 30_000 }) {
+  const cancelled = prev?.cancelledAt != null;
+  if (!live) {
+    if (cancelled && now - prev.cancelledAt >= wedgeGraceMs) {
+      return { action: 'restart', state: null, reason: `metrics unanswered ${Math.round((now - prev.cancelledAt) / 1000)}s after the cancel: engine wedged` };
+    }
+    return { action: 'ok', state: prev, reason: 'metrics unreadable' };
+  }
   if (live.state !== 'reading') return { action: 'ok', state: null, reason: `engine ${live.state ?? 'unknown'}` };
   const read = live.prompt_read ?? -1;
-  if (!prev || prev.read !== read) return { action: 'ok', state: { read, since: now, cancelledAt: null }, reason: 'prefill progressing' };
-  if (prev.cancelledAt != null) {
+  const total = live.prompt_total ?? null;
+  const samePrompt = prev && prev.read === read && prev.total === total && (cancelled || prev.reqId === reqId);
+  if (!samePrompt) return { action: 'ok', state: { reqId, read, total, since: now, cancelledAt: null }, reason: 'prefill progressing' };
+  if (cancelled) {
     if (now - prev.cancelledAt < wedgeGraceMs) return { action: 'ok', state: prev, reason: 'waiting for the cancel to land' };
     return { action: 'restart', state: null, reason: `still reading with no progress ${Math.round((now - prev.cancelledAt) / 1000)}s after the cancel: engine wedged` };
   }
   if (now - prev.since < stallMs) return { action: 'ok', state: prev, reason: 'within the prefill stall limit' };
   return {
     action: 'cancel', state: { ...prev, cancelledAt: now },
-    reason: `no prefill progress for ${Math.round((now - prev.since) / 1000)}s (read ${Math.max(0, read)}/${live.prompt_total ?? '?'})`,
+    reason: `no prefill progress for ${Math.round((now - prev.since) / 1000)}s (read ${Math.max(0, read)}/${total ?? '?'})`,
   };
 }

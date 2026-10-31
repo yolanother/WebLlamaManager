@@ -72,26 +72,32 @@ export function strataHipExpertCache({ configured, minSlots, availableBytes, bas
 /**
  * Whether a Strata running on HIP below its target cache should restart larger now. It must
  * be idle for a minute and past the cooldown since it settled, and a restart (which frees its
- * own footprint first) must buy at least MIN_GROW_SLOTS more slots, so it never flaps.
+ * own footprint first) must buy at least MIN_GROW_SLOTS more slots, so it never flaps. The
+ * grown cache must leave `growMarginBytes` free on top of the headroom: memory that just freed
+ * is usually a Pods worker that restarts on its next job (6-36 GiB), and with only the 8 GiB
+ * headroom that restart drives MemAvailable under the 6 GiB critical stop mid-request.
  * @param {{effective:number, configured:number, minSlots:number, availableBytes:number,
- *   baseBytes:number, headroomBytes:number, busy:boolean, idleSinceMs:number|null,
- *   settledAt:number, now:number, growCooldownMs:number}} p current and target slots, floor,
- *   MemAvailable, footprint knobs, whether a request is in flight or queued, the idle-streak
- *   start, when the engine settled, the clock and the cooldown.
- * @returns {{action:'grow'|'stay', slots?:number, needMemory?:boolean, idleSinceMs:number|null, reason:string}}
- *   `idleSinceMs` is the idle-streak start the caller keeps for the next tick; `needMemory` is set
- *   when only memory is missing (idle, past the cooldown), so asking other tenants to release helps.
+ *   baseBytes:number, headroomBytes:number, growMarginBytes:number, busy:boolean,
+ *   idleSinceMs:number|null, settledAt:number, now:number, growCooldownMs:number}} p current and
+ *   target slots, floor, MemAvailable, footprint knobs, the extra margin a grow leaves free,
+ *   whether a request is in flight or queued, the idle-streak start, when the engine settled,
+ *   the clock and the cooldown.
+ * @returns {{action:'grow'|'stay', slots?:number, idleSinceMs:number|null, reason:string}}
+ *   `idleSinceMs` is the idle-streak start the caller keeps for the next tick.
  */
 export function strataGrowDecision(p) {
-  const { effective, configured, availableBytes, baseBytes, busy, idleSinceMs, settledAt, now, growCooldownMs } = p;
+  const { effective, configured, availableBytes, baseBytes, headroomBytes, growMarginBytes = 0, busy, idleSinceMs, settledAt, now, growCooldownMs } = p;
   if (effective >= configured) return { action: 'stay', idleSinceMs: null, reason: 'at the configured cache' };
   if (busy) return { action: 'stay', idleSinceMs: null, reason: 'busy' };
   const idleSince = idleSinceMs ?? now;
   if (now - idleSince < GROW_IDLE_MS) return { action: 'stay', idleSinceMs: idleSince, reason: 'idle streak too short' };
   if (now - settledAt < growCooldownMs) return { action: 'stay', idleSinceMs: idleSince, reason: 'cooldown' };
-  const after = strataHipExpertCache({ ...p, availableBytes: availableBytes + strataHipFootprintBytes({ expertCache: effective, baseBytes }) });
+  const after = strataHipExpertCache({
+    ...p, headroomBytes: headroomBytes + growMarginBytes,
+    availableBytes: availableBytes + strataHipFootprintBytes({ expertCache: effective, baseBytes }),
+  });
   if (!after.slots || after.slots < effective + MIN_GROW_SLOTS) {
-    return { action: 'stay', needMemory: true, idleSinceMs: idleSince, reason: `hysteresis: a restart would get ${after.slots ?? 0} slots, running ${effective}` };
+    return { action: 'stay', idleSinceMs: idleSince, reason: `hysteresis: a restart would get ${after.slots ?? 0} slots, running ${effective}` };
   }
   return { action: 'grow', slots: after.slots, idleSinceMs: idleSince, reason: `grow ${effective} -> ${after.slots} slots: ${after.reason}` };
 }
@@ -197,6 +203,7 @@ export function resolveStrataConfig(config, { dataDirDefault, memTotalBytes, hea
           ...baseBackend(h), expertCache: h.expertCache, residentBytes, baseBytes,
           minExpertCache: Math.min(posOr(h.minExpertCache, 4000), h.expertCache),
           growCooldownMs: posOr(h.growCooldownMin, 10) * MIN_MS,
+          growMarginBytes: posOr(h.growMarginGb, 16) * GB,
         };
       }
     }

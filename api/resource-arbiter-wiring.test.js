@@ -29,56 +29,79 @@ function fnBody(name) {
   return next === -1 ? rest : rest.slice(0, next);
 }
 
-test('HIP attempt sizes the expert cache to available memory and launches with it', () => {
-  const body = fnBody('startStrataAttempt');
-  assert.match(body, /strataHipExpertCache\(\{/);
-  assert.match(body, /launch\.expertCache = fit\.slots/, 'the chosen size goes into the launch override');
-  assert.match(body, /runtime\.expertCache = /, 'the chosen size and reason are recorded');
-  assert.match(body, /getStrataSupervisor\(\)\.start\(preset, \{ planMode: true, override: launch \}\)/);
-});
-
 test('the supervisor launch passes the override size to strataServerConfig', () => {
   const body = fnBody('getStrataSupervisor');
   assert.match(body, /strataServerConfig\(\{ cfg, preset, backend, expertCache: override\?\.expertCache \}\)/);
-});
-
-test('the backend tick grows a shrunk idle HIP engine before the CUDA-only early return', () => {
-  const body = fnBody('strataBackendTick');
-  const grow = body.indexOf('strataGrowDecision(');
-  assert.ok(grow > 0, 'strataBackendTick calls strataGrowDecision');
-  assert.ok(grow < body.indexOf('|| !cfg.cuda'), 'grow-back runs on HIP-only hosts (drakemore has no cuda block)');
-  assert.match(body, /strataSwapBackend\('hip', grow\.reason\)/);
 });
 
 test('/api/stats exposes per-model queue depth across the llama and exclusive lanes', () => {
   assert.match(source, /byModel: mergeModelDepths\(llamaQueue\.getModelDepths\(\), ds4Queue\.getModelDepths\(\)\)/);
 });
 
-test('the backend tick runs the prefill watchdog on Strata /metrics: cancel the slot holder, restart a wedged engine', () => {
+test('HIP attempt sizes the expert cache with sizeStrataHipCache and launches with it', () => {
+  const body = fnBody('startStrataAttempt');
+  assert.match(body, /async function startStrataAttempt|keepAtLeast = 0/);
+  assert.match(body, /fit = await sizeStrataHipCache\(cfg, headroomBytes, keepAtLeast\)/);
+  assert.match(body, /launch\.expertCache = fit\.slots/, 'the chosen size goes into the launch override');
+  assert.match(body, /runtime\.expertCache = /, 'the chosen size and reason are recorded');
+  assert.match(body, /getStrataSupervisor\(\)\.start\(preset, \{ planMode: true, override: launch \}\)/);
+});
+
+test('a restarted serving engine waits to keep its previous cache before sizing down (review HIGH 1)', () => {
+  const body = fnBody('sizeStrataHipCache');
+  const keep = body.indexOf('if (keep > 0)');
+  const wait = body.indexOf('await waitFor(keep)');
+  const fresh = body.indexOf('const fit = choose(cfg.hip.minExpertCache)');
+  assert.ok(keep > 0 && wait > keep && fresh > wait, 'keep-previous-size wait comes before the fresh fit');
+  assert.match(body, /timeoutMs: DS4_RECLAIM_TIMEOUT_MS/);
+  assert.match(fnBody('runStrataLoadPhase'), /\{ backend: 'hip', keepAtLeast \}/);
+  assert.match(fnBody('strataSwapBackend'), /runStrataLoadPhase\(target, reason, settle, \{ keepAtLeast \}\)/);
+});
+
+test('Pods release is asked only when a start would be refused, never to grow (review MEDIUM)', () => {
+  const body = fnBody('sizeStrataHipCache');
+  const refusedOnly = body.indexOf('if (fit.slots !== null) return fit;');
+  const release = body.indexOf('await releaseIdlePodsWorkers(');
+  assert.ok(refusedOnly > 0 && release > refusedOnly, 'release only after the floor did not fit');
+  assert.match(fnBody('releaseIdlePodsWorkers'), /requestPodsIdleRelease\(\{ config, env: process\.env, reason, fetchFn: fetch/);
+  assert.doesNotMatch(fnBody('strataBackendTick'), /releaseIdlePodsWorkers/);
+  assert.doesNotMatch(fnBody('startStrataAttempt'), /releaseIdlePodsWorkers/);
+});
+
+test('the backend tick grows with the margin, before the CUDA-only early return, keeping the current size', () => {
   const body = fnBody('strataBackendTick');
-  assert.match(body, /strataPrefillVerdict\(\{ live: await readStrataLive\(cfg\.port\)/);
+  const grow = body.indexOf('strataGrowDecision(');
+  assert.ok(grow > 0 && grow < body.indexOf('|| !cfg.cuda'), 'grow-back runs on HIP-only hosts');
+  assert.match(body, /growMarginBytes: cfg\.hip\.growMarginBytes/);
+  assert.match(body, /strataSwapBackend\('hip', grow\.reason, \{ keepAtLeast: runtime\.expertCache\.effective \}\)/);
+});
+
+test('prefill watchdog: bound to the slot holder, holds the lane on cancel, restarts under that hold (review HIGH 3)', () => {
+  const body = fnBody('strataBackendTick');
+  assert.match(body, /strataPrefillVerdict\(\{\s*live: await readStrataLive\(cfg\.port\), prev: strataState\.prefillWatch, reqId: holder\?\.activeReqId \?\? null/);
   assert.match(body, /stallMs: cfg\.policy\.prefillStallMs/);
-  assert.match(body, /ds4Queue\.activeItems\.values\(\)/, 'cancels the request holding the exclusive slot');
-  assert.match(body, /strataSwapBackend\(runtime\.backend, 'prefill-wedged'\)/);
+  const hold = body.indexOf('strataState.prefillHold = holdStrataLane();');
+  const abort = body.indexOf('activeRequests.get(holder.activeReqId)?.abortController?.abort()');
+  assert.ok(hold > 0 && abort > hold, 'the lane is held before the holder is aborted');
+  const abortQueued = body.indexOf("if (entry.backend === 'strata') entry.abortController?.abort();");
+  const freeSlot = body.indexOf('await releaseStrataLaneHold(hold, { settleGate: false })');
+  assert.ok(abortQueued > 0 && freeSlot > abortQueued, 'queued requests are aborted (for replay) before the held slot is freed');
+  assert.match(body, /strataSwapBackend\(runtime\.backend, 'prefill-wedged', \{\s*settle: hold\?\.settle, keepAtLeast: runtime\.expertCache\?\.effective \?\? 0, drainMs: 0,/);
+  assert.match(body, /strataState\.prefillHold && !pf\.state\?\.cancelledAt/, 'recovery after the cancel releases the lane');
+  const holdFn = fnBody('holdStrataLane');
+  assert.match(holdFn, /armSwapGate\(\)/);
+  assert.match(holdFn, /ds4Queue\.acquire\(\{[^}]*priority: 'realtime'/);
+  assert.match(fnBody('strataSwapBackend'), /const settle = armed \|\| EXCLUSIVE_ENGINES\[ENGINE_TYPES\.STRATA\]\.armSwapGate\(\)/);
+  assert.match(fnBody('strataLeaveCuda'), /drainExclusiveRequests\(eng, drainMs \?\? strataConfig\(\)\.policy\.drainMaxWaitMs\)/);
   const live = fnBody('readStrataLive');
   assert.match(live, /\/metrics/);
   assert.match(live, /Accept: 'application\/json'/);
 });
 
-test('the Pods release client is called behind its flag from the HIP attempt and the grow-back tick', () => {
-  assert.match(fnBody('releaseIdlePodsWorkers'), /requestPodsIdleRelease\(\{ config, env: process\.env, reason, fetchFn: fetch/);
-  const attempt = fnBody('startStrataAttempt');
-  assert.match(attempt, /await releaseIdlePodsWorkers\(/);
-  assert.match(attempt, /if \(released\.released\.length\) reclaimTimeoutMs = DS4_RECLAIM_TIMEOUT_MS/, 'wait the full reclaim window only when workers were released');
-  assert.match(fnBody('strataBackendTick'), /else if \(grow\.needMemory\) void releaseIdlePodsWorkers\(/);
-});
-
-test('loopback-only config keys also require a trusted Host/Origin, and podsRelease carries only the flag and thresholds', () => {
+test('POST /api/config enforces configUpdateRefusal before saving (review LOW)', () => {
   const at = source.indexOf("app.post('/api/config'");
-  const route = source.slice(at, at + 5000);
-  assert.match(route, /'podsRelease' in updates && !isLoopbackRequest\(req\)/);
-  assert.match(route, /configWriteTrusted\(\{ host: req\.headers\.host, origin: req\.headers\.origin, localNames: configWriteLocalNames\(\) \}\)/);
-  assert.match(route, /\('strata' in updates \|\| 'podsRelease' in updates\)/);
-  assert.match(route, /PODS_RELEASE_FIELDS/);
-  assert.match(source, /const PODS_RELEASE_FIELDS = \['enabled', 'minIdleSec'\]/);
+  const route = source.slice(at, source.indexOf('\napp.', at + 10));
+  const call = route.search(/const refusal = configUpdateRefusal\(\{ updates, loopback: isLoopbackRequest\(req\), host: req\.headers\.host, origin: req\.headers\.origin, localNames: configWriteLocalNames\(\) \}\);\n\s*if \(refusal\) return res\.status\(refusal\.status\)\.json\(refusal\.body\);/);
+  assert.ok(call > 0, 'the route calls configUpdateRefusal and returns its refusal');
+  assert.ok(call < route.indexOf('config = { ...config, ...updates }'), 'before the config is changed');
 });

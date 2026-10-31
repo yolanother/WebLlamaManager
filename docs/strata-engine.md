@@ -125,12 +125,13 @@ Layout on the host:
 | `hip.expertCache` | **required** | Explicit slot count, the **target**. `auto` is rejected: it is greedy on unified memory. When the target does not fit what is available at spawn, Strata starts at the largest cache that does (see "Adaptive HIP expert cache"). |
 | `hip.minExpertCache` | `4000` | Floor for the adaptive cache; below it the attempt fails (`reclaim-timeout`) and recovery retries. Never above `expertCache`. |
 | `hip.growCooldownMin` | `10` | Minimum time since the last settle before a shrunk, idle HIP engine restarts larger. |
+| `hip.growMarginGb` | `16` | Extra free memory a grow-back must leave above the 8 GiB headroom, so a Pods worker restarting on its next job does not hit the 6 GiB critical stop. |
 | `hip.baseGb` | `65` | HIP footprint beside the expert cache (weights, KV, MTP). The reclaim target before a HIP spawn is `baseGb` + `expertCache` x 1.94 MiB (~95 GiB at 16000), plus `guard.ds4ReclaimHeadroomGb` (8). Measured on drakemore 2026-10-31: strata RSS ~49 GiB + iGPU GTT ~46 GiB at 16000 slots. |
 | `hip.residentGb` | ignored | Retired: a hand-set reclaim target went stale twice (106 blocked every spawn; 84 let 48000 slots swap the box). Logged as a warning when present. |
 | `policy.returnToCudaAfterMin` | `15` | Hysteresis before moving back to CUDA. |
 | `policy.drainMaxWaitSec` | `120` | Bounded drain of in-flight requests before cancelling. |
 | `policy.idleBaselineMb` / `yieldGrowthMb` | `1536` / `512` | Other VRAM above baseline+growth counts as a busy 3090. |
-| `policy.prefillStallSec` | `180` | A prompt read with no progress (Strata `/metrics` `live.prompt_read`) for this long is cancelled; still stuck 30 s later restarts the engine. |
+| `policy.prefillStallSec` | `180` | A prompt read with no progress (Strata `/metrics` `live.prompt_read`, per request) for this long is cancelled, and the lane is held. If the engine recovers, the lane is released. If it is still stuck, or `/metrics` is silent, 30 s later the engine is restarted and the held requests are replayed. |
 
 GB/MB values become bytes, durations become ms, env values are stringified. If `hip`
 has a missing or `auto` `expertCache` it is disabled with a warning. There are no
@@ -164,11 +165,15 @@ has a missing or `auto` `expertCache` it is disabled with a warning. There are n
 Design: [`Designs/ResourceArbiter.md`](Designs/ResourceArbiter.md).
 
 **Starting smaller instead of refusing.** After evicting llama, the HIP attempt waits up to
-30 s for the configured footprint. If idle Pods workers were released, it waits the full
-180 s instead. It then starts at
+30 s for the configured footprint. It then starts at
 `min(expertCache, floor((MemAvailable - 8 GiB - baseGb) / 1.94 MiB))` slots, rounded down
-to 100. A result below `hip.minExpertCache` fails the attempt as `reclaim-timeout`, and
-recovery retries it.
+to 100.
+- **Below the floor** (`hip.minExpertCache`), with `podsRelease` enabled: it asks Pods to
+  release idle workers and waits up to 180 s for the floor.
+- **Still short after that:** the attempt fails as `reclaim-timeout`, and recovery
+  retries it.
+- **Restart of an engine that was serving** (grow-back or prefill-wedge restart): it
+  first waits up to 180 s to keep the size it already had.
 
 - The `presets` log shows the outcome: `strata: hip expert cache <N> (<reason>)`.
 - `GET /api/stats` shows it as
@@ -180,11 +185,11 @@ target. It grows the cache back when all of these hold:
 
 - nothing has been in flight or queued in the exclusive lane for 60 s;
 - `hip.growCooldownMin` has passed since the last settle;
-- a restart would gain at least 2000 slots.
+- a restart would gain at least 2000 slots while still leaving `hip.growMarginGb` free
+  beyond the headroom.
 
 The restart goes through the normal swap path: bounded drain, verified stop, HIP load.
-When Strata is idle and short only of memory, and `podsRelease` is enabled, the manager
-asks the Pods coordinator to release idle workers on this node.
+It keeps at least the current size. Grow-back never asks Pods to release workers.
 
 **Shrinking.** A running engine is not resized in place. Below
 `guard.memCriticalBelowGb`, the memory governor stops it, and recovery starts it again
@@ -208,7 +213,8 @@ DNS-rebinding page in a browser on the host.
 
 The manager calls
 `POST /api/v1/nodes/{nodeId}/release-idle-workers` (local-runpod
-`docs/Features/release-idle-workers.md`) at most once per 5 minutes. The coordinator
+`docs/Features/release-idle-workers.md`) only when a HIP start would otherwise be refused,
+and at most once per 5 minutes. The coordinator
 releases only workers that meet all of these:
 
 - the node reports them idle for at least `minIdleSec`;

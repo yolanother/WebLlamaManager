@@ -117,7 +117,7 @@ import { remoteOnlyAliasFallback } from './remote-only-alias.js';
 import { remoteFailoverDecision, countsAsBackendFailure, managerHealthStatus } from './remote-failover.js';
 import { exclusiveRecoveryDecision } from './exclusive-recovery.js';
 import { requestPodsIdleRelease } from './pods-release.js';
-import { configWriteTrusted } from './config-write-guard.js';
+import { configUpdateRefusal } from './config-write-guard.js';
 import { seedStrataPreset, STRATA_PRESET_ID } from './strata-seed.js';
 import { kvFootprint, readGgufAttentionMetadata } from './gguf-kv.js';
 import { normalizeModelPresetOptions, applyModelPresetOptions, modelContextOverride, wantsPresetContextMode } from './model-preset-options.js';
@@ -578,8 +578,10 @@ const strataState = {
   memAvailableBeforeSpawn: 0,
   // Start of Strata's idle streak for the HIP grow-back decision (strataGrowDecision).
   growIdleSinceMs: null,
-  // Prefill watchdog state ({read, since, cancelledAt}, strataPrefillVerdict); null when not reading.
+  // Prefill watchdog state ({reqId, read, total, since, cancelledAt}, strataPrefillVerdict); null when not reading.
   prefillWatch: null,
+  // Lane hold armed by a prefill cancel (holdStrataLane); null when the lane is free.
+  prefillHold: null,
   // Backoff state while the runtime is `exhausted` ({since, attempts, nextAt, lastReason}); null when healthy.
   recovery: null,
 };
@@ -9681,15 +9683,51 @@ function strataCudaBlocked(cfg) {
 }
 
 /**
+ * Choose the HIP expert cache once llama is evicted (docs/Designs/ResourceArbiter.md section 1).
+ * A restart of a serving engine (grow-back, prefill wedge) passes `keepAtLeast`: it waits up to
+ * the full reclaim window for that size rather than come back smaller or be refused because a
+ * tenant grabbed the memory during the stop. Only when the start would be refused (even the floor
+ * does not fit) does it ask Pods to release idle workers, then wait for the floor.
+ * @param {object} cfg Resolved Strata config with `hip`.
+ * @param {number} headroomBytes Free memory kept beside Strata.
+ * @param {number} [keepAtLeast] Previous expert cache of a restarted engine (0 = fresh start).
+ * @returns {Promise<{slots:number|null, reason:string}>} strataHipExpertCache's answer.
+ */
+async function sizeStrataHipCache(cfg, headroomBytes, keepAtLeast = 0) {
+  const choose = (minSlots) => strataHipExpertCache({
+    configured: cfg.hip.expertCache, minSlots, availableBytes: memAvailableBytes(), baseBytes: cfg.hip.baseBytes, headroomBytes,
+  });
+  const waitFor = async (slots) => (await pollForReclaim({
+    readMemAvailable: memAvailableBytes,
+    targetBytes: strataHipFootprintBytes({ expertCache: slots, baseBytes: cfg.hip.baseBytes }) + headroomBytes,
+    timeoutMs: DS4_RECLAIM_TIMEOUT_MS, intervalMs: DS4_RECLAIM_INTERVAL_MS,
+  })).ok;
+  const keep = Math.min(keepAtLeast, cfg.hip.expertCache);
+  if (keep > 0) {
+    const kept = choose(Math.max(keep, cfg.hip.minExpertCache));
+    if (kept.slots !== null) return kept;
+    addLog('presets', `strata: restart waiting up to ${Math.round(DS4_RECLAIM_TIMEOUT_MS / 1000)}s to keep its ${keep} expert slots (${kept.reason})`);
+    if (await waitFor(keep)) return choose(Math.max(keep, cfg.hip.minExpertCache));
+    addLog('presets', `strata: could not keep ${keep} expert slots after ${Math.round(DS4_RECLAIM_TIMEOUT_MS / 1000)}s; sizing to what fits`);
+  }
+  const fit = choose(cfg.hip.minExpertCache);
+  if (fit.slots !== null) return fit;
+  const released = await releaseIdlePodsWorkers(`strata hip start would be refused: ${fit.reason}`);
+  if (released.released.length && await waitFor(cfg.hip.minExpertCache)) return choose(cfg.hip.minExpertCache);
+  return fit;
+}
+
+/**
  * Start one Strata backend attempt. Reaps stray `strata` pids (a previous manager
  * instance's orphans, since KillMode=process), then for HIP always evicts llama with
  * verified reclaim, then spawns. Never throws.
  *
  * @param {object} preset The strata preset.
- * @param {{backend:'hip'|'cuda'}} attempt The backend to try.
+ * @param {{backend:'hip'|'cuda', keepAtLeast?:number}} attempt The backend to try; `keepAtLeast` is the
+ *   expert cache a restarted serving HIP engine must not come back below (sizeStrataHipCache).
  * @returns {Promise<{ok:true}|{ok:false, abort:boolean, reason:string}>} `abort` ends the whole ladder.
  */
-async function startStrataAttempt(preset, { backend }) {
+async function startStrataAttempt(preset, { backend, keepAtLeast = 0 }) {
   const cfg = strataConfig();
   try {
     // 0. A missing interpreter fails every backend the same way: abort the ladder before
@@ -9747,11 +9785,6 @@ async function startStrataAttempt(preset, { backend }) {
       releaseStrataCudaLease();
       residentBytes = cfg.hip.residentBytes;
       reclaimTimeoutMs = STRATA_HIP_SETTLE_MS;
-      const needBytes = residentBytes + ds4HeadroomBytes();
-      if (memAvailableBytes() < needBytes) {
-        const released = await releaseIdlePodsWorkers(`strata hip needs ${gibStr(needBytes)} GiB for ${cfg.hip.expertCache} expert slots`);
-        if (released.released.length) reclaimTimeoutMs = DS4_RECLAIM_TIMEOUT_MS;
-      }
     } else {
       return { ok: false, abort: false, reason: `backend-unavailable:${backend}` };
     }
@@ -9766,10 +9799,7 @@ async function startStrataAttempt(preset, { backend }) {
       const { resident, residentAfterEvict, reclaimOk } = await evictLlamaForExclusive({ label: 'strata', targetBytes, keepEmbed, timeoutMs: reclaimTimeoutMs });
       let fit = null;
       if (backend === 'hip' && !residentAfterEvict) {
-        fit = strataHipExpertCache({
-          configured: cfg.hip.expertCache, minSlots: cfg.hip.minExpertCache, availableBytes: memAvailableBytes(),
-          baseBytes: cfg.hip.baseBytes, headroomBytes,
-        });
+        fit = await sizeStrataHipCache(cfg, headroomBytes, keepAtLeast);
         addLog('presets', `strata: hip expert cache ${fit.slots ?? 'refused'} (${fit.reason})`);
         if (fit.slots !== null) {
           launch.expertCache = fit.slots;
@@ -9835,7 +9865,7 @@ function warnStrataCudaPriority(cfg) {
  * @param {{swapGate?: ?function}} [opts] The caller's settle function when it already holds the gate.
  * @returns {Promise<void>}
  */
-async function strataLeaveCuda(reason, { swapGate = null } = {}) {
+async function strataLeaveCuda(reason, { swapGate = null, drainMs = null } = {}) {
   const eng = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA];
   let settle = swapGate;
   if (!settle) {
@@ -9846,7 +9876,7 @@ async function strataLeaveCuda(reason, { swapGate = null } = {}) {
   }
   try {
     addLog('presets', `strata: leaving cuda (${reason})`);
-    await drainExclusiveRequests(eng, strataConfig().policy.drainMaxWaitMs);
+    await drainExclusiveRequests(eng, drainMs ?? strataConfig().policy.drainMaxWaitMs);
     for (const entry of activeRequests.values()) {
       if (entry.backend === 'strata') entry.abortController?.abort();
     }
@@ -9866,15 +9896,18 @@ async function strataLeaveCuda(reason, { swapGate = null } = {}) {
  * @param {'cuda'|'hip'} target Preferred backend; a failed CUDA return falls back to HIP.
  * @param {string} reason Why the swap happened.
  * @param {function} settle The gate's settle function.
+ * @param {{keepAtLeast?: number}} [opts] For a restart of a serving HIP engine: the expert cache it
+ *   had, which the HIP attempt waits to keep instead of coming back smaller (sizeStrataHipCache).
  */
-function runStrataLoadPhase(target, reason, settle) {
+function runStrataLoadPhase(target, reason, settle, { keepAtLeast = 0 } = {}) {
   const runtime = strataState.runtime;
   (async () => {
     try {
       // Setup lives inside the try: a throw here must still settle the gate.
       const cfg = strataConfig();
       const preset = config.presets?.[strataState.activePresetId];
-      const attempts = (target === 'hip' ? [cfg.hip && { backend: 'hip' }] : [cfg.cuda && { backend: 'cuda' }, cfg.hip && { backend: 'hip' }]).filter(Boolean);
+      const hip = cfg.hip && { backend: 'hip', keepAtLeast };
+      const attempts = (target === 'hip' ? [hip] : [cfg.cuda && { backend: 'cuda' }, hip]).filter(Boolean);
       if (!preset || !runtime || attempts.length === 0) {
         if (runtime) Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: 'swap-no-backend' });
         return;
@@ -9935,23 +9968,57 @@ function runStrataLoadPhase(target, reason, settle) {
  *
  * @param {'cuda'|'hip'} target Backend to move to.
  * @param {string} reason Why.
+ * @param {{settle?: ?function, keepAtLeast?: number, drainMs?: ?number}} [opts] `settle`: a gate the
+ *   caller already armed (the prefill watchdog's lane hold); `keepAtLeast`: the expert cache a
+ *   restarted HIP engine must not come back below; `drainMs`: drain bound (0 for a wedged engine).
  * @returns {Promise<void>} Resolves when the leave phase is done; returns at once if a swap is in flight.
  */
-async function strataSwapBackend(target, reason) {
-  const settle = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();
+async function strataSwapBackend(target, reason, { settle: armed = null, keepAtLeast = 0, drainMs = null } = {}) {
+  const settle = armed || EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();
   if (!settle) return;
   const runtime = strataState.runtime;
   strataState.swapGeneration += 1;
   if (runtime) runtime.status = 'swapping';
   try {
-    await strataLeaveCuda(reason, { swapGate: settle }); // drain + abort + verified stop; also serves HIP -> CUDA
+    await strataLeaveCuda(reason, { swapGate: settle, drainMs }); // drain + abort + verified stop; also serves HIP -> CUDA
   } catch (err) {
     addLog('presets', `strata: leave phase failed (${err.message})`);
     if (runtime) Object.assign(runtime, { status: err.stopUnconfirmed ? 'stop-unconfirmed' : 'exhausted', backend: null, settledAt: Date.now(), reason: err.message });
     settle();
     return;
   }
-  runStrataLoadPhase(target, reason, settle);
+  runStrataLoadPhase(target, reason, settle, { keepAtLeast });
+}
+
+/**
+ * Hold Strata's exclusive lane after a prefill cancel: arm the swap gate (new requests wait) and
+ * reserve the single generation slot at realtime priority (requests already queued for it wait
+ * instead of being sent into a possibly wedged engine).
+ * @returns {?{settle: function, slot: Promise<?number>, controller: AbortController}} the hold, or
+ *   null when a swap is already in flight (it holds the lane itself).
+ */
+function holdStrataLane() {
+  const settle = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();
+  if (!settle) return null;
+  const controller = new AbortController();
+  const slot = ds4Queue.acquire({ model: 'strata-prefill-watchdog', endpoint: 'prefill-watchdog', priority: 'realtime', signal: controller.signal })
+    .catch(() => null);
+  return { settle, slot, controller };
+}
+
+/**
+ * Release a lane hold from holdStrataLane: drop or free its slot reservation and, unless the
+ * caller hands the gate to a restart, settle the swap gate.
+ * @param {?{settle: function, slot: Promise<?number>, controller: AbortController}} hold the hold.
+ * @param {{settleGate?: boolean}} [opts] false when a restart takes over the armed gate.
+ * @returns {Promise<void>}
+ */
+async function releaseStrataLaneHold(hold, { settleGate = true } = {}) {
+  if (!hold) return;
+  hold.controller.abort();
+  const id = await hold.slot;
+  if (id != null) ds4Queue.release(id);
+  if (settleGate) hold.settle();
 }
 
 /**
@@ -9969,8 +10036,6 @@ async function readStrataLive(port) {
 }
 
 const podsReleaseState = {};
-/** The only `config.podsRelease` keys a config write may set (the target lives in the environment). */
-const PODS_RELEASE_FIELDS = ['enabled', 'minIdleSec'];
 
 /** Host names this machine answers to, for configWriteTrusted. */
 function configWriteLocalNames() {
@@ -10025,22 +10090,47 @@ async function strataBackendTick() {
       return;
     }
   }
-  if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready' && !strataState.swapPromise
-    && (ds4Queue.active > 0 || strataState.prefillWatch?.cancelledAt != null)) {
-    // Prefill-hang watchdog (docs/Designs/ResourceArbiter.md section 4): a prompt read that stops
-    // progressing is cancelled; still stuck after the cancel means a wedged engine, restarted in place.
-    const pf = strataPrefillVerdict({ live: await readStrataLive(cfg.port), prev: strataState.prefillWatch, now: Date.now(), stallMs: cfg.policy.prefillStallMs });
+  if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready'
+    && (strataState.prefillHold || (!strataState.swapPromise && ds4Queue.active > 0))) {
+    // Prefill-hang watchdog (docs/Designs/ResourceArbiter.md section 4). The verdict is bound to the
+    // request holding the exclusive slot. A cancel holds the lane (swap gate + the slot itself) so no
+    // queued request is sent into a possibly wedged engine; progress or leaving 'reading' releases it,
+    // a confirmed wedge restarts the engine under that same gate and the held requests are replayed.
+    const holder = [...ds4Queue.activeItems.values()].find((item) => item.activeReqId != null);
+    const pf = strataPrefillVerdict({
+      live: await readStrataLive(cfg.port), prev: strataState.prefillWatch, reqId: holder?.activeReqId ?? null,
+      now: Date.now(), stallMs: cfg.policy.prefillStallMs,
+    });
     strataState.prefillWatch = pf.state;
     if (pf.action === 'cancel') {
-      addLog('presets', `strata prefill stalled: ${pf.reason}; cancelling the request`);
-      for (const item of ds4Queue.activeItems.values()) activeRequests.get(item.activeReqId)?.abortController?.abort();
+      addLog('presets', `strata prefill stalled: ${pf.reason}; cancelling request ${holder?.activeReqId ?? '?'} and holding the lane`);
+      strataState.prefillHold = holdStrataLane();
+      if (holder) activeRequests.get(holder.activeReqId)?.abortController?.abort();
     } else if (pf.action === 'restart') {
-      addLog('presets', `strata prefill ${pf.reason}; restarting on ${runtime.backend}`);
+      const hold = strataState.prefillHold;
+      strataState.prefillHold = null;
       strataState.prefillWatch = null;
-      await strataSwapBackend(runtime.backend, 'prefill-wedged');
+      addLog('presets', `strata prefill ${pf.reason}; restarting on ${runtime.backend}`);
+      // Abort the requests queued behind the hold first (they have sent nothing, so they are replayed
+      // after the restart); freeing the slot before that would hand it to one of them.
+      for (const entry of activeRequests.values()) if (entry.backend === 'strata') entry.abortController?.abort();
+      await releaseStrataLaneHold(hold, { settleGate: false }); // the restart below settles the gate
+      await strataSwapBackend(runtime.backend, 'prefill-wedged', {
+        settle: hold?.settle, keepAtLeast: runtime.expertCache?.effective ?? 0, drainMs: 0,
+      });
       return;
+    } else if (strataState.prefillHold && !pf.state?.cancelledAt) {
+      addLog('presets', `strata prefill: engine recovered after the cancel (${pf.reason}); releasing the lane`);
+      const hold = strataState.prefillHold;
+      strataState.prefillHold = null;
+      await releaseStrataLaneHold(hold);
     }
   } else {
+    if (strataState.prefillHold) {
+      const hold = strataState.prefillHold;
+      strataState.prefillHold = null;
+      await releaseStrataLaneHold(hold);
+    }
     strataState.prefillWatch = null;
   }
   if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready' && runtime.backend === 'hip'
@@ -10050,6 +10140,7 @@ async function strataBackendTick() {
     const grow = strataGrowDecision({
       effective: runtime.expertCache.effective, configured: cfg.hip.expertCache, minSlots: cfg.hip.minExpertCache,
       availableBytes: memAvailableBytes(), baseBytes: cfg.hip.baseBytes, headroomBytes: ds4HeadroomBytes(),
+      growMarginBytes: cfg.hip.growMarginBytes,
       busy: ds4Queue.active > 0 || ds4Queue.pending > 0 || [...activeRequests.values()].some((r) => r.backend === 'strata'),
       idleSinceMs: strataState.growIdleSinceMs, settledAt: runtime.settledAt ?? 0,
       now: Date.now(), growCooldownMs: cfg.hip.growCooldownMs,
@@ -10057,9 +10148,9 @@ async function strataBackendTick() {
     strataState.growIdleSinceMs = grow.idleSinceMs;
     if (grow.action === 'grow') {
       addLog('presets', `strata: ${grow.reason}; restarting on hip between requests`);
-      await strataSwapBackend('hip', grow.reason);
+      await strataSwapBackend('hip', grow.reason, { keepAtLeast: runtime.expertCache.effective });
       return;
-    } else if (grow.needMemory) void releaseIdlePodsWorkers(`strata idle at ${runtime.expertCache.effective} of ${cfg.hip.expertCache} expert slots`);
+    }
   }
   if (strataTickRunning || currentEngine !== ENGINE_TYPES.STRATA || runtime?.status !== 'ready'
     || !cfg.cuda || strataState.swapPromise) return;
@@ -11198,22 +11289,9 @@ app.post('/api/config', (req, res) => {
     const tooBig = fit.warnings.find((w) => w.startsWith('strata.hip.expertCache'));
     if (tooBig) return res.status(400).json({ error: tooBig, code: 'STRATA_HIP_TOO_LARGE' });
   }
-  // `podsRelease` switches the Pods release on; where the key goes is env-only (pods-release.js).
-  if ('podsRelease' in updates && !isLoopbackRequest(req)) {
-    return res.status(403).json({ error: 'The podsRelease config may only be changed from this machine.', code: 'NOT_LOOPBACK' });
-  }
-  // Loopback is not enough: a browser on this host can POST cross-origin or via DNS rebinding.
-  if ('strata' in updates || 'podsRelease' in updates) {
-    const trust = configWriteTrusted({ host: req.headers.host, origin: req.headers.origin, localNames: configWriteLocalNames() });
-    if (!trust.ok) return res.status(403).json({ error: `Refused: ${trust.reason}`, code: 'UNTRUSTED_ORIGIN' });
-  }
-  if ('podsRelease' in updates) {
-    const pr = updates.podsRelease;
-    const extra = pr && typeof pr === 'object' ? Object.keys(pr).filter((k) => !PODS_RELEASE_FIELDS.includes(k)) : ['(not an object)'];
-    if (extra.length) {
-      return res.status(400).json({ error: `podsRelease accepts only ${PODS_RELEASE_FIELDS.join(', ')}; the coordinator URL, node id and key come from the environment (PODS_COORDINATOR_URL, PODS_NODE_ID, PODS_API_KEY). Refused: ${extra.join(', ')}`, code: 'PODS_RELEASE_FIELD' });
-    }
-  }
+  // `podsRelease` (env-only target, pods-release.js) and `strata`: loopback, trusted Host/Origin, allowlist.
+  const refusal = configUpdateRefusal({ updates, loopback: isLoopbackRequest(req), host: req.headers.host, origin: req.headers.origin, localNames: configWriteLocalNames() });
+  if (refusal) return res.status(refusal.status).json(refusal.body);
   for (const [presetId, preset] of Object.entries(updates.presets || {})) {
     if (!preset || (preset.engine || ENGINE_TYPES.LLAMA) === ENGINE_TYPES.LLAMA) continue;
     const check = validatePresetEngineFields(preset);

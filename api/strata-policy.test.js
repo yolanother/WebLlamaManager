@@ -282,8 +282,8 @@ const PF = { stallMs: 180_000, wedgeGraceMs: 30_000 };
 /** Feed a sequence of [now, live] samples through the verdict; returns every verdict. */
 function run(samples) {
   let state = null;
-  return samples.map(([now, live]) => {
-    const v = strataPrefillVerdict({ live, prev: state, now, ...PF });
+  return samples.map(([now, live, reqId = 1]) => {
+    const v = strataPrefillVerdict({ live, prev: state, now, reqId, ...PF });
     state = v.state;
     return v;
   });
@@ -306,4 +306,24 @@ test('strataPrefillVerdict: generating, idle or unreadable metrics never cancel;
   assert.equal(strataPrefillVerdict({ live: null, prev: { read: -1, since: 0, cancelledAt: null }, now: 900_000, ...PF }).action, 'ok');
   const v = run([[0, reading(null)], [180_000, reading(null)], [190_000, { state: 'idle' }], [400_000, { state: 'idle' }]]);
   assert.deepEqual(v.map((x) => x.action), ['ok', 'cancel', 'ok', 'ok']);
+});
+
+test('strataPrefillVerdict: a different request (or prompt) starts its own clock; it never inherits the old one (review)', () => {
+  // Client-aborted request 1 at 170 s, request 2 starts reading: its 180 s run from 170 s, not 0.
+  const v = run([[0, reading(null), 1], [170_000, reading(null), 2], [340_000, reading(null), 2], [355_000, reading(null), 2]]);
+  assert.deepEqual(v.map((x) => x.action), ['ok', 'ok', 'ok', 'cancel']);
+  // Same request id but a different prompt total is a different prompt.
+  const w = run([[0, reading(null, 1282)], [170_000, reading(null, 35000)], [340_000, reading(null, 35000)]]);
+  assert.deepEqual(w.map((x) => x.action), ['ok', 'ok', 'ok']);
+});
+
+test('strataPrefillVerdict: after a cancel, a new prompt reading is progress, not a wedge (review probe: 4 samples, no restart)', () => {
+  const v = run([[0, reading(null, 1282)], [180_000, reading(null, 1282)], [185_000, reading(null, 35000), null], [210_000, reading(null, 35000), null]]);
+  assert.deepEqual(v.map((x) => x.action), ['ok', 'cancel', 'ok', 'ok']);
+  assert.equal(v[2].state.cancelledAt, null, 'progress clears the cancel, so the caller releases its lane hold');
+});
+
+test('strataPrefillVerdict: metrics unreadable after a cancel still escalate to restart after the grace (no hold forever)', () => {
+  const v = run([[0, reading(null)], [180_000, reading(null)], [195_000, null, null], [211_000, null, null]]);
+  assert.deepEqual(v.map((x) => x.action), ['ok', 'cancel', 'ok', 'restart']);
 });
