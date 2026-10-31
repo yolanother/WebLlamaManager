@@ -279,3 +279,34 @@ test('batching bound holds with mixed-class traffic for the batched model (revie
   const jumps = before.filter((x) => x === 'A/interactive').length;
   assert.equal(jumps, 16, `interactive A jumped B ${jumps} times; the cap is 16 (background fairness picks are not jumps)`);
 });
+
+test('batching bound holds for every skipped request when another model is picked in between (review M2)', async () => {
+  // interactive B, 80 interactive A, then background C and 7 background A; last model A.
+  const queue = new PriorityRequestQueue(1, { maxBackgroundQueued: 8 });
+  const first = await queue.acquire({ model: 'A' });
+  const tagged = [];
+  const add = (model, priority) => { const p = enqueue(queue, model, priority); tagged.push({ p, label: `${model}/${priority}` }); return p; };
+  add('B', 'interactive');
+  for (let i = 0; i < 80; i++) add('A', 'interactive');
+  add('C', 'background');
+  for (let i = 0; i < 7; i++) add('A', 'background');
+  const order = [];
+  tagged.forEach(({ p, label }) => p.then(() => order.push(label)));
+  await drainOrder(queue, first, tagged.map((t) => t.p));
+  const jumpsOver = (label, jumper) => order.slice(0, order.indexOf(label)).filter((x) => x === jumper).length;
+  assert.ok(jumpsOver('B/interactive', 'A/interactive') <= 16, `B jumped ${jumpsOver('B/interactive', 'A/interactive')} times`);
+  assert.ok(jumpsOver('C/background', 'A/background') <= 16, `C jumped ${jumpsOver('C/background', 'A/background')} times`);
+  assert.ok(order.indexOf('B/interactive') < 40, `B served at pick ${order.indexOf('B/interactive') + 1}`);
+});
+
+test('a front reservation is served before every queued request, including realtime ones for the batched model', async () => {
+  const queue = new PriorityRequestQueue(1);
+  const first = await queue.acquire({ model: 'strata' });
+  const order = [];
+  const rt = queue.acquire({ model: 'strata', priority: 'realtime' }).then((id) => { order.push('queued-realtime'); return id; });
+  const hold = queue.acquire({ model: 'hold', priority: 'realtime', front: true }).then((id) => { order.push('HOLD'); return id; });
+  queue.release(first);
+  queue.release(await hold);
+  queue.release(await rt);
+  assert.deepEqual(order, ['HOLD', 'queued-realtime']);
+});

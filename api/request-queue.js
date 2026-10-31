@@ -67,8 +67,6 @@ export class PriorityRequestQueue {
     this._highPriorityBurst = 0;
     this.maxModelBatch = Math.max(0, maxModelBatch);
     this._lastModel = null;
-    this._modelJumps = 0;
-    this._skippedId = null;
     this.activeItems = new Map();
   }
 
@@ -82,6 +80,7 @@ export class PriorityRequestQueue {
    * Acquire capacity for an item.
    * @param {object} meta Metadata exposed in queue telemetry.
    * @param {AbortSignal} [meta.signal] Cancellation signal while waiting.
+   * @param {boolean} [meta.front] Reserve the next free slot ahead of everything queued (a lane hold).
    * @returns {Promise<number>} Queue item identifier used for release/cancel.
    * @throws {Error} With name `AbortError` when cancelled before activation.
    */
@@ -111,7 +110,8 @@ export class PriorityRequestQueue {
     const pending = new Promise((resolve, reject) => {
       item._resolve = resolve;
       item._reject = reject;
-      this.queue.push(item);
+      if (meta.front) this.queue.unshift(item);
+      else this.queue.push(item);
       if (signal) {
         const onAbort = () => this._cancelPendingItem(item, this._abortError(signal.reason));
         signal.addEventListener('abort', onAbort, { once: true });
@@ -217,24 +217,27 @@ export class PriorityRequestQueue {
 
   /**
    * Prefer the oldest item in the same priority class for the model that ran last, over the
-   * class head `index`. The jump budget belongs to the head being skipped: it can be jumped at
-   * most maxModelBatch times, whatever other classes are served in between, then it runs.
+   * class head `index`. Every item jumped this way counts the jump on itself; a head that has
+   * been jumped maxModelBatch times runs next, whatever was served in other classes meanwhile.
    * @param {number} index Queue index the priority rules chose (-1 for none).
    * @returns {number} The index to activate.
    */
   _batchByModel(index) {
     if (index < 0 || this._lastModel == null) return index;
     const head = this.queue[index];
-    if (head.model === this._lastModel) return index;
-    if (this._skippedId !== head.id) { this._skippedId = head.id; this._modelJumps = 0; }
+    if (head.model === this._lastModel || (head._jumps ?? 0) >= this.maxModelBatch) return index;
     const same = this.queue.findIndex(item => item.priority === head.priority && item.model === this._lastModel);
-    if (same < 0 || this._modelJumps >= this.maxModelBatch) return index;
-    this._modelJumps++;
+    if (same < 0) return index;
+    for (let i = index; i < same; i++) {
+      const skipped = this.queue[i];
+      if (skipped.priority === head.priority) skipped._jumps = (skipped._jumps ?? 0) + 1;
+    }
     return same;
   }
 
   /** Pick the next item, enforcing priority ordering, bounded starvation and per-model batching. */
   _nextIndex() {
+    if (this.queue[0]?.front) return 0; // a front reservation (acquire({front: true})) goes first
     return this._batchByModel(this._priorityIndex());
   }
 
