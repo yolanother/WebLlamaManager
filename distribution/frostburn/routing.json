@@ -1,0 +1,22 @@
+{
+  "_comment": "Frostburn llama-manager routing (W2, T3231237771803): the durable record of the hand-applied alias + backend-priority config. default-big prefers drakemore Strata (podcast) then local Qwen3.6-35B-A3B; default-small prefers dahaka qwen3:8b (moves narration off drakemore) then drakemore then local Qwen3-8B. Lower backend priority wins before speed and alias order. Pinned by tests/remote-failover/frostburn-routing.test.mjs; apply with the curls in docs/Guides/frostburn-routing.md.",
+  "backendPriority": {
+    "drakemore-mtj8prpy": 10,
+    "dahaka-ollama-mngx88pk": 9
+  },
+  "aliases": {
+    "default-big": {
+      "targets": [
+        { "host": "drakemore-mtj8prpy", "model": "default-big" },
+        { "host": "local", "model": "unsloth_Qwen3.6-35B-A3B-GGUF" }
+      ]
+    },
+    "default-small": {
+      "targets": [
+        { "host": "dahaka-ollama-mngx88pk", "model": "qwen3:8b" },
+        { "host": "drakemore-mtj8prpy", "model": "default-small" },
+        { "host": "local", "model": "Qwen_Qwen3-8B-GGUF" }
+      ]
+    }
+  }
+}
