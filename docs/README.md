@@ -36,6 +36,7 @@ hardware-specific gotchas of the AMD Strix Halo (gfx1151) box it targets.
 - [features/model-performance-history.md](features/model-performance-history.md) — per-model prompt/decode/TTFT/speculative history, scenario labels, and the dashboard/API contract
 - [features/laya-decision-engine.md](features/laya-decision-engine.md) — System 1 DECISION engine: Laya (self-hosted Jev), `/v1/systemone`, the drakemore-first `laya` alias, ROCm/CUDA + GPU selection, how the image ships on the ISO
 - [features/gpu-reservations.md](features/gpu-reservations.md) — naming a GPU by class, leasing a card at a priority that preempts llama-manager, `reserve` vs `lock`, TTL, the loopback rule
+- [features/gpu-power-schedule.md](features/gpu-power-schedule.md) — NVIDIA power cap with hour windows (`gpuPower`), enforcement and fail-safe, the root oneshot + polkit grant, `GET /api/gpu-power`, setting the hours from UI/CLI/API
 - [Designs/GpuReservations.md](Designs/GpuReservations.md) — why pools are class-matched, why model pins are reservations, why preemption is strictly-greater, and the honest CUDA state
 - [Designs/ChatPage.md](Designs/ChatPage.md) · [Designs/ApiDocs.md](Designs/ApiDocs.md) · [Designs/DocsPage.md](Designs/DocsPage.md) — UI page designs
 - [Designs/OpenCode.md](Designs/OpenCode.md) — OpenCode provider integration

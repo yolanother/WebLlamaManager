@@ -44,6 +44,7 @@ same catalog used by the parser, so agents do not need to scrape this page.
 - Health and analytics: `status`, `stats`, `analytics`
 - Models: `models list|load|unload|delete`
 - Runtime: `server start|stop`, `settings get|update`
+- GPU power cap: `gpu-power status|set` (see [features/gpu-power-schedule.md](../features/gpu-power-schedule.md); `set` is loopback-only)
 - Presets: `presets list|activate`
 - Discovery and installation: `search`, `repo files`, `download`,
   `downloads list|status|cancel`

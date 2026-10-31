@@ -359,6 +359,18 @@ Entirely additive: with no `gpus` array configured, no pool resolves and a one-G
 appliance behaves exactly as it did. See
 [`features/gpu-reservations.md`](features/gpu-reservations.md).
 
+### GPU power-cap schedule
+
+`gpuPower` in settings caps every discrete NVIDIA card at a default wattage. Hour windows
+can set a different cap; they may cross midnight, can be limited to days, are read in an
+IANA timezone, and the highest wins where they overlap. The cap is applied at start, on a
+settings change and every minute, and only when it differs from `power.limit`. If the
+schedule cannot be evaluated, the default cap is used. The write needs root, so it goes
+through the package's `llama-manager-gpu-power@<watts>.service` oneshot, which the polkit
+rule lets the manager START. Writes are loopback-only and cross-origin requests are
+refused. `GET /api/gpu-power` is the read-only status. Inert unless `enabled`. See
+[`features/gpu-power-schedule.md`](features/gpu-power-schedule.md).
+
 ---
 
 ## Ports
@@ -382,6 +394,7 @@ appliance behaves exactly as it did. See
 | Guards | `api/mem-watchdog.js`, `resource-guard.js`, `restart-governor.js`, `queue-admission.js`, `slot-reaper.js`, `engine-kill.js`, `upstream-retry.js` |
 | System 1 DECISION engine (Laya) | `api/decision.js`, `api/decision-router.js`, `api/decision-supervisor.js`, `packaging/decision/Containerfile`, `scripts/decision-build-image.sh`, `scripts/decision-bench.mjs` |
 | GPU pools, reservations, drain, accelerator | `api/gpu-pools.js`, `api/gpu-reservations.js`, `api/gpu-drain.js`, `api/duo-accelerator.js` |
+| GPU power-cap schedule | `api/gpu-power.js`, `llama-manager-gpu-power@.service`, `scripts/llama-manager-gpu-power`, `packaging/90-llama-manager.rules`, `ui/src/pages/gpu-power-form.js` |
 | Slot KV cache | `api/slot-cache.js` |
 | Embeddings / HF token / app usage | `api/embeddings.js`, `api/hf-token.js`, `api/app-usage.js` |
 | Launchers | `start-llama.sh`, `start-preset.sh`, `container-start.sh`, `start-ds4.sh`, `start-embed.sh` |
@@ -392,6 +405,7 @@ appliance behaves exactly as it did. See
 
 - [`features/model-alias-groups.md`](features/model-alias-groups.md) — alias groups: config shape, the warm gate, migration from `modelMapping`
 - [`features/gpu-reservations.md`](features/gpu-reservations.md) — GPU pools, priorities, leases, drain, the loopback rule
+- [`features/gpu-power-schedule.md`](features/gpu-power-schedule.md) — NVIDIA power cap with hour windows, privilege model, status, how to set the hours
 - [`features/laya-decision-engine.md`](features/laya-decision-engine.md) — Laya / System 1: `/v1/systemone`, the `laya` alias, config, packaging, latency
 - [`Designs/GpuReservations.md`](Designs/GpuReservations.md) — GPU reservation design decisions and their reasons
 - [`ds4-engine.md`](ds4-engine.md) — DeepSeek V4 Flash engine (this feature set's centerpiece)
