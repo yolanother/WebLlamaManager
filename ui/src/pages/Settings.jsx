@@ -3,7 +3,8 @@
 // LICENSE file in the repository root.
 //
 // Provides appearance, general configuration, model alias groups, remote
-// backends, and llama.cpp update controls in glass-aligned settings panels.
+// backends, GPU pools and the NVIDIA power-cap schedule, duo mode, and
+// llama.cpp update controls in glass-aligned settings panels.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
@@ -19,6 +20,7 @@ import {
 import {
   duoConfigSections, defaultDuoSettings, validateDuoSettings,
 } from './duo-config.js';
+import { formFromSettings, bodyFromForm, WEEKDAYS as GPU_POWER_WEEKDAYS } from './gpu-power-form.js';
 import { resolveLlamaUpdateView } from '../llama-update-policy.js';
 import { DEFAULT_THEME_ID } from '../theme/manifest.js';
 import {
@@ -722,7 +724,10 @@ function SettingsPage() {
       )}
 
       {activeTab === 'gpus' && (
-        <GpusSection setMessage={setMessage} />
+        <>
+          <GpusSection setMessage={setMessage} />
+          <GpuPowerSection setMessage={setMessage} />
+        </>
       )}
       {activeTab === 'duo' && (
         <DuoSection setMessage={setMessage} />
@@ -1462,6 +1467,152 @@ function AliasesSection({ setMessage }) {
           </div>
         );
       })}
+    </section>
+  );
+}
+
+/**
+ * GPU power-cap schedule editor (Settings > GPUs). Edits `settings.gpuPower`: a default
+ * cap for every NVIDIA card plus hour windows that allow a different cap, in an IANA
+ * timezone. Shows the live readout from GET /api/gpu-power (current limit and draw, the
+ * active window, the next change). The server validates against the card's own range and
+ * applies a save immediately; its error text is shown as-is.
+ * @param {{setMessage: (m: {type: string, text: string}) => void}} props
+ * @returns {JSX.Element}
+ */
+function GpuPowerSection({ setMessage }) {
+  const [form, setForm] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const loadStatus = useCallback(async () => {
+    try { setStatus(await (await fetch(`${API_BASE}/gpu-power`)).json()); } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/settings`).then(r => r.json())
+      .then(d => setForm(formFromSettings(d?.settings?.gpuPower)))
+      .catch(() => setForm(formFromSettings(undefined)));
+    loadStatus();
+    const timer = setInterval(loadStatus, 15000);
+    return () => clearInterval(timer);
+  }, [loadStatus]);
+
+  if (!form) return null;
+  const set = (patch) => setForm({ ...form, ...patch });
+  const setWindow = (i, patch) => set({ windows: form.windows.map((w, j) => (j === i ? { ...w, ...patch } : w)) });
+  const toggleDay = (i, day) => {
+    const days = form.windows[i].days;
+    setWindow(i, { days: days.includes(day) ? days.filter(d => d !== day) : [...days, day] });
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const res = await fetch(`${API_BASE}/settings`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gpuPower: bodyFromForm(form) }),
+      });
+      const data = await res.json();
+      setMessage(data.success
+        ? { type: 'success', text: 'GPU power schedule saved and applied' }
+        : { type: 'error', text: data.error || `HTTP ${res.status}` });
+      if (data.success) setTimeout(loadStatus, 1500);
+    } catch (err) {
+      setMessage({ type: 'error', text: `Failed to save GPU power schedule: ${err.message}` });
+    }
+    setSaving(false);
+  };
+
+  const card = status?.cards?.[0];
+  const range = status?.range;
+  const at = (iso) => new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+  const cell = { padding: '4px 6px' };
+
+  return (
+    <section className="page-section glass-panel">
+      <h3>GPU power cap</h3>
+      <p className="setting-hint" style={{ marginBottom: '12px' }}>
+        Caps every NVIDIA card at the <strong>default</strong> wattage, except inside the hour
+        windows below. Windows may cross midnight; <strong>days</strong> name the day a window
+        starts on (none ticked = every day); where windows overlap the highest wins. Applied on
+        save, at service start and every minute.
+        {range && <> This card accepts <strong>{range.min}–{range.max} W</strong>.</>}
+      </p>
+
+      <p className="setting-hint">
+        {status == null ? 'Reading the card…'
+          : status.available === false ? `Not active: ${status.reason}`
+            : !status.enabled ? `Schedule disabled${card ? ` — card at ${card.limitWatts} W, drawing ${card.drawWatts} W` : ''}`
+              : <>
+                Now <strong>{card?.limitWatts} W</strong> limit, drawing {card?.drawWatts} W —{' '}
+                {status.activeWindow ? `window ${status.activeWindow.start}–${status.activeWindow.end}` : 'default cap'}
+                {status.nextChange ? `; next: ${status.nextChange.watts} W at ${at(status.nextChange.at)}` : '; no scheduled change'}
+                {status.timezone ? ` (${status.timezone})` : ''}
+                {status.lastError && <span style={{ color: 'var(--error, #f87171)' }}> — {status.lastError}</span>}
+              </>}
+      </p>
+
+      <div className="settings-grid">
+        <div className="setting-item">
+          <label htmlFor="gpuPowerEnabled">Enabled</label>
+          <input id="gpuPowerEnabled" type="checkbox" checked={form.enabled} onChange={e => set({ enabled: e.target.checked })} />
+        </div>
+        <div className="setting-item">
+          <label htmlFor="gpuPowerDefault">Default cap (W)</label>
+          <input id="gpuPowerDefault" className="glass-input" type="number" min={range?.min} max={range?.max}
+            value={form.defaultWatts} onChange={e => set({ defaultWatts: e.target.value })} />
+        </div>
+        <div className="setting-item">
+          <label htmlFor="gpuPowerTz">Timezone</label>
+          <input id="gpuPowerTz" className="glass-input" placeholder="system timezone, e.g. America/Los_Angeles"
+            value={form.timezone} onChange={e => set({ timezone: e.target.value })} />
+        </div>
+      </div>
+
+      <h4 style={{ margin: '12px 0 6px' }}>Windows</h4>
+      {form.windows.length === 0 && <p className="setting-hint">No windows — the default cap applies at all times.</p>}
+      {form.windows.length > 0 && (
+        <div className="model-map-table-wrap">
+          <table className="model-map-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ textAlign: 'left', color: 'var(--text-secondary)', fontSize: '0.8em' }}>
+                <th style={cell}>Start</th><th style={cell}>End</th><th style={cell}>Watts</th><th style={cell}>Days</th><th style={cell}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {form.windows.map((w, i) => (
+                <tr key={i}>
+                  <td style={cell}><input className="glass-input" type="time" value={w.start} onChange={e => setWindow(i, { start: e.target.value })} /></td>
+                  <td style={cell}><input className="glass-input" type="time" value={w.end} onChange={e => setWindow(i, { end: e.target.value })} /></td>
+                  <td style={cell}><input className="glass-input" type="number" style={{ width: '6em' }} value={w.watts} onChange={e => setWindow(i, { watts: e.target.value })} /></td>
+                  <td style={cell}>
+                    {GPU_POWER_WEEKDAYS.map(d => (
+                      <label key={d} style={{ marginRight: '6px', fontSize: '0.85em' }}>
+                        <input type="checkbox" checked={w.days.includes(d)} onChange={() => toggleDay(i, d)} /> {d}
+                      </label>
+                    ))}
+                  </td>
+                  <td style={cell}>
+                    <button className="btn-secondary glass-btn" style={{ padding: '2px 8px', fontSize: '0.85em' }}
+                      onClick={() => set({ windows: form.windows.filter((_, j) => j !== i) })}>Remove</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '10px' }}>
+        <button className="btn-secondary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }}
+          onClick={() => set({ windows: [...form.windows, { start: '22:00', end: '06:00', watts: form.defaultWatts, days: [] }] })}>
+          + Add window
+        </button>
+        <button className="btn-primary glass-btn" style={{ padding: '4px 12px', fontSize: '0.85em' }} onClick={save} disabled={saving}>
+          {saving ? 'Saving…' : 'Save power cap'}
+        </button>
+      </div>
     </section>
   );
 }
