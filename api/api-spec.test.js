@@ -45,6 +45,7 @@ const CURRENT_ENDPOINT_KEYS = [
   'POST /api/gpus/reservations/{reservationId}/wait',
   'POST /api/gpus/reservations/{reservationId}/renew',
   'DELETE /api/gpus/reservations/{reservationId}',
+  'GET /api/gpu-power',
   'GET /health',
   'GET /api/health/gpu',
   'GET /api/v1/health',

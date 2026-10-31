@@ -3434,6 +3434,44 @@
         ]
       }
     },
+    "/api/gpu-power": {
+      "get": {
+        "operationId": "get_api_gpu_power",
+        "summary": "Get the GPU power-cap schedule status: each NVIDIA card's limit and draw, the target cap, the active window and the next change",
+        "description": "Get the GPU power-cap schedule status: each NVIDIA card's limit and draw, the target cap, the active window and the next change through the Llama Manager HTTP API.",
+        "tags": [
+          "gpu"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "cURL",
+            "source": "curl -s -X GET 'http://localhost:5250/api/gpu-power'"
+          },
+          {
+            "lang": "Python",
+            "source": "import requests\n\nresponse = requests.get('http://localhost:5250/api/gpu-power')\nprint(response.json())"
+          },
+          {
+            "lang": "JavaScript",
+            "source": "const response = await fetch('http://localhost:5250/api/gpu-power');\nconsole.log(await response.json());"
+          }
+        ]
+      }
+    },
     "/api/status": {
       "get": {
         "operationId": "get_api_status",

@@ -1276,6 +1276,8 @@ const ROUTES = [
   ['POST', '/api/gpus/reservations/{reservationId}/wait', 'gpu', 'Wait for a GPU reservation to be held', GPU_WAIT_OPTIONS],
   ['POST', '/api/gpus/reservations/{reservationId}/renew', 'gpu', 'Renew a GPU reservation lease', GPU_RENEW_OPTIONS],
   ['DELETE', '/api/gpus/reservations/{reservationId}', 'gpu', 'Release a GPU reservation', GPU_RELEASE_OPTIONS],
+  // GPU power-cap schedule: configured through POST /api/settings `gpuPower`.
+  ['GET', '/api/gpu-power', 'gpu', 'Get the GPU power-cap schedule status: each NVIDIA card\'s limit and draw, the target cap, the active window and the next change'],
 
   // Health, status, and request queue.
   ['GET', '/api/status', 'system', 'Get detailed manager status'],

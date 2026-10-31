@@ -28,7 +28,7 @@
 import express from 'express';
 import { reasoningEffortMatchNames } from './reasoning-effort-targets.js';
 import cors from 'cors';
-import { spawn, exec, execSync, execFileSync } from 'child_process';
+import { spawn, exec, execFile, execSync, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, rmdirSync, unlinkSync, realpathSync, readlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, basename, isAbsolute, relative, resolve } from 'path';
@@ -271,6 +271,7 @@ import { normalizePoolConfig, resolvePools } from './gpu-pools.js';
 import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority, reservationView } from './gpu-reservations.js';
 import { drainPlan, reservationsNeedingDrain } from './gpu-drain.js';
 import { normalizeAliasGpu, poolPinPlan } from './alias-gpu.js';
+import { normalizeGpuPowerSettings, createGpuPowerController, POWER_QUERY_ARGS } from './gpu-power.js';
 import { acceleratorPlan, rpcRouterArgs,
   engineSupportsRpc,
   parseEngineNeededLibs,
@@ -4978,6 +4979,9 @@ app.get('/api/settings', (req, res) => {
       defaultBigModel: defaultAliasTarget(BIG_ALIAS),
       defaultSmallModel: defaultAliasTarget(SMALL_ALIAS),
       fullscreenInterval: config.fullscreenInterval || 30000,
+      // GPU power-cap schedule (api/gpu-power.js). Reported normalized even when never
+      // configured, so a client sees "disabled" rather than a missing key.
+      gpuPower: { enabled: false, defaultWatts: null, timezone: '', windows: [], ...(config.gpuPower || {}) },
       // HuggingFace token: never return the raw value — only whether one is set
       // and a masked preview for display.
       hasHfToken: !!resolveHfToken(config, process.env),
@@ -5008,7 +5012,7 @@ app.get('/api/settings', (req, res) => {
 
 // Update settings
 app.post('/api/settings', (req, res) => {
-  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken, gpus, duo } = req.body;
+  const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken, gpus, duo, gpuPower } = req.body;
 
   // Validate and update settings
   if (contextSize !== undefined) {
@@ -5128,6 +5132,20 @@ app.post('/api/settings', (req, res) => {
     config.gpus = gpus;
   }
 
+  // GPU power-cap schedule. Merged over the stored block so `{gpuPower:{windows:[...]}}`
+  // edits the hours alone, and checked against the cards' own min/max so an
+  // out-of-range cap is a 400 here rather than an nvidia-smi failure every minute.
+  if (gpuPower !== undefined) {
+    try {
+      config.gpuPower = normalizeGpuPowerSettings(
+        { ...(config.gpuPower || {}), ...(gpuPower || {}) },
+        { limits: gpuPowerController.limits() },
+      );
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+  }
+
   if (fullscreenInterval !== undefined) {
     const interval = parseInt(fullscreenInterval);
     if (interval >= 5000 && interval <= 300000) {
@@ -5163,6 +5181,8 @@ app.post('/api/settings', (req, res) => {
   // Re-resolve against the cards actually present, so a pool edited here takes effect
   // without a restart and the reservation layer never arbitrates over a stale pool list.
   if (gpus !== undefined) refreshGpuPools();
+  // A new cap or new hours take effect now, not at the next minute tick.
+  if (gpuPower !== undefined) gpuPowerController.tick('settings change').catch(() => {});
   // Never log the raw token.
   const logBody = { ...req.body };
   if ('hfToken' in logBody) logBody.hfToken = logBody.hfToken ? '<redacted>' : '';
@@ -6159,6 +6179,63 @@ setInterval(() => {
 }, GPU_SWEEP_INTERVAL_MS).unref?.();
 
 refreshGpuPools();
+
+// ========== GPU power-cap schedule ==========
+// Caps every discrete NVIDIA card at `gpuPower.defaultWatts`, raised (or lowered) inside
+// the configured hour windows. The schedule and its fail-safe live in api/gpu-power.js;
+// this section only supplies the two side effects. Reading uses plain nvidia-smi. Writing
+// needs root, which this service does not have, so it starts the package-owned oneshot
+// llama-manager-gpu-power@<watts>.service that the polkit rule lets this account start.
+// Inert on any box where `gpuPower.enabled` is not true.
+
+/** How often the schedule is re-applied; windows are minute-granular. */
+const GPU_POWER_TICK_MS = 60_000;
+
+/**
+ * Runs a command and resolves stdout, rejecting with stderr in the message.
+ * @param {string} cmd Executable.
+ * @param {string[]} args Arguments (no shell).
+ * @param {number} timeout Milliseconds.
+ * @returns {Promise<string>}
+ */
+function execFileText(cmd, args, timeout) {
+  return new Promise((resolveRun, rejectRun) => {
+    execFile(cmd, args, { encoding: 'utf-8', timeout }, (err, stdout, stderr) => {
+      if (err) {
+        err.message = `${err.message.split('\n')[0]}${stderr ? `: ${stderr.trim()}` : ''}`;
+        rejectRun(err);
+      } else {
+        resolveRun(stdout);
+      }
+    });
+  });
+}
+
+const gpuPowerController = createGpuPowerController({
+  getSettings: () => config.gpuPower,
+  run: () => execFileText('nvidia-smi', POWER_QUERY_ARGS, 5000),
+  apply: (watts) => execFileText('systemctl', ['start', `llama-manager-gpu-power@${watts}.service`], 40_000),
+  log: (line) => {
+    console.log(`[gpu-power] ${line}`);
+    addLog('system', line);
+  },
+});
+
+gpuPowerController.tick('service start').catch(() => {});
+setInterval(() => gpuPowerController.tick('minute').catch(() => {}), GPU_POWER_TICK_MS).unref?.();
+
+/**
+ * GET /api/gpu-power — the schedule's live state: each NVIDIA card's current limit, draw
+ * and range, the target cap, the active window, the next change time, and the last change
+ * or error. Re-evaluates on read so the draw and limit are current.
+ */
+app.get('/api/gpu-power', async (req, res) => {
+  try {
+    res.json(await gpuPowerController.tick('status read'));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ========== Model Alias Groups ==========
 // The single routing mechanism: an alias name maps to an ORDERED list of targets, each
