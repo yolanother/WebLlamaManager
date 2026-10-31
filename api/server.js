@@ -116,6 +116,7 @@ import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-re
 import { remoteOnlyAliasFallback } from './remote-only-alias.js';
 import { remoteFailoverDecision } from './remote-failover.js';
 import { exclusiveRecoveryDecision } from './exclusive-recovery.js';
+import { seedStrataPreset, STRATA_PRESET_ID } from './strata-seed.js';
 import {
   annotateModelResidency,
   modelResidencyDecision,
@@ -17498,6 +17499,21 @@ httpServer.listen(API_PORT, '0.0.0.0', () => {
   // answer its own routing out of the box.
   //
   // An alias the operator has already set is never touched; see seed-aliases.js.
+  //
+  // A Strata host (llama-manager-strata installed, model pack on /volumes) is seeded
+  // first, once: its preset, default-big/default-small on it, and boot re-activation —
+  // so a reflashed drakemore serves without hand edits. See strata-seed.js.
+  try {
+    const seeded = seedStrataPreset(config, { strataEnabled: strataConfig().enabled, exists: existsSync });
+    if (seeded.changed) {
+      saveConfig(config);
+      console.log(`[strata] seeded preset ${STRATA_PRESET_ID}; default-big/default-small -> ${STRATA_PRESET_ID}`);
+    } else if (seeded.missing.length) {
+      console.log(`[strata] not seeding ${STRATA_PRESET_ID}: missing ${seeded.missing.join(', ')}`);
+    }
+  } catch (error) {
+    console.warn(`[strata] could not seed the Strata preset: ${error.message}`);
+  }
   try {
     const localModels = scanLocalModels().map((entry) => entry?.name).filter(Boolean);
     if (seedDefaultAliases(config, localModels)) {
