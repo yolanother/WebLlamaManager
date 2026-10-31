@@ -521,6 +521,7 @@ const strataState = {
   activePresetId: null, swapPromise: null, swapGeneration: 0, lastServedAt: 0, deadSinceMs: 0,
   runtime: null,
   cudaLeaseId: null, cudaCard: null, idleSinceMs: null, cudaFailedAt: null,
+  memAvailableBeforeSpawn: 0,
 };
 
 /**
@@ -1269,7 +1270,11 @@ function readStrataDefaultsOnce(p) {
 function strataConfig() {
   // An empty/absent config.strata falls back to the packaged defaults file (read once, never persisted).
   const strata = effectiveStrataBlock(config.strata, { env: process.env, readText: readStrataDefaultsOnce });
-  return resolveStrataConfig(strata === config.strata ? config : { ...config, strata }, { dataDirDefault: join(RUNTIME_PATHS.dataDir, 'strata') });
+  return resolveStrataConfig(strata === config.strata ? config : { ...config, strata }, {
+    dataDirDefault: join(RUNTIME_PATHS.dataDir, 'strata'),
+    // A HIP expert cache that cannot fit in RAM is refused here rather than swapping the box.
+    memTotalBytes: memTotalBytes(), headroomBytes: ds4HeadroomBytes(),
+  });
 }
 
 /**
@@ -9569,6 +9574,8 @@ async function startStrataAttempt(preset, { backend }) {
     }
 
     // 4. Spawn on the chosen backend; the override makes a post-settle auto-restart reuse it.
+    // MemAvailable now is the baseline recordStrataHipFootprint measures the real footprint against.
+    strataState.memAvailableBeforeSpawn = memAvailableBytes();
     if (strataState.runtime) strataState.runtime.backend = backend;
     getStrataSupervisor().start(preset, { planMode: true, override: { backend } });
     return { ok: true };
@@ -9576,6 +9583,18 @@ async function startStrataAttempt(preset, { backend }) {
     addLog('presets', `strata: ${backend} attempt could not start: ${err.message}`);
     return { ok: false, abort: true, reason: `start-error:${err.message}` };
   }
+}
+
+/**
+ * On a HIP settle, record the measured footprint (MemAvailable drop since spawn) beside
+ * the estimate the reclaim gate used, and log both so `hip.baseGb` can be recalibrated.
+ * @param {object} runtime The Strata runtime that just settled ready.
+ * @param {object} cfg Resolved Strata config.
+ */
+function recordStrataHipFootprint(runtime, cfg) {
+  if (runtime.backend !== 'hip' || !cfg.hip || !strataState.memAvailableBeforeSpawn) return;
+  runtime.hipFootprint = { estimatedBytes: cfg.hip.residentBytes, measuredBytes: strataState.memAvailableBeforeSpawn - memAvailableBytes() };
+  addLog('presets', `strata: hip footprint measured ${gibStr(runtime.hipFootprint.measuredBytes)} GiB (MemAvailable drop) vs estimated ${gibStr(runtime.hipFootprint.estimatedBytes)} GiB`);
 }
 
 let strataPriorityWarned = false;
@@ -9673,6 +9692,7 @@ function runStrataLoadPhase(target, reason, settle) {
       if (result.ok) {
         sup.endPlan({ settled: result.settled });
         Object.assign(runtime, { status: 'ready', backend: result.settled.backend, settledAt: Date.now() });
+        recordStrataHipFootprint(runtime, cfg);
         rememberExclusivePreset(runtime.presetId);
         addLog('presets', `strata: SETTLED — serving on ${result.settled.backend} after attempt ${result.attemptsMade}/${attempts.length}`);
       } else {
@@ -9812,7 +9832,7 @@ function activateStrataSingleFlight(presetId, preset) {
 async function activateStrataExclusive(presetId, preset) {
   const cfg = strataConfig();
   if (!cfg.enabled || !(cfg.cuda || cfg.hip)) {
-    return { ok: false, status: 503, error: `Strata is not configured: ${cfg.reason || 'no usable backend (cuda or hip) for this build'}` };
+    return { ok: false, status: 503, error: `Strata is not configured: ${[cfg.reason || 'no usable backend (cuda or hip) for this build', ...cfg.warnings].join('; ')}` };
   }
   const now = Date.now();
   const admission = cudaAdmission({
@@ -9880,6 +9900,7 @@ async function activateStrataExclusive(presetId, preset) {
       if (result.ok) {
         sup.endPlan({ settled: result.settled });
         Object.assign(runtime, { status: 'ready', backend: result.settled.backend, settledAt: Date.now() });
+        recordStrataHipFootprint(runtime, cfg);
         rememberExclusivePreset(runtime.presetId);
         addLog('presets', `strata: SETTLED — serving on ${result.settled.backend} after attempt ${result.attemptsMade}/${attempts.length}`);
       } else {
@@ -10871,6 +10892,13 @@ app.post('/api/config', (req, res) => {
   // (cors() is open, so a LAN host or any visited web page could otherwise reach this).
   if ('strata' in updates && !isLoopbackRequest(req)) {
     return res.status(403).json({ error: 'The strata config may only be changed from this machine.', code: 'NOT_LOOPBACK' });
+  }
+  if (updates.strata?.hip) {
+    // Refuse a HIP expert cache that could only run by swapping (2026-10-31: 48000 slots
+    // drove drakemore to 122/124 GB + full swap and stalled sshd).
+    const fit = resolveStrataConfig({ strata: updates.strata }, { memTotalBytes: memTotalBytes(), headroomBytes: ds4HeadroomBytes() });
+    const tooBig = fit.warnings.find((w) => w.startsWith('strata.hip.expertCache'));
+    if (tooBig) return res.status(400).json({ error: tooBig, code: 'STRATA_HIP_TOO_LARGE' });
   }
   for (const [presetId, preset] of Object.entries(updates.presets || {})) {
     if (!preset || (preset.engine || ENGINE_TYPES.LLAMA) === ENGINE_TYPES.LLAMA) continue;

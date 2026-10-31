@@ -17,6 +17,28 @@ const MB = 1024 ** 2;
 const MIN_MS = 60 * 1000;
 const SEC_MS = 1000;
 
+/** One `--expert-cache` slot: ~1.94 MiB (CUDA `auto` = 6594 slots = ~12.5 GiB). */
+const EXPERT_SLOT_BYTES = Math.round(1.94 * MB);
+
+/**
+ * What a HIP Strata engine takes out of MemAvailable beside its expert cache: weights,
+ * KV, MTP and runtime. Measured on drakemore 2026-10-31 at expertCache 16000: strata
+ * RSS ~49 GiB + iGPU GTT ~46 GiB = ~95 GiB, minus 16000 slots (~30.3 GiB). HIP memory
+ * lives in GTT, not VmRSS, so neither number alone is the footprint.
+ */
+const HIP_BASE_GB = 65;
+
+/**
+ * HIP footprint estimate: base + expertCache slots. This is the reclaim target before a
+ * HIP spawn, replacing the hand-tuned `residentGb` that went stale twice (106 blocked
+ * every spawn; 84 let a 48000-slot cache drive the box into swap).
+ * @param {{expertCache: number, baseBytes?: number}} p - slot count; base bytes (default HIP_BASE_GB).
+ * @returns {number} estimated bytes the engine takes from MemAvailable.
+ */
+export function strataHipFootprintBytes({ expertCache, baseBytes = HIP_BASE_GB * GB }) {
+  return baseBytes + expertCache * EXPERT_SLOT_BYTES;
+}
+
 /** @param {unknown} v @returns {boolean} true for a finite number > 0. */
 const isPos = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0;
 
@@ -60,13 +82,15 @@ export function effectiveStrataBlock(block, { env = {}, readText }) {
 /**
  * Resolve `config.strata` into the normalized runtime shape.
  * @param {object} config - the full manager config (reads `config.strata`).
- * @param {{dataDirDefault: string}} opts - default data dir when `strata.dataDir` is unset.
+ * @param {{dataDirDefault: string, memTotalBytes?: number, headroomBytes?: number}} opts - default
+ *   data dir when `strata.dataDir` is unset; with `memTotalBytes`, a HIP block whose footprint
+ *   plus `headroomBytes` exceeds total RAM is refused (it could only run by swapping).
  * @returns {{enabled: boolean, reason: string|null, warnings: string[], root: string,
  *   pythonPath: string, port: number, dataDir: string, cuda: object|null, hip: object|null,
  *   policy: {returnToCudaAfterMs: number, drainMaxWaitMs: number, idleBaselineBytes: number,
  *   yieldGrowthBytes: number}}} the resolved config; `enabled` is false with a `reason` when unusable.
  */
-export function resolveStrataConfig(config, { dataDirDefault } = {}) {
+export function resolveStrataConfig(config, { dataDirDefault, memTotalBytes, headroomBytes = 0 } = {}) {
   const s = config && typeof config.strata === 'object' && config.strata ? config.strata : {};
   const warnings = [];
   const out = {
@@ -103,11 +127,15 @@ export function resolveStrataConfig(config, { dataDirDefault } = {}) {
     else if (!isPos(h.expertCache)) {
       warnings.push("strata.hip.expertCache must be an explicit number ('auto' is greedy on unified memory); hip backend disabled");
     } else {
-      out.hip = {
-        ...baseBackend(h),
-        expertCache: h.expertCache,
-        residentBytes: posOr(h.residentGb, 100) * GB,
-      };
+      if (h.residentGb !== undefined) {
+        warnings.push('strata.hip.residentGb is ignored: the HIP footprint is derived from expertCache (set strata.hip.baseGb to recalibrate)');
+      }
+      const residentBytes = strataHipFootprintBytes({ expertCache: h.expertCache, baseBytes: posOr(h.baseGb, HIP_BASE_GB) * GB });
+      if (isPos(memTotalBytes) && residentBytes + headroomBytes > memTotalBytes) {
+        warnings.push(`strata.hip.expertCache ${h.expertCache} needs ~${(residentBytes / GB).toFixed(1)} GiB + ${(headroomBytes / GB).toFixed(1)} GiB headroom, more than the ${(memTotalBytes / GB).toFixed(1)} GiB of RAM; hip backend disabled`);
+      } else {
+        out.hip = { ...baseBackend(h), expertCache: h.expertCache, residentBytes };
+      }
     }
   }
 

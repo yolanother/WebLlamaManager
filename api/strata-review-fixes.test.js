@@ -151,3 +151,19 @@ test('m6: handleModels advertises strata entries with Strata context capabilitie
   const stop = body.indexOf('}', at);
   assert.match(body.slice(at, stop + 200), /contextCapabilities\(ENGINE_TYPES\.STRATA/);
 });
+
+// W2c (T32312b1a33838): the HIP reclaim gate and config writes use the derived footprint.
+test('W2c: strataConfig passes RAM total + headroom so a never-fitting HIP cache is refused', () => {
+  const body = source.slice(source.indexOf('function strataConfig()'), source.indexOf('function strataConfig()') + 600);
+  assert.match(body, /memTotalBytes: memTotalBytes\(\)/);
+  assert.match(body, /headroomBytes: ds4HeadroomBytes\(\)/);
+});
+
+test('W2c: POST /api/config rejects a HIP expert cache that cannot fit', () => {
+  const body = source.slice(source.indexOf("app.post('/api/config'"), source.indexOf("app.post('/api/config'") + 1200);
+  assert.match(body, /STRATA_HIP_TOO_LARGE/);
+});
+
+test('W2c: both HIP settle points record the measured footprint', () => {
+  assert.equal((source.match(/recordStrataHipFootprint\(runtime, cfg\);/g) || []).length, 2);
+});

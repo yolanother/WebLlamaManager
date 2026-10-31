@@ -18,6 +18,7 @@ import {
   strataLaunchSpec,
   strataHealthReady,
   effectiveStrataBlock,
+  strataHipFootprintBytes,
 } from './strata-engine.js';
 
 const GB = 1024 * 1024 * 1024;
@@ -117,7 +118,7 @@ test('resolveStrataConfig: GB → bytes, durations → ms, env stringified', () 
   const r = resolveStrataConfig(baseCfg({
     policy: { returnToCudaAfterMin: 15, drainMaxWaitSec: 120, idleBaselineMb: 1536, yieldGrowthMb: 512 },
   }), opts);
-  assert.equal(r.hip.residentBytes, 100 * GB);
+  assert.equal(r.hip.residentBytes, strataHipFootprintBytes({ expertCache: 12000 }), 'hip footprint is derived, not residentGb');
   assert.equal(r.cuda.hostResidentBytes, 56 * GB);
   assert.equal(r.policy.drainMaxWaitMs, 120000);
   const policyValues = Object.values(r.policy);
@@ -248,4 +249,35 @@ test('effectiveStrataBlock: default path is the packaged location', () => {
   let seen = null;
   effectiveStrataBlock(undefined, { env: {}, readText: (p) => { seen = p; return null; } });
   assert.equal(seen, '/usr/share/llama-manager/strata/defaults.json');
+});
+
+// ── HIP footprint (W2c, T32312b1a33838) ──────────────────────────────────────
+// Measured on drakemore 2026-10-31 at expertCache 16000: strata RSS ~49 GiB + iGPU GTT
+// ~46 GiB, MemAvailable 16.4 of 124.4 GiB. The 48000-slot attempt drove the box to
+// 122/124 GB + full swap. The hand-set residentGb (106, then 84) was the only gate.
+const DRAKEMORE_TOTAL = 133620523008;
+const HEADROOM = 8 * GB;
+
+test('strataHipFootprintBytes: base + slots x ~1.94 MiB, ~95 GiB at 16000', () => {
+  const at16k = strataHipFootprintBytes({ expertCache: 16000 });
+  assert.ok(at16k > 94 * GB && at16k < 97 * GB, `${at16k / GB} GiB`);
+  const delta = strataHipFootprintBytes({ expertCache: 17000 }) - at16k;
+  assert.ok(Math.abs(delta - 1000 * 1.94 * MB) < MB, 'each slot ~1.94 MiB');
+  assert.equal(strataHipFootprintBytes({ expertCache: 0, baseBytes: 10 * GB }), 10 * GB);
+});
+
+test('resolveStrataConfig: hip.baseGb recalibrates the footprint; residentGb is ignored with a warning', () => {
+  const r = resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 16000, baseGb: 70, residentGb: 84 }) }), opts);
+  assert.equal(r.hip.residentBytes, strataHipFootprintBytes({ expertCache: 16000, baseBytes: 70 * GB }));
+  assert.ok(r.warnings.some((w) => /residentGb/.test(w)));
+});
+
+test('resolveStrataConfig: a HIP expert cache that can never fit in RAM is refused', () => {
+  const fit = { ...opts, memTotalBytes: DRAKEMORE_TOTAL, headroomBytes: HEADROOM };
+  const ok = resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 16000 }) }), fit);
+  assert.ok(ok.hip, 'the live 16000-slot config fits');
+  const big = resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 48000 }) }), fit);
+  assert.equal(big.hip, null, 'the 48000-slot incident config is refused');
+  assert.equal(big.enabled, false);
+  assert.ok(big.warnings.some((w) => /expertCache 48000/.test(w) && /GiB/.test(w)), big.warnings.join('|'));
 });

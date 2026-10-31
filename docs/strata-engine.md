@@ -99,8 +99,7 @@ Layout on the host:
              "STRATA_PF_FUSED": "1", "STRATA_PF_GEMM": "1", "STRATA_HC_UPMIX": "1",
              "STRATA_PA_FAST": "1", "STRATA_HIP_WMMA": "1", "STRATA_SELECT_WMMA": "1",
              "STRATA_HC_Q8": "1", "STRATA_PF_SWITCH_MIN_T": "4096", "STRATA_PREFILL_STREAM_MIN": "128" },
-    "expertCache": 6000,
-    "residentGb": 100
+    "expertCache": 16000
   },
   "policy": {
     "returnToCudaAfterMin": 15,
@@ -123,7 +122,8 @@ Layout on the host:
 | `cuda.reservationPriority` | `50` | Above the model pin (25), below Pods (80). |
 | `cuda.hostResidentGb` | `56` | Free-RAM target before a CUDA spawn (measured ~50 GB). |
 | `hip.expertCache` | **required** | Explicit slot count. `auto` is rejected: it is greedy on unified memory. |
-| `hip.residentGb` | `100` | Reclaim target before a HIP spawn (measured ~95 GB). |
+| `hip.baseGb` | `65` | HIP footprint beside the expert cache (weights, KV, MTP). The reclaim target before a HIP spawn is `baseGb` + `expertCache` x 1.94 MiB (~95 GiB at 16000), plus `guard.ds4ReclaimHeadroomGb` (8). Measured on drakemore 2026-10-31: strata RSS ~49 GiB + iGPU GTT ~46 GiB at 16000 slots. |
+| `hip.residentGb` | ignored | Retired: a hand-set reclaim target went stale twice (106 blocked every spawn; 84 let 48000 slots swap the box). Logged as a warning when present. |
 | `policy.returnToCudaAfterMin` | `15` | Hysteresis before moving back to CUDA. |
 | `policy.drainMaxWaitSec` | `120` | Bounded drain of in-flight requests before cancelling. |
 | `policy.idleBaselineMb` / `yieldGrowthMb` | `1536` / `512` | Other VRAM above baseline+growth counts as a busy 3090. |
@@ -144,6 +144,14 @@ has a missing or `auto` `expertCache` it is disabled with a warning. There are n
   median through `default-big`** (12-request gate, 2026-10-17; 75.6 at 2400).
 - **HIP `auto`** is greedy: it leaves just 12.9 GB free on the unified-memory iGPU, so
   HIP requires an explicit slot count.
+- **HIP sizing is computed, not hand-set.** A HIP block whose footprint (`baseGb` +
+  slots x 1.94 MiB) plus 8 GiB headroom exceeds MemTotal is refused: `POST /api/config`
+  answers 400 `STRATA_HIP_TOO_LARGE`, and an existing config disables HIP with a warning
+  that activation errors repeat. drakemore (124.4 GiB) runs 16000 slots (~95 GiB, leaves
+  ~16 GiB available); the 48000-slot attempt (~156 GiB) that drove it to 122/124 GB + full
+  swap on 2026-10-31 is now refused. After each HIP settle the manager logs the measured
+  footprint (MemAvailable drop since spawn) beside the estimate and exposes it as
+  `strataRuntime.hipFootprint`; recalibrate `baseGb` from that if they drift apart.
 - HIP allocations do not show in `VmRSS` (12.9 GB RES vs 168 GB VIRT). Look at
   `MemAvailable`, not RSS.
 
