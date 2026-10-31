@@ -10,7 +10,9 @@
  * differs from the current power.limit, clamps to the card's own range, logs
  * every change, and falls back to the default cap when the schedule cannot be
  * evaluated. The privileged write itself is injected (see server.js), so this
- * module never needs root and is fully testable with a fake nvidia-smi.
+ * module never needs root and is fully testable with a fake nvidia-smi. Also
+ * holds the two access guards server.js applies: the strict unit-name builder
+ * for the root oneshot, and the foreign-Origin (CSRF) check.
  */
 
 /** Day keys in JavaScript getDay() order. */
@@ -195,6 +197,44 @@ export function normalizeGpuPowerSettings(input, { limits = null } = {}) {
 }
 
 /**
+ * Builds the privileged unit name for a cap, refusing anything but an integer
+ * inside the card's own range. This is the last check before a root action, so
+ * it does not trust the caller to have validated: a value that reached here
+ * malformed must not become part of a unit name.
+ * @param {number} watts Cap to apply.
+ * @param {{min: number, max: number}|null} range The cards' common min/max.
+ * @returns {string} `llama-manager-gpu-power@<watts>.service`.
+ * @throws {Error} When watts is not an integer in range, or the range is unknown.
+ */
+export function gpuPowerUnitName(watts, range) {
+  if (!range || !Number.isFinite(range.min) || !Number.isFinite(range.max)) {
+    throw new Error('refusing to set a power cap while the card range is unknown');
+  }
+  if (!Number.isInteger(watts) || watts < range.min || watts > range.max) {
+    throw new Error(`refusing to set ${String(watts)} watts: not an integer within ${range.min}-${range.max} W`);
+  }
+  return `llama-manager-gpu-power@${watts}.service`;
+}
+
+/**
+ * Whether a request carries a browser Origin other than the manager's own. A
+ * page on another origin (or an opaque "null" origin) must not change or read
+ * the power schedule through the visitor's browser; curl and the CLI send no
+ * Origin and are unaffected.
+ * @param {{headers: Record<string, string|undefined>}} req Incoming request.
+ * @returns {boolean} True when an Origin is present and its host differs from Host.
+ */
+export function isForeignOrigin(req) {
+  const origin = req.headers.origin;
+  if (origin === undefined) return false;
+  try {
+    return new URL(origin).host !== req.headers.host;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Parses `nvidia-smi` output produced with POWER_QUERY_ARGS.
  * @param {string} stdout CSV without header or units.
  * @returns {Array<{uuid: string, name: string, limit: number|null, min: number|null, max: number|null, draw: number|null}>}
@@ -278,6 +318,8 @@ export function createGpuPowerController({ getSettings, run, apply, log, now = (
         : 'default';
       try {
         await apply(target);
+        // nvidia-smi accepted it, so the readout shows the new limit, not the pre-apply one.
+        for (const c of view.cards) c.limitWatts = target;
         lastChange = { at: now().toISOString(), from: old, to: target, reason, window: resolved.window };
         log(`GPU power cap ${old} W -> ${target} W (${reason}; ${why})`);
       } catch (err) {

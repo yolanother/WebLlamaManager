@@ -271,7 +271,7 @@ import { normalizePoolConfig, resolvePools } from './gpu-pools.js';
 import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority, reservationView } from './gpu-reservations.js';
 import { drainPlan, reservationsNeedingDrain } from './gpu-drain.js';
 import { normalizeAliasGpu, poolPinPlan } from './alias-gpu.js';
-import { normalizeGpuPowerSettings, createGpuPowerController, POWER_QUERY_ARGS } from './gpu-power.js';
+import { normalizeGpuPowerSettings, createGpuPowerController, POWER_QUERY_ARGS, gpuPowerUnitName, isForeignOrigin } from './gpu-power.js';
 import { acceleratorPlan, rpcRouterArgs,
   engineSupportsRpc,
   parseEngineNeededLibs,
@@ -313,6 +313,13 @@ const app = express();
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
+// The GPU power-cap status route is mounted BEFORE the open cors() so it never carries a
+// wildcard grant: the manager's own UI is same-origin and needs none, and a foreign page
+// (including its preflight) is refused outright rather than answered with `*`.
+app.use('/api/gpu-power', (req, res, next) => {
+  if (isForeignOrigin(req)) return res.status(403).json({ error: 'Cross-origin access to the GPU power schedule is not allowed.', code: 'FOREIGN_ORIGIN' });
+  next();
+});
 app.use(cors());
 app.use(express.json({ limit: '200mb' }));
 
@@ -5014,6 +5021,20 @@ app.get('/api/settings', (req, res) => {
 app.post('/api/settings', (req, res) => {
   const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken, gpus, duo, gpuPower } = req.body;
 
+  // `gpuPower` drives a root action (the llama-manager-gpu-power@ unit), so like `strata`
+  // on /api/config it is loopback-only -- this server has no other inbound auth yet -- and
+  // a foreign browser Origin is refused so a page open on the box itself cannot change it
+  // (CSRF). Checked before any field below mutates config, so a refused request changes
+  // nothing. Every other field keeps its existing access rules.
+  if (gpuPower !== undefined) {
+    if (!isLoopbackRequest(req)) {
+      return res.status(403).json({ error: 'The GPU power schedule may only be changed from this machine.', code: 'NOT_LOOPBACK' });
+    }
+    if (isForeignOrigin(req)) {
+      return res.status(403).json({ error: 'Cross-origin changes to the GPU power schedule are not allowed.', code: 'FOREIGN_ORIGIN' });
+    }
+  }
+
   // Validate and update settings
   if (contextSize !== undefined) {
     const size = parseInt(contextSize);
@@ -5135,6 +5156,7 @@ app.post('/api/settings', (req, res) => {
   // GPU power-cap schedule. Merged over the stored block so `{gpuPower:{windows:[...]}}`
   // edits the hours alone, and checked against the cards' own min/max so an
   // out-of-range cap is a 400 here rather than an nvidia-smi failure every minute.
+  // Access to this field is checked at the top of the handler.
   if (gpuPower !== undefined) {
     try {
       config.gpuPower = normalizeGpuPowerSettings(
@@ -6214,7 +6236,11 @@ function execFileText(cmd, args, timeout) {
 const gpuPowerController = createGpuPowerController({
   getSettings: () => config.gpuPower,
   run: () => execFileText('nvidia-smi', POWER_QUERY_ARGS, 5000),
-  apply: (watts) => execFileText('systemctl', ['start', `llama-manager-gpu-power@${watts}.service`], 40_000),
+  // gpuPowerUnitName throws unless watts is an integer inside the card range, so nothing
+  // malformed can become part of the root unit's instance name.
+  apply: async (watts) => {
+    await execFileText('systemctl', ['start', gpuPowerUnitName(watts, gpuPowerController.limits())], 40_000);
+  },
   log: (line) => {
     console.log(`[gpu-power] ${line}`);
     addLog('system', line);
@@ -6225,16 +6251,14 @@ gpuPowerController.tick('service start').catch(() => {});
 setInterval(() => gpuPowerController.tick('minute').catch(() => {}), GPU_POWER_TICK_MS).unref?.();
 
 /**
- * GET /api/gpu-power — the schedule's live state: each NVIDIA card's current limit, draw
- * and range, the target cap, the active window, the next change time, and the last change
- * or error. Re-evaluates on read so the draw and limit are current.
+ * GET /api/gpu-power — the schedule's state as of the last evaluation (start, settings
+ * change, or the minute tick; see `checkedAt`): each NVIDIA card's limit, draw and range,
+ * the target cap, the active window, the next change time, and the last change or error.
+ * READ-ONLY: it returns the cached status and never starts the privileged unit. Foreign
+ * origins are refused by the middleware mounted ahead of cors().
  */
-app.get('/api/gpu-power', async (req, res) => {
-  try {
-    res.json(await gpuPowerController.tick('status read'));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.get('/api/gpu-power', (req, res) => {
+  res.json(gpuPowerController.status());
 });
 
 // ========== Model Alias Groups ==========

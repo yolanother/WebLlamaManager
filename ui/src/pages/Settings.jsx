@@ -1538,6 +1538,8 @@ function GpuPowerSection({ setMessage }) {
         starts on (none ticked = every day); where windows overlap the highest wins. Applied on
         save, at service start and every minute.
         {range && <> This card accepts <strong>{range.min}–{range.max} W</strong>.</>}
+        {' '}Changes are accepted only from this machine itself (its own screen, or an SSH
+        tunnel to it); from elsewhere this panel is read-only.
       </p>
 
       <p className="setting-hint">

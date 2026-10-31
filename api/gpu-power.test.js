@@ -16,6 +16,8 @@ import {
   resolveGpuPowerTarget,
   parsePowerQuery,
   createGpuPowerController,
+  gpuPowerUnitName,
+  isForeignOrigin,
 } from './gpu-power.js';
 
 const LA = 'America/Los_Angeles';
@@ -312,4 +314,30 @@ test('overlapping ticks are serialized so one change is applied once', async () 
   const rig = fakeRig({ limit: 420 });
   await Promise.all([rig.controller.tick('a'), rig.controller.tick('b')]);
   assert.deepEqual(rig.applied, [300]);
+});
+
+// ---------- privileged unit name + origin guard ----------
+
+test('the privileged unit name is built only from an integer inside the card range', () => {
+  const range = { min: 100, max: 450 };
+  assert.equal(gpuPowerUnitName(300, range), 'llama-manager-gpu-power@300.service');
+  assert.equal(gpuPowerUnitName(100, range), 'llama-manager-gpu-power@100.service');
+  assert.equal(gpuPowerUnitName(450, range), 'llama-manager-gpu-power@450.service');
+  for (const bad of [99, 451, 300.5, NaN, '300', '300;reboot', -1, null, undefined]) {
+    assert.throws(() => gpuPowerUnitName(bad, range), /watts/, `accepted ${String(bad)}`);
+  }
+});
+
+test('the privileged unit name is refused while the card range is unknown', () => {
+  assert.throws(() => gpuPowerUnitName(300, null), /range/);
+});
+
+test('a foreign Origin is detected; same-origin and no Origin are not', () => {
+  const req = (origin, host = '192.168.1.79:3001') => ({ headers: { ...(origin ? { origin } : {}), host } });
+  assert.equal(isForeignOrigin(req(undefined)), false); // curl / CLI
+  assert.equal(isForeignOrigin(req('http://192.168.1.79:3001')), false); // the manager's own UI
+  assert.equal(isForeignOrigin(req('http://evil.example')), true);
+  assert.equal(isForeignOrigin(req('http://192.168.1.79:5250')), true); // another port is another origin
+  assert.equal(isForeignOrigin(req('null')), true); // sandboxed iframe / file://
+  assert.equal(isForeignOrigin(req('not a url')), true);
 });

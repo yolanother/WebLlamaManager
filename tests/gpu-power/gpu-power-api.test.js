@@ -9,13 +9,17 @@
 // service start, that /api/settings exposes and validates `gpuPower` against the
 // card's range, that a window raises the cap immediately and removing it
 // restores the default, and that /api/gpu-power reports the live schedule.
+// Also pins the access rules: writing `gpuPower` is loopback-only and refused
+// for a foreign browser Origin (CSRF), the rest of /api/settings is unchanged,
+// and GET /api/gpu-power is read-only (never starts the privileged unit) and
+// carries no wildcard CORS grant.
 
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -69,15 +73,34 @@ exit 0
   chmodSync(join(BIN, 'systemctl'), 0o755);
 }
 
-/** Fetch JSON from the manager with its status. */
-async function call(method, path, body) {
-  const response = await fetch(`http://127.0.0.1:${apiPort}${path}`, {
+/**
+ * Fetch JSON from the manager with its status and headers.
+ * @param {string} method HTTP method.
+ * @param {string} path Request path.
+ * @param {object} [body] JSON body.
+ * @param {{host?: string, headers?: object}} [opts] Connect host (default loopback) and extra headers.
+ */
+async function call(method, path, body, { host = '127.0.0.1', headers = {} } = {}) {
+  const response = await fetch(`http://${host}:${apiPort}${path}`, {
     method,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...headers },
     body: body == null ? undefined : JSON.stringify(body),
   });
-  return { status: response.status, body: await response.json() };
+  const text = await response.text();
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { parsed = text; }
+  return { status: response.status, body: parsed, headers: response.headers };
 }
+
+/** This machine's first non-loopback IPv4 address, or null. */
+function lanAddress() {
+  for (const list of Object.values(networkInterfaces())) {
+    for (const a of list || []) if (a.family === 'IPv4' && !a.internal) return a.address;
+  }
+  return null;
+}
+
+const systemctlCalls = () => (existsSync(SYSTEMCTL_LOG) ? readFileSync(SYSTEMCTL_LOG, 'utf8') : '');
 
 /** Poll until accept(read()) holds. */
 async function eventually(read, accept, description) {
@@ -161,6 +184,47 @@ test('/api/settings exposes gpuPower and rejects a cap outside the card range', 
   assert.equal(badWindow.status, 400);
 });
 
+test('GET /api/gpu-power is read-only: it never starts the privileged unit', async () => {
+  writeFileSync(LIMIT_FILE, '420'); // drift the card behind the manager's back
+  writeFileSync(SYSTEMCTL_LOG, '');
+  for (let i = 0; i < 3; i++) assert.equal((await call('GET', '/api/gpu-power')).status, 200);
+  assert.equal(limit(), 420);
+  assert.equal(systemctlCalls(), '');
+  // A settings write is a deliberate apply, and restores the default.
+  assert.equal((await call('POST', '/api/settings', { gpuPower: { enabled: true } })).status, 200);
+  await eventually(async () => limit(), (w) => w === 300, 'settings write did not re-apply');
+});
+
+test('a foreign browser Origin can neither read nor write the power schedule', async () => {
+  const foreign = { origin: 'http://evil.example' };
+  const read = await call('GET', '/api/gpu-power', null, { headers: foreign });
+  assert.equal(read.status, 403);
+  assert.notEqual(read.headers.get('access-control-allow-origin'), '*');
+  const preflight = await call('OPTIONS', '/api/gpu-power', null, {
+    headers: { ...foreign, 'access-control-request-method': 'GET' },
+  });
+  assert.equal(preflight.status, 403);
+  assert.equal(preflight.headers.get('access-control-allow-origin'), null);
+
+  const write = await call('POST', '/api/settings', { gpuPower: { defaultWatts: 450 } }, { headers: foreign });
+  assert.equal(write.status, 403);
+  assert.equal(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).gpuPower.defaultWatts, 300);
+
+  const sameOrigin = { origin: `http://127.0.0.1:${apiPort}` };
+  assert.equal((await call('GET', '/api/gpu-power', null, { headers: sameOrigin })).status, 200);
+});
+
+test('off-box callers may not change gpuPower; other settings are unaffected', async (t) => {
+  const lan = lanAddress();
+  if (!lan) return t.skip('no non-loopback IPv4 address on this machine');
+  const denied = await call('POST', '/api/settings', { gpuPower: { defaultWatts: 450 } }, { host: lan });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.code, 'NOT_LOOPBACK');
+  assert.equal(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).gpuPower.defaultWatts, 300);
+  assert.equal((await call('POST', '/api/settings', { requestLogging: false }, { host: lan })).status, 200);
+  assert.equal((await call('GET', '/api/gpu-power', null, { host: lan })).status, 200);
+});
+
 test('a window raises the cap now and removing it restores the default', async () => {
   const now = Date.now();
   const windows = [{ start: hhmm(now), end: hhmm(now + 3 * 60_000), watts: 320 }];
@@ -168,7 +232,12 @@ test('a window raises the cap now and removing it restores the default', async (
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
   await eventually(async () => limit(), (w) => w === 320, 'window cap was not applied');
 
-  const status = await call('GET', '/api/gpu-power');
+  // The status is cached from the settings-change evaluation, which lands just after apply.
+  const status = await eventually(
+    () => call('GET', '/api/gpu-power'),
+    (s) => s.body.cards?.[0]?.limitWatts === 320,
+    'status did not catch up with the applied window',
+  );
   assert.equal(status.body.available, true);
   assert.equal(status.body.targetWatts, 320);
   assert.equal(status.body.activeWindow.watts, 320);
