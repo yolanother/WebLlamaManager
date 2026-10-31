@@ -116,6 +116,7 @@ import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-re
 import { remoteOnlyAliasFallback } from './remote-only-alias.js';
 import { remoteFailoverDecision, countsAsBackendFailure, managerHealthStatus } from './remote-failover.js';
 import { exclusiveRecoveryDecision } from './exclusive-recovery.js';
+import { requestPodsIdleRelease } from './pods-release.js';
 import { seedStrataPreset, STRATA_PRESET_ID } from './strata-seed.js';
 import { kvFootprint, readGgufAttentionMetadata } from './gguf-kv.js';
 import { normalizeModelPresetOptions, applyModelPresetOptions, modelContextOverride, wantsPresetContextMode } from './model-preset-options.js';
@@ -9762,6 +9763,11 @@ async function startStrataAttempt(preset, { backend }) {
       releaseStrataCudaLease();
       residentBytes = cfg.hip.residentBytes;
       reclaimTimeoutMs = STRATA_HIP_SETTLE_MS;
+      const needBytes = residentBytes + ds4HeadroomBytes();
+      if (memAvailableBytes() < needBytes) {
+        const released = await releaseIdlePodsWorkers(`strata hip needs ${gibStr(needBytes)} GiB for ${cfg.hip.expertCache} expert slots`);
+        if (released.released.length) reclaimTimeoutMs = DS4_RECLAIM_TIMEOUT_MS;
+      }
     } else {
       return { ok: false, abort: false, reason: `backend-unavailable:${backend}` };
     }
@@ -9978,6 +9984,19 @@ async function readStrataLive(port) {
   }
 }
 
+const podsReleaseState = {};
+/**
+ * Ask the Pods coordinator to release this node's idle workers (behind config.podsRelease and
+ * PODS_API_KEY, rate-limited; see pods-release.js). Logs what happened; never throws.
+ * @param {string} reason Why the memory is needed.
+ * @returns {Promise<{sent:boolean, released:string[], detail:string}>}
+ */
+async function releaseIdlePodsWorkers(reason) {
+  const r = await requestPodsIdleRelease({ config, env: process.env, reason, fetchFn: fetch, state: podsReleaseState, now: Date.now() });
+  if (r.sent) addLog('presets', `pods: asked the coordinator to release idle workers (${reason}): ${r.detail}`);
+  return r;
+}
+
 let strataTickRunning = false;
 /**
  * Periodic CUDA/HIP policy poll, called from the GPU sweep timer. Samples foreign compute
@@ -10048,7 +10067,7 @@ async function strataBackendTick() {
       addLog('presets', `strata: ${grow.reason}; restarting on hip between requests`);
       await strataSwapBackend('hip', grow.reason);
       return;
-    }
+    } else if (grow.needMemory) void releaseIdlePodsWorkers(`strata idle at ${runtime.expertCache.effective} of ${cfg.hip.expertCache} expert slots`);
   }
   if (strataTickRunning || currentEngine !== ENGINE_TYPES.STRATA || runtime?.status !== 'ready'
     || !cfg.cuda || strataState.swapPromise) return;
@@ -11186,6 +11205,10 @@ app.post('/api/config', (req, res) => {
     const fit = resolveStrataConfig({ strata: updates.strata }, { memTotalBytes: memTotalBytes(), headroomBytes: ds4HeadroomBytes() });
     const tooBig = fit.warnings.find((w) => w.startsWith('strata.hip.expertCache'));
     if (tooBig) return res.status(400).json({ error: tooBig, code: 'STRATA_HIP_TOO_LARGE' });
+  }
+  // `podsRelease.coordinatorUrl` receives the PODS_API_KEY bearer; a remote caller must not redirect it.
+  if ('podsRelease' in updates && !isLoopbackRequest(req)) {
+    return res.status(403).json({ error: 'The podsRelease config may only be changed from this machine.', code: 'NOT_LOOPBACK' });
   }
   for (const [presetId, preset] of Object.entries(updates.presets || {})) {
     if (!preset || (preset.engine || ENGINE_TYPES.LLAMA) === ENGINE_TYPES.LLAMA) continue;

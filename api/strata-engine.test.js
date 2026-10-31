@@ -359,6 +359,8 @@ test('strataGrowDecision: hysteresis, a small gain does not restart', () => {
   const r = strataGrowDecision(growArgs({ availableBytes: avail }));
   assert.equal(r.action, 'stay');
   assert.match(r.reason, /hysteresis/);
+  assert.equal(r.needMemory, true, 'idle and past the cooldown but short of memory: worth asking tenants to release');
+  assert.equal(strataGrowDecision(growArgs({ availableBytes: avail, busy: true })).needMemory, undefined);
 });
 
 test('strataGrowDecision: nothing to do at the configured size', () => {

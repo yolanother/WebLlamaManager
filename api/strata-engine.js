@@ -78,8 +78,9 @@ export function strataHipExpertCache({ configured, minSlots, availableBytes, bas
  *   settledAt:number, now:number, growCooldownMs:number}} p current and target slots, floor,
  *   MemAvailable, footprint knobs, whether a request is in flight or queued, the idle-streak
  *   start, when the engine settled, the clock and the cooldown.
- * @returns {{action:'grow'|'stay', slots?:number, idleSinceMs:number|null, reason:string}}
- *   `idleSinceMs` is the idle-streak start the caller keeps for the next tick.
+ * @returns {{action:'grow'|'stay', slots?:number, needMemory?:boolean, idleSinceMs:number|null, reason:string}}
+ *   `idleSinceMs` is the idle-streak start the caller keeps for the next tick; `needMemory` is set
+ *   when only memory is missing (idle, past the cooldown), so asking other tenants to release helps.
  */
 export function strataGrowDecision(p) {
   const { effective, configured, availableBytes, baseBytes, busy, idleSinceMs, settledAt, now, growCooldownMs } = p;
@@ -90,7 +91,7 @@ export function strataGrowDecision(p) {
   if (now - settledAt < growCooldownMs) return { action: 'stay', idleSinceMs: idleSince, reason: 'cooldown' };
   const after = strataHipExpertCache({ ...p, availableBytes: availableBytes + strataHipFootprintBytes({ expertCache: effective, baseBytes }) });
   if (!after.slots || after.slots < effective + MIN_GROW_SLOTS) {
-    return { action: 'stay', idleSinceMs: idleSince, reason: `hysteresis: a restart would get ${after.slots ?? 0} slots, running ${effective}` };
+    return { action: 'stay', needMemory: true, idleSinceMs: idleSince, reason: `hysteresis: a restart would get ${after.slots ?? 0} slots, running ${effective}` };
   }
   return { action: 'grow', slots: after.slots, idleSinceMs: idleSince, reason: `grow ${effective} -> ${after.slots} slots: ${after.reason}` };
 }

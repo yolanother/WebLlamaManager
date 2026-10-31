@@ -64,3 +64,17 @@ test('the backend tick runs the prefill watchdog on Strata /metrics: cancel the 
   assert.match(live, /\/metrics/);
   assert.match(live, /Accept: 'application\/json'/);
 });
+
+test('the Pods release client is called behind its flag from the HIP attempt and the grow-back tick', () => {
+  assert.match(fnBody('releaseIdlePodsWorkers'), /requestPodsIdleRelease\(\{ config, env: process\.env, reason, fetchFn: fetch/);
+  const attempt = fnBody('startStrataAttempt');
+  assert.match(attempt, /await releaseIdlePodsWorkers\(/);
+  assert.match(attempt, /if \(released\.released\.length\) reclaimTimeoutMs = DS4_RECLAIM_TIMEOUT_MS/, 'wait the full reclaim window only when workers were released');
+  assert.match(fnBody('strataBackendTick'), /else if \(grow\.needMemory\) void releaseIdlePodsWorkers\(/);
+});
+
+test('podsRelease may only be changed from this machine (its URL receives the Pods key)', () => {
+  const at = source.indexOf("app.post('/api/config'");
+  const route = source.slice(at, at + 4000);
+  assert.match(route, /'podsRelease' in updates && !isLoopbackRequest\(req\)/);
+});
