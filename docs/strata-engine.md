@@ -331,6 +331,7 @@ Since 2026-10-15 both `default-big` and `default-small` on drakemore target the
 | **Asset job preempts Strata** | Expected. The Pods node agent locks `rtx3090` at priority 80 before handing a job to an NVIDIA worker (renewed every 30 s, released at job-done, worker exit or a 2 h cap); Strata leaves CUDA in ~2 s, reloads on HIP, and returns to CUDA after 15 idle minutes. Lock state: `GET /api/gpus`; agent side: `journalctl -u doubtech-pods-node \| grep GpuReservation`. |
 | **Always on HIP although the 3090 is idle** | Idle Pods workers hold ~352 MiB of CUDA context each; if their total exceeds `policy.idleBaselineMb`, Strata treats the card as busy. drakemore uses 6144 (13 workers = ~4.6 GB). |
 | Over-long prompt gets 400 | Strata rejects, never truncates; keep prompts under the preset `context`. |
+| Strata stopped with reason `memory-critical` | MemAvailable fell below `guard.memCriticalBelowGb` (default 6). The memory governor stopped Strata cleanly, because the kernel's global OOM killer had already done it messily: on 2026-10-31 that killed strata, desktop dbus and a root python3, and left systemd (PID 1) unresponsive for ~2.6 h, so no ssh session could open. The preset stays remembered and auto re-activation retries it with backoff under the HIP gate. Find what else grew (`ps`, Pods containers) before raising the floor. |
 | Mem-watchdog logs but does not restart Strata | By design: a restart reloads the same weights, and HIP memory does not show in RSS. |
 
 ## Related

@@ -67,7 +67,7 @@ import { routeSmartAlias, candidateSize, smartAliasRouting } from './smart-alias
 import { askSystem1 } from './system1.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
-import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes, modelAdmissionKnobs } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes, modelAdmissionKnobs, exclusiveCriticalStopDecision } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { buildStorageStats } from './drive-health.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
@@ -3373,6 +3373,7 @@ function guardCfg() {
     // Runtime memory-pressure governor (see memoryPressureDecision). Bytes of
     // MemAvailable; configured in GiB for operator sanity.
     memShedBelowBytes: (g.memShedBelowGb ?? 16) * (2 ** 30),
+    memCriticalBelowBytes: (g.memCriticalBelowGb ?? 6) * (2 ** 30),
     memWatchBelowBytes: (g.memWatchBelowGb ?? 24) * (2 ** 30),
     memResumeAboveBytes: (g.memResumeAboveGb ?? 32) * (2 ** 30),
     memShedCooldownMs: g.memShedCooldownMs ?? GUARD_DEFAULTS.memShedCooldownMs,
@@ -18283,12 +18284,51 @@ setInterval(async () => {
       addLog('system', `[memory] SHEDDING resident models — ${decision.reason}`);
       await shedResidentModelsForMemory(cfg);
     }
+
+    // The exclusive engine is not a router model, so the shed above cannot free it.
+    // Below the critical floor, stop it cleanly before the kernel's global OOM does it
+    // messily (2026-10-31: that left PID 1 unresponsive for hours). Strata only: it is
+    // the engine with automatic re-activation (exclusive-recovery.js).
+    const critical = exclusiveCriticalStopDecision({
+      availableBytes,
+      exclusiveStatus: currentEngine === ENGINE_TYPES.STRATA ? strataState.runtime?.status : undefined,
+      criticalBelowBytes: cfg.memCriticalBelowBytes,
+      lastStopAt: guardMemLastCriticalStopAt,
+      cooldownMs: cfg.memShedCooldownMs,
+    });
+    if (critical.stop) {
+      guardMemLastCriticalStopAt = Date.now();
+      await stopStrataForMemory(critical.reason);
+    }
   } catch (error) {
     console.error(`[memory-governor] tick failed: ${error.message}`);
   } finally {
     memGovernorInFlight = false;
   }
 }, MEMORY_GOVERNOR_INTERVAL);
+
+let guardMemLastCriticalStopAt = 0;
+
+/**
+ * Stop Strata because MemAvailable fell below the critical floor. The runtime becomes
+ * `exhausted` with reason 'memory-critical' and the preset stays remembered, so
+ * exclusive-recovery.js re-activates it with backoff under the honest HIP gate once memory
+ * allows. In-flight Strata requests fail; that is cheaper than a global OOM.
+ * @param {string} reason why (logged).
+ * @returns {Promise<void>}
+ */
+async function stopStrataForMemory(reason) {
+  const runtime = strataState.runtime;
+  const msg = `[memory] CRITICAL: stopping Strata to keep the kernel OOM killer away — ${reason}`;
+  console.warn(msg);
+  addLog('system', msg);
+  addLog('presets', `strata: ${msg}`);
+  try { await stopStrataServer(); } catch (err) { addLog('presets', `strata: critical stop failed: ${err.message}`); }
+  releaseStrataCudaLease();
+  if (runtime && strataState.runtime === runtime) {
+    Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: 'memory-critical' });
+  }
+}
 
 /**
  * Gracefully free resident models until MemAvailable clears the resume threshold.

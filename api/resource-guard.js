@@ -60,6 +60,7 @@ export const DEFAULTS = {
   memShedBelowBytes: 16 * (2 ** 30),   // shed the model below this
   memWatchBelowBytes: 24 * (2 ** 30),  // stop taking new local work below this
   memResumeAboveBytes: 32 * (2 ** 30), // only declare recovery above this (hysteresis)
+  memCriticalBelowBytes: 6 * (2 ** 30), // stop an exclusive engine (Strata/DS4) below this
   memShedCooldownMs: 60_000            // grace period for an in-flight unload to land
 };
 
@@ -148,6 +149,34 @@ export function checkModelFit({
     fits: false, recommendedContext: ctx, requiredBytes, budgetBytes,
     reason: 'requested context too large; capped to fit memory'
   };
+}
+
+/**
+ * Whether the memory governor must stop the exclusive engine (DS4/Strata) to keep the
+ * kernel's global OOM killer away. The engine is not a router model, so the normal shed
+ * path has nothing to unload; on 2026-10-31 a global OOM with Strata resident killed strata,
+ * desktop dbus and a root python3 and left systemd (PID 1) unresponsive for ~2.6 h. Below
+ * the critical floor a controlled stop is cheaper than that; exclusive-recovery.js brings
+ * the engine back once memory allows.
+ * @param {object} a
+ * @param {number} a.availableBytes MemAvailable (0/unreadable fails open).
+ * @param {string} [a.exclusiveStatus] the active exclusive engine's runtime status, undefined when none.
+ * @param {number} [a.criticalBelowBytes] the critical floor.
+ * @param {number} [a.lastStopAt] when the governor last stopped it (ms epoch, 0 = never).
+ * @param {number} [a.now] clock.
+ * @param {number} [a.cooldownMs] grace for a previous stop to free memory.
+ * @returns {{stop: boolean, reason: string}}
+ */
+export function exclusiveCriticalStopDecision({
+  availableBytes, exclusiveStatus, criticalBelowBytes = DEFAULTS.memCriticalBelowBytes,
+  lastStopAt = 0, now = Date.now(), cooldownMs = DEFAULTS.memShedCooldownMs,
+}) {
+  const gib = (b) => (b / (2 ** 30)).toFixed(1);
+  if (!(availableBytes > 0)) return { stop: false, reason: 'MemAvailable unreadable — failing open' };
+  if (availableBytes >= criticalBelowBytes) return { stop: false, reason: 'above the critical floor' };
+  if (!['ready', 'loading', 'swapping'].includes(exclusiveStatus)) return { stop: false, reason: 'no running exclusive engine' };
+  if (lastStopAt > 0 && now - lastStopAt < cooldownMs) return { stop: false, reason: 'previous critical stop still freeing memory' };
+  return { stop: true, reason: `MemAvailable ${gib(availableBytes)} GiB < ${gib(criticalBelowBytes)} GiB critical floor` };
 }
 
 /**

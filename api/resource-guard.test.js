@@ -621,3 +621,44 @@ test('Frostburn 2026-10-31: Qwen3.6-35B-A3B requirement with honest knobs', asyn
   assert.ok(Math.abs(need(32768).requiredBytes / GiB - 24.45) < 0.05);
   assert.equal(at65k.fits, false, 'still short at 40.2 GiB free with 15% (18.7 GiB) headroom');
 });
+
+// G2 (W2, T3231237771803): on 2026-10-31 at 00:31Z drakemore ran out of memory with Strata as the
+// big consumer; the kernel's global OOM killer took strata, then desktop dbus and a root
+// python3, and systemd (PID 1) stopped answering for ~2.6 h, so no ssh session could open.
+// The memory governor said "nothing resident left to shed" because the exclusive engine is
+// not a router model. Below a critical MemAvailable the exclusive engine is stopped cleanly.
+test('exclusiveCriticalStopDecision: stops a serving exclusive engine below the critical floor', async () => {
+  const { exclusiveCriticalStopDecision } = await import('./resource-guard.js');
+  const GiB = 2 ** 30;
+  const base = { criticalBelowBytes: 6 * GiB, now: 100_000, cooldownMs: 60_000 };
+  for (const exclusiveStatus of ['ready', 'loading', 'swapping']) {
+    assert.equal(exclusiveCriticalStopDecision({ ...base, availableBytes: 5 * GiB, exclusiveStatus }).stop, true, exclusiveStatus);
+  }
+});
+
+test('exclusiveCriticalStopDecision negative controls: never stops above the floor, on dark telemetry, with no engine, when already down, or in cooldown', async () => {
+  const { exclusiveCriticalStopDecision, DEFAULTS: D } = await import('./resource-guard.js');
+  const GiB = 2 ** 30;
+  const base = { criticalBelowBytes: 6 * GiB, now: 100_000, cooldownMs: 60_000, exclusiveStatus: 'ready' };
+  assert.equal(exclusiveCriticalStopDecision({ ...base, availableBytes: 16.3 * GiB }).stop, false, 'drakemore steady state (16.3 GiB) keeps serving');
+  assert.equal(exclusiveCriticalStopDecision({ ...base, availableBytes: 6 * GiB }).stop, false, 'at the floor is not below it');
+  assert.equal(exclusiveCriticalStopDecision({ ...base, availableBytes: 0 }).stop, false, 'unreadable MemAvailable fails open');
+  assert.equal(exclusiveCriticalStopDecision({ ...base, availableBytes: 1 * GiB, exclusiveStatus: undefined }).stop, false);
+  for (const exclusiveStatus of ['exhausted', 'stop-unconfirmed']) {
+    assert.equal(exclusiveCriticalStopDecision({ ...base, availableBytes: 1 * GiB, exclusiveStatus }).stop, false, exclusiveStatus);
+  }
+  assert.equal(exclusiveCriticalStopDecision({ ...base, availableBytes: 1 * GiB, lastStopAt: 90_000 }).stop, false, 'cooldown');
+  assert.equal(D.memCriticalBelowBytes, 6 * GiB);
+});
+
+test('the memory governor stops Strata cleanly below the critical floor and lets recovery retry it', async () => {
+  const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
+  const gov = source.slice(source.indexOf('const MEMORY_GOVERNOR_INTERVAL'), source.indexOf('async function shedResidentModelsForMemory('));
+  assert.match(gov, /exclusiveCriticalStopDecision\(/);
+  assert.match(gov, /stopStrataForMemory\(/);
+  const stop = source.slice(source.indexOf('async function stopStrataForMemory('), source.indexOf('async function stopStrataForMemory(') + 1500);
+  assert.match(stop, /status: 'exhausted'/);
+  assert.match(stop, /reason: 'memory-critical'/);
+  assert.doesNotMatch(stop, /lastExclusivePreset/, 'must not forget the preset: exclusive-recovery retries it');
+  assert.match(source, /memCriticalBelowBytes: \(g\.memCriticalBelowGb \?\? 6\)/);
+});

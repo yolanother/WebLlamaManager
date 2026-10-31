@@ -206,6 +206,17 @@ Other per-model rules:
 - Admission uses the model's own `ctx-size` from `modelPresetOptions` when one is set.
 - Models without readable metadata keep the flat estimate.
 
+### Critical stop of the exclusive engine
+
+The memory governor (1 s tick) unloads router models below `guard.memShedBelowGb`, but an
+exclusive engine (DS4/Strata) is not a router model, so on a Strata box it found "nothing
+resident left to shed". Below `guard.memCriticalBelowGb` (default 6 GiB of MemAvailable),
+it now stops Strata (`exclusiveCriticalStopDecision`, `stopStrataForMemory`):
+- the runtime becomes `exhausted` with reason `memory-critical`;
+- the preset stays remembered, and `exclusive-recovery.js` re-activates it with backoff once
+  memory allows;
+- there is a 60 s cooldown between stops, and unreadable telemetry never triggers a stop.
+
 ### Reactive Fallback
 
 When a model passes proactive admission but llama.cpp still reports insufficient
