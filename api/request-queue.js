@@ -178,19 +178,20 @@ export class PriorityRequestQueue {
   }
 
   /**
-   * Active and pending item counts per model, for /api/stats.
+   * Active and pending item counts per model, for /api/stats. Model names come from requests,
+   * so counts are kept in a Map (a model named "__proto__" must not touch Object.prototype).
    * @returns {Object<string, {active:number, pending:number}>} counts keyed by model.
    */
   getModelDepths() {
-    const depths = {};
+    const depths = new Map();
     const add = (item, key) => {
-      const model = item.model || 'unknown';
-      depths[model] ??= { active: 0, pending: 0 };
-      depths[model][key]++;
+      const model = typeof item.model === 'string' && item.model ? item.model : 'unknown';
+      if (!depths.has(model)) depths.set(model, { active: 0, pending: 0 });
+      depths.get(model)[key]++;
     };
     for (const item of this.activeItems.values()) add(item, 'active');
     for (const item of this.queue) add(item, 'pending');
-    return depths;
+    return Object.fromEntries(depths);
   }
 
   /** Activate a queued item and resolve its acquisition promise. */
@@ -285,4 +286,23 @@ export class PriorityRequestQueue {
     error.code = 'ABORT_ERR';
     return error;
   }
+}
+
+/**
+ * Sum per-model queue depths from several lanes (PriorityRequestQueue.getModelDepths). Keys are
+ * request-controlled model names, so they are summed in a Map and only own entries are read.
+ * @param {...Object<string, {active:number, pending:number}>} lanes per-lane depths.
+ * @returns {Object<string, {active:number, pending:number}>} combined depths keyed by model.
+ */
+export function mergeModelDepths(...lanes) {
+  const out = new Map();
+  for (const lane of lanes) {
+    for (const [model, d] of Object.entries(lane)) {
+      const sum = out.get(model) ?? { active: 0, pending: 0 };
+      sum.active += Number(d?.active) || 0;
+      sum.pending += Number(d?.pending) || 0;
+      out.set(model, sum);
+    }
+  }
+  return Object.fromEntries(out);
 }

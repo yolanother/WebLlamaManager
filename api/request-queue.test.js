@@ -11,6 +11,7 @@ import {
   parseQueueItemId,
   PriorityRequestQueue,
   normalizeRequestPriority,
+  mergeModelDepths,
 } from './request-queue.js';
 
 test('normalizes supported priorities and defaults to interactive', () => {
@@ -248,4 +249,18 @@ test('getModelDepths counts active and pending items per model', async () => {
   await queue.acquire({ model: 'A' });
   enqueue(queue, 'B'); enqueue(queue, 'B'); enqueue(queue, 'A');
   assert.deepEqual(queue.getModelDepths(), { A: { active: 1, pending: 1 }, B: { active: 0, pending: 2 } });
+});
+
+test('getModelDepths and mergeModelDepths are safe for hostile model names', async () => {
+  const queue = new PriorityRequestQueue(1);
+  await queue.acquire({ model: '__proto__' });
+  enqueue(queue, 'constructor'); enqueue(queue, { evil: true }); enqueue(queue, '__proto__');
+  const depths = queue.getModelDepths();
+  assert.deepEqual(depths.__proto__, { active: 1, pending: 1 });
+  assert.deepEqual(depths.constructor, { active: 0, pending: 1 });
+  assert.deepEqual(depths.unknown, { active: 0, pending: 1 }, 'a non-string model counts as unknown');
+  const merged = mergeModelDepths(depths, { __proto__: { active: 2, pending: 0 } }, JSON.parse('{"__proto__":{"active":1,"pending":1}}'));
+  assert.deepEqual(merged.__proto__, { active: 2, pending: 2 }, 'own "__proto__" keys sum; a literal {__proto__: x} sets a prototype and is not a model');
+  assert.equal(({}).active, undefined, 'Object.prototype is not polluted');
+  assert.equal(({}).pending, undefined);
 });

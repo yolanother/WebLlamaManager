@@ -173,7 +173,7 @@ import {
   createRequestTimingRecorder,
   tokenizerRevision,
 } from './timing-evidence.js';
-import { parseQueueItemId, PriorityRequestQueue } from './request-queue.js';
+import { parseQueueItemId, PriorityRequestQueue, mergeModelDepths } from './request-queue.js';
 import { managerRequestPolicy, stripManagerRequestFields } from './request-policy.js';
 import {
   QUESTION_MARK_ONLY_OUTPUT_ERROR,
@@ -733,23 +733,6 @@ let loadedModelsSnapshot = [];
 let idleShutdown = false;   // true when server was stopped due to idle timeout
 
 const llamaQueue = new PriorityRequestQueue(1); // default: 1 concurrent request
-
-/**
- * Sum per-model queue depths from several lanes (PriorityRequestQueue.getModelDepths).
- * @param {...Object<string, {active:number, pending:number}>} lanes per-lane depths.
- * @returns {Object<string, {active:number, pending:number}>} combined depths keyed by model.
- */
-function mergeModelDepths(...lanes) {
-  const out = {};
-  for (const lane of lanes) {
-    for (const [model, d] of Object.entries(lane)) {
-      out[model] ??= { active: 0, pending: 0 };
-      out[model].active += d.active;
-      out[model].pending += d.pending;
-    }
-  }
-  return out;
-}
 
 // Timestamp of the most recent LOCAL request completion (slot release). Used by the
 // queue-admission policy to tell a deep-but-DRAINING queue (completions still happening)
