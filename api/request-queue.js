@@ -68,6 +68,7 @@ export class PriorityRequestQueue {
     this.maxModelBatch = Math.max(0, maxModelBatch);
     this._lastModel = null;
     this._modelJumps = 0;
+    this._skippedId = null;
     this.activeItems = new Map();
   }
 
@@ -216,16 +217,18 @@ export class PriorityRequestQueue {
 
   /**
    * Prefer the oldest item in the same priority class for the model that ran last, over the
-   * class head `index`, at most maxModelBatch times in a row (then FIFO once).
+   * class head `index`. The jump budget belongs to the head being skipped: it can be jumped at
+   * most maxModelBatch times, whatever other classes are served in between, then it runs.
    * @param {number} index Queue index the priority rules chose (-1 for none).
    * @returns {number} The index to activate.
    */
   _batchByModel(index) {
     if (index < 0 || this._lastModel == null) return index;
-    const { priority, model } = this.queue[index];
-    if (model === this._lastModel) { this._modelJumps = 0; return index; }
-    const same = this.queue.findIndex(item => item.priority === priority && item.model === this._lastModel);
-    if (same < 0 || this._modelJumps >= this.maxModelBatch) { this._modelJumps = 0; return index; }
+    const head = this.queue[index];
+    if (head.model === this._lastModel) return index;
+    if (this._skippedId !== head.id) { this._skippedId = head.id; this._modelJumps = 0; }
+    const same = this.queue.findIndex(item => item.priority === head.priority && item.model === this._lastModel);
+    if (same < 0 || this._modelJumps >= this.maxModelBatch) return index;
     this._modelJumps++;
     return same;
   }

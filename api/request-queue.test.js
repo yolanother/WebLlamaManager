@@ -264,3 +264,18 @@ test('getModelDepths and mergeModelDepths are safe for hostile model names', asy
   assert.equal(({}).active, undefined, 'Object.prototype is not polluted');
   assert.equal(({}).pending, undefined);
 });
+
+test('batching bound holds with mixed-class traffic for the batched model (review: fairness picks must not reset the jump budget)', async () => {
+  const queue = new PriorityRequestQueue(1, { maxBackgroundQueued: 8 });
+  const first = await queue.acquire({ model: 'A' });
+  const pending = [enqueue(queue, 'B')];
+  for (let i = 0; i < 60; i++) pending.push(enqueue(queue, 'A'));
+  for (let i = 0; i < 8; i++) pending.push(enqueue(queue, 'A', 'background'));
+  const tagged = pending.map((p, i) => ({ p, cls: i > 60 ? 'background' : 'interactive' }));
+  const order = [];
+  tagged.forEach(({ p, cls }) => p.then(() => order.push(`${p.model}/${cls}`)));
+  await drainOrder(queue, first, pending);
+  const before = order.slice(0, order.indexOf('B/interactive'));
+  const jumps = before.filter((x) => x === 'A/interactive').length;
+  assert.equal(jumps, 16, `interactive A jumped B ${jumps} times; the cap is 16 (background fairness picks are not jumps)`);
+});
