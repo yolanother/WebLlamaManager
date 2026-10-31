@@ -367,7 +367,8 @@ IANA timezone, and the highest wins where they overlap. The cap is applied at st
 settings change and every minute, and only when it differs from `power.limit`. If the
 schedule cannot be evaluated, the default cap is used. The write needs root, so it goes
 through the package's `llama-manager-gpu-power@<watts>.service` oneshot, which the polkit
-rule lets the manager START. Writes are loopback-only and cross-origin requests are
+rule lets the manager START. Writes are loopback-only and need the `X-Llama-Manager`
+header. Requests with an unknown `Host` (DNS rebinding) or a foreign `Origin` are
 refused. `GET /api/gpu-power` is the read-only status. Inert unless `enabled`. See
 [`features/gpu-power-schedule.md`](features/gpu-power-schedule.md).
 

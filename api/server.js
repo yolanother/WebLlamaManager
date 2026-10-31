@@ -271,7 +271,7 @@ import { normalizePoolConfig, resolvePools } from './gpu-pools.js';
 import { GpuReservations, LLAMA_MANAGER_HOLDER, normalizeReservationPriority, reservationView } from './gpu-reservations.js';
 import { drainPlan, reservationsNeedingDrain } from './gpu-drain.js';
 import { normalizeAliasGpu, poolPinPlan } from './alias-gpu.js';
-import { normalizeGpuPowerSettings, createGpuPowerController, POWER_QUERY_ARGS, gpuPowerUnitName, isForeignOrigin } from './gpu-power.js';
+import { normalizeGpuPowerSettings, createGpuPowerController, POWER_QUERY_ARGS, gpuPowerUnitName, isForeignOrigin, isAllowedHost, GPU_POWER_WRITE_HEADER } from './gpu-power.js';
 import { acceleratorPlan, rpcRouterArgs,
   engineSupportsRpc,
   parseEngineNeededLibs,
@@ -313,11 +313,50 @@ const app = express();
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
-// The GPU power-cap status route is mounted BEFORE the open cors() so it never carries a
-// wildcard grant: the manager's own UI is same-origin and needs none, and a foreign page
-// (including its preflight) is refused outright rather than answered with `*`.
+/**
+ * Why a GPU power-cap request must be refused, or null to proceed. Every gpu-power
+ * request must name this manager in Host (DNS rebinding) and carry no foreign Origin
+ * (CSRF). A write must also carry the X-Llama-Manager intent header -- a non-safelisted
+ * header a foreign page cannot get past the refused preflight below -- and come from
+ * loopback, since the server has no other inbound auth (as for `strata` on /api/config).
+ * @param {import('express').Request} req The request.
+ * @param {{write: boolean}} opts Whether the request changes the schedule.
+ * @returns {{code: string, error: string}|null}
+ */
+function gpuPowerRefusal(req, { write }) {
+  const me = {
+    port: API_PORT,
+    hostname: systemHostname(),
+    addresses: Object.values(networkInterfaces()).flat().filter(Boolean).map((a) => a.address),
+  };
+  if (!isAllowedHost(req.headers.host, me)) {
+    return { code: 'UNKNOWN_HOST', error: 'The GPU power schedule only answers to this machine\'s own host names.' };
+  }
+  if (isForeignOrigin(req)) {
+    return { code: 'FOREIGN_ORIGIN', error: 'Cross-origin access to the GPU power schedule is not allowed.' };
+  }
+  if (write && req.headers[GPU_POWER_WRITE_HEADER] === undefined) {
+    return { code: 'MISSING_INTENT_HEADER', error: `Changing the GPU power schedule requires the ${GPU_POWER_WRITE_HEADER} header.` };
+  }
+  if (write && !isLoopbackRequest(req)) {
+    return { code: 'NOT_LOOPBACK', error: 'The GPU power schedule may only be changed from this machine.' };
+  }
+  return null;
+}
+
+// Mounted BEFORE the open cors() so neither of these is ever answered with a wildcard:
+// the GPU power-cap status route (and its preflight) is refused for a foreign Origin or an
+// unknown Host, and no foreign page may preflight the gpuPower write header anywhere.
 app.use('/api/gpu-power', (req, res, next) => {
-  if (isForeignOrigin(req)) return res.status(403).json({ error: 'Cross-origin access to the GPU power schedule is not allowed.', code: 'FOREIGN_ORIGIN' });
+  const refusal = gpuPowerRefusal(req, { write: false });
+  if (refusal) return res.status(403).json(refusal);
+  next();
+});
+app.use((req, res, next) => {
+  const asked = String(req.headers['access-control-request-headers'] || '').toLowerCase().split(',').map((h) => h.trim());
+  if (req.method === 'OPTIONS' && asked.includes(GPU_POWER_WRITE_HEADER) && isForeignOrigin(req)) {
+    return res.status(403).json({ code: 'FOREIGN_ORIGIN', error: 'Cross-origin GPU power schedule writes are not allowed.' });
+  }
   next();
 });
 app.use(cors());
@@ -5021,18 +5060,13 @@ app.get('/api/settings', (req, res) => {
 app.post('/api/settings', (req, res) => {
   const { contextSize, modelsMax, autoStart, noWarmup, flashAttn, gpuLayers, requestLogging, maxConcurrentRequests, localStallMs, defaultReasoningEffort, modelReasoningEffort, defaultBigModel, defaultSmallModel, fullscreenInterval, hfToken, gpus, duo, gpuPower } = req.body;
 
-  // `gpuPower` drives a root action (the llama-manager-gpu-power@ unit), so like `strata`
-  // on /api/config it is loopback-only -- this server has no other inbound auth yet -- and
-  // a foreign browser Origin is refused so a page open on the box itself cannot change it
-  // (CSRF). Checked before any field below mutates config, so a refused request changes
-  // nothing. Every other field keeps its existing access rules.
+  // `gpuPower` drives a root action (the llama-manager-gpu-power@ unit): Host allowlist,
+  // no foreign Origin, the X-Llama-Manager intent header, and loopback only -- see
+  // gpuPowerRefusal. Checked before any field below mutates config, so a refused request
+  // changes nothing. Every other field keeps its existing access rules.
   if (gpuPower !== undefined) {
-    if (!isLoopbackRequest(req)) {
-      return res.status(403).json({ error: 'The GPU power schedule may only be changed from this machine.', code: 'NOT_LOOPBACK' });
-    }
-    if (isForeignOrigin(req)) {
-      return res.status(403).json({ error: 'Cross-origin changes to the GPU power schedule are not allowed.', code: 'FOREIGN_ORIGIN' });
-    }
+    const refusal = gpuPowerRefusal(req, { write: true });
+    if (refusal) return res.status(403).json(refusal);
   }
 
   // Validate and update settings

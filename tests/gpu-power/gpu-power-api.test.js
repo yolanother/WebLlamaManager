@@ -17,7 +17,7 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -102,6 +102,43 @@ function lanAddress() {
 
 const systemctlCalls = () => (existsSync(SYSTEMCTL_LOG) ? readFileSync(SYSTEMCTL_LOG, 'utf8') : '');
 
+/**
+ * A gpuPower settings write exactly as the Settings page sends it: same-origin, with the
+ * X-Llama-Manager intent header.
+ */
+function uiWrite(gpuPower, { host, headers = {} } = {}) {
+  return call('POST', '/api/settings', { gpuPower }, {
+    host,
+    headers: { 'x-llama-manager': '1', origin: `http://${host || '127.0.0.1'}:${apiPort}`, ...headers },
+  });
+}
+
+/**
+ * Raw request with an explicit Host header (fetch will not let a caller set Host), as a
+ * DNS-rebinding page would produce: the browser connects to this box but names the
+ * attacker's domain in Host and Origin.
+ */
+function rawRequest(method, path, { host, headers = {}, body } = {}) {
+  return new Promise((accept, reject) => {
+    const data = body == null ? null : JSON.stringify(body);
+    const req = httpRequest({
+      host: '127.0.0.1', port: apiPort, method, path,
+      headers: { host, 'content-type': 'application/json', ...headers, ...(data ? { 'content-length': Buffer.byteLength(data) } : {}) },
+    }, (res) => {
+      let text = '';
+      res.on('data', (c) => { text += c; });
+      res.on('end', () => {
+        let parsed;
+        try { parsed = JSON.parse(text); } catch { parsed = text; }
+        accept({ status: res.statusCode, body: parsed });
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
 /** Poll until accept(read()) holds. */
 async function eventually(read, accept, description) {
   let value;
@@ -177,10 +214,10 @@ test('/api/settings exposes gpuPower and rejects a cap outside the card range', 
   const settings = await call('GET', '/api/settings');
   assert.deepEqual(settings.body.settings.gpuPower, { enabled: true, defaultWatts: 300, timezone: 'UTC', windows: [] });
   await call('GET', '/api/gpu-power'); // learn the card range
-  const bad = await call('POST', '/api/settings', { gpuPower: { defaultWatts: 500 } });
+  const bad = await uiWrite({ defaultWatts: 500 });
   assert.equal(bad.status, 400);
   assert.match(bad.body.error, /100-450/);
-  const badWindow = await call('POST', '/api/settings', { gpuPower: { windows: [{ start: '25:00', end: '01:00', watts: 320 }] } });
+  const badWindow = await uiWrite({ windows: [{ start: '25:00', end: '01:00', watts: 320 }] });
   assert.equal(badWindow.status, 400);
 });
 
@@ -191,8 +228,46 @@ test('GET /api/gpu-power is read-only: it never starts the privileged unit', asy
   assert.equal(limit(), 420);
   assert.equal(systemctlCalls(), '');
   // A settings write is a deliberate apply, and restores the default.
-  assert.equal((await call('POST', '/api/settings', { gpuPower: { enabled: true } })).status, 200);
+  assert.equal((await uiWrite({ enabled: true })).status, 200);
   await eventually(async () => limit(), (w) => w === 300, 'settings write did not re-apply');
+});
+
+test('a gpuPower write without the X-Llama-Manager header is refused', async () => {
+  const plain = await call('POST', '/api/settings', { gpuPower: { defaultWatts: 450 } });
+  assert.equal(plain.status, 403);
+  assert.equal(plain.body.code, 'MISSING_INTENT_HEADER');
+  assert.equal(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).gpuPower.defaultWatts, 300);
+  // Other settings fields keep their existing rules.
+  assert.equal((await call('POST', '/api/settings', { requestLogging: false })).status, 200);
+});
+
+test('a DNS-rebinding Host is refused for both write and read', async () => {
+  const rebound = `evil.example:${apiPort}`;
+  const write = await rawRequest('POST', '/api/settings', {
+    host: rebound,
+    headers: { origin: `http://${rebound}`, 'x-llama-manager': '1' },
+    body: { gpuPower: { defaultWatts: 450 } },
+  });
+  assert.equal(write.status, 403);
+  assert.equal(write.body.code, 'UNKNOWN_HOST');
+  assert.equal(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).gpuPower.defaultWatts, 300);
+  const read = await rawRequest('GET', '/api/gpu-power', { host: rebound, headers: { origin: `http://${rebound}` } });
+  assert.equal(read.status, 403);
+  assert.equal(read.body.code, 'UNKNOWN_HOST');
+  // The manager's own names still work.
+  assert.equal((await rawRequest('GET', '/api/gpu-power', { host: `localhost:${apiPort}` })).status, 200);
+});
+
+test('a foreign page cannot preflight the X-Llama-Manager header', async () => {
+  const preflight = await call('OPTIONS', '/api/settings', null, {
+    headers: {
+      origin: 'http://evil.example',
+      'access-control-request-method': 'POST',
+      'access-control-request-headers': 'content-type,x-llama-manager',
+    },
+  });
+  assert.equal(preflight.status, 403);
+  assert.equal(preflight.headers.get('access-control-allow-headers'), null);
 });
 
 test('a foreign browser Origin can neither read nor write the power schedule', async () => {
@@ -206,7 +281,7 @@ test('a foreign browser Origin can neither read nor write the power schedule', a
   assert.equal(preflight.status, 403);
   assert.equal(preflight.headers.get('access-control-allow-origin'), null);
 
-  const write = await call('POST', '/api/settings', { gpuPower: { defaultWatts: 450 } }, { headers: foreign });
+  const write = await uiWrite({ defaultWatts: 450 }, { headers: foreign });
   assert.equal(write.status, 403);
   assert.equal(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).gpuPower.defaultWatts, 300);
 
@@ -217,7 +292,7 @@ test('a foreign browser Origin can neither read nor write the power schedule', a
 test('off-box callers may not change gpuPower; other settings are unaffected', async (t) => {
   const lan = lanAddress();
   if (!lan) return t.skip('no non-loopback IPv4 address on this machine');
-  const denied = await call('POST', '/api/settings', { gpuPower: { defaultWatts: 450 } }, { host: lan });
+  const denied = await uiWrite({ defaultWatts: 450 }, { host: lan });
   assert.equal(denied.status, 403);
   assert.equal(denied.body.code, 'NOT_LOOPBACK');
   assert.equal(JSON.parse(readFileSync(CONFIG_PATH, 'utf8')).gpuPower.defaultWatts, 300);
@@ -228,7 +303,7 @@ test('off-box callers may not change gpuPower; other settings are unaffected', a
 test('a window raises the cap now and removing it restores the default', async () => {
   const now = Date.now();
   const windows = [{ start: hhmm(now), end: hhmm(now + 3 * 60_000), watts: 320 }];
-  const saved = await call('POST', '/api/settings', { gpuPower: { windows } });
+  const saved = await uiWrite({ windows });
   assert.equal(saved.status, 200, JSON.stringify(saved.body));
   await eventually(async () => limit(), (w) => w === 320, 'window cap was not applied');
 
@@ -245,7 +320,7 @@ test('a window raises the cap now and removing it restores the default', async (
   assert.equal(status.body.cards[0].drawWatts, 150);
   assert.equal(status.body.nextChange.watts, 300);
 
-  await call('POST', '/api/settings', { gpuPower: { windows: [] } });
+  assert.equal((await uiWrite({ windows: [] })).status, 200);
   await eventually(async () => limit(), (w) => w === 300, 'default cap was not restored');
   const persisted = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
   assert.deepEqual(persisted.gpuPower, { enabled: true, defaultWatts: 300, timezone: 'UTC', windows: [] });

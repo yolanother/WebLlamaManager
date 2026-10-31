@@ -94,15 +94,33 @@ root. It follows the identity-unit pattern:
 llama-manager has no inbound authentication yet, so the gates are the same as for
 `strata` and the GPU reservation routes (wider gap: task T3232ac3050828):
 
-- **Writing `gpuPower` is loopback-only.** Off-box callers get
-  `403 {code: "NOT_LOOPBACK"}`. Other settings fields keep their existing rules.
-- **No cross-origin access.** A browser `Origin` whose host differs from `Host` gets
-  `403 {code: "FOREIGN_ORIGIN"}`. This applies to a `gpuPower` write and to every request
-  to `/api/gpu-power`, including its preflight. `/api/gpu-power` is guarded before the
-  open `cors()`, so it never carries a wildcard grant. curl and the CLI send no `Origin`
-  and are unaffected.
+All checks are in `gpuPowerRefusal()` in `api/server.js`, which builds on
+`isAllowedHost` and `isForeignOrigin` in `api/gpu-power.js`. Other settings fields keep
+their existing rules.
+
+- **Host allowlist (DNS rebinding).** `Host` must be one of this machine's own names
+  on the listening port: a loopback literal, `localhost`, the system hostname (bare or
+  with `.local`), or an interface IP. Any other `Host` gets `403 {code: "UNKNOWN_HOST"}`.
+  The allowlist matters because a rebinding domain is in both `Origin` and `Host`, so
+  comparing those two headers cannot catch it. This applies to reads and to writes.
+- **No cross-origin access (CSRF).** A browser `Origin` whose host differs from `Host`
+  gets `403 {code: "FOREIGN_ORIGIN"}`. This covers a `gpuPower` write and every
+  request to `/api/gpu-power`, including its preflight.
+- **Intent header on writes.** A `gpuPower` write must carry `X-Llama-Manager: 1`, or it
+  gets `403 {code: "MISSING_INTENT_HEADER"}`. The header is not CORS-safelisted, so a
+  foreign page can send it only after a preflight, and that preflight is refused
+  (`403`, with no allow-headers in the response). The UI and `llm gpu-power set` send
+  it.
+- **Writes are loopback-only.** Off-box callers get `403 {code: "NOT_LOOPBACK"}`.
+- **No wildcard CORS.** Both guards run before the open `cors()`, so `/api/gpu-power`
+  never carries a wildcard grant.
 - **`GET /api/gpu-power` is read-only.** It returns the status cached by the last
-  evaluation (see `checkedAt`, at most 60 s old) and never starts the unit.
+  evaluation and never starts the unit. `checkedAt` gives the evaluation time, which is
+  at most 60 s old.
+- **Dev box caveat.** Through the vite dev proxy (`:5250`, `changeOrigin`), the browser
+  `Origin` is `:5250` and `Host` is rewritten to `localhost:3001`. Writes from the dev UI
+  are therefore refused as `FOREIGN_ORIGIN`. Appliances serve the UI and the API from the
+  same origin, so this does not affect them.
 
 From another machine, the UI panel is read-only. Edit the hours on the box's own screen,
 through an SSH tunnel (`ssh -L 3001:127.0.0.1:3001 root@drakemore`, then open
@@ -142,7 +160,7 @@ llm --url http://127.0.0.1:3001 gpu-power set --body '{"windows":[{"start":"08:0
 **API** (on the box, or over `ssh drakemore`):
 
 ```bash
-curl -s -X POST http://127.0.0.1:3001/api/settings -H 'content-type: application/json' \
+curl -s -X POST http://127.0.0.1:3001/api/settings -H 'content-type: application/json' -H 'X-Llama-Manager: 1' \
   -d '{"gpuPower":{"enabled":true,"defaultWatts":300,"timezone":"America/Los_Angeles",
        "windows":[{"start":"08:00","end":"22:00","watts":350}]}}'
 curl -s http://127.0.0.1:3001/api/gpu-power

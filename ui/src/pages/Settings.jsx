@@ -1510,7 +1510,8 @@ function GpuPowerSection({ setMessage }) {
     setSaving(true);
     try {
       const res = await fetch(`${API_BASE}/settings`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        // X-Llama-Manager is required on gpuPower writes (CSRF guard; api/gpu-power.js).
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Llama-Manager': '1' },
         body: JSON.stringify({ gpuPower: bodyFromForm(form) }),
       });
       const data = await res.json();

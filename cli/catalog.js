@@ -225,7 +225,8 @@ const COMMANDS = [
     exactPositionals(positionals, 0);
     const rawBody = option(options, 'body');
     if (rawBody === undefined) throw new Error('gpu-power set requires --body JSON');
-    return { method: 'POST', path: '/api/settings', body: { gpuPower: jsonOption(rawBody, '--body') } };
+    // The server refuses a gpuPower write without this header (CSRF guard; see api/gpu-power.js).
+    return { method: 'POST', path: '/api/settings', headers: [['X-Llama-Manager', '1']], body: { gpuPower: jsonOption(rawBody, '--body') } };
   }),
   command(['presets', 'list'], 'llm presets list', 'List available model presets.', [], ({ positionals }) => {
     exactPositionals(positionals, 0);

@@ -18,6 +18,8 @@ import {
   createGpuPowerController,
   gpuPowerUnitName,
   isForeignOrigin,
+  isAllowedHost,
+  GPU_POWER_WRITE_HEADER,
 } from './gpu-power.js';
 
 const LA = 'America/Los_Angeles';
@@ -340,4 +342,29 @@ test('a foreign Origin is detected; same-origin and no Origin are not', () => {
   assert.equal(isForeignOrigin(req('http://192.168.1.79:5250')), true); // another port is another origin
   assert.equal(isForeignOrigin(req('null')), true); // sandboxed iframe / file://
   assert.equal(isForeignOrigin(req('not a url')), true);
+});
+
+test('Host must be one of the manager\'s own names on its own port (DNS rebinding)', () => {
+  const me = { port: 3001, hostname: 'Drakemore-Llama-Manager', addresses: ['192.168.1.79', 'fe80::1'] };
+  for (const host of [
+    '127.0.0.1:3001', '127.5.6.7:3001', 'localhost:3001', 'LOCALHOST:3001', '[::1]:3001',
+    'drakemore-llama-manager:3001', 'drakemore-llama-manager.local:3001',
+    '192.168.1.79:3001', '[fe80::1]:3001',
+  ]) {
+    assert.equal(isAllowedHost(host, me), true, host);
+  }
+  for (const host of [
+    'evil.example:3001', // a rebinding name resolving to this box
+    '127.0.0.1.evil.example:3001', 'localhost.evil.example:3001',
+    '127.0.0.1:9999', // another port
+    '127.0.0.1', // no port: a browser omits it only for :80
+    '', undefined, 'not a host:x',
+  ]) {
+    assert.equal(isAllowedHost(host, me), false, String(host));
+  }
+});
+
+test('the write header is a non-simple custom header', () => {
+  // Not a CORS-safelisted name, so a browser must preflight it cross-origin.
+  assert.equal(GPU_POWER_WRITE_HEADER, 'x-llama-manager');
 });

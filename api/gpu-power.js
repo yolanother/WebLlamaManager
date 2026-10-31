@@ -235,6 +235,38 @@ export function isForeignOrigin(req) {
 }
 
 /**
+ * Header every gpuPower write must carry (any value). It is not a CORS-safelisted
+ * header, so a browser can send it cross-origin only after a preflight, and that
+ * preflight is refused (see server.js), so a foreign page cannot forge a write.
+ */
+export const GPU_POWER_WRITE_HEADER = 'x-llama-manager';
+
+/**
+ * Whether a Host header names this manager: a loopback literal, `localhost`, the
+ * system hostname (bare or `.local`), or one of the interface addresses -- AND the
+ * port it listens on. Defeats DNS rebinding, where the attacker's own domain
+ * resolves to this box so the browser treats it as same-origin: that domain is in
+ * both Origin and Host, so only an allowlist of real names can tell it apart.
+ * @param {string|undefined} host Raw Host header.
+ * @param {{port: number|string, hostname: string, addresses: string[]}} me This manager's names.
+ * @returns {boolean}
+ */
+export function isAllowedHost(host, { port, hostname, addresses }) {
+  let url;
+  try {
+    url = new URL(`http://${host}`);
+  } catch {
+    return false;
+  }
+  if (!host || url.port !== String(port) || url.username || url.pathname !== '/') return false;
+  const name = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const own = hostname.toLowerCase();
+  return name === 'localhost' || name === '::1' || /^127(\.\d{1,3}){3}$/.test(name)
+    || name === own || name === `${own}.local`
+    || addresses.some((a) => a.toLowerCase() === name);
+}
+
+/**
  * Parses `nvidia-smi` output produced with POWER_QUERY_ARGS.
  * @param {string} stdout CSV without header or units.
  * @returns {Array<{uuid: string, name: string, limit: number|null, min: number|null, max: number|null, draw: number|null}>}

@@ -133,6 +133,13 @@ test('ergonomic commands preserve every MCP method, path, query, and JSON body',
   }
 });
 
+test('gpu-power set sends the X-Llama-Manager intent header the server requires', async t => {
+  const manager = await startManager();
+  t.after(manager.close);
+  successfulOutput(await runAt(manager.url, ['gpu-power', 'set', '--body', '{"defaultWatts":300}']));
+  assert.equal(manager.requests.at(-1).headers['x-llama-manager'], '1');
+});
+
 test('download accepts filename and pattern selectors without adding unrelated body fields', async t => {
   const manager = await startManager();
   t.after(manager.close);
