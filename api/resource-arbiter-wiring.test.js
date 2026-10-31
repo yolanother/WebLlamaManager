@@ -49,3 +49,7 @@ test('the backend tick grows a shrunk idle HIP engine before the CUDA-only early
   assert.ok(grow < body.indexOf('|| !cfg.cuda'), 'grow-back runs on HIP-only hosts (drakemore has no cuda block)');
   assert.match(body, /strataSwapBackend\('hip', grow\.reason\)/);
 });
+
+test('/api/stats exposes per-model queue depth across the llama and exclusive lanes', () => {
+  assert.match(source, /byModel: mergeModelDepths\(llamaQueue\.getModelDepths\(\), ds4Queue\.getModelDepths\(\)\)/);
+});

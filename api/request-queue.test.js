@@ -183,3 +183,69 @@ test('contract 4: an already-aborted acquisition is rejected without consuming c
   assert.equal(queue.pending, 0);
   assert.equal(queue.active, 0);
 });
+
+// ── Per-model batching (docs/Designs/ResourceArbiter.md section 3) ───────────
+
+/**
+ * Drain a queue one item at a time and return the models in activation order.
+ * @param {PriorityRequestQueue} queue - queue holding one active item.
+ * @param {number} firstId - id of that active item.
+ * @param {Array<Promise<number>>} pending - acquisitions tagged with `.model`.
+ * @returns {Promise<string[]>} models in the order they were activated.
+ */
+async function drainOrder(queue, firstId, pending) {
+  const order = [];
+  const ids = new Map();
+  pending.forEach(p => p.then(id => { order.push(p.model); ids.set(order.length - 1, id); }));
+  queue.release(firstId);
+  for (let i = 0; i < pending.length; i++) {
+    await new Promise(r => setImmediate(r));
+    queue.release(ids.get(i));
+  }
+  await Promise.all(pending);
+  return order;
+}
+
+/** @param {PriorityRequestQueue} q @param {string} model @param {string} [priority] */
+function enqueue(q, model, priority = 'interactive') {
+  const p = q.acquire({ model, priority });
+  p.model = model;
+  return p;
+}
+
+/** Count model switches in an activation order, starting from `from`. */
+const switches = (from, order) => order.reduce((n, m, i) => n + ((i ? order[i - 1] : from) !== m ? 1 : 0), 0);
+
+test('batching: a mixed-model queue switches at most once per model', async () => {
+  const queue = new PriorityRequestQueue(1);
+  const first = await queue.acquire({ model: 'A' });
+  const pending = ['B', 'A', 'B', 'A', 'C', 'B', 'A'].map(m => enqueue(queue, m));
+  const order = await drainOrder(queue, first, pending);
+  assert.deepEqual(order, ['A', 'A', 'A', 'B', 'B', 'B', 'C']);
+  assert.equal(switches('A', order), 2, 'A -> B -> C');
+  // Negative control: the same arrivals in plain FIFO order switch seven times.
+  assert.equal(switches('A', ['B', 'A', 'B', 'A', 'C', 'B', 'A']), 7);
+});
+
+test('batching never overrides priority: realtime for another model goes first', async () => {
+  const queue = new PriorityRequestQueue(1);
+  const first = await queue.acquire({ model: 'A' });
+  const pending = [enqueue(queue, 'A'), enqueue(queue, 'B', 'realtime')];
+  const order = await drainOrder(queue, first, pending);
+  assert.deepEqual(order, ['B', 'A']);
+});
+
+test('batching is bounded: an older request for another model is served after maxModelBatch jumps', async () => {
+  const queue = new PriorityRequestQueue(1, { maxModelBatch: 2 });
+  const first = await queue.acquire({ model: 'A' });
+  const pending = ['B', 'A', 'A', 'A'].map(m => enqueue(queue, m));
+  const order = await drainOrder(queue, first, pending);
+  assert.deepEqual(order, ['A', 'A', 'B', 'A']);
+});
+
+test('getModelDepths counts active and pending items per model', async () => {
+  const queue = new PriorityRequestQueue(1);
+  await queue.acquire({ model: 'A' });
+  enqueue(queue, 'B'); enqueue(queue, 'B'); enqueue(queue, 'A');
+  assert.deepEqual(queue.getModelDepths(), { A: { active: 1, pending: 1 }, B: { active: 0, pending: 2 } });
+});

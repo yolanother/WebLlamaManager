@@ -5,7 +5,10 @@
 // This module serializes work against constrained inference lanes while letting
 // realtime requests skip queued lower-priority work, cooperatively preempting
 // background work, bounding background admission, removing aborted pending
-// work before activation, and preventing starvation.
+// work before activation, and preventing starvation. Within a priority class it
+// batches by model: the model that last ran is served before an older request
+// for another model, bounded by maxModelBatch, so a mixed queue does not
+// load/unload a model between every request (docs/Designs/ResourceArbiter.md).
 
 /** Supported request priority classes, ordered from highest to lowest. */
 export const REQUEST_PRIORITIES = Object.freeze(['realtime', 'interactive', 'background']);
@@ -50,9 +53,10 @@ export function parseQueueItemId(value) {
 export class PriorityRequestQueue {
   /**
    * @param {number} concurrency Maximum simultaneously active items.
-   * @param {{maxBackgroundQueued?:number,maxHighPriorityBurst?:number}} options Queue policy.
+   * @param {{maxBackgroundQueued?:number,maxHighPriorityBurst?:number,maxModelBatch?:number}} options Queue
+   *   policy; `maxModelBatch` caps consecutive picks of the last model ahead of an older request for another.
    */
-  constructor(concurrency = 1, { maxBackgroundQueued = 8, maxHighPriorityBurst = 8 } = {}) {
+  constructor(concurrency = 1, { maxBackgroundQueued = 8, maxHighPriorityBurst = 8, maxModelBatch = 16 } = {}) {
     this.concurrency = Math.max(1, concurrency);
     this.maxBackgroundQueued = Math.max(0, maxBackgroundQueued);
     this.maxHighPriorityBurst = Math.max(1, maxHighPriorityBurst);
@@ -61,6 +65,9 @@ export class PriorityRequestQueue {
     this.queuedCount = 0;
     this._nextId = 1;
     this._highPriorityBurst = 0;
+    this.maxModelBatch = Math.max(0, maxModelBatch);
+    this._lastModel = null;
+    this._modelJumps = 0;
     this.activeItems = new Map();
   }
 
@@ -170,9 +177,26 @@ export class PriorityRequestQueue {
     return [...this.activeItems.values(), ...this.queue].map(publicItem);
   }
 
+  /**
+   * Active and pending item counts per model, for /api/stats.
+   * @returns {Object<string, {active:number, pending:number}>} counts keyed by model.
+   */
+  getModelDepths() {
+    const depths = {};
+    const add = (item, key) => {
+      const model = item.model || 'unknown';
+      depths[model] ??= { active: 0, pending: 0 };
+      depths[model][key]++;
+    };
+    for (const item of this.activeItems.values()) add(item, 'active');
+    for (const item of this.queue) add(item, 'pending');
+    return depths;
+  }
+
   /** Activate a queued item and resolve its acquisition promise. */
   _activate(item) {
     item._abortCleanup?.();
+    if (item.model) this._lastModel = item.model;
     this.running++;
     item.status = 'active';
     item.startedAt = Date.now();
@@ -189,8 +213,29 @@ export class PriorityRequestQueue {
     }
   }
 
-  /** Pick the next item, enforcing priority ordering and bounded starvation. */
+  /**
+   * Prefer the oldest item in the same priority class for the model that ran last, over the
+   * class head `index`, at most maxModelBatch times in a row (then FIFO once).
+   * @param {number} index Queue index the priority rules chose (-1 for none).
+   * @returns {number} The index to activate.
+   */
+  _batchByModel(index) {
+    if (index < 0 || this._lastModel == null) return index;
+    const { priority, model } = this.queue[index];
+    if (model === this._lastModel) { this._modelJumps = 0; return index; }
+    const same = this.queue.findIndex(item => item.priority === priority && item.model === this._lastModel);
+    if (same < 0 || this._modelJumps >= this.maxModelBatch) { this._modelJumps = 0; return index; }
+    this._modelJumps++;
+    return same;
+  }
+
+  /** Pick the next item, enforcing priority ordering, bounded starvation and per-model batching. */
   _nextIndex() {
+    return this._batchByModel(this._priorityIndex());
+  }
+
+  /** Pick the head of the next priority class, enforcing priority ordering and bounded starvation. */
+  _priorityIndex() {
     // Realtime is a hard latency class: queued background work must never use
     // the starvation budget to jump ahead of it. Background fairness applies
     // only once no realtime request is waiting.
