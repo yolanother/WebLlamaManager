@@ -17,14 +17,12 @@ durable record. `tests/remote-failover/frostburn-routing.test.mjs` boots the rea
 
 | Alias | Order | Why |
 |---|---|---|
-| `default-big` | drakemore Strata, then local `unsloth_Qwen3.6-35B-A3B-GGUF` | The podcast's heavy calls (`zf_FH3EDHPM49peNzQs7k:default-big`) run on drakemore's iGPU (Qwen3.8 Flash Next, 55-75 tok/s). The fallback is Frostburn's fastest model (50.2 tok/s median). The dense Gemma 31B (~7.5 tok/s) is not used. |
-| `default-small` | dahaka `qwen3:8b`, then drakemore, then local `Qwen_Qwen3-8B-GGUF` | Narration (~5 req/min) goes to dahaka (79.8 tok/s), which leaves drakemore's single Strata stream to the podcast. |
+| `default-big` | drakemore Strata only | The podcast's heavy calls (`zf_FH3EDHPM49peNzQs7k:default-big`) run on drakemore's iGPU (Qwen3.8 Flash Next, 55-75 tok/s). The intended overflow target, local `unsloth_Qwen3.6-35B-A3B-GGUF` (50.2 tok/s median), is NOT added yet: Frostburn's memory guard refuses it at today's free memory (estimate 39.8 GiB vs 21.3 GiB budget, 2026-10-31). An 8B is not acceptable for podcast authoring. |
+| `default-small` | dahaka `qwen3:8b`, then local `Qwen_Qwen3-8B-GGUF`; never drakemore | Narration, display metadata, diary and tool-event clients (14 of 17 drakemore requests in one 5-minute window) used to fall back onto drakemore whenever dahaka's single slot was busy, queueing the podcast behind them and tripping drakemore's breaker with REASONING_EXHAUSTED. Applied live 2026-10-31 02:57Z. |
 
 Ranking is backend **priority (lower number wins)**, then measured tok/s, then alias
-order. dahaka is priority 9 and drakemore 10, so `default-small` goes to dahaka whatever
-the speeds measure. dahaka is not a `default-big` member, so its priority cannot move
-`default-big`. Do not give drakemore a lower number than dahaka: that flips
-`default-small` back onto drakemore, and the test fails.
+order. dahaka is priority 9 (applied live) and drakemore 10; with drakemore out of
+`default-small` that priority only matters if drakemore is ever added back.
 
 A member that answers 503/504/429 or a backend-down 502, or that refuses the connection,
 fails over to the next member. A `REASONING_EXHAUSTED` 502 is the caller's token budget,
@@ -34,9 +32,9 @@ so it passes through (see [model alias groups](../features/model-alias-groups.md
 
 ```console
 $ curl -s -X PUT http://127.0.0.1:5250/api/aliases/default-big -H 'Content-Type: application/json' \
-    -d '{"targets":[{"host":"drakemore-mtj8prpy","model":"default-big"},{"host":"local","model":"unsloth_Qwen3.6-35B-A3B-GGUF"}]}'
+    -d '{"targets":[{"host":"drakemore-mtj8prpy","model":"default-big"}]}'
 $ curl -s -X PUT http://127.0.0.1:5250/api/aliases/default-small -H 'Content-Type: application/json' \
-    -d '{"targets":[{"host":"dahaka-ollama-mngx88pk","model":"qwen3:8b"},{"host":"drakemore-mtj8prpy","model":"default-small"},{"host":"local","model":"Qwen_Qwen3-8B-GGUF"}]}'
+    -d '{"targets":[{"host":"dahaka-ollama-mngx88pk","model":"qwen3:8b"},{"host":"local","model":"Qwen_Qwen3-8B-GGUF"}]}'
 $ curl -s -X PUT http://127.0.0.1:5250/api/backends/dahaka-ollama-mngx88pk -H 'Content-Type: application/json' -d '{"priority":9}'
 $ curl -s http://127.0.0.1:5250/api/aliases   # check the targets and localTarget
 ```
