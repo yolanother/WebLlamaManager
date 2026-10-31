@@ -114,6 +114,7 @@ import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watch
 import { slotCacheFilename, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import { remoteOnlyAliasFallback } from './remote-only-alias.js';
+import { remoteFailoverDecision } from './remote-failover.js';
 import {
   annotateModelResidency,
   modelResidencyDecision,
@@ -1441,10 +1442,11 @@ function estimateLocalProcessingMs(inputTokens) {
  * @param {string} requestedModel the concrete model the LOCAL engine would serve.
  * @param {string} endpoint the OpenAI endpoint path, e.g. 'chat/completions'.
  * @param {object|null} body the request body, used only for size-based offload estimates.
- * @param {{localOnly?: boolean, aliasRouting?: AliasRouting|null, inboundRelay?:object|null}} [options] `aliasRouting`
+ * @param {{localOnly?: boolean, aliasRouting?: AliasRouting|null, inboundRelay?:object|null, excludeBackendIds?:Set<string>}} [options] `aliasRouting`
  *   is the tiers resolved from the ORIGINAL request name; pass it explicitly whenever the
  *   alias name differs from `requestedModel`, since it cannot be re-derived from the
- *   resolved name. Omit it and it is derived from `requestedModel`.
+ *   resolved name. Omit it and it is derived from `requestedModel`. `excludeBackendIds`
+ *   are remote backends that already refused this request (remote-failover.js).
  * @returns {object} a routing decision: `{remote:false}` for local, a remote routing
  *   envelope from `buildRemoteRouting()`, or a blocked marker (residency conflict, or a
  *   remote-only alias with no member available — see remoteOnlyAliasRouting()). A
@@ -1468,7 +1470,7 @@ function resolveBackend(requestedModel, endpoint, body, options = {}) {
  * @param {{localOnly?: boolean, aliasRouting?: AliasRouting|null, inboundRelay?:object|null}} [options] see resolveBackend().
  * @returns {object} a routing decision, as resolveBackend() documents.
  */
-function resolveBackendRoute(requestedModel, endpoint, body, { localOnly = false, aliasRouting, inboundRelay = null } = {}) {
+function resolveBackendRoute(requestedModel, endpoint, body, { localOnly = false, aliasRouting, inboundRelay = null, excludeBackendIds = new Set() } = {}) {
   const alias = aliasRouting !== undefined ? aliasRouting : resolveAliasRouting(requestedModel);
   const backends = config.backends || {};
   const desiredModels = desiredResidentModels();
@@ -1530,7 +1532,7 @@ function resolveBackendRoute(requestedModel, endpoint, body, { localOnly = false
   const viableRemoteEndpointKey = endpoint.replace(/\//g, '/');
   const hasViableRemote = backends.directory.some(b => {
     if (!b.enabled || !b.tested) return false;
-    if (isBackendCircuitOpen(b.id)) return false;
+    if (isBackendCircuitOpen(b.id) || excludeBackendIds.has(b.id)) return false;
     if (b.supportedEndpoints && !b.supportedEndpoints.includes(viableRemoteEndpointKey)) return false;
     if (!remoteTargetModel(b, alias)) return false;
     const queue = backendQueues.get(b.id);
@@ -1705,6 +1707,7 @@ function resolveBackendRoute(requestedModel, endpoint, body, { localOnly = false
     if (!b.enabled) return false;
     if (!b.tested) return false; // Must pass a connectivity test before use
     if (isBackendCircuitOpen(b.id)) return false; // Skip backends with tripped circuit breaker
+    if (excludeBackendIds.has(b.id)) return false; // already failed this request (remote-failover.js)
     if (b.supportedEndpoints && !b.supportedEndpoints.includes(endpointKey)) return false;
     // Alias request → this backend must be one of the alias's own ranked targets.
     // Direct request → only an acceptsAny host can serve it.
@@ -1769,11 +1772,11 @@ function resolveBackendRoute(requestedModel, endpoint, body, { localOnly = false
  * @returns {object} `routing` unchanged, a remote routing envelope, or a blocked rejection
  *   (`{remote:false, blocked:true, status, code, type, message}`) for sendBlockedResidency().
  */
-function remoteOnlyAliasRouting(routing, alias, endpoint, { localOnly = false, inboundRelay = null } = {}) {
+function remoteOnlyAliasRouting(routing, alias, endpoint, { localOnly = false, inboundRelay = null, excludeBackendIds = new Set() } = {}) {
   if (!alias || alias.localTarget) return routing;
   const backends = config.backends || {};
   const reachable = (backends.enabled ? backends.directory || [] : []).filter(b =>
-    b.enabled && b.tested && !isBackendCircuitOpen(b.id) &&
+    b.enabled && b.tested && !isBackendCircuitOpen(b.id) && !excludeBackendIds.has(b.id) &&
     (!b.supportedEndpoints || b.supportedEndpoints.includes(endpoint)) &&
     remoteTargetModel(b, alias));
   const decision = remoteOnlyAliasFallback({
@@ -14607,18 +14610,41 @@ async function handleChatCompletions(req, res) {
   });
 
   // ===== REMOTE BACKEND PATH =====
-  if (routing.remote) {
+  remotePath: if (routing.remote) {
     req._backend = routing.backend.id;
-    const remoteBody = { ...proxyBody, model: routing.targetModel };
     console.log(`[chat/completions] Routing to remote backend: ${routing.backend.name} (model: ${routing.targetModel})`);
     addLog('backends', `Routing chat/completions to ${routing.backend.name} (queue: local=${llamaQueue.pending} pending)`);
 
     try {
-      const { response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
-        method: 'POST',
-        headers: { ...routing.headers },
-        body: JSON.stringify(remoteBody)
-      }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId), activeReqId });
+      // A member that cannot serve right now (503 exclusive/exhausted, 502, 504, 429) fails
+      // over to the alias's next member, then its local target, before the error reaches the
+      // caller (remote-failover.js). Each refusing backend is excluded, so this terminates.
+      const excludeBackendIds = new Set();
+      let response;
+      let backend;
+      for (;;) {
+        ({ response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+          method: 'POST',
+          headers: { ...routing.headers },
+          body: JSON.stringify({ ...proxyBody, model: routing.targetModel })
+        }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId), activeReqId }));
+        if (response.ok) break;
+        excludeBackendIds.add(backend.id);
+        const failover = remoteFailoverDecision({
+          status: response.status,
+          next: resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting, excludeBackendIds }),
+          exclusiveActive: !!exclusive,
+        });
+        if (failover.action === 'pass-through') break;
+        try { await response.body?.cancel(); } catch { /* already closed */ }
+        console.log(`[chat/completions] failover: ${backend.name} answered ${response.status}; ${failover.action === 'remote' ? `retrying on ${failover.routing.backend.name}` : 'serving locally'}`);
+        addLog('backends', `failover: ${backend.name} answered ${response.status} for ${requestedModel}; ${failover.action === 'remote' ? `retrying on ${failover.routing.backend.name}` : 'serving locally'}`);
+        routing = failover.routing;
+        req._backend = routing.remote ? routing.backend.id : undefined;
+        const entry = activeRequests.get(activeReqId);
+        if (entry) entry.backend = routing.remote ? routing.backend.id : 'local';
+        if (!routing.remote) break remotePath;
+      }
 
       if (!response.ok) {
         const error = await response.text();
