@@ -85,15 +85,17 @@ CUDA is unchanged. There the expert cache lives in VRAM and `cuda.expertCache` i
 
 ### llama-manager client
 
-`config.podsRelease = {enabled: false, coordinatorUrl, nodeId, minIdleSec: 600}`. The
-key comes from the `PODS_API_KEY` environment variable (a systemd drop-in
-`EnvironmentFile`). It is never stored in config.json and never logged. Requests are
+`config.podsRelease = {enabled: false, coordinatorUrl, nodeId, minIdleSec: 600}`
+(`api/pods-release.js`). The key comes from the `PODS_API_KEY` environment variable (a
+systemd drop-in `EnvironmentFile`). It is never stored in config.json and never logged.
+`POST /api/config` accepts `podsRelease` only from loopback, because `coordinatorUrl`
+receives the key. Requests are
 rate-limited to one per 5 minutes and time out after 10 s. A failure is logged and
 ignored, so adaptive sizing still runs. Calls are made from:
 
 - the HIP attempt, when the configured cache does not fit;
-- the grow-back tick, when Strata is shrunk and idle and the predicted growth is below
-  the hysteresis.
+- the grow-back tick, when Strata is shrunk, idle and past the cooldown, but short of
+  memory (`strataGrowDecision` returns `needMemory`).
 
 The reverse direction already exists: Pods takes a priority-80 `rtx3090` reservation
 before a job, and Strata leaves the card. RAM for a Pods job is not reserved. This task

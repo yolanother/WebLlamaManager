@@ -5,8 +5,9 @@ LICENSE file in the repository root.
 Operator guide for the Strata engine: what Strata is, how to set it up on the host
 (ROCm/HIP and CUDA builds), the config.strata block and preset shape, how to activate
 it, how the manager moves it between the RTX 3090 (CUDA) and the Strix Halo iGPU (HIP)
-with hysteresis, how to test that swap with a priority-80 GPU lock, measured performance
-on drakemore, and troubleshooting. The design record lives in Designs/StrataEngine.md.
+with hysteresis, how to test that swap with a priority-80 GPU lock, the adaptive HIP expert
+cache (start smaller when memory is short, grow back when idle), releasing idle Pods workers,
+the prefill-hang watchdog, measured performance on drakemore, and troubleshooting. The design record lives in Designs/StrataEngine.md.
 -->
 
 # Strata Engine - Qwen3.8 Flash Next
@@ -121,12 +122,15 @@ Layout on the host:
 | `cuda.gpuPool` | `rtx3090` | Pool the manager reserves before a CUDA spawn. |
 | `cuda.reservationPriority` | `50` | Above the model pin (25), below Pods (80). |
 | `cuda.hostResidentGb` | `56` | Free-RAM target before a CUDA spawn (measured ~50 GB). |
-| `hip.expertCache` | **required** | Explicit slot count. `auto` is rejected: it is greedy on unified memory. |
+| `hip.expertCache` | **required** | Explicit slot count, the **target**. `auto` is rejected: it is greedy on unified memory. When the target does not fit what is available at spawn, Strata starts at the largest cache that does (see "Adaptive HIP expert cache"). |
+| `hip.minExpertCache` | `4000` | Floor for the adaptive cache; below it the attempt fails (`reclaim-timeout`) and recovery retries. Never above `expertCache`. |
+| `hip.growCooldownMin` | `10` | Minimum time since the last settle before a shrunk, idle HIP engine restarts larger. |
 | `hip.baseGb` | `65` | HIP footprint beside the expert cache (weights, KV, MTP). The reclaim target before a HIP spawn is `baseGb` + `expertCache` x 1.94 MiB (~95 GiB at 16000), plus `guard.ds4ReclaimHeadroomGb` (8). Measured on drakemore 2026-10-31: strata RSS ~49 GiB + iGPU GTT ~46 GiB at 16000 slots. |
 | `hip.residentGb` | ignored | Retired: a hand-set reclaim target went stale twice (106 blocked every spawn; 84 let 48000 slots swap the box). Logged as a warning when present. |
 | `policy.returnToCudaAfterMin` | `15` | Hysteresis before moving back to CUDA. |
 | `policy.drainMaxWaitSec` | `120` | Bounded drain of in-flight requests before cancelling. |
 | `policy.idleBaselineMb` / `yieldGrowthMb` | `1536` / `512` | Other VRAM above baseline+growth counts as a busy 3090. |
+| `policy.prefillStallSec` | `180` | A prompt read with no progress (Strata `/metrics` `live.prompt_read`) for this long is cancelled; still stuck 30 s later restarts the engine. |
 
 GB/MB values become bytes, durations become ms, env values are stringified. If `hip`
 has a missing or `auto` `expertCache` it is disabled with a warning. There are no
@@ -154,6 +158,61 @@ has a missing or `auto` `expertCache` it is disabled with a warning. There are n
   `strataRuntime.hipFootprint`; recalibrate `baseGb` from that if they drift apart.
 - HIP allocations do not show in `VmRSS` (12.9 GB RES vs 168 GB VIRT). Look at
   `MemAvailable`, not RSS.
+
+### Adaptive HIP expert cache
+
+Design: [`Designs/ResourceArbiter.md`](Designs/ResourceArbiter.md).
+
+**Starting smaller instead of refusing.** After evicting llama, the HIP attempt waits up to
+30 s for the configured footprint. If idle Pods workers were released, it waits the full
+180 s instead. It then starts at
+`min(expertCache, floor((MemAvailable - 8 GiB - baseGb) / 1.94 MiB))` slots, rounded down
+to 100. A result below `hip.minExpertCache` fails the attempt as `reclaim-timeout`, and
+recovery retries it.
+
+- The `presets` log shows the outcome: `strata: hip expert cache <N> (<reason>)`.
+- `GET /api/stats` shows it as
+  `strataRuntime.expertCache = {configured, effective, reason, at}`.
+- A crash restart reuses the same size.
+
+**Growing back.** Every 5 s the backend tick checks a Strata running on HIP below its
+target. It grows the cache back when all of these hold:
+
+- nothing has been in flight or queued in the exclusive lane for 60 s;
+- `hip.growCooldownMin` has passed since the last settle;
+- a restart would gain at least 2000 slots.
+
+The restart goes through the normal swap path: bounded drain, verified stop, HIP load.
+When Strata is idle and short only of memory, and `podsRelease` is enabled, the manager
+asks the Pods coordinator to release idle workers on this node.
+
+**Shrinking.** A running engine is not resized in place. Below
+`guard.memCriticalBelowGb`, the memory governor stops it, and recovery starts it again
+at whatever then fits.
+
+### Releasing idle Pods workers (`podsRelease`, off by default)
+
+```json
+"podsRelease": { "enabled": true, "coordinatorUrl": "https://<coordinator>", "nodeId": "<drakemore's Pods node id>", "minIdleSec": 600 }
+```
+
+The coordinator key goes in `PODS_API_KEY`, set through a systemd drop-in
+`EnvironmentFile`, never in config.json. It must belong to the principal that owns the
+node. `podsRelease` can only be changed from loopback, because its URL receives that
+key.
+
+The manager calls
+`POST /api/v1/nodes/{nodeId}/release-idle-workers` (local-runpod
+`docs/Features/release-idle-workers.md`) at most once per 5 minutes. The coordinator
+releases only workers that meet all of these:
+
+- the node reports them idle for at least `minIdleSec`;
+- the coordinator holds no job for them;
+- their endpoint has nothing queued;
+- their endpoint is not pinned and holds no warm GPU hold.
+
+The node agent stops those containers, and the next job restarts them. Results appear
+in the `presets` log as `pods: asked the coordinator to release idle workers ...`.
 
 ## Presets
 
@@ -325,6 +384,8 @@ Since 2026-10-15 both `default-big` and `default-small` on drakemore target the
 | HIP backend disabled with warning | `hip.expertCache` missing or `auto`; set an explicit slot count. |
 | Status `exhausted` / 503 on local requests | Both backends failed. The manager re-activates the preset by itself: first retry 1 min after the failure, then every 2, 4, 8, 16 and 30 min (capped, never gives up), logging each attempt in the `presets` log; `GET /api/stats` shows `strataRecovery` (`since`, `attempts`, `nextAt`, `lastReason`) while it is down. Read `<dataDir>/engine-<backend>.log` for the cause, or re-activate via the activate route to retry at once. If the engine was brought back some other way, the next local request probes its health (at most every 5 s) and clears the status itself. A `stop-unconfirmed` runtime (wedged process) is never retried automatically. |
 | Manager `GET /health` said `down` (503) while Strata served | Fixed: `/health` counted only llama. It now reports `healthy` while the exclusive engine is `ready` (`degraded` while loading/swapping, `down` when exhausted), plus `exclusive: {engine, status}`. Frostburn's router never probed `/health`; its alias trips came from the circuit breaker (see model-alias-groups.md). |
+| `strata prefill stalled: no prefill progress for Ns (read R/T)` in the `presets` log | The prefill watchdog cancelled a request whose prompt read stopped moving for `policy.prefillStallSec`. A following `restarting on <backend>` line means Strata stayed stuck after the cancel and was restarted. If Strata's `/metrics` does not answer, the watchdog cannot see progress, and only the 900 s zero-token ceiling ends the request. |
+| Strata serving with fewer expert slots than configured | Adaptive cache: memory was short at spawn. `strataRuntime.expertCache.reason` says why. It grows back once memory frees and Strata has been idle past `hip.growCooldownMin`. Check `ps` and the Pods containers for what holds the memory. |
 | Status `stop-unconfirmed` | A `strata` process survived the stop. Kill it (`pkill -x strata` as the service user's root) and re-activate. |
 | Engine logs mlock / pinned allocation failure | Add a `LimitMEMLOCK=infinity` drop-in to the unit. |
 | **Pods busy-poll CPU contention** | Fixed in the node agent (2026-10-17): idle job-take long-polls for 25 s, so idle workers use ~0.5% CPU instead of ~1-2 cores, and RunPod SDK logging is INFO. Workers created before that still poll until redeployed. |
