@@ -191,6 +191,22 @@ back to local anyway and forward the raw alias name, which llama.cpp answers wit
 
 Aliases with a local member are unaffected.
 
+### A member that answers "can't serve" fails over (chat/completions)
+
+A reachable member can still refuse: drakemore answered **503 `exclusive_ds4_mode`** to
+everything for 12 days (2026-10-19 → 10-31) while its Strata runtime was `exhausted`, and
+Frostburn passed each 503 straight to the caller. A `chat/completions` request forwarded to
+a member that answers **429, 502, 503 or 504** before sending anything is now re-routed with
+that member excluded (`api/remote-failover.js`, `excludeBackendIds` on `resolveBackend()`):
+to the next remote member, else to the alias's `local` target (not while a DS4/Strata engine
+owns the box). Log: `failover: <backend> answered <status> for <model>; retrying on … /
+serving locally`. 4xx and 500 pass through (another member would answer the same), and so
+does the original error when nothing else can serve it.
+
+Failover only helps an alias that has somewhere to go: give a remote-only alias a second
+member or a `local` target (e.g. Frostburn `default-big` → `[drakemore, local <resident
+model>]`). `completions`, `responses` and `messages` still pass a refusal through.
+
 ### `acceptsAny` is a host policy, NOT an alias fallback
 
 `backend.acceptsAny` (a model name string, migrated from the old
@@ -450,6 +466,7 @@ the local engine *would* serve, not a claim that it is being served.
 |---|---|
 | Alias request behaves like an unknown model | `GET /api/aliases` — `resolvable: false`, or the name is missing. A miss is a **no-op**: the name is passed through unchanged as a literal model, exactly as before aliases existed. |
 | A target never appears in `candidates` | Its backend is missing, `enabled: false`, or `tested: false` — those are dropped silently. Or its glob matched nothing in that host's cached `remoteModels`. |
+| Alias returns the member's own 503 (`exclusive_ds4_mode`, `exhausted`) | The alias has no other member or `local` target to fail over to (or the endpoint is not `chat/completions`). Add one; see "A member that answers can't serve fails over". |
 | Remote-only alias returns 503 `model_unavailable` | Every member is disabled, untested, or circuit-open. Check `[routing] remote-only alias` in the logs and the backends' breaker state. |
 | Alias keeps going remote | Working as designed. Look for `[routing] alias warm-gate:` in the logs — the local member is cold. |
 | Alias cold-loaded locally and evicted something | The warm gate could not fire: no remote member had queue capacity. See [the soft-protection caveat](#the-warm-gate-is-soft-protection-not-a-residency-guarantee); use `config.modelResidency.desiredModels` for a hard pin. |
