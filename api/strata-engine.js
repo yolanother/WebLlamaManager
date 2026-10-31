@@ -6,7 +6,9 @@
 // a normalized shape (bytes/ms units, stringified env, per-backend CUDA/HIP
 // blocks, policy knobs), builds the per-backend server.py config JSON from a
 // preset, computes the config file path and the python launch spec, and decides
-// whether a /health body means the engine is ready. See
+// whether a /health body means the engine is ready. Sizes the HIP expert cache to the
+// memory available (strataHipExpertCache) and decides when an idle, shrunk engine should
+// restart larger (strataGrowDecision); see docs/Designs/ResourceArbiter.md. See
 // docs/Designs/StrataEngine.md sections 4, 5.1 and 6.
 
 import path from 'node:path';
@@ -37,6 +39,60 @@ const HIP_BASE_GB = 65;
  */
 export function strataHipFootprintBytes({ expertCache, baseBytes = HIP_BASE_GB * GB }) {
   return baseBytes + expertCache * EXPERT_SLOT_BYTES;
+}
+
+/** Slot step the adaptive cache rounds down to, so logged sizes stay readable. */
+const SLOT_ROUND = 100;
+/** Smallest gain (slots, ~3.8 GiB) worth a grow-back restart: the hysteresis band. */
+const MIN_GROW_SLOTS = 2000;
+/** Strata must be idle this long before a grow-back restart. */
+const GROW_IDLE_MS = 60_000;
+
+/**
+ * The largest HIP expert cache that fits the memory available now, capped at the configured
+ * target. On unified memory the cache is the only part of Strata's footprint that can shrink,
+ * so a starved box gets a smaller cache instead of a refused spawn (drakemore 2026-10-31:
+ * 87-99.6 GiB available against ~103 GiB for 16000 slots refused Strata for hours).
+ * @param {{configured:number, minSlots:number, availableBytes:number, baseBytes:number, headroomBytes:number}} p
+ *   target slots, floor slots, MemAvailable, the HIP base footprint and the headroom kept free.
+ * @returns {{slots:number|null, reason:string}} slots to launch with (a multiple of 100 unless it
+ *   is the target), or null when even the floor does not fit.
+ */
+export function strataHipExpertCache({ configured, minSlots, availableBytes, baseBytes, headroomBytes }) {
+  const gib = (b) => (b / GB).toFixed(1);
+  const fit = Math.floor((availableBytes - headroomBytes - baseBytes) / EXPERT_SLOT_BYTES);
+  if (fit >= configured) return { slots: configured, reason: `configured ${configured} slots fit (MemAvailable ${gib(availableBytes)} GiB)` };
+  const slots = fit - (fit % SLOT_ROUND);
+  if (slots < minSlots) {
+    return { slots: null, reason: `MemAvailable ${gib(availableBytes)} GiB fits ${Math.max(0, slots)} slots, below the ${minSlots}-slot floor` };
+  }
+  return { slots, reason: `MemAvailable ${gib(availableBytes)} GiB fits ${slots} of ${configured} slots` };
+}
+
+/**
+ * Whether a Strata running on HIP below its target cache should restart larger now. It must
+ * be idle for a minute and past the cooldown since it settled, and a restart (which frees its
+ * own footprint first) must buy at least MIN_GROW_SLOTS more slots, so it never flaps.
+ * @param {{effective:number, configured:number, minSlots:number, availableBytes:number,
+ *   baseBytes:number, headroomBytes:number, busy:boolean, idleSinceMs:number|null,
+ *   settledAt:number, now:number, growCooldownMs:number}} p current and target slots, floor,
+ *   MemAvailable, footprint knobs, whether a request is in flight or queued, the idle-streak
+ *   start, when the engine settled, the clock and the cooldown.
+ * @returns {{action:'grow'|'stay', slots?:number, idleSinceMs:number|null, reason:string}}
+ *   `idleSinceMs` is the idle-streak start the caller keeps for the next tick.
+ */
+export function strataGrowDecision(p) {
+  const { effective, configured, availableBytes, baseBytes, busy, idleSinceMs, settledAt, now, growCooldownMs } = p;
+  if (effective >= configured) return { action: 'stay', idleSinceMs: null, reason: 'at the configured cache' };
+  if (busy) return { action: 'stay', idleSinceMs: null, reason: 'busy' };
+  const idleSince = idleSinceMs ?? now;
+  if (now - idleSince < GROW_IDLE_MS) return { action: 'stay', idleSinceMs: idleSince, reason: 'idle streak too short' };
+  if (now - settledAt < growCooldownMs) return { action: 'stay', idleSinceMs: idleSince, reason: 'cooldown' };
+  const after = strataHipExpertCache({ ...p, availableBytes: availableBytes + strataHipFootprintBytes({ expertCache: effective, baseBytes }) });
+  if (!after.slots || after.slots < effective + MIN_GROW_SLOTS) {
+    return { action: 'stay', idleSinceMs: idleSince, reason: `hysteresis: a restart would get ${after.slots ?? 0} slots, running ${effective}` };
+  }
+  return { action: 'grow', slots: after.slots, idleSinceMs: idleSince, reason: `grow ${effective} -> ${after.slots} slots: ${after.reason}` };
 }
 
 /** @param {unknown} v @returns {boolean} true for a finite number > 0. */
@@ -104,6 +160,7 @@ export function resolveStrataConfig(config, { dataDirDefault, memTotalBytes, hea
       drainMaxWaitMs: posOr(s.policy?.drainMaxWaitSec, 120) * SEC_MS,
       idleBaselineBytes: posOr(s.policy?.idleBaselineMb, 1536) * MB,
       yieldGrowthBytes: posOr(s.policy?.yieldGrowthMb, 512) * MB,
+      prefillStallMs: posOr(s.policy?.prefillStallSec, 180) * SEC_MS,
     },
   };
 
@@ -130,11 +187,16 @@ export function resolveStrataConfig(config, { dataDirDefault, memTotalBytes, hea
       if (h.residentGb !== undefined) {
         warnings.push('strata.hip.residentGb is ignored: the HIP footprint is derived from expertCache (set strata.hip.baseGb to recalibrate)');
       }
-      const residentBytes = strataHipFootprintBytes({ expertCache: h.expertCache, baseBytes: posOr(h.baseGb, HIP_BASE_GB) * GB });
+      const baseBytes = posOr(h.baseGb, HIP_BASE_GB) * GB;
+      const residentBytes = strataHipFootprintBytes({ expertCache: h.expertCache, baseBytes });
       if (isPos(memTotalBytes) && residentBytes + headroomBytes > memTotalBytes) {
         warnings.push(`strata.hip.expertCache ${h.expertCache} needs ~${(residentBytes / GB).toFixed(1)} GiB + ${(headroomBytes / GB).toFixed(1)} GiB headroom, more than the ${(memTotalBytes / GB).toFixed(1)} GiB of RAM; hip backend disabled`);
       } else {
-        out.hip = { ...baseBackend(h), expertCache: h.expertCache, residentBytes };
+        out.hip = {
+          ...baseBackend(h), expertCache: h.expertCache, residentBytes, baseBytes,
+          minExpertCache: Math.min(posOr(h.minExpertCache, 4000), h.expertCache),
+          growCooldownMs: posOr(h.growCooldownMin, 10) * MIN_MS,
+        };
       }
     }
   }
@@ -148,16 +210,17 @@ export function resolveStrataConfig(config, { dataDirDefault, memTotalBytes, hea
 
 /**
  * Build the JSON document server.py reads for one backend.
- * @param {{cfg: object, preset: object, backend: 'cuda'|'hip'}} p - resolved config, strata preset, backend.
+ * @param {{cfg: object, preset: object, backend: 'cuda'|'hip', expertCache?: number}} p - resolved config,
+ *   strata preset, backend, and the adaptive cache size when it differs from the configured one.
  * @returns {object} the server config (exe, args, cwd, tokenizer, model_name, log, lib_dirs, port, backend, env, open_browser).
  * @throws {Error} when `cfg[backend]` is null (backend not configured).
  */
-export function strataServerConfig({ cfg, preset, backend }) {
+export function strataServerConfig({ cfg, preset, backend, expertCache }) {
   const b = cfg[backend];
   if (!b) throw new Error(`strata backend '${backend}' is not configured`);
   return {
     exe: b.exe,
-    args: [...preset.strata.args, '--expert-cache', String(b.expertCache),
+    args: [...preset.strata.args, '--expert-cache', String(expertCache ?? b.expertCache),
       '--max-context', String(preset.context || QWEN38_FLASH_NEXT_CONTEXT)],
     cwd: cfg.root,
     tokenizer: preset.strata.tokenizer,

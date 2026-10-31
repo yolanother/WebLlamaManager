@@ -19,6 +19,8 @@ import {
   strataHealthReady,
   effectiveStrataBlock,
   strataHipFootprintBytes,
+  strataHipExpertCache,
+  strataGrowDecision,
 } from './strata-engine.js';
 
 const GB = 1024 * 1024 * 1024;
@@ -280,4 +282,85 @@ test('resolveStrataConfig: a HIP expert cache that can never fit in RAM is refus
   assert.equal(big.hip, null, 'the 48000-slot incident config is refused');
   assert.equal(big.enabled, false);
   assert.ok(big.warnings.some((w) => /expertCache 48000/.test(w) && /GiB/.test(w)), big.warnings.join('|'));
+});
+
+// ── Adaptive HIP expert cache (docs/Designs/ResourceArbiter.md §1) ───────────
+// drakemore 2026-10-31 after the deploy: MemAvailable 87-99.6 GiB against ~103 GiB for
+// 16000 slots, so the gate refused Strata for hours instead of starting it smaller.
+const fitArgs = (over = {}) => ({ configured: 16000, minSlots: 4000, baseBytes: 65 * GB, headroomBytes: HEADROOM, ...over });
+
+test('strataHipExpertCache: starved memory picks a smaller cache instead of refusing', () => {
+  const r = strataHipExpertCache(fitArgs({ availableBytes: 87 * GB }));
+  assert.ok(r.slots >= 4000 && r.slots < 16000, `slots ${r.slots}`);
+  assert.equal(r.slots % 100, 0, 'rounded down to 100');
+  assert.ok(strataHipFootprintBytes({ expertCache: r.slots }) + HEADROOM <= 87 * GB, 'the chosen cache fits');
+  assert.ok(strataHipFootprintBytes({ expertCache: r.slots + 100 }) + HEADROOM > 87 * GB, 'and is the largest that does');
+  assert.match(r.reason, /87\.0 GiB/);
+});
+
+test('strataHipExpertCache: enough memory keeps the configured cache', () => {
+  const r = strataHipExpertCache(fitArgs({ availableBytes: 110 * GB }));
+  assert.equal(r.slots, 16000);
+});
+
+test('strataHipExpertCache: below the floor returns null (negative control: the floor is enforced)', () => {
+  const r = strataHipExpertCache(fitArgs({ availableBytes: 78 * GB }));
+  assert.equal(r.slots, null);
+  assert.match(r.reason, /4000/);
+  assert.equal(strataHipExpertCache(fitArgs({ availableBytes: 0 })).slots, null, 'unreadable MemAvailable never spawns');
+});
+
+test('resolveStrataConfig: hip minExpertCache defaults to 4000, never above the target; growCooldownMin to 10; prefillStallSec to 180', () => {
+  const r = resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 16000 }) }), opts);
+  assert.equal(r.hip.minExpertCache, 4000);
+  assert.equal(r.hip.growCooldownMs, 10 * 60_000);
+  assert.equal(r.hip.baseBytes, 65 * GB);
+  assert.equal(r.policy.prefillStallMs, 180_000);
+  const small = resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 3000 }) }), opts);
+  assert.equal(small.hip.minExpertCache, 3000);
+  const set = resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 16000, minExpertCache: 6000, growCooldownMin: 3 }), policy: { prefillStallSec: 60 } }), opts);
+  assert.equal(set.hip.minExpertCache, 6000);
+  assert.equal(set.hip.growCooldownMs, 3 * 60_000);
+  assert.equal(set.policy.prefillStallMs, 60_000);
+});
+
+test('strataServerConfig: an expertCache override replaces the configured size', () => {
+  const cfg = resolveStrataConfig(baseCfg(), opts);
+  const out = strataServerConfig({ cfg, preset: preset(), backend: 'hip', expertCache: 7300 });
+  assert.deepEqual(out.args.slice(-4), ['--expert-cache', '7300', '--max-context', '131072']);
+});
+
+const growArgs = (over = {}) => ({
+  ...fitArgs(), effective: 8000, busy: false, idleSinceMs: 0, settledAt: 0,
+  now: 3_600_000, growCooldownMs: 600_000, ...over,
+});
+
+test('strataGrowDecision: memory freed while idle grows back after the cooldown', () => {
+  // Running at 8000 slots; others released ~20 GiB so a restart would fit the full 16000.
+  const r = strataGrowDecision(growArgs({ availableBytes: 30 * GB }));
+  assert.equal(r.action, 'grow');
+  assert.equal(r.slots, 16000);
+});
+
+test('strataGrowDecision: never inside the cooldown, while busy, or before 60 s of idle (negative controls)', () => {
+  const freed = { availableBytes: 30 * GB };
+  assert.equal(strataGrowDecision(growArgs({ ...freed, settledAt: 3_600_000 - 60_000 })).action, 'stay', 'cooldown');
+  const busy = strataGrowDecision(growArgs({ ...freed, busy: true }));
+  assert.equal(busy.action, 'stay', 'busy');
+  assert.equal(busy.idleSinceMs, null, 'busy resets the idle streak');
+  const fresh = strataGrowDecision(growArgs({ ...freed, idleSinceMs: null }));
+  assert.equal(fresh.action, 'stay', 'idle streak just started');
+  assert.equal(fresh.idleSinceMs, 3_600_000);
+});
+
+test('strataGrowDecision: hysteresis, a small gain does not restart', () => {
+  // ~2 GiB free beyond the headroom at 8000 slots buys ~1000 more slots: below the 2000-slot step.
+  const avail = HEADROOM + 2 * GB;
+  const r = strataGrowDecision(growArgs({ availableBytes: avail }));
+  assert.equal(r.action, 'stay');
+  assert.match(r.reason, /hysteresis/);
+});
+
+test('strataGrowDecision: nothing to do at the configured size', () => {
+  assert.equal(strataGrowDecision(growArgs({ effective: 16000, availableBytes: 60 * GB })).action, 'stay');
 });
