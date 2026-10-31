@@ -3,9 +3,11 @@
 // LICENSE file in the repository root.
 //
 // Verifies requestPodsIdleRelease without a network: it does nothing unless
-// config.podsRelease is enabled and complete with a PODS_API_KEY, posts the
-// node-scoped release request with a bearer key, is rate-limited, never throws on
-// a failed or refused call, and never puts the key in what it returns.
+// config.podsRelease is enabled and the environment carries PODS_COORDINATOR_URL,
+// PODS_NODE_ID and PODS_API_KEY, posts the node-scoped release request with a
+// bearer key only to the environment's coordinator (a coordinatorUrl in runtime
+// config is ignored), is rate-limited, never throws on a failed or refused call,
+// and never puts the key in what it returns.
 // Design: docs/Designs/ResourceArbiter.md section 2.
 
 import { test } from 'node:test';
@@ -13,8 +15,8 @@ import assert from 'node:assert/strict';
 import { requestPodsIdleRelease } from './pods-release.js';
 
 const KEY = 'pods-test-key-0123456789';
-const cfg = (over = {}) => ({ podsRelease: { enabled: true, coordinatorUrl: 'https://pods.example/', nodeId: 'n-drakemore', ...over } });
-const env = { PODS_API_KEY: KEY };
+const cfg = (over = {}) => ({ podsRelease: { enabled: true, ...over } });
+const env = { PODS_API_KEY: KEY, PODS_COORDINATOR_URL: 'https://pods.example/', PODS_NODE_ID: 'n-drakemore' };
 
 /** A fetch double that records calls and answers with `body` (or throws `error`). */
 function fakeFetch({ status = 200, body = { released: ['w-up'], skipped: [] }, error = null } = {}) {
@@ -42,7 +44,9 @@ test('posts the node-scoped release request with the bearer key and returns the 
 
 test('does nothing when disabled, incomplete or without a key (negative control: the flag gates every call)', async () => {
   const { fn, calls } = fakeFetch();
-  for (const [config, e] of [[cfg({ enabled: false }), env], [{}, env], [cfg({ nodeId: '' }), env], [cfg({ coordinatorUrl: '' }), env], [cfg(), {}]]) {
+  const without = (k) => ({ ...env, [k]: '' });
+  for (const [config, e] of [[cfg({ enabled: false }), env], [{}, env], [cfg(), without('PODS_NODE_ID')],
+    [cfg(), without('PODS_COORDINATOR_URL')], [cfg(), without('PODS_API_KEY')], [cfg(), { ...env, PODS_COORDINATOR_URL: 'file:///etc/passwd' }]]) {
     const r = await requestPodsIdleRelease({ config, env: e, reason: 'x', fetchFn: fn, state: {}, now: 0 });
     assert.equal(r.sent, false);
   }
@@ -67,4 +71,16 @@ test('a refused or failed call never throws and never leaks the key', async () =
     assert.deepEqual(r.released, []);
     assert.ok(!JSON.stringify(r).includes(KEY), JSON.stringify(r));
   }
+});
+
+test('the key only ever goes to the coordinator named in the environment, never to a runtime-config URL', async () => {
+  const { fn, calls } = fakeFetch();
+  await requestPodsIdleRelease({ config: cfg({ coordinatorUrl: 'https://attacker.example', nodeId: 'other' }), env, reason: 'x', fetchFn: fn, state: {}, now: 0 });
+  assert.equal(calls.length, 1);
+  assert.equal(new URL(calls[0].url).origin, 'https://pods.example');
+  assert.match(calls[0].url, /\/nodes\/n-drakemore\//);
+  const lone = fakeFetch();
+  const r = await requestPodsIdleRelease({ config: cfg({ coordinatorUrl: 'https://attacker.example', nodeId: 'n' }), env: { PODS_API_KEY: KEY }, reason: 'x', fetchFn: lone.fn, state: {}, now: 0 });
+  assert.equal(r.sent, false);
+  assert.equal(lone.calls.length, 0, 'a runtime-config URL alone never receives the key');
 });

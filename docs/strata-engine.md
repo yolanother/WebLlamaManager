@@ -193,13 +193,18 @@ at whatever then fits.
 ### Releasing idle Pods workers (`podsRelease`, off by default)
 
 ```json
-"podsRelease": { "enabled": true, "coordinatorUrl": "https://<coordinator>", "nodeId": "<drakemore's Pods node id>", "minIdleSec": 600 }
+"podsRelease": { "enabled": true, "minIdleSec": 600 }
 ```
 
-The coordinator key goes in `PODS_API_KEY`, set through a systemd drop-in
-`EnvironmentFile`, never in config.json. It must belong to the principal that owns the
-node. `podsRelease` can only be changed from loopback, because its URL receives that
-key.
+Where the request goes and the credential come only from the environment: a root-owned
+systemd drop-in `EnvironmentFile` sets `PODS_COORDINATOR_URL` (http/https),
+`PODS_NODE_ID` (drakemore's Pods node id) and `PODS_API_KEY`. The key must belong to the
+principal that owns the node. They are never read from config.json, so a config write
+cannot redirect the key. `POST /api/config` accepts only `enabled` and `minIdleSec` in
+`podsRelease` (400 `PODS_RELEASE_FIELD` otherwise), only from loopback, and, like
+`strata`, only with a Host that is a name of this machine or an IP literal and no
+foreign Origin (403 `UNTRUSTED_ORIGIN`). That blocks a cross-origin page or a
+DNS-rebinding page in a browser on the host.
 
 The manager calls
 `POST /api/v1/nodes/{nodeId}/release-idle-workers` (local-runpod

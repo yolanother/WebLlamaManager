@@ -85,11 +85,14 @@ CUDA is unchanged. There the expert cache lives in VRAM and `cuda.expertCache` i
 
 ### llama-manager client
 
-`config.podsRelease = {enabled: false, coordinatorUrl, nodeId, minIdleSec: 600}`
-(`api/pods-release.js`). The key comes from the `PODS_API_KEY` environment variable (a
-systemd drop-in `EnvironmentFile`). It is never stored in config.json and never logged.
-`POST /api/config` accepts `podsRelease` only from loopback, because `coordinatorUrl`
-receives the key. Requests are
+`config.podsRelease = {enabled: false, minIdleSec: 600}` (`api/pods-release.js`). The
+coordinator URL, node id and key come only from the environment
+(`PODS_COORDINATOR_URL`, `PODS_NODE_ID`, `PODS_API_KEY`, a root-owned systemd drop-in
+`EnvironmentFile`), never from config.json, and the key is never logged, so no config
+write can send the key elsewhere. `POST /api/config` accepts only `enabled` and
+`minIdleSec` there, only from loopback, and, for both `strata` and `podsRelease`, only
+with a local Host and no foreign Origin (`api/config-write-guard.js`: blocks CSRF and DNS
+rebinding from a browser on the host). Requests are
 rate-limited to one per 5 minutes and time out after 10 s. A failure is logged and
 ignored, so adaptive sizing still runs. Calls are made from:
 
@@ -144,6 +147,6 @@ rate take about a minute.
 | `strata.hip.growCooldownMin` | 10 | Minimum time between a settle and a grow-back restart. |
 | `strata.policy.prefillStallSec` | 180 | No prefill progress for this long cancels the request. |
 | `podsRelease.enabled` | false | Ask the Pods coordinator to release idle workers. |
-| `podsRelease.coordinatorUrl` / `nodeId` | none | Coordinator base URL and this host's Pods node id. |
+| env `PODS_COORDINATOR_URL` / `PODS_NODE_ID` | none | Coordinator base URL and this host's Pods node id (environment only). |
 | `podsRelease.minIdleSec` | 600 | Only workers idle at least this long are released. |
 | env `PODS_API_KEY` | none | Key of the principal that owns the node. |

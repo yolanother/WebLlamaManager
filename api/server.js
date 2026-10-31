@@ -117,6 +117,7 @@ import { remoteOnlyAliasFallback } from './remote-only-alias.js';
 import { remoteFailoverDecision, countsAsBackendFailure, managerHealthStatus } from './remote-failover.js';
 import { exclusiveRecoveryDecision } from './exclusive-recovery.js';
 import { requestPodsIdleRelease } from './pods-release.js';
+import { configWriteTrusted } from './config-write-guard.js';
 import { seedStrataPreset, STRATA_PRESET_ID } from './strata-seed.js';
 import { kvFootprint, readGgufAttentionMetadata } from './gguf-kv.js';
 import { normalizeModelPresetOptions, applyModelPresetOptions, modelContextOverride, wantsPresetContextMode } from './model-preset-options.js';
@@ -9968,6 +9969,14 @@ async function readStrataLive(port) {
 }
 
 const podsReleaseState = {};
+/** The only `config.podsRelease` keys a config write may set (the target lives in the environment). */
+const PODS_RELEASE_FIELDS = ['enabled', 'minIdleSec'];
+
+/** Host names this machine answers to, for configWriteTrusted. */
+function configWriteLocalNames() {
+  const h = systemHostname();
+  return ['localhost', h, `${h}.local`];
+}
 /**
  * Ask the Pods coordinator to release this node's idle workers (behind config.podsRelease and
  * PODS_API_KEY, rate-limited; see pods-release.js). Logs what happened; never throws.
@@ -11189,9 +11198,21 @@ app.post('/api/config', (req, res) => {
     const tooBig = fit.warnings.find((w) => w.startsWith('strata.hip.expertCache'));
     if (tooBig) return res.status(400).json({ error: tooBig, code: 'STRATA_HIP_TOO_LARGE' });
   }
-  // `podsRelease.coordinatorUrl` receives the PODS_API_KEY bearer; a remote caller must not redirect it.
+  // `podsRelease` switches the Pods release on; where the key goes is env-only (pods-release.js).
   if ('podsRelease' in updates && !isLoopbackRequest(req)) {
     return res.status(403).json({ error: 'The podsRelease config may only be changed from this machine.', code: 'NOT_LOOPBACK' });
+  }
+  // Loopback is not enough: a browser on this host can POST cross-origin or via DNS rebinding.
+  if ('strata' in updates || 'podsRelease' in updates) {
+    const trust = configWriteTrusted({ host: req.headers.host, origin: req.headers.origin, localNames: configWriteLocalNames() });
+    if (!trust.ok) return res.status(403).json({ error: `Refused: ${trust.reason}`, code: 'UNTRUSTED_ORIGIN' });
+  }
+  if ('podsRelease' in updates) {
+    const pr = updates.podsRelease;
+    const extra = pr && typeof pr === 'object' ? Object.keys(pr).filter((k) => !PODS_RELEASE_FIELDS.includes(k)) : ['(not an object)'];
+    if (extra.length) {
+      return res.status(400).json({ error: `podsRelease accepts only ${PODS_RELEASE_FIELDS.join(', ')}; the coordinator URL, node id and key come from the environment (PODS_COORDINATOR_URL, PODS_NODE_ID, PODS_API_KEY). Refused: ${extra.join(', ')}`, code: 'PODS_RELEASE_FIELD' });
+    }
   }
   for (const [presetId, preset] of Object.entries(updates.presets || {})) {
     if (!preset || (preset.engine || ENGINE_TYPES.LLAMA) === ENGINE_TYPES.LLAMA) continue;

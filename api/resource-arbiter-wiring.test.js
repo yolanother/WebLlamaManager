@@ -73,8 +73,12 @@ test('the Pods release client is called behind its flag from the HIP attempt and
   assert.match(fnBody('strataBackendTick'), /else if \(grow\.needMemory\) void releaseIdlePodsWorkers\(/);
 });
 
-test('podsRelease may only be changed from this machine (its URL receives the Pods key)', () => {
+test('loopback-only config keys also require a trusted Host/Origin, and podsRelease carries only the flag and thresholds', () => {
   const at = source.indexOf("app.post('/api/config'");
-  const route = source.slice(at, at + 4000);
+  const route = source.slice(at, at + 5000);
   assert.match(route, /'podsRelease' in updates && !isLoopbackRequest\(req\)/);
+  assert.match(route, /configWriteTrusted\(\{ host: req\.headers\.host, origin: req\.headers\.origin, localNames: configWriteLocalNames\(\) \}\)/);
+  assert.match(route, /\('strata' in updates \|\| 'podsRelease' in updates\)/);
+  assert.match(route, /PODS_RELEASE_FIELDS/);
+  assert.match(source, /const PODS_RELEASE_FIELDS = \['enabled', 'minIdleSec'\]/);
 });
