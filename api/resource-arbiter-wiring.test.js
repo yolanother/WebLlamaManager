@@ -53,3 +53,14 @@ test('the backend tick grows a shrunk idle HIP engine before the CUDA-only early
 test('/api/stats exposes per-model queue depth across the llama and exclusive lanes', () => {
   assert.match(source, /byModel: mergeModelDepths\(llamaQueue\.getModelDepths\(\), ds4Queue\.getModelDepths\(\)\)/);
 });
+
+test('the backend tick runs the prefill watchdog on Strata /metrics: cancel the slot holder, restart a wedged engine', () => {
+  const body = fnBody('strataBackendTick');
+  assert.match(body, /strataPrefillVerdict\(\{ live: await readStrataLive\(cfg\.port\)/);
+  assert.match(body, /stallMs: cfg\.policy\.prefillStallMs/);
+  assert.match(body, /ds4Queue\.activeItems\.values\(\)/, 'cancels the request holding the exclusive slot');
+  assert.match(body, /strataSwapBackend\(runtime\.backend, 'prefill-wedged'\)/);
+  const live = fnBody('readStrataLive');
+  assert.match(live, /\/metrics/);
+  assert.match(live, /Accept: 'application\/json'/);
+});

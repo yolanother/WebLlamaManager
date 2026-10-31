@@ -225,7 +225,7 @@ import {
 } from './strata-engine.js';
 import {
   STRATA_HOLDER, parseComputeApps, otherComputeVramBytes, blockingClaim, strataBackendDecision, cudaAdmission,
-  waitForCudaLeaseRelease,
+  waitForCudaLeaseRelease, strataPrefillVerdict,
 } from './strata-policy.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
@@ -576,6 +576,8 @@ const strataState = {
   memAvailableBeforeSpawn: 0,
   // Start of Strata's idle streak for the HIP grow-back decision (strataGrowDecision).
   growIdleSinceMs: null,
+  // Prefill watchdog state ({read, since, cancelledAt}, strataPrefillVerdict); null when not reading.
+  prefillWatch: null,
   // Backoff state while the runtime is `exhausted` ({since, attempts, nextAt, lastReason}); null when healthy.
   recovery: null,
 };
@@ -9962,6 +9964,20 @@ async function strataSwapBackend(target, reason) {
   runStrataLoadPhase(target, reason, settle);
 }
 
+/**
+ * Read the `live` block of Strata's JSON GET /metrics (state, prompt_read, prompt_total).
+ * @param {number} port Strata's port.
+ * @returns {Promise<?object>} the block, or null when Strata does not answer within 3 s.
+ */
+async function readStrataLive(port) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/metrics`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(3000) });
+    return r.ok ? (await r.json())?.live ?? null : null;
+  } catch {
+    return null;
+  }
+}
+
 let strataTickRunning = false;
 /**
  * Periodic CUDA/HIP policy poll, called from the GPU sweep timer. Samples foreign compute
@@ -9997,6 +10013,24 @@ async function strataBackendTick() {
       addLog('presets', 'strata: engine is no longer running and is not restarting; marked exhausted and released the CUDA lease. Re-activate the preset to retry.');
       return;
     }
+  }
+  if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready' && !strataState.swapPromise
+    && (ds4Queue.active > 0 || strataState.prefillWatch?.cancelledAt != null)) {
+    // Prefill-hang watchdog (docs/Designs/ResourceArbiter.md section 4): a prompt read that stops
+    // progressing is cancelled; still stuck after the cancel means a wedged engine, restarted in place.
+    const pf = strataPrefillVerdict({ live: await readStrataLive(cfg.port), prev: strataState.prefillWatch, now: Date.now(), stallMs: cfg.policy.prefillStallMs });
+    strataState.prefillWatch = pf.state;
+    if (pf.action === 'cancel') {
+      addLog('presets', `strata prefill stalled: ${pf.reason}; cancelling the request`);
+      for (const item of ds4Queue.activeItems.values()) activeRequests.get(item.activeReqId)?.abortController?.abort();
+    } else if (pf.action === 'restart') {
+      addLog('presets', `strata prefill ${pf.reason}; restarting on ${runtime.backend}`);
+      strataState.prefillWatch = null;
+      await strataSwapBackend(runtime.backend, 'prefill-wedged');
+      return;
+    }
+  } else {
+    strataState.prefillWatch = null;
   }
   if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready' && runtime.backend === 'hip'
     && runtime.expertCache && cfg.hip && !strataState.swapPromise) {

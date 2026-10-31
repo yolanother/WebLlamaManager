@@ -16,6 +16,7 @@ import {
   blockingClaim,
   strataBackendDecision,
   cudaAdmission,
+  strataPrefillVerdict,
 } from './strata-policy.js';
 
 const MiB = 1048576;
@@ -271,4 +272,38 @@ test('waitForCudaLeaseRelease: throws when the lease is still held at the timeou
     isHeld: () => true, swapInFlight: () => true, leave: async () => {},
     sleep: async () => { t += 500; }, now: () => t, timeoutMs: 2000,
   }), /timed out/);
+});
+
+// ── Prefill-hang watchdog (docs/Designs/ResourceArbiter.md section 4) ────────
+// drakemore 2026-10-31: Strata sat 540 s reading a 1282-token prompt at 0 tok/s.
+const reading = (read, total = 1282) => ({ state: 'reading', prompt_read: read, prompt_total: total });
+const PF = { stallMs: 180_000, wedgeGraceMs: 30_000 };
+
+/** Feed a sequence of [now, live] samples through the verdict; returns every verdict. */
+function run(samples) {
+  let state = null;
+  return samples.map(([now, live]) => {
+    const v = strataPrefillVerdict({ live, prev: state, now, ...PF });
+    state = v.state;
+    return v;
+  });
+}
+
+test('strataPrefillVerdict: a prefill with no progress past the limit is cancelled, then a wedged engine restarted', () => {
+  const v = run([[0, reading(null)], [100_000, reading(null)], [180_000, reading(null)], [200_000, reading(null)], [210_000, reading(null)]]);
+  assert.deepEqual(v.map((x) => x.action), ['ok', 'ok', 'cancel', 'ok', 'restart']);
+  assert.match(v[2].reason, /no prefill progress for 180s/);
+  assert.match(v[2].reason, /0\/1282/);
+});
+
+test('strataPrefillVerdict: progress resets the clock (negative control: a slow healthy prefill is never cancelled)', () => {
+  const v = run([[0, reading(0, 100000)], [170_000, reading(16384, 100000)], [340_000, reading(32768, 100000)], [500_000, reading(49152, 100000)]]);
+  assert.ok(v.every((x) => x.action === 'ok'), v.map((x) => x.action).join());
+});
+
+test('strataPrefillVerdict: generating, idle or unreadable metrics never cancel; a cancelled prefill that recovers is not restarted', () => {
+  assert.equal(strataPrefillVerdict({ live: { state: 'generating' }, prev: { read: -1, since: 0, cancelledAt: null }, now: 900_000, ...PF }).action, 'ok');
+  assert.equal(strataPrefillVerdict({ live: null, prev: { read: -1, since: 0, cancelledAt: null }, now: 900_000, ...PF }).action, 'ok');
+  const v = run([[0, reading(null)], [180_000, reading(null)], [190_000, { state: 'idle' }], [400_000, { state: 'idle' }]]);
+  assert.deepEqual(v.map((x) => x.action), ['ok', 'cancel', 'ok', 'ok']);
 });
