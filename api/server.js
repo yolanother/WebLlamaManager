@@ -227,7 +227,7 @@ import {
 } from './strata-engine.js';
 import {
   STRATA_HOLDER, parseComputeApps, otherComputeVramBytes, blockingClaim, strataBackendDecision, cudaAdmission,
-  waitForCudaLeaseRelease, strataPrefillVerdict, prefillStalledError, isPrefillStalled,
+  waitForCudaLeaseRelease, strataPrefillVerdict, prefillStalledError, isPrefillStalled, prefillStalledSseFrame,
 } from './strata-policy.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
@@ -10174,7 +10174,11 @@ async function strataBackendTick() {
       lastDecision: { action: decision.action, reason: decision.reason, at: now },
     };
     if (decision.action === 'yield-to-hip') await strataSwapBackend('hip', decision.reason);
-    else if (decision.action === 'return-to-cuda') await strataSwapBackend('cuda', decision.reason);
+    else if (decision.action === 'return-to-cuda') {
+      // A failed CUDA return falls back to HIP: keep the HIP size it was serving at.
+      const size = runtime.expertCache?.effective;
+      await strataSwapBackend('cuda', decision.reason, { hipAttempts: [size ? { keepAtLeast: size } : {}] });
+    }
   } finally {
     strataTickRunning = false;
   }
@@ -13932,9 +13936,6 @@ async function serveDs4WithSwapRecovery(req, res, opts) {
         if (prefillStalled && !res.headersSent) {
           return res.status(504).json({ error: { message: err.message, type: 'prefill_stalled', code: 'prefill_stalled' } });
         }
-        if (prefillStalled && !res.writableEnded) {
-          try { res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'prefill_stalled', code: 'prefill_stalled' } })}\n\n`); } catch { /* client gone */ }
-        }
         if (!res.headersSent) {
           return res.status(502).json({
             error: { message: `${engine.type}-server request failed: ${err.message}`, type: `${engine.type}_backend_error` },
@@ -14079,6 +14080,7 @@ async function proxyChatToDs4(req, res, { requestedModel, isStreaming, startTime
     // invisible to the caller) or a real backend fault (answer 502). Sending
     // the 502 here would make a swap indistinguishable from a broken engine.
     if (!res.headersSent) throw err;
+    if (isPrefillStalled(err) && !res.writableEnded) { try { res.write(prefillStalledSseFrame('chat/completions', err.message)); } catch { /* client gone */ } }
     try { res.end(); } catch { /* ignore */ }
   } finally {
     ds4Slot.release();
@@ -14162,6 +14164,7 @@ async function proxyCompletionsToDs4(req, res, { requestedModel, isStreaming, st
     // Rethrow like proxyChatToDs4 so serveDs4WithSwapRecovery can tell our own
     // hot-swap from a real backend fault.
     if (!res.headersSent) throw err;
+    if (isPrefillStalled(err) && !res.writableEnded) { try { res.write(prefillStalledSseFrame('completions', err.message)); } catch { /* client gone */ } }
     try { res.end(); } catch { /* ignore */ }
   } finally {
     ds4Slot.release();
@@ -16833,6 +16836,7 @@ async function proxyResponsesToDs4(req, res, {
     endActiveRequest(activeReqId, { status: 'error' });
     addLlmLog({ endpoint: 'responses', model: requestedModel, stream: isStreaming, status: 502, duration: Date.now() - startTime, promptTokens: 0, completionTokens: 0, tokensPerSecond: 0, messages, prompt: null, response: null, error: error.message, backend: engine.type, requestBody: req.body });
     if (!res.headersSent) throw error;
+    if (isPrefillStalled(error) && !res.writableEnded) { try { res.write(prefillStalledSseFrame('responses', error.message)); } catch { /* client gone */ } }
     if (!res.writableEnded) res.end();
   } finally {
     res.off('close', abort);
@@ -17427,6 +17431,7 @@ async function proxyMessagesToExclusive(req, res, {
     log({ status: 502, duration: Date.now() - startTime, error: error.message });
     // Rethrow so serveDs4WithSwapRecovery can tell our own hot-swap from a real fault.
     if (!res.headersSent) throw error;
+    if (isPrefillStalled(error) && !res.writableEnded) { try { res.write(prefillStalledSseFrame('messages', error.message)); } catch { /* client gone */ } }
     if (!res.writableEnded) res.end();
   } finally {
     res.off('close', abort);

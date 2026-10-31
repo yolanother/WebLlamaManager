@@ -250,7 +250,8 @@ export function resolveStrataConfig(config, { dataDirDefault, memTotalBytes, hea
           ...baseBackend(h), expertCache: h.expertCache, residentBytes, baseBytes,
           minExpertCache: Math.min(posOr(h.minExpertCache, 4000), h.expertCache),
           growCooldownMs: posOr(h.growCooldownMin, 10) * MIN_MS,
-          growMarginBytes: posOr(h.growMarginGb, 16) * GB,
+          // 34 = 6 GiB critical stop + 36 GiB largest Pods worker measured on drakemore - 8 GiB headroom.
+          growMarginBytes: posOr(h.growMarginGb, 34) * GB,
         };
       }
     }

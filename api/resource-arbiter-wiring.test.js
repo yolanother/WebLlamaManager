@@ -87,3 +87,17 @@ test('prefill watchdog: the cancelled request fails, only Strata waits, a wedge 
   assert.match(recovery, /prefillStalled = isPrefillStalled\(err\)/);
   assert.match(recovery, /res\.status\(504\)\.json\(\{ error: \{ message: err\.message, type: 'prefill_stalled'/);
 });
+
+test('a streaming request the prefill watchdog cancels gets the typed SSE error in every exclusive proxy (r3)', () => {
+  for (const [proxy, endpoint, v] of [['proxyChatToDs4', 'chat/completions', 'err'], ['proxyCompletionsToDs4', 'completions', 'err'],
+    ['proxyResponsesToDs4', 'responses', 'error'], ['proxyMessagesToExclusive', 'messages', 'error']]) {
+    const body = fnBody(proxy);
+    const frame = body.indexOf(`if (isPrefillStalled(${v}) && !res.writableEnded) { try { res.write(prefillStalledSseFrame('${endpoint}', ${v}.message)); }`);
+    assert.ok(frame > 0, `${proxy} writes the prefill_stalled frame`);
+    assert.ok(frame > body.indexOf(`if (!res.headersSent) throw ${v};`), `${proxy}: only once headers are out (else the 504 path)`);
+  }
+});
+
+test('a return to CUDA that falls back to HIP keeps the HIP size (r3)', () => {
+  assert.match(fnBody('strataBackendTick'), /strataSwapBackend\('cuda', decision\.reason, \{ hipAttempts: \[size \? \{ keepAtLeast: size \} : \{\}\] \}\)/);
+});

@@ -314,7 +314,7 @@ test('strataHipExpertCache: below the floor returns null (negative control: the 
 test('resolveStrataConfig: hip minExpertCache defaults to 4000, never above the target; growCooldownMin to 10; prefillStallSec to 180', () => {
   const r = resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 16000 }) }), opts);
   assert.equal(r.hip.minExpertCache, 4000);
-  assert.equal(r.hip.growMarginBytes, 16 * GB, 'hip.growMarginGb defaults to 16');
+  assert.equal(r.hip.growMarginBytes, 34 * GB, 'hip.growMarginGb defaults to 34 (6 GiB critical + 36 GiB largest worker - 8 GiB headroom)');
   assert.equal(resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 16000, growMarginGb: 24 }) }), opts).hip.growMarginBytes, 24 * GB);
   assert.equal(r.hip.growCooldownMs, 10 * 60_000);
   assert.equal(r.hip.baseBytes, 65 * GB);
@@ -333,32 +333,32 @@ test('strataServerConfig: an expertCache override replaces the configured size',
   assert.deepEqual(out.args.slice(-4), ['--expert-cache', '7300', '--max-context', '131072']);
 });
 
-const MARGIN = 16 * GB;
+const MARGIN = 34 * GB; // default: a returning 36 GiB Pods worker must not reach the 6 GiB critical stop
 const growArgs = (over = {}) => ({
   ...fitArgs(), effective: 8000, busy: false, idleSinceMs: 0, settledAt: 0,
   now: 3_600_000, growCooldownMs: 600_000, growMarginBytes: MARGIN, ...over,
 });
 
 test('strataGrowDecision: memory freed while idle grows back after the cooldown', () => {
-  // Running at 8000 slots with 45 GiB free: a restart fits the full 16000 and still leaves the margin.
-  const r = strataGrowDecision(growArgs({ availableBytes: 45 * GB }));
+  // Running at 8000 slots with 60 GiB free: a restart fits the full 16000 and still leaves the margin.
+  const r = strataGrowDecision(growArgs({ availableBytes: 60 * GB }));
   assert.equal(r.action, 'grow');
   assert.equal(r.slots, 16000);
 });
 
 test('strataGrowDecision: a grow always leaves headroom + growMargin free (review: never grow to 2 GiB above the critical stop)', () => {
-  // 30 GiB free at 8000 slots: without the margin it would grow to 16000 and leave only the 8 GiB headroom.
-  const r = strataGrowDecision(growArgs({ availableBytes: 30 * GB }));
+  // 50 GiB free at 8000 slots: without the margin it would grow to 16000 and leave only the 8 GiB headroom.
+  const r = strataGrowDecision(growArgs({ availableBytes: 50 * GB }));
   assert.equal(r.action, 'grow');
-  const left = 30 * GB + strataHipFootprintBytes({ expertCache: 8000 }) - strataHipFootprintBytes({ expertCache: r.slots });
+  const left = 50 * GB + strataHipFootprintBytes({ expertCache: 8000 }) - strataHipFootprintBytes({ expertCache: r.slots });
   assert.ok(left >= HEADROOM + MARGIN, `leaves ${(left / GB).toFixed(1)} GiB`);
   assert.ok(r.slots < 16000);
   // Negative control: with no margin the same memory grows to the full target.
-  assert.equal(strataGrowDecision(growArgs({ availableBytes: 30 * GB, growMarginBytes: 0 })).slots, 16000);
+  assert.equal(strataGrowDecision(growArgs({ availableBytes: 50 * GB, growMarginBytes: 0 })).slots, 16000);
 });
 
 test('strataGrowDecision: never inside the cooldown, while busy, or before 60 s of idle (negative controls)', () => {
-  const freed = { availableBytes: 45 * GB };
+  const freed = { availableBytes: 60 * GB };
   assert.equal(strataGrowDecision(growArgs({ ...freed, settledAt: 3_600_000 - 60_000 })).action, 'stay', 'cooldown');
   const busy = strataGrowDecision(growArgs({ ...freed, busy: true }));
   assert.equal(busy.action, 'stay', 'busy');
@@ -404,8 +404,9 @@ async function sizeWith({ mem, waitOk = false, released = [], ...opts }) {
 }
 
 test('sizeStrataHipCache: a grow restart launches at the decided size, leaving headroom + margin (review HIGH)', async () => {
-  const decision = strataGrowDecision(growArgs({ availableBytes: 30 * GB }));
-  const afterStop = 30 * GB + strataHipFootprintBytes({ expertCache: 8000 });
+  const decision = strataGrowDecision(growArgs({ availableBytes: 50 * GB }));
+  assert.equal(decision.action, 'grow');
+  const afterStop = 50 * GB + strataHipFootprintBytes({ expertCache: 8000 });
   const r = await sizeWith({ mem: [afterStop], keepAtLeast: 8000, maxSlots: decision.slots });
   assert.equal(r.slots, decision.slots);
   const left = afterStop - strataHipFootprintBytes({ expertCache: r.slots });
@@ -439,4 +440,19 @@ test('sizeStrataHipCache: Pods release only when even the floor does not fit; th
   const some = await sizeWith({ mem: [short, freed], released: ['w-up'], waitOk: true });
   assert.ok(some.slots >= 4000);
   assert.deepEqual(some.calls.waits.map((w) => w.ms), [180_000]);
+});
+
+test('strataGrowDecision: after a grow, the largest documented Pods worker (36 GiB) can return without a critical stop (r3)', () => {
+  const CRITICAL = 6 * GB;
+  // 10 GiB free plus a 36 GiB worker that just went idle and freed its memory.
+  const freeNow = 46 * GB;
+  const cfgMargin = resolveStrataConfig(baseCfg({ cuda: undefined, hip: hipBlock({ expertCache: 16000 }) }), opts).hip.growMarginBytes;
+  const r = strataGrowDecision(growArgs({ availableBytes: freeNow, growMarginBytes: cfgMargin }));
+  const grownTo = r.action === 'grow' ? r.slots : 8000;
+  const afterGrow = freeNow + strataHipFootprintBytes({ expertCache: 8000 }) - strataHipFootprintBytes({ expertCache: grownTo });
+  assert.ok(afterGrow - 36 * GB >= CRITICAL, `worker returns: ${((afterGrow - 36 * GB) / GB).toFixed(1)} GiB left`);
+  // Negative control: the old 16 GiB margin grows into it and the returning worker crosses the critical stop.
+  const old = strataGrowDecision(growArgs({ availableBytes: freeNow, growMarginBytes: 16 * GB }));
+  const oldAfter = freeNow + strataHipFootprintBytes({ expertCache: 8000 }) - strataHipFootprintBytes({ expertCache: old.slots });
+  assert.ok(oldAfter - 36 * GB < CRITICAL);
 });

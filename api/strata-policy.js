@@ -142,8 +142,9 @@ export async function waitForCudaLeaseRelease({ isHeld, swapInFlight, leave, sle
  * different prompt_total starts a fresh one, so a request never inherits another's stall time.
  * A prompt whose read position has not moved for `stallMs` is cancelled. After the cancel the
  * caller holds the exclusive lane; if the engine is still reading with no progress (or its
- * metrics stop answering) `wedgeGraceMs` later it is wedged and must be restarted, while any
- * progress or leaving the reading state clears the cancel so the caller releases the lane.
+ * metrics stop answering) `wedgeGraceMs` later it is wedged and must be restarted. Progress on
+ * the cancelled prompt keeps the lane held (restarting the grace); leaving the reading state or
+ * a different prompt clears the cancel so the caller releases the lane.
  * drakemore 2026-10-31: 540 s reading a 1282-token prompt at 0 tok/s. Unreadable metrics with
  * no cancel pending fail open.
  * @param {{live: ?{state?:string, prompt_read?:?number, prompt_total?:?number}, prev: ?{reqId:*,
@@ -165,6 +166,11 @@ export function strataPrefillVerdict({ live, prev, reqId = null, now, stallMs, w
   if (live.state !== 'reading') return { action: 'ok', state: null, reason: `engine ${live.state ?? 'unknown'}` };
   const read = live.prompt_read ?? -1;
   const total = live.prompt_total ?? null;
+  if (cancelled && prev.total === total && prev.read !== read) {
+    // Strata is still reading the abandoned prompt: alive, but a queued request sent now would
+    // sit behind it and inherit its stall. Keep the lane held and restart the wedge grace.
+    return { action: 'ok', state: { ...prev, read, cancelledAt: now }, reason: 'still reading the cancelled prompt' };
+  }
   const samePrompt = prev && prev.read === read && prev.total === total && (cancelled || prev.reqId === reqId);
   if (!samePrompt) return { action: 'ok', state: { reqId, read, total, since: now, cancelledAt: null }, reason: 'prefill progressing' };
   if (cancelled) {
@@ -197,4 +203,22 @@ export function prefillStalledError(detail) {
  */
 export function isPrefillStalled(err) {
   return err?.code === PREFILL_STALLED || err?.cause?.code === PREFILL_STALLED;
+}
+
+/**
+ * The SSE frames that tell a streaming client its request was cancelled by the prefill watchdog,
+ * in the dialect of the endpoint it called, ending the stream. Without them a cancelled stream
+ * just stops, which a client can read as an empty or partial success.
+ * @param {string} endpoint 'chat/completions', 'completions', 'responses' or 'messages'.
+ * @param {string} message the prefillStalledError message.
+ * @returns {string} frames to write before ending the response.
+ */
+export function prefillStalledSseFrame(endpoint, message) {
+  if (endpoint === 'responses') {
+    return `event: error\ndata: ${JSON.stringify({ type: 'error', code: 'prefill_stalled', message })}\n\n`;
+  }
+  if (endpoint === 'messages') {
+    return `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'prefill_stalled', message } })}\n\n`;
+  }
+  return `data: ${JSON.stringify({ error: { message, type: 'prefill_stalled', code: 'prefill_stalled' } })}\n\ndata: [DONE]\n\n`;
 }

@@ -52,10 +52,17 @@ must be ready on HIP below its configured cache, with nothing in flight or queue
 exclusive lane for 60 s, and `hip.growCooldownMin` (default 10) must have passed since
 the last settle. The decision predicts the size a restart would get: the current
 MemAvailable plus the current footprint estimate, through the same chooser. The grown size
-must still leave `hip.growMarginGb` (default 16 GiB) free on top of the 8 GiB headroom.
-Freed memory usually belongs to a Pods worker that restarts on its next job (6-36 GiB).
-Growing into all of it would put MemAvailable under the 6 GiB critical stop mid-request
-and start a loop: grow, critical stop, smaller restart, grow again.
+must still leave `hip.growMarginGb` free on top of the 8 GiB headroom. The default is 34
+GiB: the 6 GiB critical stop plus the largest Pods worker measured on drakemore (36 GiB,
+upscale-detail) minus the headroom. Freed memory usually belongs to a Pods worker that
+restarts on its next job (6-36 GiB). Growing into it would put MemAvailable under the
+critical stop mid-request and start a loop: grow, critical stop, smaller restart, grow
+again. With 34 GiB, even the largest worker can return after a grow.
+
+The margin is not derived live from Pods. The coordinator's `runningWorkers` report
+lists only running containers, but the worker that comes back is one that is stopped
+now, so its size is not in that report. Deriving it would need per-endpoint size history
+on the coordinator. Raise the setting if a larger worker appears.
 
 It grows only when the gain is at least 2000 slots, about 3.8 GiB (hysteresis). The
 restart is the existing swap path, `strataSwapBackend('hip', ...)`: bounded drain,
@@ -68,8 +75,9 @@ A request that arrives mid-restart is held by the swap gate and replayed. Grow-b
 asks Pods to release workers. It only uses memory that is already free.
 
 **How long the swap gate is held.** While the gate is armed, every LLM request waits on
-it, not just Strata's, because a swap has always gated all traffic. The worst case for a
-grow or wedge restart is about 13.5 minutes:
+it, not just Strata's, because a swap has always gated all traffic. The bounds below are
+per HIP attempt, about 14 minutes. A wedge restart makes one attempt. A grow restart may
+make two (the capped size, then the previous size), so its worst case is about 28 minutes:
 
 | Phase | Bound |
 |---|---|
@@ -188,13 +196,17 @@ request's stall time. When the state is `reading` and nothing has moved for
    slot at the front of the exclusive queue (`acquire({front: true})`), so requests
    already queued for Strata are not sent into a possibly wedged engine. No swap gate is
    armed, so llama and remote requests are unaffected.
-2. **It fails the slot holder.** The holder is aborted with a `PREFILL_STALLED` reason. Its
-   caller gets 504 `prefill_stalled`, or an SSE error event if the stream had started. It
-   is never replayed, because the same prompt would wedge the engine again.
+2. **It fails the slot holder.** The holder is aborted with a `PREFILL_STALLED` reason. A
+   non-streaming caller gets 504 `prefill_stalled`. A stream that had already started
+   gets a typed error event in its own dialect (`prefillStalledSseFrame`), then the end
+   marker. The request is never replayed, because the same prompt would wedge the engine
+   again.
 
 What happens next depends on the engine:
-- **Recovered:** the engine leaves `reading`, or a prompt makes progress. The hold is
-  released and the queue resumes.
+- **Recovered:** the engine leaves `reading`, or starts a different prompt. The hold is
+  released and the queue resumes. If it is still reading the cancelled prompt and making
+  progress, the hold stays and the wedge grace restarts. A queued request is never sent
+  in behind the abandoned prompt, where it would inherit that prompt's stall.
 - **Wedged:** after 30 s the engine is still `reading` with no progress, or `/metrics`
   stops answering. The steps run in this order:
   1. The swap gate is armed.

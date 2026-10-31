@@ -125,7 +125,7 @@ Layout on the host:
 | `hip.expertCache` | **required** | Explicit slot count, the **target**. `auto` is rejected: it is greedy on unified memory. When the target does not fit what is available at spawn, Strata starts at the largest cache that does (see "Adaptive HIP expert cache"). |
 | `hip.minExpertCache` | `4000` | Floor for the adaptive cache; below it the attempt fails (`reclaim-timeout`) and recovery retries. Never above `expertCache`. |
 | `hip.growCooldownMin` | `10` | Minimum time since the last settle before a shrunk, idle HIP engine restarts larger. |
-| `hip.growMarginGb` | `16` | Extra free memory a grow-back must leave above the 8 GiB headroom, so a Pods worker restarting on its next job does not hit the 6 GiB critical stop. |
+| `hip.growMarginGb` | `34` | Extra free memory a grow-back must leave above the 8 GiB headroom. The default lets the largest Pods worker measured on drakemore (36 GiB) restart on its next job without pushing MemAvailable under the 6 GiB critical stop. |
 | `hip.baseGb` | `65` | HIP footprint beside the expert cache (weights, KV, MTP). The reclaim target before a HIP spawn is `baseGb` + `expertCache` x 1.94 MiB (~95 GiB at 16000), plus `guard.ds4ReclaimHeadroomGb` (8). Measured on drakemore 2026-10-31: strata RSS ~49 GiB + iGPU GTT ~46 GiB at 16000 slots. |
 | `hip.residentGb` | ignored | Retired: a hand-set reclaim target went stale twice (106 blocked every spawn; 84 let 48000 slots swap the box). Logged as a warning when present. |
 | `policy.returnToCudaAfterMin` | `15` | Hysteresis before moving back to CUDA. |

@@ -19,6 +19,7 @@ import {
   strataPrefillVerdict,
   prefillStalledError,
   isPrefillStalled,
+  prefillStalledSseFrame,
 } from './strata-policy.js';
 import { ds4SwapRetryDecision } from './ds4-exclusive.js';
 
@@ -342,4 +343,27 @@ test('a prefill-stalled cancel is never replayed, even while a swap is in progre
   assert.match(d.reason, /prefill/);
   // Negative control: the same swap without the stall is replayed.
   assert.equal(ds4SwapRetryDecision({ swapOccurred: true, attempt: 0, maxRetries: 2, bodyCommitted: false }).retry, true);
+});
+
+test('strataPrefillVerdict: progress on the abandoned prompt keeps the lane held; only leaving it releases (r3)', () => {
+  // Cancelled at 180 s; Strata keeps reading the same 35k prompt (read advances, same total).
+  const v = run([[0, reading(null, 35000)], [180_000, reading(null, 35000)],
+    [190_000, reading(16384, 35000), null], [215_000, reading(32768, 35000), null],
+    [240_000, { state: 'idle' }, null]]);
+  assert.deepEqual(v.map((x) => x.action), ['ok', 'cancel', 'ok', 'ok', 'ok']);
+  assert.ok(v[2].state.cancelledAt != null && v[3].state.cancelledAt != null, 'the hold stays while the abandoned prompt is read');
+  assert.equal(v[4].state, null, 'released once Strata leaves reading');
+  // Progress then a stop on the same prompt still escalates to a restart after the grace.
+  const w = run([[0, reading(null, 35000)], [180_000, reading(null, 35000)], [190_000, reading(16384, 35000), null], [221_000, reading(16384, 35000), null]]);
+  assert.deepEqual(w.map((x) => x.action), ['ok', 'cancel', 'ok', 'restart']);
+});
+
+test('prefillStalledSseFrame: a typed error event per streaming dialect, then the end marker (r3)', () => {
+  const chat = prefillStalledSseFrame('chat/completions', 'Strata prefill stalled: x');
+  assert.match(chat, /^data: \{"error":\{"message":"Strata prefill stalled: x","type":"prefill_stalled","code":"prefill_stalled"\}\}\n\ndata: \[DONE\]\n\n$/);
+  assert.match(prefillStalledSseFrame('completions', 'm'), /"type":"prefill_stalled"[\s\S]*data: \[DONE\]/);
+  const responses = prefillStalledSseFrame('responses', 'm');
+  assert.match(responses, /^event: error\ndata: \{"type":"error","code":"prefill_stalled","message":"m"\}\n\n$/);
+  const messages = prefillStalledSseFrame('messages', 'm');
+  assert.match(messages, /^event: error\ndata: \{"type":"error","error":\{"type":"prefill_stalled","message":"m"\}\}\n\n$/);
 });
