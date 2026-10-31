@@ -3,13 +3,14 @@
 // LICENSE file in the repository root.
 //
 // This module reads only the GGUF metadata header of a model projector and
-// reports whether its CLIP tower has vision and audio encoders. It owns model-
+// reports whether its CLIP tower has vision and audio encoders. Its low-level GGUF
+// header reader is exported for gguf-kv.js. It owns model-
 // directory lookup and caching so request routing never reparses projector files.
 
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from 'fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'path';
 
-const GGUF_TYPES = Object.freeze({
+export const GGUF_TYPES = Object.freeze({
   UINT8: 0,
   INT8: 1,
   UINT16: 2,
@@ -52,7 +53,7 @@ const CAPABILITY_KEYS = Object.freeze({
  * @returns {number} safe non-negative integer.
  * @throws {Error} When the value cannot be represented safely.
  */
-function safeLength(value, label) {
+export function safeLength(value, label) {
   if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new Error(`GGUF ${label} exceeds JavaScript's safe integer range`);
   }
@@ -65,7 +66,7 @@ function safeLength(value, label) {
  * @param {number} fd open file descriptor.
  * @returns {{position:number, bytes:function(number):Buffer, skip:function(number):void, u8:function():number, u32:function():number, u64:function():bigint, string:function():string}} reader helpers.
  */
-function createReader(fd) {
+export function createReader(fd) {
   return {
     position: 0,
     bytes(length) {
@@ -103,7 +104,7 @@ function createReader(fd) {
  * @returns {void}
  * @throws {Error} When the value type or encoded length is invalid.
  */
-function skipValue(reader, type) {
+export function skipValue(reader, type) {
   const fixedBytes = FIXED_TYPE_BYTES.get(type);
   if (fixedBytes) {
     reader.skip(fixedBytes);
