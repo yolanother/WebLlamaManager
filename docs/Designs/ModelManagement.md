@@ -187,6 +187,25 @@ returns `507 MODEL_TOO_LARGE`; an explicit preload whose local size cannot be
 resolved returns `503 MODEL_SIZE_UNKNOWN`. Neither case starts loading the
 target model.
 
+**Per-model sizing (W2e).** The KV term comes from the model's own GGUF attention
+metadata (`api/gguf-kv.js`) instead of the flat `guard.kvBytesPerToken` (256 KiB/token):
+- Only attention layers count. A hybrid model with `full_attention_interval` 4 keeps KV in
+  1 of every 4 layers.
+- Per-layer `head_count_kv` arrays are summed.
+- Sliding-window layers are charged their window once, as a constant added to the
+  overhead.
+- The f16 cache is assumed, which over-estimates a quantized cache, the safe direction.
+
+Measured on Frostburn at ctx 65536: Qwen3-8B 9.0 GiB, which matches its GTT (4.7 GiB
+weights + 9.0 GiB KV); Qwen3.6-35B-A3B 1.25 GiB (it was charged 16 GiB); Gemma 4 31B
+5.8 GiB.
+
+Other per-model rules:
+- A model that is fully offloaded (`gpuLayers` >= its `block_count`) gets no mmap discount:
+  on unified memory its weights are copied into GTT anyway.
+- Admission uses the model's own `ctx-size` from `modelPresetOptions` when one is set.
+- Models without readable metadata keep the flat estimate.
+
 ### Reactive Fallback
 
 When a model passes proactive admission but llama.cpp still reports insufficient
@@ -296,6 +315,7 @@ This handles the brief window where llama.cpp is restarting or a model is being 
 | `noWarmup` | false | boolean | Skip model warmup on load. Faster startup but first inference is slower. |
 | `flashAttn` | false | boolean | Enable flash attention. Reduces memory usage and improves speed on compatible GPUs. |
 | `autoStart` | true | boolean | Auto-start llama server in router mode when the API starts. |
+| `modelPresetOptions` | `{}` | `{ "<model id>": { "ctx-size": int>=512, "cache-ram": int>=-1 } }` | Per-model llama.cpp options merged into the models-preset INI. The operator value wins over a generated section. `ctx-size` gives that model its own context window: the router switches to preset context mode so the value is honoured, and admission sizes the model at it. `cache-ram` caps llama.cpp's host prompt cache in MiB; its default is about 8 GiB per resident model (-1 = no limit, 0 = off). Other keys are dropped with a `[presets]` log warning. |
 
 ### Environment Variables
 

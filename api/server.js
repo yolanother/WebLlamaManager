@@ -67,7 +67,7 @@ import { routeSmartAlias, candidateSize, smartAliasRouting } from './smart-alias
 import { askSystem1 } from './system1.js';
 import { resolveHfToken, maskToken, redactConfig, actionableDownloadError, isGatedOutput, hfModelUrl } from './hf-token.js';
 import { normalizeModelKey, modelDirectoryKey } from './model-identity.js';
-import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes } from './resource-guard.js';
+import { checkModelFit, thermalDecision, planMemoryRecovery, dispatchPreference, memoryPressureDecision, DEFAULTS as GUARD_DEFAULTS, reclaimableMemoryBytes, modelAdmissionKnobs } from './resource-guard.js';
 import { restartDecision, RESTART_DEFAULTS } from './restart-governor.js';
 import { buildStorageStats } from './drive-health.js';
 import { parseRssKb, parseProcCpuJiffies, parseTotalCpuJiffies, appMemoryPercent, appCpuPercent } from './app-usage.js';
@@ -117,6 +117,8 @@ import { remoteOnlyAliasFallback } from './remote-only-alias.js';
 import { remoteFailoverDecision, countsAsBackendFailure, managerHealthStatus } from './remote-failover.js';
 import { exclusiveRecoveryDecision } from './exclusive-recovery.js';
 import { seedStrataPreset, STRATA_PRESET_ID } from './strata-seed.js';
+import { kvFootprint, readGgufAttentionMetadata } from './gguf-kv.js';
+import { normalizeModelPresetOptions, applyModelPresetOptions, modelContextOverride, wantsPresetContextMode } from './model-preset-options.js';
 import {
   annotateModelResidency,
   modelResidencyDecision,
@@ -3425,19 +3427,27 @@ function memTotalBytes() {
 
 /** Best-effort: on-disk size (bytes) of the GGUF backing a model id (0 = unknown). */
 function resolveModelSizeBytes(modelId) {
-  if (!modelId) return 0;
+  return bestLocalModelMatch(modelId)?.size || 0;
+}
+
+/**
+ * The largest local GGUF entry whose name matches `modelId` (normalized, either way a
+ * substring), i.e. the model's weights rather than a projector beside them.
+ * @param {string} modelId model id as the router names it.
+ * @returns {{name:string, path:string, size:number}|null} the scanLocalModels() entry, or null.
+ */
+function bestLocalModelMatch(modelId) {
+  if (!modelId) return null;
   try {
     const norm = normalizeModelKey;
     const target = norm(modelId);
-    let best = 0;
+    let best = null;
     for (const m of scanLocalModels()) {
       const n = norm(m.name);
-      if (n === target || n.includes(target) || target.includes(n)) {
-        best = Math.max(best, m.size || 0);
-      }
+      if ((n === target || n.includes(target) || target.includes(n)) && (m.size || 0) > (best?.size || 0)) best = m;
     }
     return best;
-  } catch { return 0; }
+  } catch { return null; }
 }
 
 // path -> on-disk size cache so the loaded-models snapshot refresher never re-stats an
@@ -3684,15 +3694,26 @@ async function preflightModelGuard(modelId, contextSize, { requireKnownSize = fa
     throw error;
   }
 
+  // Size THIS model: KV from its GGUF attention metadata (a hybrid such as Qwen3.6-35B-A3B
+  // needs 20 KiB/token, not the flat 256), its own context when the operator set one, and
+  // no mmap discount when every layer lives in GTT anyway. Unknown models keep the flat knobs.
+  const gguf = bestLocalModelMatch(modelId)?.path;
+  const meta = gguf ? readGgufAttentionMetadata(gguf) : null;
+  const model = modelAdmissionKnobs({
+    kv: kvFootprint(meta), blockCount: meta?.blockCount, gpuLayers: config.gpuLayers || 99,
+    loadModeMmap: modelUsesMmap(), flatKvBytesPerToken: cfg.kvBytesPerToken, overheadBytes: cfg.overheadBytes,
+    contextSize: contextSize || cfg.minContext,
+    contextOverride: modelContextOverride(normalizeModelPresetOptions(config.modelPresetOptions).options, modelId),
+  });
   const knobs = {
-    kvBytesPerToken: cfg.kvBytesPerToken, overheadBytes: cfg.overheadBytes,
+    kvBytesPerToken: model.kvBytesPerToken, overheadBytes: model.overheadBytes,
     headroomFrac: cfg.headroomFrac,
     totalBytes: memTotalBytes(),
     reservedHeadroomBytes: cfg.reservedHeadroomGb > 0 ? cfg.reservedHeadroomGb * (2 ** 30) : undefined,
     minContext: cfg.minContext,
-    mmapped: modelUsesMmap()
+    mmapped: model.mmapped
   };
-  const ctx = contextSize || cfg.minContext;
+  const ctx = model.contextSize;
 
   const plan = planMemoryRecovery({
     fileBytes, contextSize: ctx, availableBytes: memAvailableBytes(),
@@ -8294,7 +8315,10 @@ function resolveLoadMode() {
  * @returns {'cli'|'preset'} Where the router should get its default context.
  */
 function resolveContextMode() {
-  return duoWeightPaths().plannerExists ? 'preset' : 'cli';
+  // An operator per-model ctx-size (config.modelPresetOptions) is only honoured when the
+  // default context lives in the preset's [*] section, not on the router CLI.
+  return duoWeightPaths().plannerExists || wantsPresetContextMode(normalizeModelPresetOptions(config.modelPresetOptions).options)
+    ? 'preset' : 'cli';
 }
 
 /**
@@ -8427,7 +8451,10 @@ function writeModelsPresetFile(contextSize = (config.contextSize || 8192), { rpc
     if (resolveContextMode() === 'preset') {
       sections.unshift(globalContextPresetSection({ contextSize }));
     }
-    const ini = renderModelsPresetIni(applyDevicePins(sections, gpuPinPresetDevices(rpcEndpoint)));
+    // Operator per-model ctx-size / cache-ram (config.modelPresetOptions) win over generated values.
+    const presetOptions = normalizeModelPresetOptions(config.modelPresetOptions);
+    for (const warning of presetOptions.warnings) addLog('system', `[presets] ${warning}`);
+    const ini = renderModelsPresetIni(applyDevicePins(applyModelPresetOptions(sections, presetOptions.options), gpuPinPresetDevices(rpcEndpoint)));
     if (!ini) return '';
     // MUST live under a path the ENGINE can see. The engine runs inside the
     // distrobox, which mounts only $HOME and /run/host. On a packaged appliance

@@ -151,6 +151,33 @@ export function checkModelFit({
 }
 
 /**
+ * Admission knobs for one model: its KV from GGUF metadata when known, its own context when
+ * the operator set one, and no mmap discount when every layer is offloaded (on unified
+ * memory the weights are copied into GTT, so mapping the file saves nothing).
+ * @param {object} p
+ * @param {?{perTokenBytes:number, fixedBytes:number}} p.kv model KV footprint (gguf-kv.js), null if unknown.
+ * @param {number} [p.blockCount] model layer count, from the same metadata.
+ * @param {number} [p.gpuLayers] layers offloaded (-ngl), default 99 = all.
+ * @param {boolean} p.loadModeMmap whether the router loads weights with mmap.
+ * @param {number} p.flatKvBytesPerToken the guard's flat KV estimate, used when `kv` is null.
+ * @param {number} p.overheadBytes the guard's fixed overhead.
+ * @param {number} p.contextSize the router-wide default context.
+ * @param {?number} [p.contextOverride] the model's own context (config.modelPresetOptions).
+ * @returns {{contextSize:number, kvBytesPerToken:number, overheadBytes:number, mmapped:boolean}}
+ *   knobs for checkModelFit / planMemoryRecovery; an unknown model gets exactly the old ones.
+ */
+export function modelAdmissionKnobs({
+  kv, blockCount, gpuLayers = 99, loadModeMmap, flatKvBytesPerToken, overheadBytes, contextSize, contextOverride = null,
+}) {
+  return {
+    contextSize: contextOverride ?? contextSize,
+    kvBytesPerToken: kv ? Math.max(1, kv.perTokenBytes) : flatKvBytesPerToken,
+    overheadBytes: overheadBytes + (kv?.fixedBytes ?? 0),
+    mmapped: loadModeMmap && !(Number.isInteger(blockCount) && gpuLayers >= blockCount),
+  };
+}
+
+/**
  * Decide how to recover memory so a requested model can be served, given what is
  * currently holding RAM. Pure decision logic — the caller performs the actual
  * unload/restart and re-measures, then re-runs the normal fit check.

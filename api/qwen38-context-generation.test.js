@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import * as engines from './engines.js';
+import * as presetOptions from './model-preset-options.js';
 
 const source = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
 const writer = source.slice(source.indexOf('function writeModelsPresetFile('),
@@ -30,7 +31,7 @@ function sectionsFor(t, configured, requested, present = true) {
   t.after(() => rmSync(dataDir, { recursive: true, force: true }));
   const errors = [];
   const path = runInNewContext(`${writer}\nwriteModelsPresetFile(requested);`, {
-    ...engines, join, mkdirSync, writeFileSync,
+    ...engines, ...presetOptions, join, mkdirSync, writeFileSync, addLog: () => {},
     MODELS_DIR: '/models', RUNTIME_PATHS: { dataDir },
     config: { contextSize: configured }, requested,
     resolveHardwareProfile: () => ({ threads: 16 }),

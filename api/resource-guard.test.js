@@ -544,7 +544,9 @@ test('the server tells the guard whether weights are mmap-backed', async () => {
   const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
   assert.match(source, /function modelUsesMmap\(\)/);
   assert.match(source, /resolveLoadMode\(\) === 'per-model'/);
-  const sites = source.match(/mmapped: modelUsesMmap\(\)/g) || [];
+  // The recovery plan passes it through modelAdmissionKnobs (W2e), which drops the mmap
+  // discount for a fully offloaded model; the fit warning still passes it directly.
+  const sites = source.match(/(?:mmapped|loadModeMmap): modelUsesMmap\(\)/g) || [];
   assert.ok(sites.length >= 2, `expected both admission sites to pass mmapped, found ${sites.length}`);
 });
 
@@ -585,4 +587,37 @@ test('Frostburn: Qwen3.8-Flash-Next is never admitted beside a resident gemma-4-
     });
     assert.notEqual(plan.action, 'serve', `mmapped=${mmapped}: ${plan.reason}`);
   }
+});
+
+// W2e (T3231898735806): admission knobs from the model's own GGUF metadata and context.
+test('modelAdmissionKnobs: model-aware KV, SWA constant in overhead, per-model ctx', async () => {
+  const { modelAdmissionKnobs } = await import('./resource-guard.js');
+  const k = modelAdmissionKnobs({
+    kv: { perTokenBytes: 20480, fixedBytes: 7 }, blockCount: 40, gpuLayers: 99, loadModeMmap: false,
+    flatKvBytesPerToken: 262144, overheadBytes: 100, contextSize: 65536, contextOverride: 32768,
+  });
+  assert.deepEqual(k, { contextSize: 32768, kvBytesPerToken: 20480, overheadBytes: 107, mmapped: false });
+  const unknown = modelAdmissionKnobs({ kv: null, blockCount: undefined, loadModeMmap: true, flatKvBytesPerToken: 262144, overheadBytes: 100, contextSize: 65536 });
+  assert.deepEqual(unknown, { contextSize: 65536, kvBytesPerToken: 262144, overheadBytes: 100, mmapped: true }, 'unknown model: old behaviour');
+});
+
+test('modelAdmissionKnobs: no mmap discount when every layer is offloaded to the GPU', async () => {
+  const { modelAdmissionKnobs } = await import('./resource-guard.js');
+  const base = { kv: null, blockCount: 40, loadModeMmap: true, flatKvBytesPerToken: 262144, overheadBytes: 0, contextSize: 4096 };
+  assert.equal(modelAdmissionKnobs({ ...base, gpuLayers: 99 }).mmapped, false, 'weights live in GTT anyway');
+  assert.equal(modelAdmissionKnobs({ ...base, gpuLayers: 20 }).mmapped, true, 'partial offload keeps the discount');
+});
+
+test('Frostburn 2026-10-31: Qwen3.6-35B-A3B requirement with honest knobs', async () => {
+  const { modelAdmissionKnobs } = await import('./resource-guard.js');
+  const GiB = 2 ** 30;
+  const need = (contextOverride) => {
+    const k = modelAdmissionKnobs({ kv: { perTokenBytes: 20480, fixedBytes: 0 }, blockCount: 40, gpuLayers: 99, loadModeMmap: false,
+      flatKvBytesPerToken: DEFAULTS.kvBytesPerToken, overheadBytes: DEFAULTS.overheadBytes, contextSize: 65536, contextOverride });
+    return checkModelFit({ fileBytes: 22360456286, availableBytes: 40.2 * GiB, totalBytes: 130490776 * 1024, headroomFrac: 0.15, minContext: 4096, ...k });
+  };
+  const at65k = need(null);
+  assert.ok(Math.abs(at65k.requiredBytes / GiB - 25.07) < 0.05, `${at65k.requiredBytes / GiB}`);
+  assert.ok(Math.abs(need(32768).requiredBytes / GiB - 24.45) < 0.05);
+  assert.equal(at65k.fits, false, 'still short at 40.2 GiB free with 15% (18.7 GiB) headroom');
 });
