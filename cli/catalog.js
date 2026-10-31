@@ -215,6 +215,18 @@ const COMMANDS = [
     if (Object.keys(body).length === 0) throw new Error('settings update requires --body or at least one setting option');
     return { method: 'POST', path: '/api/settings', body };
   }),
+  command(['gpu-power', 'status'], 'llm gpu-power status', 'Show the NVIDIA power-cap schedule: current limit, draw, active window, next change.', [], ({ positionals }) => {
+    exactPositionals(positionals, 0);
+    return { method: 'GET', path: '/api/gpu-power' };
+  }),
+  command(['gpu-power', 'set'], 'llm gpu-power set --body JSON', 'Update the power-cap schedule (merged into settings.gpuPower).', [
+    '--body JSON  Any of enabled, defaultWatts, timezone, windows [{start:"HH:MM", end:"HH:MM", watts, days?}].',
+  ], ({ positionals, options }) => {
+    exactPositionals(positionals, 0);
+    const rawBody = option(options, 'body');
+    if (rawBody === undefined) throw new Error('gpu-power set requires --body JSON');
+    return { method: 'POST', path: '/api/settings', body: { gpuPower: jsonOption(rawBody, '--body') } };
+  }),
   command(['presets', 'list'], 'llm presets list', 'List available model presets.', [], ({ positionals }) => {
     exactPositionals(positionals, 0);
     return { method: 'GET', path: '/api/presets' };

@@ -55,6 +55,13 @@ test('ergonomic commands preserve every MCP method, path, query, and JSON body',
     { args: ['server', 'start'], method: 'POST', path: '/api/server/start' },
     { args: ['server', 'stop'], method: 'POST', path: '/api/server/stop' },
     { args: ['settings', 'get'], method: 'GET', path: '/api/settings' },
+    { args: ['gpu-power', 'status'], method: 'GET', path: '/api/gpu-power' },
+    {
+      args: ['gpu-power', 'set', '--body', JSON.stringify({ windows: [{ start: '22:00', end: '06:00', watts: 420 }] })],
+      method: 'POST',
+      path: '/api/settings',
+      body: { gpuPower: { windows: [{ start: '22:00', end: '06:00', watts: 420 }] } },
+    },
     {
       args: ['settings', 'update', '--body', JSON.stringify({ contextSize: 32768, modelsMax: 2, gpuLayers: 99, autoStart: false, noWarmup: true, flashAttn: true })],
       method: 'POST',
