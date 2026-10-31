@@ -239,3 +239,17 @@ test('normalizeDuoSettings rejects an unknown priority rather than silently defa
   assert.throws(() => normalizeDuoSettings({ useAccelerator: 'yes' }), TypeError);
   assert.throws(() => normalizeDuoSettings([]), TypeError);
 });
+
+// Operator rule (W2, T3231237771803): on drakemore no LLM may use the RTX 3090 (reserved for
+// AssetForge). The duo accelerator is the only way llama (a HIP build) reaches that card, so a
+// fresh install must ship it OFF: no config default turns it on, and an unset or partial duo
+// block normalizes to off.
+test('shipped default: a fresh config never starts the accelerator, even with an NVIDIA card', async () => {
+  const { applyConfigDefaults } = await import('./config-defaults.js');
+  const fresh = applyConfigDefaults({}, {});
+  assert.notEqual(fresh.duo?.useAccelerator, true);
+  assert.equal(normalizeDuoSettings({}).useAccelerator, false);
+  const plan = acceleratorPlan({ profile: { hasNvidia: true }, settings: fresh.duo ?? null, gpu: { totalBytes: 24 * 2 ** 30, usedBytes: 0 } });
+  assert.equal(plan.startRpc, false);
+  assert.match(plan.reason, /disabled by the operator/);
+});

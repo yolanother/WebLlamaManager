@@ -573,3 +573,16 @@ test('thermalDecision: external heat below warn from a normal state still serves
   assert.equal(d.state, 'normal');
   assert.equal(d.pauseDispatch, false);
 });
+
+// W2 (T3231237771803): Frostburn on 2026-10-31 had 33.8 GiB MemAvailable of 124.4 GiB with
+// gemma-4-31B resident and swap full. Qwen3.8-Flash-Next (76.3 GiB of weights) must never be
+// admitted beside it: the guard must reclaim (unload gemma) or refuse, never serve in place.
+test('Frostburn: Qwen3.8-Flash-Next is never admitted beside a resident gemma-4-31B', () => {
+  for (const mmapped of [true, false]) {
+    const plan = planMemoryRecovery({
+      fileBytes: 76.3 * 2 ** 30, contextSize: 65536, availableBytes: 36311334912,
+      totalBytes: 133622554624, headroomFrac: 0.15, mmapped, reclaimableBytes: 20 * 2 ** 30,
+    });
+    assert.notEqual(plan.action, 'serve', `mmapped=${mmapped}: ${plan.reason}`);
+  }
+});

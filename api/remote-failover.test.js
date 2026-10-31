@@ -41,6 +41,12 @@ test('an output error (REASONING_EXHAUSTED etc.) passes through: the caller budg
   assert.deepEqual(remoteFailoverDecision({ status: 502, body: '<html>bad gateway</html>', next: other }), { action: 'remote', routing: other });
 });
 
+test('a connection error / timeout (no HTTP answer) fails over too', () => {
+  assert.deepEqual(remoteFailoverDecision({ status: 0, connectionError: true, next: other }), { action: 'remote', routing: other });
+  assert.deepEqual(remoteFailoverDecision({ status: 0, connectionError: true, next: local }), { action: 'local', routing: local });
+  assert.deepEqual(remoteFailoverDecision({ status: 0, connectionError: true, next: null }), { action: 'pass-through' });
+});
+
 test('nowhere else to go passes the original error through', () => {
   assert.deepEqual(remoteFailoverDecision({ status: 503, next: null }), { action: 'pass-through' });
   assert.deepEqual(remoteFailoverDecision({ status: 503, next: { remote: false, blocked: true } }), { action: 'pass-through' });
@@ -58,6 +64,7 @@ test('chat/completions remote branch fails over with the failed backend excluded
   const body = source.slice(start, source.indexOf('// ===== LOCAL BACKEND PATH', start));
   assert.match(body, /remoteFailoverDecision\(/);
   assert.match(body, /body: error/, 'the upstream body reaches the decision');
+  assert.match(body, /connectionError: !!thrown/, 'a thrown fetch (connection error, timeout) reaches the decision');
   assert.match(body, /excludeBackendIds/);
   assert.match(body, /break remotePath/, 'a local failover must leave the remote block and run the local path');
 });

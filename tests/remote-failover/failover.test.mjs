@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const repoRoot = new URL('../../', import.meta.url).pathname;
-const hits = { refusing: 0, healthy: 0, reasoning: 0 };
+const hits = { refusing: 0, healthy: 0, reasoning: 0, preferred: 0 };
 const fakes = [];
 let api;
 let apiPort;
@@ -64,6 +64,8 @@ before(async () => {
   const refusingPort = await fakeBackend('refusing', 503);
   const healthyPort = await fakeBackend('healthy', 200);
   const reasoningPort = await fakeBackend('reasoning', 502);
+  const preferredPort = await fakeBackend('preferred', 200);
+  const deadPort = await freePort(); // nothing listens: connection refused
   apiPort = await freePort();
   work = mkdtempSync(join(tmpdir(), 'failover-test-'));
   for (const d of ['home', 'models', 'etc', 'data', 'cache']) mkdirSync(join(work, d));
@@ -72,12 +74,16 @@ before(async () => {
     requestLogging: false, maxConcurrentRequests: 1, logFilters: [], presets: {},
     backends: {
       enabled: true, offloadPolicy: 'overflow', preferLocal: false,
-      directory: [backend('refusing', refusingPort, 1), backend('healthy', healthyPort, 2), backend('reasoning', reasoningPort, 1)],
+      directory: [backend('refusing', refusingPort, 1), backend('healthy', healthyPort, 2), backend('reasoning', reasoningPort, 1),
+        backend('preferred', preferredPort, 1), backend('dead', deadPort, 1)],
     },
     aliases: {
       both: { targets: [{ host: 'refusing', model: 'm' }, { host: 'healthy', model: 'm' }] },
       only: { targets: [{ host: 'refusing', model: 'm' }] },
       budget: { targets: [{ host: 'reasoning', model: 'm' }, { host: 'healthy', model: 'm' }] },
+      // authored order lists the priority-2 member first: the priority-1 member must still win
+      prio: { targets: [{ host: 'healthy', model: 'm' }, { host: 'preferred', model: 'm' }] },
+      deadfirst: { targets: [{ host: 'dead', model: 'm' }, { host: 'healthy', model: 'm' }] },
     },
   }));
   api = spawn(process.execPath, [join(repoRoot, 'api/server.js')], {
@@ -130,4 +136,17 @@ test('a REASONING_EXHAUSTED 502 is the caller budget: it passes through, no fail
   assert.equal((await res.json()).error.code, 'REASONING_EXHAUSTED');
   assert.equal(hits.reasoning, 1);
   assert.equal(hits.healthy, healthyBefore, 'the healthy member must not be tried');
+});
+
+test('a LOWER backend priority number is preferred over a higher one and over alias order', async () => {
+  const res = await chat('prio');
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).choices[0].message.content, 'from preferred');
+});
+
+test('a member that refuses the connection fails over to the next member', async () => {
+  const res = await chat('deadfirst');
+  const body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(body.choices[0].message.content, 'from healthy');
 });

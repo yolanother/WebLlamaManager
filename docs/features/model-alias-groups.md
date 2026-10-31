@@ -198,7 +198,8 @@ everything for 12 days (2026-10-19 → 10-31) while its Strata runtime was `exha
 Frostburn passed each 503 straight to the caller. A `chat/completions` request forwarded to
 a member that answers **429, 502, 503 or 504** before sending anything is now re-routed with
 that member excluded (`api/remote-failover.js`, `excludeBackendIds` on `resolveBackend()`):
-to the next remote member, else to the alias's `local` target (not while a DS4/Strata engine
+— or that gets no HTTP answer at all (connection refused/reset, or a timeout after the
+per-backend retries) — to the next remote member, else to the alias's `local` target (not while a DS4/Strata engine
 owns the box). Log: `failover: <backend> answered <status> for <model>; retrying on … /
 serving locally`. 4xx and 500 pass through (another member would answer the same), and so
 does a 502 `upstream_output_error` such as `REASONING_EXHAUSTED`: the caller's `max_tokens`
@@ -210,6 +211,10 @@ Failover only helps an alias that has somewhere to go: give a remote-only alias 
 member or a `local` target that is fast enough to be worth it (e.g. Frostburn
 `default-big` → `[drakemore, local unsloth_Qwen3.6-35B-A3B-GGUF]`, not the dense Gemma 31B
 at ~7 tok/s). `completions`, `responses` and `messages` still pass a refusal through.
+
+Member order is backend **priority first (lower number wins)**, then measured tok/s,
+and only then the alias's authored order (pinned by `tests/remote-failover/failover.test.mjs`).
+Two members at the same priority go to the faster one, whatever order the alias lists them in.
 
 ### `acceptsAny` is a host policy, NOT an alias fallback
 

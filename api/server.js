@@ -14670,23 +14670,35 @@ async function handleChatCompletions(req, res) {
       let backend;
       let error = null; // a refusal's body, read once: it decides failover and is what passes through
       for (;;) {
-        ({ response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
-          method: 'POST',
-          headers: { ...routing.headers },
-          body: JSON.stringify({ ...proxyBody, model: routing.targetModel })
-        }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId), activeReqId }));
-        if (response.ok) break;
+        let thrown = null; // no HTTP answer at all (connection error, timeout) after fetchRemoteBackend's retries
+        try {
+          ({ response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
+            method: 'POST',
+            headers: { ...routing.headers },
+            body: JSON.stringify({ ...proxyBody, model: routing.targetModel })
+          }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId), activeReqId }));
+        } catch (err) {
+          if (getActiveRequestSignal(activeReqId)?.aborted) throw err; // the client left: nothing to fail over for
+          thrown = err;
+          backend = routing.backend;
+        }
+        if (!thrown && response.ok) break;
         excludeBackendIds.add(backend.id);
-        error = await response.text();
+        if (!thrown) error = await response.text();
         const failover = remoteFailoverDecision({
-          status: response.status,
-          body: error,
+          status: thrown ? 0 : response.status,
+          body: error ?? '',
+          connectionError: !!thrown,
           next: resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting, excludeBackendIds }),
           exclusiveActive: !!exclusive,
         });
-        if (failover.action === 'pass-through') break;
-        console.log(`[chat/completions] failover: ${backend.name} answered ${response.status}; ${failover.action === 'remote' ? `retrying on ${failover.routing.backend.name}` : 'serving locally'}`);
-        addLog('backends', `failover: ${backend.name} answered ${response.status} for ${requestedModel}; ${failover.action === 'remote' ? `retrying on ${failover.routing.backend.name}` : 'serving locally'}`);
+        if (failover.action === 'pass-through') {
+          if (thrown) throw thrown; // the catch below answers 502 'Failed to reach remote backend'
+          break;
+        }
+        const answered = thrown ? `failed (${thrown.message})` : `answered ${response.status}`;
+        console.log(`[chat/completions] failover: ${backend.name} ${answered}; ${failover.action === 'remote' ? `retrying on ${failover.routing.backend.name}` : 'serving locally'}`);
+        addLog('backends', `failover: ${backend.name} ${answered} for ${requestedModel}; ${failover.action === 'remote' ? `retrying on ${failover.routing.backend.name}` : 'serving locally'}`);
         routing = failover.routing;
         req._backend = routing.remote ? routing.backend.id : undefined;
         const entry = activeRequests.get(activeReqId);
