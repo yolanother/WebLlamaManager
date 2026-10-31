@@ -12,7 +12,11 @@
 // drakemore default-small 502s in 31 min, measured by W4 on 2026-10-31); another
 // member would fail it the same way, only slower. A request that got no HTTP answer at
 // all (connection refused/reset, timeout after fetchRemoteBackend's own retries) fails
-// over like a 503. Pure; the caller re-resolves routing with the failed backend excluded
+// over like a 503. The same output-error test decides what counts toward a backend's
+// circuit breaker (countsAsBackendFailure): narration REASONING_EXHAUSTED 502s used to trip
+// drakemore and 503 the podcast's default-big while Strata served fine (2026-10-31).
+// managerHealthStatus makes /health report an exclusive engine that is serving as healthy.
+// Pure; the caller re-resolves routing with the failed backend excluded
 // and hands the result in as `next`. See remote-failover.test.js.
 
 const FAILOVER_STATUSES = new Set([429, 502, 503, 504]);
@@ -30,6 +34,29 @@ export function remoteFailoverDecision({ status, body = '', connectionError = fa
   if (next.remote) return { action: 'remote', routing: next };
   if (exclusiveActive) return { action: 'pass-through' };
   return { action: 'local', routing: next };
+}
+
+/**
+ * Whether a non-ok remote answer counts toward that backend's circuit breaker.
+ * @param {number} status HTTP status. @param {string} body response text.
+ * @returns {boolean} true for a 5xx that is not an output error; never for a 4xx (the request's fault).
+ */
+export function countsAsBackendFailure(status, body) {
+  return status >= 500 && !isOutputError(body);
+}
+
+/**
+ * The manager's own /health verdict.
+ * @param {{idle?:boolean, llamaRunning?:boolean, llamaHealthy?:boolean, exclusiveStatus?:string}} p
+ *   `exclusiveStatus` is the active DS4/Strata runtime status, absent when none owns the box.
+ * @returns {'idle'|'healthy'|'degraded'|'down'} the status /health reports (503 only for 'down').
+ */
+export function managerHealthStatus({ idle = false, llamaRunning = false, llamaHealthy = false, exclusiveStatus } = {}) {
+  if (idle) return 'idle';
+  if (llamaRunning) return llamaHealthy ? 'healthy' : 'degraded';
+  if (exclusiveStatus === 'ready') return 'healthy';
+  if (exclusiveStatus === 'loading' || exclusiveStatus === 'swapping') return 'degraded';
+  return 'down';
 }
 
 /** @param {string} body upstream response text. @returns {boolean} true for a manager's output-content error. */

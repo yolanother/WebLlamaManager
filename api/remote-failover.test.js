@@ -11,7 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'fs/promises';
-import { remoteFailoverDecision } from './remote-failover.js';
+import { remoteFailoverDecision, countsAsBackendFailure, managerHealthStatus } from './remote-failover.js';
 
 const other = { remote: true, backend: { id: 'b2' } };
 const local = { remote: false };
@@ -57,6 +57,27 @@ test('no local fallback while an exclusive engine owns the box', () => {
   assert.deepEqual(remoteFailoverDecision({ status: 503, next: other, exclusiveActive: true }), { action: 'remote', routing: other });
 });
 
+// W1 evidence 2026-10-31 02:32Z: drakemore's breaker tripped on 3 consecutive narration
+// REASONING_EXHAUSTED 502s, and default-big (the podcast) then got 503 "all remote members
+// down or tripped" for ~40-60 s while Strata was serving fine.
+const reasoning = JSON.stringify({ error: { type: 'upstream_output_error', code: 'REASONING_EXHAUSTED' } });
+
+test('only backend faults count toward the circuit breaker', () => {
+  assert.equal(countsAsBackendFailure(502, reasoning), false, 'the caller budget is not a backend fault');
+  for (const status of [400, 404, 413, 429]) assert.equal(countsAsBackendFailure(status, '{}'), false, `${status}`);
+  for (const status of [500, 502, 503, 504]) assert.equal(countsAsBackendFailure(status, 'bad gateway'), true, `${status}`);
+});
+
+test('/health is healthy while an exclusive engine serves with llama stopped', () => {
+  assert.equal(managerHealthStatus({ llamaRunning: false, llamaHealthy: false, exclusiveStatus: 'ready' }), 'healthy');
+  assert.equal(managerHealthStatus({ llamaRunning: false, llamaHealthy: false, exclusiveStatus: 'loading' }), 'degraded');
+  assert.equal(managerHealthStatus({ llamaRunning: false, llamaHealthy: false, exclusiveStatus: 'exhausted' }), 'down');
+  assert.equal(managerHealthStatus({ llamaRunning: false, llamaHealthy: false }), 'down');
+  assert.equal(managerHealthStatus({ llamaRunning: true, llamaHealthy: true }), 'healthy');
+  assert.equal(managerHealthStatus({ llamaRunning: true, llamaHealthy: false }), 'degraded');
+  assert.equal(managerHealthStatus({ idle: true }), 'idle');
+});
+
 const source = await readFile(new URL('./server.js', import.meta.url), 'utf8');
 
 test('chat/completions remote branch fails over with the failed backend excluded', () => {
@@ -73,4 +94,11 @@ test('routing honours excludeBackendIds in every remote member filter', () => {
   const route = source.slice(source.indexOf('function resolveBackendRoute('), source.indexOf('function buildRemoteRouting('));
   // hasViableRemote, the candidate filter and remoteOnlyAliasRouting's reachable list
   assert.ok((route.match(/excludeBackendIds\.has\(b\.id\)/g) || []).length >= 3);
+});
+
+test('fetchRemoteBackend and /health use the shared classifiers', () => {
+  const fetchFn = source.slice(source.indexOf('async function fetchRemoteBackend('), source.indexOf('// Calculate cost for a remote backend request'));
+  assert.match(fetchFn, /countsAsBackendFailure\(/);
+  const health = source.slice(source.indexOf("app.get('/health'"), source.indexOf("app.get('/health'") + 800);
+  assert.match(health, /managerHealthStatus\(/);
 });

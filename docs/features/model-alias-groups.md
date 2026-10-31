@@ -212,6 +212,13 @@ member or a `local` target that is fast enough to be worth it (e.g. Frostburn
 `default-big` → `[drakemore, local unsloth_Qwen3.6-35B-A3B-GGUF]`, not the dense Gemma 31B
 at ~7 tok/s). `completions`, `responses` and `messages` still pass a refusal through.
 
+**Circuit breaker.** Only backend faults count toward a backend's 3-strike breaker: a
+5xx that is not an output error. A 4xx (the request's own fault) and a `REASONING_EXHAUSTED`
+502 (the caller's budget) do not. Before this, three narration `REASONING_EXHAUSTED` calls
+in a row tripped drakemore for 60 s, and the podcast's `default-big` answered 503 "all remote
+members down or tripped" while Strata was serving (2026-10-31 02:32Z,
+`tests/remote-failover/breaker.test.mjs`).
+
 Member order is backend **priority first (lower number wins)**, then measured tok/s,
 and only then the alias's authored order (pinned by `tests/remote-failover/failover.test.mjs`).
 Two members at the same priority go to the faster one, whatever order the alias lists them in.

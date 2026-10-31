@@ -7,7 +7,9 @@
 // without touching the dev server, its config or any real host. Each fake answers
 // /models, and answers chat/completions with its configured status: 200 says
 // `from <id>`; 502 `reasoning` is a REASONING_EXHAUSTED output error; any other non-200
-// is an `exclusive_ds4_mode` refusal. `dead: true` reserves a port nothing listens on.
+// is an `exclusive_ds4_mode` refusal. `reasoningModel` answers that one model with the
+// REASONING_EXHAUSTED 502 and everything else 200. `dead: true` reserves a port nothing
+// listens on.
 
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -25,14 +27,20 @@ function freePort() {
 
 /**
  * Start one fake backend.
- * @param {{id:string, status?:number, reasoning?:boolean}} spec
+ * @param {{id:string, status?:number, reasoning?:boolean, reasoningModel?:string}} spec
  * @param {Record<string, number>} hits chat/completions call counter per id (mutated).
  * @returns {Promise<{server: import('node:http').Server, port: number}>}
  */
-function fakeBackend({ id, status = 200, reasoning = false }, hits) {
+function fakeBackend({ id, status: fixedStatus = 200, reasoning: fixedReasoning = false, reasoningModel = null }, hits) {
   const server = createServer((req, res) => {
-    req.resume();
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
     req.on('end', () => {
+      let model = null;
+      try { model = JSON.parse(raw || '{}').model; } catch { /* not JSON */ }
+      const budgetHit = reasoningModel !== null && model === reasoningModel;
+      const status = budgetHit ? 502 : fixedStatus;
+      const reasoning = budgetHit || fixedReasoning;
       if (req.url.endsWith('/models')) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ object: 'list', data: [{ id: 'm', object: 'model' }] }));
@@ -51,7 +59,7 @@ function fakeBackend({ id, status = 200, reasoning = false }, hits) {
 
 /**
  * Boot the stack.
- * @param {{backends: Array<{id:string, priority:number, status?:number, reasoning?:boolean, dead?:boolean}>, aliases: object}} spec
+ * @param {{backends: Array<{id:string, priority:number, status?:number, reasoning?:boolean, reasoningModel?:string, dead?:boolean}>, aliases: object}} spec
  * @returns {Promise<{chat:(model:string)=>Promise<Response>, hits:Record<string,number>, stop:()=>void}>}
  */
 export async function startStack({ backends, aliases }) {

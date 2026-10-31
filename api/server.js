@@ -114,7 +114,7 @@ import { shouldDeferMemRestart, shouldRestartForResidentLeak } from './mem-watch
 import { slotCacheFilename, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import { remoteOnlyAliasFallback } from './remote-only-alias.js';
-import { remoteFailoverDecision } from './remote-failover.js';
+import { remoteFailoverDecision, countsAsBackendFailure, managerHealthStatus } from './remote-failover.js';
 import { exclusiveRecoveryDecision } from './exclusive-recovery.js';
 import { seedStrataPreset, STRATA_PRESET_ID } from './strata-seed.js';
 import {
@@ -2378,7 +2378,12 @@ async function fetchRemoteBackend(backend, url, options, { label = 'remote', mod
             recordBackendSuccess(backend.id);
           } else {
             stats.errorRequests++;
-            recordBackendFailure(backend.id, backend.name);
+            // Only a backend fault counts toward the breaker: a 4xx is the request's, and a
+            // REASONING_EXHAUSTED 502 is the caller's token budget. Three of those from
+            // narration tripped drakemore and 503'd the podcast's default-big (2026-10-31).
+            // clone() leaves the body readable for the caller.
+            const errorText = await response.clone().text().catch(() => '');
+            if (countsAsBackendFailure(response.status, errorText)) recordBackendFailure(backend.id, backend.name);
           }
           stats.totalDurationMs += duration;
           stats.recentLatencies.push(duration);
@@ -6791,7 +6796,11 @@ app.get('/health', async (req, res) => {
   const llamaStatus = await fetchLlamaStatus();
   const memPercent = getSystemMemoryPercent();
 
-  const status = idleShutdown ? 'idle' : llamaRunning && llamaStatus.healthy ? 'healthy' : llamaRunning ? 'degraded' : 'down';
+  // An exclusive engine (DS4/Strata) serving with llama stopped is healthy, not 'down'.
+  const status = managerHealthStatus({
+    idle: idleShutdown, llamaRunning, llamaHealthy: llamaStatus.healthy,
+    exclusiveStatus: activeExclusive()?.runtime()?.status,
+  });
   const httpStatus = status === 'down' ? 503 : 200;
 
   res.status(httpStatus).json({
@@ -6804,6 +6813,7 @@ app.get('/health', async (req, res) => {
       mode: currentMode,
       preset: currentPreset || null
     },
+    exclusive: activeExclusive() ? { engine: currentEngine, status: activeExclusive().runtime()?.status ?? null } : null,
     queue: {
       active: llamaQueue.active,
       pending: llamaQueue.pending,
