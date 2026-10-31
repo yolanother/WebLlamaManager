@@ -115,6 +115,7 @@ import { slotCacheFilename, shouldRestoreSlot } from './slot-cache.js';
 import { protectResidentDecision, DEFAULT_PROTECT_MIN_BYTES } from './protect-resident.js';
 import { remoteOnlyAliasFallback } from './remote-only-alias.js';
 import { remoteFailoverDecision } from './remote-failover.js';
+import { exclusiveRecoveryDecision } from './exclusive-recovery.js';
 import {
   annotateModelResidency,
   modelResidencyDecision,
@@ -522,6 +523,8 @@ const strataState = {
   runtime: null,
   cudaLeaseId: null, cudaCard: null, idleSinceMs: null, cudaFailedAt: null,
   memAvailableBeforeSpawn: 0,
+  // Backoff state while the runtime is `exhausted` ({since, attempts, nextAt, lastReason}); null when healthy.
+  recovery: null,
 };
 
 /**
@@ -4283,6 +4286,7 @@ async function getSystemStats() {
     ds4Runtime: ds4SettledRuntime,
     strata: strataStats,
     strataRuntime: strataState.runtime,
+    strataRecovery: strataState.recovery,
     engine: currentEngine,
     guard: guardLast,
     memoryGuard: guardMemLast,
@@ -9745,11 +9749,24 @@ let strataTickRunning = false;
  * Periodic CUDA/HIP policy poll, called from the GPU sweep timer. Samples foreign compute
  * VRAM, asks {@link strataBackendDecision}, records `runtime.cuda`, and swaps when told to.
  * Non-reentrant; a no-op unless Strata is ready, CUDA is configured and no swap is in flight.
+ * First, an `exhausted` runtime is re-activated with backoff (exclusive-recovery.js).
  * @returns {Promise<void>}
  */
 async function strataBackendTick() {
   const cfg = strataConfig();
   const runtime = strataState.runtime;
+  if (currentEngine === ENGINE_TYPES.STRATA && runtime && !strataState.swapPromise) {
+    const rec = exclusiveRecoveryDecision({ status: runtime.status, state: strataState.recovery, now: Date.now(), reason: runtime.reason ?? null });
+    strataState.recovery = rec.state;
+    const preset = config.presets?.[runtime.presetId];
+    if (rec.action === 'retry' && preset) {
+      const msg = `strata: runtime exhausted since ${new Date(rec.state.since).toISOString()} (${rec.state.lastReason || 'unknown'}); auto re-activation attempt ${rec.state.attempts}, next in ${Math.round((rec.state.nextAt - Date.now()) / 60000)} min if it fails`;
+      console.warn(`[strata] ${msg}`);
+      addLog('presets', msg);
+      activateStrataSingleFlight(runtime.presetId, preset).catch((err) => addLog('presets', `strata: auto re-activation failed to start: ${err.message}`));
+      return;
+    }
+  }
   if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready' && !strataState.swapPromise) {
     // The supervisor gave up (load-failure breaker / governor): a ready runtime over a dead
     // engine would hold the CUDA lease forever. Debounced past the 3 s auto-restart delay.
