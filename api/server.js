@@ -221,6 +221,7 @@ import { loopingTextReason } from './degenerate-output.js';
 import { createDs4Supervisor, createEngineSupervisor } from './ds4-supervisor.js';
 import {
   resolveStrataConfig, strataServerConfig, strataConfigPath, strataLaunchSpec, strataHealthReady, effectiveStrataBlock,
+  strataHipExpertCache, strataHipFootprintBytes, strataGrowDecision,
 } from './strata-engine.js';
 import {
   STRATA_HOLDER, parseComputeApps, otherComputeVramBytes, blockingClaim, strataBackendDecision, cudaAdmission,
@@ -573,6 +574,8 @@ const strataState = {
   runtime: null,
   cudaLeaseId: null, cudaCard: null, idleSinceMs: null, cudaFailedAt: null,
   memAvailableBeforeSpawn: 0,
+  // Start of Strata's idle streak for the HIP grow-back decision (strataGrowDecision).
+  growIdleSinceMs: null,
   // Backoff state while the runtime is `exhausted` ({since, attempts, nextAt, lastReason}); null when healthy.
   recovery: null,
 };
@@ -9157,6 +9160,9 @@ app.post('/api/ds4/update/apply', (req, res) => {
  *  oom_score_adj=1000 and would be OOM-killed if we over-commit). */
 const DS4_RECLAIM_TIMEOUT_MS = parseInt(process.env.DS4_RECLAIM_TIMEOUT_MS) || 180_000;
 const DS4_RECLAIM_INTERVAL_MS = parseInt(process.env.DS4_RECLAIM_INTERVAL_MS) || 2000;
+// HIP Strata waits only this long for its configured footprint after evicting llama, then
+// starts at the largest expert cache that fits (docs/Designs/ResourceArbiter.md section 1).
+const STRATA_HIP_SETTLE_MS = 30_000;
 /** How long to wait for ds4 /v1/models readiness before releasing the swap gate. */
 const DS4_READY_TIMEOUT_MS = parseInt(process.env.DS4_READY_TIMEOUT_MS) || 600_000;
 const DS4_READY_INTERVAL_MS = parseInt(process.env.DS4_READY_INTERVAL_MS) || 3000;
@@ -9240,11 +9246,12 @@ function ds4AdaptiveSettings(preset, ds4cfg) {
  * the caller decides what a failed eviction means (see ds4ActivationDecision).
  * Shared by activateDs4Exclusive and the Strata HIP attempt.
  *
- * @param {{label:string, targetBytes:number, keepEmbed?:boolean}} opts `label` prefixes the log lines ('ds4'|'strata').
+ * @param {{label:string, targetBytes:number, keepEmbed?:boolean, timeoutMs?:number}} opts `label` prefixes the log
+ *   lines ('ds4'|'strata'); `timeoutMs` bounds the reclaim wait (default DS4_RECLAIM_TIMEOUT_MS).
  * @returns {Promise<{resident:number[], residentAfterEvict:boolean, reclaimOk:boolean}>}
  *   `resident` lists llama-server pids that survived; `reclaimOk` is only measured when none did.
  */
-async function evictLlamaForExclusive({ label, targetBytes, keepEmbed = false }) {
+async function evictLlamaForExclusive({ label, targetBytes, keepEmbed = false, timeoutMs = DS4_RECLAIM_TIMEOUT_MS }) {
   await stopLlamaServer();
   if (!keepEmbed) {
     addLog('presets', `${label}: stopping embed server — does not fit the exclusive-${label.toUpperCase()} memory budget`);
@@ -9268,7 +9275,7 @@ async function evictLlamaForExclusive({ label, targetBytes, keepEmbed = false })
     const poll = await pollForReclaim({
       readMemAvailable: memAvailableBytes,
       targetBytes,
-      timeoutMs: DS4_RECLAIM_TIMEOUT_MS,
+      timeoutMs,
       intervalMs: DS4_RECLAIM_INTERVAL_MS,
     });
     reclaimOk = poll.ok;
@@ -9580,7 +9587,7 @@ function getStrataSupervisor() {
         const backend = override?.backend || 'hip';
         const path = strataConfigPath(cfg, backend);
         mkdirSync(cfg.dataDir, { recursive: true });
-        writeFileSync(path, JSON.stringify(strataServerConfig({ cfg, preset, backend }), null, 2));
+        writeFileSync(path, JSON.stringify(strataServerConfig({ cfg, preset, backend, expertCache: override?.expertCache }), null, 2));
         const spec = strataLaunchSpec({ cfg, configPath: path });
         return { cmd: spec.cmd, args: spec.args, opts: { cwd: spec.cwd, env: { ...RUNTIME_ENV } } };
       },
@@ -9698,6 +9705,8 @@ async function startStrataAttempt(preset, { backend }) {
     }
     let residentBytes;
     let evictNeeded = true;
+    let reclaimTimeoutMs = DS4_RECLAIM_TIMEOUT_MS;
+    const launch = { backend };
     if (backend === 'cuda' && cfg.cuda) {
       // 2. CUDA: take the 3090 through the GPU reservation state machine, drain it, and
       // evict llama only when host RAM is short (llama may co-reside on the iGPU).
@@ -9723,12 +9732,16 @@ async function startStrataAttempt(preset, { backend }) {
       const waited = await waitForGpuReservation(lease.id, GPU_DRAIN_INFLIGHT_WAIT_MS + 30_000);
       if (waited.status !== 200) return skip(`cuda-not-held:${waited.status}`);
       gpuDrainStoppedEngine.delete(lease.id); // Strata restarts llama itself, lazily
+      if (strataState.runtime) strataState.runtime.expertCache = null; // the HIP adaptive size does not apply on CUDA
       residentBytes = cfg.cuda.hostResidentBytes;
       evictNeeded = memAvailableBytes() < residentBytes + ds4HeadroomBytes();
     } else if (backend === 'hip' && cfg.hip) {
-      // 3. HIP: unified memory, so llama is always evicted (verified reclaim), like DS4.
+      // 3. HIP: unified memory, so llama is always evicted (verified reclaim), like DS4. The
+      // configured cache is a target: after a short settle Strata starts at whatever fits
+      // (strataHipExpertCache, docs/Designs/ResourceArbiter.md section 1).
       releaseStrataCudaLease();
       residentBytes = cfg.hip.residentBytes;
+      reclaimTimeoutMs = STRATA_HIP_SETTLE_MS;
     } else {
       return { ok: false, abort: false, reason: `backend-unavailable:${backend}` };
     }
@@ -9740,8 +9753,20 @@ async function startStrataAttempt(preset, { backend }) {
         ds4ModelBytes: residentBytes, embedServerBytes: DS4_EMBED_APPROX_BYTES,
         totalBytes: memTotalBytes(), headroomBytes,
       });
-      const { resident, residentAfterEvict, reclaimOk } = await evictLlamaForExclusive({ label: 'strata', targetBytes, keepEmbed });
-      const evict = ds4ActivationDecision({ residentAfterEvict, reclaimOk, spawnOk: undefined });
+      const { resident, residentAfterEvict, reclaimOk } = await evictLlamaForExclusive({ label: 'strata', targetBytes, keepEmbed, timeoutMs: reclaimTimeoutMs });
+      let fit = null;
+      if (backend === 'hip' && !residentAfterEvict) {
+        fit = strataHipExpertCache({
+          configured: cfg.hip.expertCache, minSlots: cfg.hip.minExpertCache, availableBytes: memAvailableBytes(),
+          baseBytes: cfg.hip.baseBytes, headroomBytes,
+        });
+        addLog('presets', `strata: hip expert cache ${fit.slots ?? 'refused'} (${fit.reason})`);
+        if (fit.slots !== null) {
+          launch.expertCache = fit.slots;
+          if (strataState.runtime) strataState.runtime.expertCache = { configured: cfg.hip.expertCache, effective: fit.slots, reason: fit.reason, at: Date.now() };
+        }
+      }
+      const evict = ds4ActivationDecision({ residentAfterEvict, reclaimOk: fit ? fit.slots !== null : reclaimOk, spawnOk: undefined });
       if (evict.action === 'abort-stay-exclusive') {
         addLog('presets', evict.reason === 'llama-wedged-resident'
           ? `strata activation blocked: llama-server pids [${resident.join(', ')}] would not die after SIGKILL. NOT spawning Strata on top; box stays in exclusive-Strata offload mode.`
@@ -9755,7 +9780,7 @@ async function startStrataAttempt(preset, { backend }) {
     // MemAvailable now is the baseline recordStrataHipFootprint measures the real footprint against.
     strataState.memAvailableBeforeSpawn = memAvailableBytes();
     if (strataState.runtime) strataState.runtime.backend = backend;
-    getStrataSupervisor().start(preset, { planMode: true, override: { backend } });
+    getStrataSupervisor().start(preset, { planMode: true, override: launch });
     return { ok: true };
   } catch (err) {
     addLog('presets', `strata: ${backend} attempt could not start: ${err.message}`);
@@ -9771,7 +9796,8 @@ async function startStrataAttempt(preset, { backend }) {
  */
 function recordStrataHipFootprint(runtime, cfg) {
   if (runtime.backend !== 'hip' || !cfg.hip || !strataState.memAvailableBeforeSpawn) return;
-  runtime.hipFootprint = { estimatedBytes: cfg.hip.residentBytes, measuredBytes: strataState.memAvailableBeforeSpawn - memAvailableBytes() };
+  const effective = runtime.expertCache?.effective ?? cfg.hip.expertCache;
+  runtime.hipFootprint = { estimatedBytes: strataHipFootprintBytes({ expertCache: effective, baseBytes: cfg.hip.baseBytes }), measuredBytes: strataState.memAvailableBeforeSpawn - memAvailableBytes() };
   addLog('presets', `strata: hip footprint measured ${gibStr(runtime.hipFootprint.measuredBytes)} GiB (MemAvailable drop) vs estimated ${gibStr(runtime.hipFootprint.estimatedBytes)} GiB`);
 }
 
@@ -9951,6 +9977,24 @@ async function strataBackendTick() {
       Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: 'engine-stopped' });
       releaseStrataCudaLease();
       addLog('presets', 'strata: engine is no longer running and is not restarting; marked exhausted and released the CUDA lease. Re-activate the preset to retry.');
+      return;
+    }
+  }
+  if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready' && runtime.backend === 'hip'
+    && runtime.expertCache && cfg.hip && !strataState.swapPromise) {
+    // Grow a shrunk HIP cache back toward its target once memory frees and Strata is idle
+    // (docs/Designs/ResourceArbiter.md section 1); the swap path drains, stops and reloads.
+    const grow = strataGrowDecision({
+      effective: runtime.expertCache.effective, configured: cfg.hip.expertCache, minSlots: cfg.hip.minExpertCache,
+      availableBytes: memAvailableBytes(), baseBytes: cfg.hip.baseBytes, headroomBytes: ds4HeadroomBytes(),
+      busy: ds4Queue.active > 0 || ds4Queue.pending > 0 || [...activeRequests.values()].some((r) => r.backend === 'strata'),
+      idleSinceMs: strataState.growIdleSinceMs, settledAt: runtime.settledAt ?? 0,
+      now: Date.now(), growCooldownMs: cfg.hip.growCooldownMs,
+    });
+    strataState.growIdleSinceMs = grow.idleSinceMs;
+    if (grow.action === 'grow') {
+      addLog('presets', `strata: ${grow.reason}; restarting on hip between requests`);
+      await strataSwapBackend('hip', grow.reason);
       return;
     }
   }
