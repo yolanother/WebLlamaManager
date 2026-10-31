@@ -201,11 +201,15 @@ that member excluded (`api/remote-failover.js`, `excludeBackendIds` on `resolveB
 to the next remote member, else to the alias's `local` target (not while a DS4/Strata engine
 owns the box). Log: `failover: <backend> answered <status> for <model>; retrying on … /
 serving locally`. 4xx and 500 pass through (another member would answer the same), and so
-does the original error when nothing else can serve it.
+does a 502 `upstream_output_error` such as `REASONING_EXHAUSTED`: the caller's `max_tokens`
+ran out on reasoning (71 of 157 drakemore default-small 502s in one 31-minute window), and
+another member would fail it the same way, only slower. The original error also passes
+through when nothing else can serve it.
 
 Failover only helps an alias that has somewhere to go: give a remote-only alias a second
-member or a `local` target (e.g. Frostburn `default-big` → `[drakemore, local <resident
-model>]`). `completions`, `responses` and `messages` still pass a refusal through.
+member or a `local` target that is fast enough to be worth it (e.g. Frostburn
+`default-big` → `[drakemore, local unsloth_Qwen3.6-35B-A3B-GGUF]`, not the dense Gemma 31B
+at ~7 tok/s). `completions`, `responses` and `messages` still pass a refusal through.
 
 ### `acceptsAny` is a host policy, NOT an alias fallback
 

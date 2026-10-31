@@ -32,6 +32,15 @@ test('client errors and 500s pass through: another backend would answer the same
   }
 });
 
+test('an output error (REASONING_EXHAUSTED etc.) passes through: the caller budget, not the backend', () => {
+  // W4 measured 71 of 157 drakemore default-small 502s in 31 min were REASONING_EXHAUSTED.
+  const body = JSON.stringify({ error: { type: 'upstream_output_error', code: 'REASONING_EXHAUSTED' } });
+  assert.deepEqual(remoteFailoverDecision({ status: 502, body, next: other }), { action: 'pass-through' });
+  const exclusive = JSON.stringify({ error: { type: 'exclusive_ds4_mode', code: 'exclusive_ds4_mode' } });
+  assert.deepEqual(remoteFailoverDecision({ status: 503, body: exclusive, next: other }), { action: 'remote', routing: other });
+  assert.deepEqual(remoteFailoverDecision({ status: 502, body: '<html>bad gateway</html>', next: other }), { action: 'remote', routing: other });
+});
+
 test('nowhere else to go passes the original error through', () => {
   assert.deepEqual(remoteFailoverDecision({ status: 503, next: null }), { action: 'pass-through' });
   assert.deepEqual(remoteFailoverDecision({ status: 503, next: { remote: false, blocked: true } }), { action: 'pass-through' });
@@ -48,6 +57,7 @@ test('chat/completions remote branch fails over with the failed backend excluded
   const start = source.indexOf('async function handleChatCompletions(');
   const body = source.slice(start, source.indexOf('// ===== LOCAL BACKEND PATH', start));
   assert.match(body, /remoteFailoverDecision\(/);
+  assert.match(body, /body: error/, 'the upstream body reaches the decision');
   assert.match(body, /excludeBackendIds/);
   assert.match(body, /break remotePath/, 'a local failover must leave the remote block and run the local path');
 });

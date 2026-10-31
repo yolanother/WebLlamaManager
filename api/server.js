@@ -14668,6 +14668,7 @@ async function handleChatCompletions(req, res) {
       const excludeBackendIds = new Set();
       let response;
       let backend;
+      let error = null; // a refusal's body, read once: it decides failover and is what passes through
       for (;;) {
         ({ response, backend } = await fetchRemoteBackend(routing.backend, routing.targetUrl, {
           method: 'POST',
@@ -14676,13 +14677,14 @@ async function handleChatCompletions(req, res) {
         }, { label: 'chat/completions', model: routing.targetModel, externalSignal: getActiveRequestSignal(activeReqId), activeReqId }));
         if (response.ok) break;
         excludeBackendIds.add(backend.id);
+        error = await response.text();
         const failover = remoteFailoverDecision({
           status: response.status,
+          body: error,
           next: resolveBackend(requestedModel, 'chat/completions', req.body, { localOnly: requestPolicy.localOnly, aliasRouting, excludeBackendIds }),
           exclusiveActive: !!exclusive,
         });
         if (failover.action === 'pass-through') break;
-        try { await response.body?.cancel(); } catch { /* already closed */ }
         console.log(`[chat/completions] failover: ${backend.name} answered ${response.status}; ${failover.action === 'remote' ? `retrying on ${failover.routing.backend.name}` : 'serving locally'}`);
         addLog('backends', `failover: ${backend.name} answered ${response.status} for ${requestedModel}; ${failover.action === 'remote' ? `retrying on ${failover.routing.backend.name}` : 'serving locally'}`);
         routing = failover.routing;
@@ -14693,7 +14695,7 @@ async function handleChatCompletions(req, res) {
       }
 
       if (!response.ok) {
-        const error = await response.text();
+        error ??= await response.text();
         addLlmLog({
           endpoint: 'chat/completions', model: requestedModel, stream: isStreaming,
           status: response.status, duration: Date.now() - startTime,

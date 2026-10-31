@@ -6,8 +6,9 @@
 // OpenAI-compatible backends behind one alias: the preferred member answers 503
 // `exclusive_ds4_mode` (what drakemore sent for 12 days while its Strata runtime was
 // `exhausted`), the other answers 200. The request must be served by the second member
-// instead of surfacing the 503 (W2a, T32312b081981f). A third case pins that a 503 with
-// nowhere else to go still reaches the caller unchanged. Run: node --test tests/remote-failover/
+// instead of surfacing the 503 (W2a, T32312b081981f). Further cases pin that a 503 with
+// nowhere else to go, and a REASONING_EXHAUSTED 502 (the caller's token budget), reach
+// the caller unchanged. Run: node --test tests/remote-failover/
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const repoRoot = new URL('../../', import.meta.url).pathname;
-const hits = { refusing: 0, healthy: 0 };
+const hits = { refusing: 0, healthy: 0, reasoning: 0 };
 const fakes = [];
 let api;
 let apiPort;
@@ -38,7 +39,9 @@ function fakeBackend(name, status) {
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(status === 200
         ? { id: 'x', object: 'chat.completion', model: 'm', choices: [{ index: 0, message: { role: 'assistant', content: `from ${name}` }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } }
-        : { error: { message: 'exclusive mode', type: 'exclusive_ds4_mode', code: 'exclusive_ds4_mode' } }));
+        : name === 'reasoning'
+          ? { error: { message: 'spent its entire output budget on reasoning', type: 'upstream_output_error', code: 'REASONING_EXHAUSTED' } }
+          : { error: { message: 'exclusive mode', type: 'exclusive_ds4_mode', code: 'exclusive_ds4_mode' } }));
     });
   });
   fakes.push(srv);
@@ -60,6 +63,7 @@ const backend = (id, port, priority) => ({
 before(async () => {
   const refusingPort = await fakeBackend('refusing', 503);
   const healthyPort = await fakeBackend('healthy', 200);
+  const reasoningPort = await fakeBackend('reasoning', 502);
   apiPort = await freePort();
   work = mkdtempSync(join(tmpdir(), 'failover-test-'));
   for (const d of ['home', 'models', 'etc', 'data', 'cache']) mkdirSync(join(work, d));
@@ -68,11 +72,12 @@ before(async () => {
     requestLogging: false, maxConcurrentRequests: 1, logFilters: [], presets: {},
     backends: {
       enabled: true, offloadPolicy: 'overflow', preferLocal: false,
-      directory: [backend('refusing', refusingPort, 1), backend('healthy', healthyPort, 2)],
+      directory: [backend('refusing', refusingPort, 1), backend('healthy', healthyPort, 2), backend('reasoning', reasoningPort, 1)],
     },
     aliases: {
       both: { targets: [{ host: 'refusing', model: 'm' }, { host: 'healthy', model: 'm' }] },
       only: { targets: [{ host: 'refusing', model: 'm' }] },
+      budget: { targets: [{ host: 'reasoning', model: 'm' }, { host: 'healthy', model: 'm' }] },
     },
   }));
   api = spawn(process.execPath, [join(repoRoot, 'api/server.js')], {
@@ -116,4 +121,13 @@ test('a 503 with nowhere else to go reaches the caller', async () => {
   const res = await chat('only');
   assert.equal(res.status, 503);
   assert.equal(hits.refusing, before + 1);
+});
+
+test('a REASONING_EXHAUSTED 502 is the caller budget: it passes through, no failover', async () => {
+  const healthyBefore = hits.healthy;
+  const res = await chat('budget');
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error.code, 'REASONING_EXHAUSTED');
+  assert.equal(hits.reasoning, 1);
+  assert.equal(hits.healthy, healthyBefore, 'the healthy member must not be tried');
 });
