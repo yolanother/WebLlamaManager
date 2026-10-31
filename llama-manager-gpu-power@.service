@@ -1,0 +1,22 @@
+# Llama Manager — GPU power-cap writer.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Root oneshot that sets the power limit of every NVIDIA card to the instance
+# name in watts: `systemctl start llama-manager-gpu-power@300.service`. The
+# manager runs as the unprivileged llama-manager account and nvidia-smi -pl needs
+# root, so the GPU power-cap schedule (api/gpu-power.js) starts this unit through
+# the package's polkit rule, which grants START of this template only. Not
+# enabled and never started at boot by itself: the manager applies the schedule
+# on its own start, on every settings change and every minute.
+
+[Unit]
+Description=Llama Manager GPU power cap (%i W)
+Documentation=https://github.com/yolanother/llama-manager
+
+[Service]
+Type=oneshot
+# No RemainAfterExit: every start must run the helper again, or a second start of
+# the same wattage would be a silent no-op while the card sits at another limit.
+ExecStart=/usr/lib/llama-manager/scripts/llama-manager-gpu-power %i
+TimeoutStartSec=30

@@ -1,0 +1,28 @@
+#!/bin/bash
+# Llama Manager — set the power limit of every NVIDIA card.
+# Copyright (c) Llama Manager project. Use of this file is governed by the
+# LICENSE file in the repository root.
+#
+# Root-run helper behind llama-manager-gpu-power@<watts>.service. Takes one
+# argument, a whole number of watts, turns persistence mode on (so the cap
+# survives the driver unloading between clients) and sets that limit on every
+# NVIDIA card with nvidia-smi, which itself rejects a value outside the card's
+# min/max range. Exits 2 on a malformed argument without touching anything,
+# exits 0 doing nothing on a box without nvidia-smi, and otherwise returns
+# nvidia-smi's own status so the manager can report a rejected limit.
+
+set -uo pipefail
+
+watts="${1:-}"
+if ! [[ "$watts" =~ ^[0-9]{1,4}$ ]]; then
+  printf 'llama-manager-gpu-power: expected watts as a number, got %q\n' "$watts" >&2
+  exit 2
+fi
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  printf 'llama-manager-gpu-power: nvidia-smi not found; nothing to cap\n'
+  exit 0
+fi
+
+nvidia-smi -pm 1 >/dev/null || printf 'llama-manager-gpu-power: could not enable persistence mode\n' >&2
+exec nvidia-smi -pl "$watts"

@@ -7,9 +7,12 @@
 // included because renaming the node has to take effect live, and it is the one
 // component permitted to change the hostname -- granting the manager the systemd
 // unit instead of the hostname1 action keeps the privilege scoped to a single
-// script whose behaviour is fixed by the package. It intentionally grants no
-// authority over other units, systemd manager operations, package installation,
-// or general root commands.
+// script whose behaviour is fixed by the package. The same reasoning grants START
+// of llama-manager-gpu-power@<watts>.service, the root oneshot that writes the
+// GPU power-cap schedule's limit with nvidia-smi; its instance name is the only
+// input and the helper accepts nothing but a number of watts. It intentionally
+// grants no authority over other units, systemd manager operations, package
+// installation, or general root commands.
 
 polkit.addRule(function(action, subject) {
     if (action.id !== "org.freedesktop.systemd1.manage-units" ||
@@ -22,6 +25,9 @@ polkit.addRule(function(action, subject) {
     var units = ["llama-manager.service", "llama-manager-identity.service"];
     if (units.indexOf(unit) !== -1 &&
         ["start", "stop", "restart"].indexOf(verb) !== -1) {
+        return polkit.Result.YES;
+    }
+    if (/^llama-manager-gpu-power@[0-9]{1,4}\.service$/.test(unit) && verb === "start") {
         return polkit.Result.YES;
     }
     return polkit.Result.NOT_HANDLED;

@@ -208,6 +208,12 @@ test_canonical_service_assets_are_package_safe() {
   assert_contains "polkit authorises the manager unit" "$polkit" '"llama-manager.service"'
   assert_contains "polkit authorises the identity unit" "$polkit" '"llama-manager-identity.service"'
   assert_contains "polkit authorises by explicit unit list" "$polkit" 'units.indexOf(unit) !== -1'
+  # The GPU power-cap schedule writes nvidia-smi -pl, which needs root. The grant
+  # is START of llama-manager-gpu-power@<digits>.service only: the instance is the
+  # watts and the package-owned helper accepts nothing else, so the manager can set
+  # a power limit and do nothing more with that authority.
+  assert_contains "polkit authorises only the gpu-power template by exact pattern" "$polkit" \
+    '/^llama-manager-gpu-power@[0-9]{1,4}\.service$/.test(unit) && verb === "start"'
   assert_contains "polkit still gates on the manager group" "$polkit" 'subject.isInGroup("llama-manager")'
   if printf '%s' "$polkit" | grep -qE 'polkit\.Result\.YES' ; then
     :
