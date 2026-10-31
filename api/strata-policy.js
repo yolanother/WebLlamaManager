@@ -177,3 +177,24 @@ export function strataPrefillVerdict({ live, prev, reqId = null, now, stallMs, w
     reason: `no prefill progress for ${Math.round((now - prev.since) / 1000)}s (read ${Math.max(0, read)}/${total ?? '?'})`,
   };
 }
+
+/** Error code of a request the prefill watchdog cancelled. */
+const PREFILL_STALLED = 'PREFILL_STALLED';
+
+/**
+ * The abort reason for a request whose prefill stopped progressing. It is failed to the caller
+ * with this message, never replayed: the same prompt would wedge the engine again.
+ * @param {string} detail the watchdog verdict's reason.
+ * @returns {Error} an error with code PREFILL_STALLED.
+ */
+export function prefillStalledError(detail) {
+  return Object.assign(new Error(`Strata prefill stalled: ${detail}; the request was cancelled`), { code: PREFILL_STALLED });
+}
+
+/**
+ * @param {unknown} err an error thrown by a proxied request (possibly wrapping the abort reason).
+ * @returns {boolean} true when the prefill watchdog cancelled it.
+ */
+export function isPrefillStalled(err) {
+  return err?.code === PREFILL_STALLED || err?.cause?.code === PREFILL_STALLED;
+}

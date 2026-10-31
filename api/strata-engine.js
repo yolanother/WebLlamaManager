@@ -70,6 +70,53 @@ export function strataHipExpertCache({ configured, minSlots, availableBytes, bas
 }
 
 /**
+ * Choose the expert cache a HIP (re)start launches with, once llama is evicted. I/O is injected
+ * so this is testable; server.js passes MemAvailable, a reclaim poll and the Pods release.
+ * - `maxSlots` caps the size: a grow restart passes the size strataGrowDecision chose (which left
+ *   the grow margin free), so the restart never takes more than the decision allowed.
+ * - `keepAtLeast` (a restart of a serving engine) waits up to `keepWaitMs` for that size before
+ *   sizing to what fits; a reading that dips again after the wait falls through, never refuses.
+ * - Only when even the floor does not fit does it ask Pods to release idle workers, then waits up
+ *   to `floorWaitMs` for the floor.
+ * @param {{hip: {expertCache:number, minExpertCache:number, baseBytes:number}, headroomBytes:number,
+ *   keepAtLeast?:number, maxSlots?:number, readMemAvailable: () => number,
+ *   waitForBytes: (bytes:number, timeoutMs:number) => Promise<boolean>,
+ *   releaseIdle: (reason:string) => Promise<{released: string[]}>, keepWaitMs:number,
+ *   floorWaitMs:number, log?: (msg:string) => void}} p sizing inputs and injected I/O.
+ * @returns {Promise<{slots:number|null, reason:string}>} the size to launch, or null (refuse).
+ */
+export async function sizeStrataHipCache({
+  hip, headroomBytes, keepAtLeast = 0, maxSlots = Infinity, readMemAvailable, waitForBytes, releaseIdle,
+  keepWaitMs, floorWaitMs, log = () => {},
+}) {
+  const target = Math.min(hip.expertCache, maxSlots);
+  const choose = (minSlots) => strataHipExpertCache({
+    configured: target, minSlots, availableBytes: readMemAvailable(), baseBytes: hip.baseBytes, headroomBytes,
+  });
+  const bytesFor = (slots) => strataHipFootprintBytes({ expertCache: slots, baseBytes: hip.baseBytes }) + headroomBytes;
+  const keep = Math.min(keepAtLeast, target);
+  if (keep > 0) {
+    const keepMin = Math.max(keep, hip.minExpertCache);
+    const kept = choose(keepMin);
+    if (kept.slots !== null) return kept;
+    log(`restart waiting up to ${Math.round(keepWaitMs / 1000)}s to keep its ${keep} expert slots (${kept.reason})`);
+    if (await waitForBytes(bytesFor(keep), keepWaitMs)) {
+      const again = choose(keepMin);
+      if (again.slots !== null) return again;
+    }
+    log(`could not keep ${keep} expert slots; sizing to what fits`);
+  }
+  const fit = choose(hip.minExpertCache);
+  if (fit.slots !== null) return fit;
+  const { released } = await releaseIdle(`strata hip start would be refused: ${fit.reason}`);
+  if (released.length && await waitForBytes(bytesFor(hip.minExpertCache), floorWaitMs)) {
+    const after = choose(hip.minExpertCache);
+    if (after.slots !== null) return after;
+  }
+  return fit;
+}
+
+/**
  * Whether a Strata running on HIP below its target cache should restart larger now. It must
  * be idle for a minute and past the cooldown since it settled, and a restart (which frees its
  * own footprint first) must buy at least MIN_GROW_SLOTS more slots, so it never flaps. The

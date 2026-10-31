@@ -374,11 +374,15 @@ export function ds4EvictionPlan({
  * @param {number}  p.attempt       0-based attempt already made.
  * @param {number}  p.maxRetries    Extra attempts permitted.
  * @param {boolean} p.bodyCommitted Whether response bytes were already sent.
+ * @param {boolean} [p.prefillStalled] The Strata prefill watchdog cancelled it: never replay.
  * @returns {{retry:boolean, reason:string}}
  */
 export function ds4SwapRetryDecision({
-  swapOccurred = false, attempt = 0, maxRetries = 2, bodyCommitted = false,
+  swapOccurred = false, attempt = 0, maxRetries = 2, bodyCommitted = false, prefillStalled = false,
 } = {}) {
+  if (prefillStalled) {
+    return { retry: false, reason: 'the prefill watchdog cancelled it; replaying the same prompt would wedge the engine again' };
+  }
   if (!swapOccurred) {
     return { retry: false, reason: 'failure was not caused by an engine swap' };
   }

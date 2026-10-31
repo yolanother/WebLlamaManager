@@ -23,8 +23,9 @@ image-classification 6 GiB, all with no job). Strata also hung 540 s in prefill 
 (`startStrataAttempt`) evicts llama as before, then:
 
 1. It waits a short settle (30 s) for llama's memory to come back.
-2. It picks the cache size (`sizeStrataHipCache` in `server.js`, built on
-   `strataHipExpertCache` in `strata-engine.js`). The size is
+2. It picks the cache size (`sizeStrataHipCache` in `strata-engine.js`, unit-tested with
+   injected memory; `server.js` supplies MemAvailable, the reclaim poll and the Pods
+   release). The size is
    `slots = min(configured, floor((MemAvailable - headroom - baseGb) / 1.94 MiB))`,
    rounded down to 100.
    - At least `hip.minExpertCache` (default 4000): Strata starts at that size.
@@ -33,11 +34,12 @@ image-classification 6 GiB, all with no job). Strata also hung 540 s in prefill 
      `reclaim-timeout`, and exclusive recovery retries with backoff.
    - Restart of an engine that was serving (grow-back or prefill-wedge restart): the
      restart passes `keepAtLeast`, the size the engine already had. The attempt waits up
-     to 180 s for that size instead of coming back smaller, or being refused, because a
+     to 30 s for that size instead of coming back smaller, or being refused, because a
      tenant took the memory during the stop. If the memory is still gone after the wait,
-     the attempt sizes to what fits. That keeps Strata serving; the alternative is an
-     exhausted engine whose recovery would start at the same smaller size after a minute
-     or more.
+     or dips again right after it, the attempt sizes to what fits. That keeps Strata
+     serving; the alternative is an exhausted engine whose recovery would start at the
+     same smaller size after a minute or more.
+   - A restart can also pass `maxSlots`, a cap on the new size.
 3. The chosen size and the reason are logged and kept on
    `strataRuntime.expertCache = {configured, effective, reason, at}`. The size travels in
    the supervisor's launch override, so a crash restart reuses it.
@@ -57,9 +59,26 @@ and start a loop: grow, critical stop, smaller restart, grow again.
 
 It grows only when the gain is at least 2000 slots, about 3.8 GiB (hysteresis). The
 restart is the existing swap path, `strataSwapBackend('hip', ...)`: bounded drain,
-verified stop, HIP load, with `keepAtLeast` set to the current size. A request that
-arrives mid-restart is held by the swap gate and replayed. Grow-back never asks Pods to
-release workers. It only uses memory that is already free.
+verified stop, HIP load. It makes two HIP attempts:
+1. Capped at the size the decision chose (`maxSlots`), so the restart never takes the
+   margin the decision left free, and kept at least at the current size.
+2. If that load fails, exactly the size it was serving at, instead of going exhausted.
+
+A request that arrives mid-restart is held by the swap gate and replayed. Grow-back never
+asks Pods to release workers. It only uses memory that is already free.
+
+**How long the swap gate is held.** While the gate is armed, every LLM request waits on
+it, not just Strata's, because a swap has always gated all traffic. The worst case for a
+grow or wedge restart is about 13.5 minutes:
+
+| Phase | Bound |
+|---|---|
+| Settle after evicting llama | 30 s |
+| Keep wait | 30 s |
+| Pods release, then wait for the floor | 180 s, only when even the floor does not fit |
+| Engine ready timeout | 600 s |
+
+The usual case is the drain plus a 27-52 s load.
 
 Shrinking a *running* Strata is not separate code. The existing memory governor stops
 Strata below `guard.memCriticalBelowGb` (6 GiB), and recovery re-activates it through the
@@ -126,6 +145,11 @@ worker container: `{workerId, endpointId, containerId, busy, idleSeconds, hostMe
 the agent change in T323255ff4b83c. The coordinator merges it with `gpu_processes` per
 worker. If either report says busy the worker stays, and the shorter idle time counts.
 
+**Best effort.** The release request returns the workers the coordinator chose. The node
+agent can still decline one it finds busy, for example because a claim is in flight when
+the stop arrives. A declined worker is not retried, so the manager re-checks MemAvailable
+rather than trusting the list.
+
 **Claims in flight.** Once a worker is chosen, its release is checked again under three
 guards:
 - the coordinator refuses `/job-take` for a worker it has marked as releasing;
@@ -160,19 +184,25 @@ a different `prompt_total`, starts a fresh clock, so a request never inherits an
 request's stall time. When the state is `reading` and nothing has moved for
 `strata.policy.prefillStallSec` (default 180), the manager does two things.
 
-1. **It holds the lane** (`holdStrataLane`). It arms the swap gate, so new requests wait.
-   It also reserves the single generation slot at realtime priority, so requests already
-   queued are not sent into a possibly wedged engine.
-2. **It aborts the slot holder** and logs `strata prefill stalled: ...`.
+1. **It holds Strata's lane** (`holdStrataLane`). It reserves Strata's single generation
+   slot at the front of the exclusive queue (`acquire({front: true})`), so requests
+   already queued for Strata are not sent into a possibly wedged engine. No swap gate is
+   armed, so llama and remote requests are unaffected.
+2. **It fails the slot holder.** The holder is aborted with a `PREFILL_STALLED` reason. Its
+   caller gets 504 `prefill_stalled`, or an SSE error event if the stream had started. It
+   is never replayed, because the same prompt would wedge the engine again.
 
 What happens next depends on the engine:
 - **Recovered:** the engine leaves `reading`, or a prompt makes progress. The hold is
   released and the queue resumes.
 - **Wedged:** after 30 s the engine is still `reading` with no progress, or `/metrics`
-  stops answering. The queued requests, which have sent nothing yet, are aborted first so
-  they are replayed. The slot is then freed, and the engine is restarted on the same
-  backend under the same gate. The drain is skipped (0 s) because the engine cannot
-  finish anything, and `keepAtLeast` keeps the current cache size.
+  stops answering. The steps run in this order:
+  1. The swap gate is armed.
+  2. The queued Strata requests, which have sent nothing yet, are aborted. Because the
+     gate is armed, they are replayed after the restart.
+  3. The slot is freed.
+  4. The engine restarts on the same backend at its current size (`keepAtLeast` =
+     `maxSlots`). The drain is skipped (0 s) because the engine cannot finish anything.
 
 The existing 900 s zero-token ceiling stays as the backstop when `/metrics` never answers
 and nothing was cancelled. A healthy

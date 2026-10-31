@@ -223,11 +223,11 @@ import { loopingTextReason } from './degenerate-output.js';
 import { createDs4Supervisor, createEngineSupervisor } from './ds4-supervisor.js';
 import {
   resolveStrataConfig, strataServerConfig, strataConfigPath, strataLaunchSpec, strataHealthReady, effectiveStrataBlock,
-  strataHipExpertCache, strataHipFootprintBytes, strataGrowDecision,
+  strataHipExpertCache, strataHipFootprintBytes, strataGrowDecision, sizeStrataHipCache,
 } from './strata-engine.js';
 import {
   STRATA_HOLDER, parseComputeApps, otherComputeVramBytes, blockingClaim, strataBackendDecision, cudaAdmission,
-  waitForCudaLeaseRelease, strataPrefillVerdict,
+  waitForCudaLeaseRelease, strataPrefillVerdict, prefillStalledError, isPrefillStalled,
 } from './strata-policy.js';
 import { createDs4Updater } from './ds4-updater.js';
 import { resolveDs4ModelPath } from './engines.js';
@@ -9682,39 +9682,30 @@ function strataCudaBlocked(cfg) {
   return blockingClaim(gpuReservations.list({ gpu: cfg.cuda.gpuPool }), cfg.cuda.reservationPriority, strataState.cudaLeaseId);
 }
 
+/** A restart of a serving HIP engine waits this long to keep its size (grow-back, prefill wedge). */
+const STRATA_RESTART_KEEP_WAIT_MS = 30_000;
+
 /**
- * Choose the HIP expert cache once llama is evicted (docs/Designs/ResourceArbiter.md section 1).
- * A restart of a serving engine (grow-back, prefill wedge) passes `keepAtLeast`: it waits up to
- * the full reclaim window for that size rather than come back smaller or be refused because a
- * tenant grabbed the memory during the stop. Only when the start would be refused (even the floor
- * does not fit) does it ask Pods to release idle workers, then wait for the floor.
+ * Choose the HIP expert cache once llama is evicted: strataHipExpertCache's sizing with this
+ * host's MemAvailable, reclaim poll and Pods release (sizeStrataHipCache in strata-engine.js;
+ * docs/Designs/ResourceArbiter.md section 1).
  * @param {object} cfg Resolved Strata config with `hip`.
  * @param {number} headroomBytes Free memory kept beside Strata.
- * @param {number} [keepAtLeast] Previous expert cache of a restarted engine (0 = fresh start).
- * @returns {Promise<{slots:number|null, reason:string}>} strataHipExpertCache's answer.
+ * @param {{keepAtLeast?: number, maxSlots?: number}} [opts] A restart's previous size, and a cap
+ *   (a grow restart's decided size).
+ * @returns {Promise<{slots:number|null, reason:string}>} the size to launch, or null (refuse).
  */
-async function sizeStrataHipCache(cfg, headroomBytes, keepAtLeast = 0) {
-  const choose = (minSlots) => strataHipExpertCache({
-    configured: cfg.hip.expertCache, minSlots, availableBytes: memAvailableBytes(), baseBytes: cfg.hip.baseBytes, headroomBytes,
-  });
-  const waitFor = async (slots) => (await pollForReclaim({
+function sizeHipCacheNow(cfg, headroomBytes, { keepAtLeast = 0, maxSlots = Infinity } = {}) {
+  return sizeStrataHipCache({
+    hip: cfg.hip, headroomBytes, keepAtLeast, maxSlots,
     readMemAvailable: memAvailableBytes,
-    targetBytes: strataHipFootprintBytes({ expertCache: slots, baseBytes: cfg.hip.baseBytes }) + headroomBytes,
-    timeoutMs: DS4_RECLAIM_TIMEOUT_MS, intervalMs: DS4_RECLAIM_INTERVAL_MS,
-  })).ok;
-  const keep = Math.min(keepAtLeast, cfg.hip.expertCache);
-  if (keep > 0) {
-    const kept = choose(Math.max(keep, cfg.hip.minExpertCache));
-    if (kept.slots !== null) return kept;
-    addLog('presets', `strata: restart waiting up to ${Math.round(DS4_RECLAIM_TIMEOUT_MS / 1000)}s to keep its ${keep} expert slots (${kept.reason})`);
-    if (await waitFor(keep)) return choose(Math.max(keep, cfg.hip.minExpertCache));
-    addLog('presets', `strata: could not keep ${keep} expert slots after ${Math.round(DS4_RECLAIM_TIMEOUT_MS / 1000)}s; sizing to what fits`);
-  }
-  const fit = choose(cfg.hip.minExpertCache);
-  if (fit.slots !== null) return fit;
-  const released = await releaseIdlePodsWorkers(`strata hip start would be refused: ${fit.reason}`);
-  if (released.released.length && await waitFor(cfg.hip.minExpertCache)) return choose(cfg.hip.minExpertCache);
-  return fit;
+    waitForBytes: async (targetBytes, timeoutMs) => (await pollForReclaim({
+      readMemAvailable: memAvailableBytes, targetBytes, timeoutMs, intervalMs: DS4_RECLAIM_INTERVAL_MS,
+    })).ok,
+    releaseIdle: releaseIdlePodsWorkers,
+    keepWaitMs: STRATA_RESTART_KEEP_WAIT_MS, floorWaitMs: DS4_RECLAIM_TIMEOUT_MS,
+    log: (msg) => addLog('presets', `strata: ${msg}`),
+  });
 }
 
 /**
@@ -9723,11 +9714,11 @@ async function sizeStrataHipCache(cfg, headroomBytes, keepAtLeast = 0) {
  * verified reclaim, then spawns. Never throws.
  *
  * @param {object} preset The strata preset.
- * @param {{backend:'hip'|'cuda', keepAtLeast?:number}} attempt The backend to try; `keepAtLeast` is the
- *   expert cache a restarted serving HIP engine must not come back below (sizeStrataHipCache).
+ * @param {{backend:'hip'|'cuda', keepAtLeast?:number, maxSlots?:number}} attempt The backend to try;
+ *   for HIP, a restart's previous size and a cap on the new one (sizeHipCacheNow).
  * @returns {Promise<{ok:true}|{ok:false, abort:boolean, reason:string}>} `abort` ends the whole ladder.
  */
-async function startStrataAttempt(preset, { backend, keepAtLeast = 0 }) {
+async function startStrataAttempt(preset, { backend, keepAtLeast = 0, maxSlots = Infinity }) {
   const cfg = strataConfig();
   try {
     // 0. A missing interpreter fails every backend the same way: abort the ladder before
@@ -9799,7 +9790,7 @@ async function startStrataAttempt(preset, { backend, keepAtLeast = 0 }) {
       const { resident, residentAfterEvict, reclaimOk } = await evictLlamaForExclusive({ label: 'strata', targetBytes, keepEmbed, timeoutMs: reclaimTimeoutMs });
       let fit = null;
       if (backend === 'hip' && !residentAfterEvict) {
-        fit = await sizeStrataHipCache(cfg, headroomBytes, keepAtLeast);
+        fit = await sizeHipCacheNow(cfg, headroomBytes, { keepAtLeast, maxSlots });
         addLog('presets', `strata: hip expert cache ${fit.slots ?? 'refused'} (${fit.reason})`);
         if (fit.slots !== null) {
           launch.expertCache = fit.slots;
@@ -9896,18 +9887,18 @@ async function strataLeaveCuda(reason, { swapGate = null, drainMs = null } = {})
  * @param {'cuda'|'hip'} target Preferred backend; a failed CUDA return falls back to HIP.
  * @param {string} reason Why the swap happened.
  * @param {function} settle The gate's settle function.
- * @param {{keepAtLeast?: number}} [opts] For a restart of a serving HIP engine: the expert cache it
- *   had, which the HIP attempt waits to keep instead of coming back smaller (sizeStrataHipCache).
+ * @param {{hipAttempts?: Array<{keepAtLeast?: number, maxSlots?: number}>}} [opts] For a restart of a
+ *   serving HIP engine: its HIP attempts in order (e.g. the grown size, then the previous size).
  */
-function runStrataLoadPhase(target, reason, settle, { keepAtLeast = 0 } = {}) {
+function runStrataLoadPhase(target, reason, settle, { hipAttempts = [{}] } = {}) {
   const runtime = strataState.runtime;
   (async () => {
     try {
       // Setup lives inside the try: a throw here must still settle the gate.
       const cfg = strataConfig();
       const preset = config.presets?.[strataState.activePresetId];
-      const hip = cfg.hip && { backend: 'hip', keepAtLeast };
-      const attempts = (target === 'hip' ? [hip] : [cfg.cuda && { backend: 'cuda' }, hip]).filter(Boolean);
+      const hip = cfg.hip ? hipAttempts.map((a) => ({ backend: 'hip', ...a })) : [];
+      const attempts = (target === 'hip' ? hip : [cfg.cuda && { backend: 'cuda' }, ...hip]).filter(Boolean);
       if (!preset || !runtime || attempts.length === 0) {
         if (runtime) Object.assign(runtime, { status: 'exhausted', backend: null, settledAt: Date.now(), reason: 'swap-no-backend' });
         return;
@@ -9968,12 +9959,12 @@ function runStrataLoadPhase(target, reason, settle, { keepAtLeast = 0 } = {}) {
  *
  * @param {'cuda'|'hip'} target Backend to move to.
  * @param {string} reason Why.
- * @param {{settle?: ?function, keepAtLeast?: number, drainMs?: ?number}} [opts] `settle`: a gate the
- *   caller already armed (the prefill watchdog's lane hold); `keepAtLeast`: the expert cache a
- *   restarted HIP engine must not come back below; `drainMs`: drain bound (0 for a wedged engine).
+ * @param {{settle?: ?function, hipAttempts?: Array<{keepAtLeast?: number, maxSlots?: number}>, drainMs?: ?number}} [opts]
+ *   `settle`: a gate the caller already armed (the prefill-wedge restart); `hipAttempts`: the HIP
+ *   attempts of a restart (runStrataLoadPhase); `drainMs`: drain bound (0 for a wedged engine).
  * @returns {Promise<void>} Resolves when the leave phase is done; returns at once if a swap is in flight.
  */
-async function strataSwapBackend(target, reason, { settle: armed = null, keepAtLeast = 0, drainMs = null } = {}) {
+async function strataSwapBackend(target, reason, { settle: armed = null, hipAttempts = [{}], drainMs = null } = {}) {
   const settle = armed || EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();
   if (!settle) return;
   const runtime = strataState.runtime;
@@ -9987,38 +9978,34 @@ async function strataSwapBackend(target, reason, { settle: armed = null, keepAtL
     settle();
     return;
   }
-  runStrataLoadPhase(target, reason, settle, { keepAtLeast });
+  runStrataLoadPhase(target, reason, settle, { hipAttempts });
 }
 
 /**
- * Hold Strata's exclusive lane after a prefill cancel: arm the swap gate (new requests wait) and
- * reserve the single generation slot at realtime priority (requests already queued for it wait
- * instead of being sent into a possibly wedged engine).
- * @returns {?{settle: function, slot: Promise<?number>, controller: AbortController}} the hold, or
- *   null when a swap is already in flight (it holds the lane itself).
+ * Hold Strata's lane after a prefill cancel: reserve its single generation slot at the front of
+ * the exclusive queue, so requests already queued for Strata wait instead of being sent into a
+ * possibly wedged engine. Only Strata traffic waits: no swap gate is armed, so llama and remote
+ * requests carry on.
+ * @returns {{slot: Promise<?number>, controller: AbortController}} the hold.
  */
 function holdStrataLane() {
-  const settle = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();
-  if (!settle) return null;
   const controller = new AbortController();
-  const slot = ds4Queue.acquire({ model: 'strata-prefill-watchdog', endpoint: 'prefill-watchdog', priority: 'realtime', signal: controller.signal })
-    .catch(() => null);
-  return { settle, slot, controller };
+  const slot = ds4Queue.acquire({
+    model: 'strata-prefill-watchdog', endpoint: 'prefill-watchdog', priority: 'realtime', front: true, signal: controller.signal,
+  }).catch(() => null);
+  return { slot, controller };
 }
 
 /**
- * Release a lane hold from holdStrataLane: drop or free its slot reservation and, unless the
- * caller hands the gate to a restart, settle the swap gate.
- * @param {?{settle: function, slot: Promise<?number>, controller: AbortController}} hold the hold.
- * @param {{settleGate?: boolean}} [opts] false when a restart takes over the armed gate.
+ * Release a lane hold from holdStrataLane: drop its reservation if still pending, else free the slot.
+ * @param {?{slot: Promise<?number>, controller: AbortController}} hold the hold.
  * @returns {Promise<void>}
  */
-async function releaseStrataLaneHold(hold, { settleGate = true } = {}) {
+async function releaseStrataLaneHold(hold) {
   if (!hold) return;
   hold.controller.abort();
   const id = await hold.slot;
   if (id != null) ds4Queue.release(id);
-  if (settleGate) hold.settle();
 }
 
 /**
@@ -10093,9 +10080,10 @@ async function strataBackendTick() {
   if (currentEngine === ENGINE_TYPES.STRATA && runtime?.status === 'ready'
     && (strataState.prefillHold || (!strataState.swapPromise && ds4Queue.active > 0))) {
     // Prefill-hang watchdog (docs/Designs/ResourceArbiter.md section 4). The verdict is bound to the
-    // request holding the exclusive slot. A cancel holds the lane (swap gate + the slot itself) so no
-    // queued request is sent into a possibly wedged engine; progress or leaving 'reading' releases it,
-    // a confirmed wedge restarts the engine under that same gate and the held requests are replayed.
+    // request holding the exclusive slot. A cancel fails that request (never replayed) and holds
+    // Strata's lane (its slot, front of the queue) so no queued request is sent into a possibly
+    // wedged engine; progress or leaving 'reading' releases it; a confirmed wedge arms the swap
+    // gate, aborts the queued Strata requests (they replay after the restart) and restarts.
     const holder = [...ds4Queue.activeItems.values()].find((item) => item.activeReqId != null);
     const pf = strataPrefillVerdict({
       live: await readStrataLive(cfg.port), prev: strataState.prefillWatch, reqId: holder?.activeReqId ?? null,
@@ -10105,18 +10093,21 @@ async function strataBackendTick() {
     if (pf.action === 'cancel') {
       addLog('presets', `strata prefill stalled: ${pf.reason}; cancelling request ${holder?.activeReqId ?? '?'} and holding the lane`);
       strataState.prefillHold = holdStrataLane();
-      if (holder) activeRequests.get(holder.activeReqId)?.abortController?.abort();
+      if (holder) activeRequests.get(holder.activeReqId)?.abortController?.abort(prefillStalledError(pf.reason));
     } else if (pf.action === 'restart') {
       const hold = strataState.prefillHold;
       strataState.prefillHold = null;
       strataState.prefillWatch = null;
       addLog('presets', `strata prefill ${pf.reason}; restarting on ${runtime.backend}`);
-      // Abort the requests queued behind the hold first (they have sent nothing, so they are replayed
-      // after the restart); freeing the slot before that would hand it to one of them.
-      for (const entry of activeRequests.values()) if (entry.backend === 'strata') entry.abortController?.abort();
-      await releaseStrataLaneHold(hold, { settleGate: false }); // the restart below settles the gate
+      // Arm the gate first so the queued requests aborted next are replayed after the restart (they
+      // have sent nothing); then free the slot, which none of them can now take.
+      const settle = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();
+      if (settle) for (const entry of activeRequests.values()) if (entry.backend === 'strata') entry.abortController?.abort();
+      await releaseStrataLaneHold(hold);
+      if (!settle) return; // a swap already in flight restarts the engine itself
+      const size = runtime.expertCache?.effective;
       await strataSwapBackend(runtime.backend, 'prefill-wedged', {
-        settle: hold?.settle, keepAtLeast: runtime.expertCache?.effective ?? 0, drainMs: 0,
+        settle, drainMs: 0, hipAttempts: [size ? { keepAtLeast: size, maxSlots: size } : {}],
       });
       return;
     } else if (strataState.prefillHold && !pf.state?.cancelledAt) {
@@ -10148,7 +10139,12 @@ async function strataBackendTick() {
     strataState.growIdleSinceMs = grow.idleSinceMs;
     if (grow.action === 'grow') {
       addLog('presets', `strata: ${grow.reason}; restarting on hip between requests`);
-      await strataSwapBackend('hip', grow.reason, { keepAtLeast: runtime.expertCache.effective });
+      // Launch at most at the decided size (which left the grow margin free); if that load fails,
+      // fall back to the size it was serving at instead of going exhausted.
+      const prev = runtime.expertCache.effective;
+      await strataSwapBackend('hip', grow.reason, {
+        hipAttempts: [{ keepAtLeast: prev, maxSlots: grow.slots }, { keepAtLeast: prev, maxSlots: prev }],
+      });
       return;
     }
   }
@@ -13923,14 +13919,22 @@ async function serveDs4WithSwapRecovery(req, res, opts) {
       const proxy = opts.proxy || proxyChatToDs4;
       return await proxy(req, res, opts);
     } catch (err) {
+      const prefillStalled = isPrefillStalled(err);
       const decision = ds4SwapRetryDecision({
         swapOccurred: engine.swapGeneration() !== genBefore || !!engine.swapPromise(),
         attempt,
         maxRetries: DS4_SWAP_MAX_RETRIES,
         bodyCommitted: res.headersSent || res.writableEnded,
+        prefillStalled,
       });
       if (!decision.retry) {
         console.warn(`[${engine.type}] not re-serving '${opts.requestedModel}': ${decision.reason} (${err.message})`);
+        if (prefillStalled && !res.headersSent) {
+          return res.status(504).json({ error: { message: err.message, type: 'prefill_stalled', code: 'prefill_stalled' } });
+        }
+        if (prefillStalled && !res.writableEnded) {
+          try { res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'prefill_stalled', code: 'prefill_stalled' } })}\n\n`); } catch { /* client gone */ }
+        }
         if (!res.headersSent) {
           return res.status(502).json({
             error: { message: `${engine.type}-server request failed: ${err.message}`, type: `${engine.type}_backend_error` },

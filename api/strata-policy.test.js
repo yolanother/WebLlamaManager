@@ -17,7 +17,10 @@ import {
   strataBackendDecision,
   cudaAdmission,
   strataPrefillVerdict,
+  prefillStalledError,
+  isPrefillStalled,
 } from './strata-policy.js';
+import { ds4SwapRetryDecision } from './ds4-exclusive.js';
 
 const MiB = 1048576;
 const OWN = ['strata', 'ggml-rpc-server', 'rpc-server'];
@@ -326,4 +329,17 @@ test('strataPrefillVerdict: after a cancel, a new prompt reading is progress, no
 test('strataPrefillVerdict: metrics unreadable after a cancel still escalate to restart after the grace (no hold forever)', () => {
   const v = run([[0, reading(null)], [180_000, reading(null)], [195_000, null, null], [211_000, null, null]]);
   assert.deepEqual(v.map((x) => x.action), ['ok', 'cancel', 'ok', 'restart']);
+});
+
+test('a prefill-stalled cancel is never replayed, even while a swap is in progress (re-review: a wedging prompt looped)', () => {
+  const err = prefillStalledError('no prefill progress for 180s (read 0/1282)');
+  assert.equal(isPrefillStalled(err), true);
+  assert.match(err.message, /prefill stalled/);
+  assert.equal(isPrefillStalled(new Error('x')), false);
+  assert.equal(isPrefillStalled(Object.assign(new Error('wrapped'), { cause: err })), true, 'a fetch abort may wrap the reason');
+  const d = ds4SwapRetryDecision({ swapOccurred: true, attempt: 0, maxRetries: 2, bodyCommitted: false, prefillStalled: true });
+  assert.equal(d.retry, false);
+  assert.match(d.reason, /prefill/);
+  // Negative control: the same swap without the stall is replayed.
+  assert.equal(ds4SwapRetryDecision({ swapOccurred: true, attempt: 0, maxRetries: 2, bodyCommitted: false }).retry, true);
 });

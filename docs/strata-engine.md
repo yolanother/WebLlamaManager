@@ -131,7 +131,7 @@ Layout on the host:
 | `policy.returnToCudaAfterMin` | `15` | Hysteresis before moving back to CUDA. |
 | `policy.drainMaxWaitSec` | `120` | Bounded drain of in-flight requests before cancelling. |
 | `policy.idleBaselineMb` / `yieldGrowthMb` | `1536` / `512` | Other VRAM above baseline+growth counts as a busy 3090. |
-| `policy.prefillStallSec` | `180` | A prompt read with no progress (Strata `/metrics` `live.prompt_read`, per request) for this long is cancelled, and the lane is held. If the engine recovers, the lane is released. If it is still stuck, or `/metrics` is silent, 30 s later the engine is restarted and the held requests are replayed. |
+| `policy.prefillStallSec` | `180` | A prompt read with no progress for this long, per request (Strata `/metrics` `live.prompt_read`), is failed with 504 `prefill_stalled`. It is never replayed. Strata's lane is then held; llama and remote traffic is not. If the engine recovers, the lane is released. If it is still stuck, or `/metrics` is silent, 30 s later the engine restarts at its current size, and the queued Strata requests are replayed. |
 
 GB/MB values become bytes, durations become ms, env values are stringified. If `hip`
 has a missing or `auto` `expertCache` it is disabled with a warning. There are no
@@ -173,7 +173,9 @@ to 100.
 - **Still short after that:** the attempt fails as `reclaim-timeout`, and recovery
   retries it.
 - **Restart of an engine that was serving** (grow-back or prefill-wedge restart): it
-  first waits up to 180 s to keep the size it already had.
+  first waits up to 30 s to keep the size it already had. A grow restart is also capped at
+  the size the grow decision chose. If that load fails, it is retried once at the previous
+  size.
 
 - The `presets` log shows the outcome: `strata: hip expert cache <N> (<reason>)`.
 - `GET /api/stats` shows it as
@@ -395,7 +397,7 @@ Since 2026-10-15 both `default-big` and `default-small` on drakemore target the
 | HIP backend disabled with warning | `hip.expertCache` missing or `auto`; set an explicit slot count. |
 | Status `exhausted` / 503 on local requests | Both backends failed. The manager re-activates the preset by itself: first retry 1 min after the failure, then every 2, 4, 8, 16 and 30 min (capped, never gives up), logging each attempt in the `presets` log; `GET /api/stats` shows `strataRecovery` (`since`, `attempts`, `nextAt`, `lastReason`) while it is down. Read `<dataDir>/engine-<backend>.log` for the cause, or re-activate via the activate route to retry at once. If the engine was brought back some other way, the next local request probes its health (at most every 5 s) and clears the status itself. A `stop-unconfirmed` runtime (wedged process) is never retried automatically. |
 | Manager `GET /health` said `down` (503) while Strata served | Fixed: `/health` counted only llama. It now reports `healthy` while the exclusive engine is `ready` (`degraded` while loading/swapping, `down` when exhausted), plus `exclusive: {engine, status}`. Frostburn's router never probed `/health`; its alias trips came from the circuit breaker (see model-alias-groups.md). |
-| `strata prefill stalled: no prefill progress for Ns (read R/T)` in the `presets` log | The prefill watchdog cancelled a request whose prompt read stopped moving for `policy.prefillStallSec`. A following `restarting on <backend>` line means Strata stayed stuck after the cancel and was restarted. If Strata's `/metrics` does not answer, the watchdog cannot see progress, and only the 900 s zero-token ceiling ends the request. |
+| `strata prefill stalled: no prefill progress for Ns (read R/T)` in the `presets` log, and the caller got 504 `prefill_stalled` | The prefill watchdog cancelled a request whose prompt read stopped moving for `policy.prefillStallSec`. The request is not replayed, because the same prompt would wedge the engine again. A following `restarting on <backend>` line means Strata stayed stuck after the cancel and was restarted. If Strata's `/metrics` does not answer, the watchdog cannot see progress, and only the 900 s zero-token ceiling ends the request. |
 | Strata serving with fewer expert slots than configured | Adaptive cache: memory was short at spawn. `strataRuntime.expertCache.reason` says why. It grows back once memory frees and Strata has been idle past `hip.growCooldownMin`. Check `ps` and the Pods containers for what holds the memory. |
 | Status `stop-unconfirmed` | A `strata` process survived the stop. Kill it (`pkill -x strata` as the service user's root) and re-activate. |
 | Engine logs mlock / pinned allocation failure | Add a `LimitMEMLOCK=infinity` drop-in to the unit. |

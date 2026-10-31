@@ -21,6 +21,7 @@ import {
   strataHipFootprintBytes,
   strataHipExpertCache,
   strataGrowDecision,
+  sizeStrataHipCache,
 } from './strata-engine.js';
 
 const GB = 1024 * 1024 * 1024;
@@ -377,4 +378,65 @@ test('strataGrowDecision: hysteresis, a small gain does not restart', () => {
 
 test('strataGrowDecision: nothing to do at the configured size', () => {
   assert.equal(strataGrowDecision(growArgs({ effective: 16000, availableBytes: 60 * GB })).action, 'stay');
+});
+
+// ── sizeStrataHipCache: the size a HIP (re)start actually launches with (re-review) ─────────
+// Behavioural, with injected memory: the earlier tests checked only the grow decision, and the
+// restart launched at the plain-headroom size, not the decision's (16000 vs 11100 at 30 GiB).
+const hip = { expertCache: 16000, minExpertCache: 4000, baseBytes: 65 * GB };
+
+/**
+ * Run sizeStrataHipCache against a scripted MemAvailable.
+ * @param {object} opts sizing options; `mem` is an array of successive readings (the last repeats),
+ *   `waitOk` what waitForBytes answers, `released` what the Pods release frees.
+ */
+async function sizeWith({ mem, waitOk = false, released = [], ...opts }) {
+  const readings = [...mem];
+  const calls = { waits: [], releases: 0 };
+  const result = await sizeStrataHipCache({
+    hip, headroomBytes: HEADROOM, keepWaitMs: 30_000, floorWaitMs: 180_000,
+    readMemAvailable: () => (readings.length > 1 ? readings.shift() : readings[0]),
+    waitForBytes: async (bytes, ms) => { calls.waits.push({ bytes, ms }); return waitOk; },
+    releaseIdle: async () => { calls.releases++; return { released }; },
+    ...opts,
+  });
+  return { ...result, calls };
+}
+
+test('sizeStrataHipCache: a grow restart launches at the decided size, leaving headroom + margin (review HIGH)', async () => {
+  const decision = strataGrowDecision(growArgs({ availableBytes: 30 * GB }));
+  const afterStop = 30 * GB + strataHipFootprintBytes({ expertCache: 8000 });
+  const r = await sizeWith({ mem: [afterStop], keepAtLeast: 8000, maxSlots: decision.slots });
+  assert.equal(r.slots, decision.slots);
+  const left = afterStop - strataHipFootprintBytes({ expertCache: r.slots });
+  assert.ok(left >= HEADROOM + MARGIN, `leaves ${(left / GB).toFixed(1)} GiB`);
+  // Negative control: uncapped, the same memory launches at the full target and eats the margin.
+  assert.equal((await sizeWith({ mem: [afterStop], keepAtLeast: 8000 })).slots, 16000);
+});
+
+test('sizeStrataHipCache: a restart keeps its size when memory returns within the bounded keep wait', async () => {
+  const keepBytes = strataHipFootprintBytes({ expertCache: 8000 }) + HEADROOM;
+  const r = await sizeWith({ mem: [keepBytes - 4 * GB, keepBytes + GB], waitOk: true, keepAtLeast: 8000 });
+  assert.ok(r.slots >= 8000, `slots ${r.slots}`);
+  assert.deepEqual(r.calls.waits.map((w) => w.ms), [30_000], 'the keep wait is capped at 30 s');
+});
+
+test('sizeStrataHipCache: memory that dips again right after the keep wait sizes to what fits, never refuses (review LOW)', async () => {
+  const keepBytes = strataHipFootprintBytes({ expertCache: 8000 }) + HEADROOM;
+  const dipped = strataHipFootprintBytes({ expertCache: 6000 }) + HEADROOM;
+  const r = await sizeWith({ mem: [keepBytes - GB, dipped, dipped], waitOk: true, keepAtLeast: 8000 });
+  assert.ok(r.slots !== null && r.slots >= 4000 && r.slots < 8000, `slots ${r.slots}`);
+  assert.equal(r.calls.releases, 0, 'a start above the floor never asks Pods');
+});
+
+test('sizeStrataHipCache: Pods release only when even the floor does not fit; then the floor wait', async () => {
+  const short = strataHipFootprintBytes({ expertCache: 2000 }) + HEADROOM;
+  const none = await sizeWith({ mem: [short], released: [] });
+  assert.equal(none.slots, null);
+  assert.equal(none.calls.releases, 1);
+  assert.deepEqual(none.calls.waits, [], 'nothing released: no pointless wait');
+  const freed = strataHipFootprintBytes({ expertCache: 9000 }) + HEADROOM;
+  const some = await sizeWith({ mem: [short, freed], released: ['w-up'], waitOk: true });
+  assert.ok(some.slots >= 4000);
+  assert.deepEqual(some.calls.waits.map((w) => w.ms), [180_000]);
 });

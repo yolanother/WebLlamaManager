@@ -38,70 +38,52 @@ test('/api/stats exposes per-model queue depth across the llama and exclusive la
   assert.match(source, /byModel: mergeModelDepths\(llamaQueue\.getModelDepths\(\), ds4Queue\.getModelDepths\(\)\)/);
 });
 
-test('HIP attempt sizes the expert cache with sizeStrataHipCache and launches with it', () => {
-  const body = fnBody('startStrataAttempt');
-  assert.match(body, /async function startStrataAttempt|keepAtLeast = 0/);
-  assert.match(body, /fit = await sizeStrataHipCache\(cfg, headroomBytes, keepAtLeast\)/);
-  assert.match(body, /launch\.expertCache = fit\.slots/, 'the chosen size goes into the launch override');
-  assert.match(body, /runtime\.expertCache = /, 'the chosen size and reason are recorded');
-  assert.match(body, /getStrataSupervisor\(\)\.start\(preset, \{ planMode: true, override: launch \}\)/);
-});
-
-test('a restarted serving engine waits to keep its previous cache before sizing down (review HIGH 1)', () => {
-  const body = fnBody('sizeStrataHipCache');
-  const keep = body.indexOf('if (keep > 0)');
-  const wait = body.indexOf('await waitFor(keep)');
-  const fresh = body.indexOf('const fit = choose(cfg.hip.minExpertCache)');
-  assert.ok(keep > 0 && wait > keep && fresh > wait, 'keep-previous-size wait comes before the fresh fit');
-  assert.match(body, /timeoutMs: DS4_RECLAIM_TIMEOUT_MS/);
-  assert.match(fnBody('runStrataLoadPhase'), /\{ backend: 'hip', keepAtLeast \}/);
-  assert.match(fnBody('strataSwapBackend'), /runStrataLoadPhase\(target, reason, settle, \{ keepAtLeast \}\)/);
-});
-
-test('Pods release is asked only when a start would be refused, never to grow (review MEDIUM)', () => {
-  const body = fnBody('sizeStrataHipCache');
-  const refusedOnly = body.indexOf('if (fit.slots !== null) return fit;');
-  const release = body.indexOf('await releaseIdlePodsWorkers(');
-  assert.ok(refusedOnly > 0 && release > refusedOnly, 'release only after the floor did not fit');
-  assert.match(fnBody('releaseIdlePodsWorkers'), /requestPodsIdleRelease\(\{ config, env: process\.env, reason, fetchFn: fetch/);
-  assert.doesNotMatch(fnBody('strataBackendTick'), /releaseIdlePodsWorkers/);
-  assert.doesNotMatch(fnBody('startStrataAttempt'), /releaseIdlePodsWorkers/);
-});
-
-test('the backend tick grows with the margin, before the CUDA-only early return, keeping the current size', () => {
-  const body = fnBody('strataBackendTick');
-  const grow = body.indexOf('strataGrowDecision(');
-  assert.ok(grow > 0 && grow < body.indexOf('|| !cfg.cuda'), 'grow-back runs on HIP-only hosts');
-  assert.match(body, /growMarginBytes: cfg\.hip\.growMarginBytes/);
-  assert.match(body, /strataSwapBackend\('hip', grow\.reason, \{ keepAtLeast: runtime\.expertCache\.effective \}\)/);
-});
-
-test('prefill watchdog: bound to the slot holder, holds the lane on cancel, restarts under that hold (review HIGH 3)', () => {
-  const body = fnBody('strataBackendTick');
-  assert.match(body, /strataPrefillVerdict\(\{\s*live: await readStrataLive\(cfg\.port\), prev: strataState\.prefillWatch, reqId: holder\?\.activeReqId \?\? null/);
-  assert.match(body, /stallMs: cfg\.policy\.prefillStallMs/);
-  const hold = body.indexOf('strataState.prefillHold = holdStrataLane();');
-  const abort = body.indexOf('activeRequests.get(holder.activeReqId)?.abortController?.abort()');
-  assert.ok(hold > 0 && abort > hold, 'the lane is held before the holder is aborted');
-  const abortQueued = body.indexOf("if (entry.backend === 'strata') entry.abortController?.abort();");
-  const freeSlot = body.indexOf('await releaseStrataLaneHold(hold, { settleGate: false })');
-  assert.ok(abortQueued > 0 && freeSlot > abortQueued, 'queued requests are aborted (for replay) before the held slot is freed');
-  assert.match(body, /strataSwapBackend\(runtime\.backend, 'prefill-wedged', \{\s*settle: hold\?\.settle, keepAtLeast: runtime\.expertCache\?\.effective \?\? 0, drainMs: 0,/);
-  assert.match(body, /strataState\.prefillHold && !pf\.state\?\.cancelledAt/, 'recovery after the cancel releases the lane');
-  const holdFn = fnBody('holdStrataLane');
-  assert.match(holdFn, /armSwapGate\(\)/);
-  assert.match(holdFn, /ds4Queue\.acquire\(\{[^}]*priority: 'realtime'/);
-  assert.match(fnBody('strataSwapBackend'), /const settle = armed \|\| EXCLUSIVE_ENGINES\[ENGINE_TYPES\.STRATA\]\.armSwapGate\(\)/);
-  assert.match(fnBody('strataLeaveCuda'), /drainExclusiveRequests\(eng, drainMs \?\? strataConfig\(\)\.policy\.drainMaxWaitMs\)/);
-  const live = fnBody('readStrataLive');
-  assert.match(live, /\/metrics/);
-  assert.match(live, /Accept: 'application\/json'/);
-});
-
 test('POST /api/config enforces configUpdateRefusal before saving (review LOW)', () => {
   const at = source.indexOf("app.post('/api/config'");
   const route = source.slice(at, source.indexOf('\napp.', at + 10));
   const call = route.search(/const refusal = configUpdateRefusal\(\{ updates, loopback: isLoopbackRequest\(req\), host: req\.headers\.host, origin: req\.headers\.origin, localNames: configWriteLocalNames\(\) \}\);\n\s*if \(refusal\) return res\.status\(refusal\.status\)\.json\(refusal\.body\);/);
   assert.ok(call > 0, 'the route calls configUpdateRefusal and returns its refusal');
   assert.ok(call < route.indexOf('config = { ...config, ...updates }'), 'before the config is changed');
+});
+
+test('HIP attempt sizes through sizeHipCacheNow (the tested sizeStrataHipCache) and launches with it', () => {
+  const body = fnBody('startStrataAttempt');
+  assert.match(body, /fit = await sizeHipCacheNow\(cfg, headroomBytes, \{ keepAtLeast, maxSlots \}\)/);
+  assert.match(body, /launch\.expertCache = fit\.slots/);
+  assert.match(body, /getStrataSupervisor\(\)\.start\(preset, \{ planMode: true, override: launch \}\)/);
+  const now = fnBody('sizeHipCacheNow');
+  assert.match(now, /return sizeStrataHipCache\(\{/);
+  assert.match(now, /releaseIdle: releaseIdlePodsWorkers/);
+  assert.match(now, /keepWaitMs: STRATA_RESTART_KEEP_WAIT_MS, floorWaitMs: DS4_RECLAIM_TIMEOUT_MS/);
+  assert.match(source, /const STRATA_RESTART_KEEP_WAIT_MS = 30_000;/);
+  assert.doesNotMatch(fnBody('strataBackendTick'), /releaseIdlePodsWorkers/, 'grow-back never asks Pods');
+});
+
+test('a grow restart is capped at the decided size and falls back to the previous size (re-review)', () => {
+  const body = fnBody('strataBackendTick');
+  const grow = body.indexOf('strataGrowDecision(');
+  assert.ok(grow > 0 && grow < body.indexOf('|| !cfg.cuda'), 'grow-back runs on HIP-only hosts');
+  assert.match(body, /growMarginBytes: cfg\.hip\.growMarginBytes/);
+  assert.match(body, /hipAttempts: \[\{ keepAtLeast: prev, maxSlots: grow\.slots \}, \{ keepAtLeast: prev, maxSlots: prev \}\]/);
+  assert.match(fnBody('runStrataLoadPhase'), /hipAttempts\.map\(\(a\) => \(\{ backend: 'hip', \.\.\.a \}\)\)/);
+  assert.match(fnBody('strataSwapBackend'), /runStrataLoadPhase\(target, reason, settle, \{ hipAttempts \}\)/);
+  assert.match(fnBody('startStrataAttempt'), /keepAtLeast = 0, maxSlots = Infinity/);
+});
+
+test('prefill watchdog: the cancelled request fails, only Strata waits, a wedge restarts at the same size (re-review)', () => {
+  const body = fnBody('strataBackendTick');
+  assert.match(body, /strataPrefillVerdict\(\{\s*live: await readStrataLive\(cfg\.port\), prev: strataState\.prefillWatch, reqId: holder\?\.activeReqId \?\? null/);
+  assert.match(body, /abort\(prefillStalledError\(pf\.reason\)\)/, 'the holder is aborted with the no-replay reason');
+  const hold = fnBody('holdStrataLane');
+  assert.doesNotMatch(hold, /armSwapGate/, 'the hold does not gate llama or remote traffic');
+  assert.match(hold, /front: true/);
+  const arm = body.indexOf('const settle = EXCLUSIVE_ENGINES[ENGINE_TYPES.STRATA].armSwapGate();');
+  const abortQueued = body.indexOf("if (settle) for (const entry of activeRequests.values()) if (entry.backend === 'strata') entry.abortController?.abort();");
+  const free = body.indexOf('await releaseStrataLaneHold(hold);', abortQueued);
+  assert.ok(arm > 0 && abortQueued > arm && free > abortQueued, 'gate, then abort queued (replayed), then free the slot');
+  assert.match(body, /hipAttempts: \[size \? \{ keepAtLeast: size, maxSlots: size \} : \{\}\]/);
+  assert.match(body, /strataState\.prefillHold && !pf\.state\?\.cancelledAt/);
+  const recovery = fnBody('serveDs4WithSwapRecovery');
+  assert.match(recovery, /prefillStalled = isPrefillStalled\(err\)/);
+  assert.match(recovery, /res\.status\(504\)\.json\(\{ error: \{ message: err\.message, type: 'prefill_stalled'/);
 });
